@@ -17,6 +17,7 @@ use super::*;
 use crate::layers::deepseek_v41::cache_recipe::{completed_group, visible_groups};
 use crate::layers::deepseek_v41::index::INDEX_DIM;
 use crate::layers::deepseek_v41::ops::HEAD_DIM;
+use crate::layers::deepseek_v41::parts::Held;
 use crate::layers::deepseek_v41::test_support::{
     Recording, SHAPE, backend, bf16s, block, chosen, closeness, download, free_store, hand_choice,
     hand_keys, role, rows_of, source_keys,
@@ -33,6 +34,7 @@ fn blocks_replay_the_reference_token_by_token() -> Result<()> {
     let stream = gpu.default_stream();
     let shared = Shared {
         shape: SHAPE,
+        held: Held::ALL,
         kernels: BlockKernels::load(gpu)?,
         scratch: Arc::new(Scratch::alloc(gpu, &SHAPE, 1024)?),
         handoff: Arc::new(Mutex::new(Handoff::default())),
@@ -92,7 +94,7 @@ fn blocks_replay_the_reference_token_by_token() -> Result<()> {
                 );
                 hand_choice(&block, &role, &theirs, visible_groups(position, ratio));
             }
-            block.attend(gpu, 0, streams, pre, &mut state, position, stream)?;
+            block.attend(gpu, 0, streams, pre, &mut state, position, None, stream)?;
             attended.extend(download(gpu, scratch.sublayer_out, hidden)?);
             // A key is FP4: one rounding step in it is a large step, and
             // every later token reads it. So once a group's keys have been
@@ -163,6 +165,7 @@ fn blocks_replay_the_reference_token_by_token() -> Result<()> {
         worst_pre = worst_pre.max(pre_gap);
         state.free(gpu)?;
         free_store(gpu, &store)?;
+        block.weights.free_parts(gpu)?;
         gpu.free(block.freqs)?;
     }
     println!(

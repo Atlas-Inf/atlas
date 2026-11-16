@@ -38,7 +38,7 @@ impl MoeKernels {
             scores: kernel("dsv41_moe_scores")?,
             pick: kernel("dsv41_moe_pick")?,
             fp4_gemv: kernel("dsv41_fp4_gemv")?,
-            fp4_gemv_tc: gpu.kernel("dsv41_fp4_tc", "dsv41_fp4_gemv_tc8")?,
+            fp4_gemv_tc: gpu.kernel("dsv41_tc", "dsv41_fp4_gemv_tc8")?,
             plain_fp4: std::env::var("ATLAS_DSV41_PLAIN_FP4").is_ok_and(|v| v == "1"),
             swiglu: kernel("dsv41_swiglu")?,
             accumulate: kernel("dsv41_accumulate")?,

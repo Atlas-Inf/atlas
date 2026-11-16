@@ -14,6 +14,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::hc::{self, HcSite};
 use super::ops;
+use super::parts::Held;
 use super::profile;
 pub use super::shape::{BlockKernels, Scratch, Shape};
 pub use super::state::{CompressedKeys, Handoff, SeqState};
@@ -25,6 +26,8 @@ use crate::weight_map::DenseWeight;
 #[derive(Clone)]
 pub struct Shared {
     pub shape: Shape,
+    /// The parts of the wide projections this rank computes.
+    pub held: Held,
     pub kernels: BlockKernels,
     pub scratch: Arc<Scratch>,
     pub handoff: Arc<Mutex<Handoff>>,
@@ -131,6 +134,7 @@ impl Block {
 
     /// The attention sublayer of one token, up to its output in
     /// `scratch.sublayer_out`; the site's post and comb are left in scratch.
+    #[allow(clippy::too_many_arguments)]
     fn attend(
         &self,
         gpu: &dyn GpuBackend,
@@ -139,6 +143,7 @@ impl Block {
         pre: DevicePtr,
         state: &mut SeqState,
         position: usize,
+        comm: Option<&dyn CommBackend>,
         stream: u64,
     ) -> Result<()> {
         let (s, k, sc, w) = (
@@ -153,7 +158,7 @@ impl Block {
             hc::collapse(gpu, k.hc.collapse, &s.hc, streams, pre, sc.x, 1, stream)?;
             self.norm(gpu, sc.x, w.attn.norm, sc.normed, s.hidden, stream)
         })?;
-        self.attention(gpu, row, state, position, stream)
+        self.attention(gpu, row, state, position, comm, stream)
     }
 
     /// The rest of the block: the attention output into the stream, then the
@@ -224,7 +229,7 @@ impl Block {
         comm: Option<&dyn CommBackend>,
         stream: u64,
     ) -> Result<()> {
-        self.attend(gpu, row, streams, pre, state, position, stream)?;
+        self.attend(gpu, row, streams, pre, state, position, comm, stream)?;
         self.finish(gpu, streams, pre, comm, stream)
     }
 }

@@ -22,6 +22,7 @@ use crate::layers::deepseek_v41::block::{BlockKernels, Handoff, Scratch, SeqStat
 use crate::layers::deepseek_v41::cache_recipe::{WINDOW, completed_group, visible_groups};
 use crate::layers::deepseek_v41::index::INDEX_DIM;
 use crate::layers::deepseek_v41::ops::HEAD_DIM;
+use crate::layers::deepseek_v41::parts::Held;
 use crate::layers::deepseek_v41::test_support::{
     Recording, SHAPE, backend, bf16s, block, chosen, closeness, download, free_store, hand_choice,
     hand_keys, role, source_keys,
@@ -69,6 +70,7 @@ fn run(layer: usize) -> Result<Report> {
     let total = rec.prefill + rec.decode;
     let shared = Shared {
         shape: SHAPE,
+        held: Held::ALL,
         kernels: BlockKernels::load(gpu)?,
         scratch: Arc::new(Scratch::alloc(gpu, &SHAPE, total / ratio)?),
         handoff: Arc::new(Mutex::new(Handoff::default())),
@@ -120,7 +122,7 @@ fn run(layer: usize) -> Result<Report> {
         hand_choice(&block, &role, &theirs, visible);
         gpu.synchronize(stream)?;
         gpu.copy_h2d(&input, sc.normed)?;
-        block.attention(gpu, 0, &mut state, position, stream)?;
+        block.attention(gpu, 0, &mut state, position, None, stream)?;
         let kind = match step {
             None => 0,
             Some(_) if visible.is_multiple_of(2) => 1,
@@ -218,6 +220,7 @@ fn run(layer: usize) -> Result<Report> {
     );
     state.free(gpu)?;
     free_store(gpu, &store)?;
+    block.weights.free_parts(gpu)?;
     Ok(Report {
         prefill,
         even,

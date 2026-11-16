@@ -3,6 +3,7 @@
 //! The attention sublayer of a DeepSeek-V4.1 block on one token.
 
 use anyhow::{Context, Result, ensure};
+use spark_comm::CommBackend;
 use spark_runtime::gpu::GpuBackend;
 
 use super::block::Block;
@@ -10,9 +11,11 @@ use super::cache_recipe::{WINDOW, completed_group, group_position, window_row, w
 use super::index::INDEX_DIM;
 use super::moe;
 use super::ops::{self, Fp4Scale, HEAD_DIM};
+use super::parts::{self, PARTS};
 use super::profile;
 use super::side;
 use super::state::SeqState;
+use super::weights::row_part;
 use crate::layers::ops::mxfp8_gemv_rows;
 use crate::weight_map::Mxfp8Weight;
 
@@ -129,13 +132,16 @@ impl Block {
     }
 
     /// Attention of the normed input in `scratch.normed` into
-    /// `scratch.sublayer_out`.
+    /// `scratch.sublayer_out`. The heads, and the output projections behind
+    /// them, are in four parts; `comm` reaches the ranks that hold the
+    /// others.
     pub(super) fn attention(
         &self,
         gpu: &dyn GpuBackend,
         row: usize,
         state: &mut SeqState,
         position: usize,
+        comm: Option<&dyn CommBackend>,
         stream: u64,
     ) -> Result<()> {
         let (s, k, sc, w) = (
@@ -144,16 +150,18 @@ impl Block {
             &self.shared.scratch,
             &self.weights.attn,
         );
+        let held = self.shared.held;
         let began = profile::begin(gpu, stream)?;
-        // q: low-rank projection, norm, per-head projection, rotation.
+        // The low-rank query, normed, and its FP8 form, which every head's
+        // projection and the indexer's read.
         self.fp8(gpu, &w.wq_a, sc.normed, sc.quantized, sc.q_low, stream)?;
         self.norm(gpu, sc.q_low, w.q_norm, sc.q_low_normed, s.q_rank, stream)?;
-        self.fp8(
+        ops::fp8_quant_dequant(
             gpu,
-            &w.wq_b,
+            k.cache.fp8_quant_dequant,
             sc.q_low_normed,
             sc.q_low_quantized,
-            sc.q,
+            s.q_rank,
             stream,
         )?;
         // The window key, from the same FP8 input, into the ring.
@@ -175,19 +183,6 @@ impl Block {
         ops::rotate(
             gpu,
             k.cache.rotate,
-            sc.q,
-            at,
-            self.freqs,
-            1,
-            s.heads,
-            HEAD_DIM,
-            s.rope,
-            false,
-            stream,
-        )?;
-        ops::rotate(
-            gpu,
-            k.cache.rotate,
             sc.pooled,
             at,
             self.freqs,
@@ -206,7 +201,6 @@ impl Block {
             HEAD_DIM,
             stream,
         )?;
-
         profile::end(gpu, stream, "query and window key", began)?;
         let began = profile::begin(gpu, stream)?;
         // Compressed keys: a source writes its own and chooses which a query
@@ -222,85 +216,154 @@ impl Block {
             idx.extend(chosen);
         }
         profile::end(gpu, stream, "compress and choose", began)?;
-        let began = profile::begin(gpu, stream)?;
         gpu.synchronize(stream)?;
         let bytes: Vec<u8> = idx.iter().flat_map(|i| i.to_le_bytes()).collect();
         gpu.copy_h2d(&bytes, sc.idx)?;
-        ops::sparse_attn(
-            gpu,
-            k.cache.sparse_attn,
-            sc.q,
-            state.window,
-            compressed,
-            sc.idx,
-            w.sink,
-            sc.attended,
-            1,
-            s.heads,
-            idx.len(),
-            WINDOW,
-            stream,
-        )?;
-        profile::end(gpu, stream, "sparse attention", began)?;
-        let began = profile::begin(gpu, stream)?;
 
-        // Undo the query's rotation, quantize, and project out: each group of
-        // heads through its own block of wo_a, then wo_b.
-        ops::rotate(
-            gpu,
-            k.cache.rotate,
-            sc.attended,
-            at,
-            self.freqs,
-            1,
-            s.heads,
-            HEAD_DIM,
-            s.rope,
-            true,
-            stream,
-        )?;
-        ops::fp8_quant_dequant(
-            gpu,
-            k.cache.fp8_quant_dequant,
-            sc.attended,
-            sc.attended,
-            s.heads * HEAD_DIM,
-            stream,
-        )?;
+        let (heads, groups) = (s.heads / PARTS, s.o_groups / PARTS);
         let group_in = s.heads / s.o_groups * HEAD_DIM;
         ensure!(
-            w.wo_a.k == group_in && w.wo_a.n == s.o_groups * s.o_rank,
-            "wo_a [{}, {}]",
+            w.wo_a.k == group_in
+                && w.wo_a.n == s.o_groups * s.o_rank
+                && w.wq_b.n == s.heads * HEAD_DIM,
+            "wo_a [{}, {}], wq_b [{}, {}]",
             w.wo_a.n,
-            w.wo_a.k
+            w.wo_a.k,
+            w.wq_b.n,
+            w.wq_b.k
         );
-        for group in 0..s.o_groups {
-            let block = Mxfp8Weight {
-                data: w.wo_a.w.data.offset(group * s.o_rank * group_in),
-                scales: w.wo_a.w.scales.offset(group * s.o_rank * group_in / 32),
-                tiled: false,
-            };
-            mxfp8_gemv_rows(
+        for part in held.range() {
+            let began = profile::begin(gpu, stream)?;
+            // This part's heads: project, rotate, attend, and undo the
+            // rotation.
+            let q = sc.q.offset(part * heads * HEAD_DIM * 2);
+            let attended = sc.attended.offset(part * heads * HEAD_DIM * 2);
+            let wq = row_part(&w.wq_b, part);
+            parts::project(
                 gpu,
-                &k.tiers,
-                &block,
-                sc.attended.offset(group * group_in * 2),
-                sc.o_low.offset(group * s.o_rank * 2),
-                1,
-                s.o_rank,
-                group_in,
-                s.o_rank,
+                k.parts.fp8,
+                sc.q_low_quantized,
+                wq.data,
+                wq.scales,
+                q,
+                heads * HEAD_DIM,
+                w.wq_b.k,
                 stream,
             )?;
+            ops::rotate(
+                gpu,
+                k.cache.rotate,
+                q,
+                at,
+                self.freqs,
+                1,
+                heads,
+                HEAD_DIM,
+                s.rope,
+                false,
+                stream,
+            )?;
+            ops::sparse_attn(
+                gpu,
+                k.cache.sparse_attn,
+                q,
+                state.window,
+                compressed,
+                sc.idx,
+                w.sink.offset(part * heads * 4),
+                attended,
+                1,
+                heads,
+                idx.len(),
+                WINDOW,
+                stream,
+            )?;
+            ops::rotate(
+                gpu,
+                k.cache.rotate,
+                attended,
+                at,
+                self.freqs,
+                1,
+                heads,
+                HEAD_DIM,
+                s.rope,
+                true,
+                stream,
+            )?;
+            profile::end(gpu, stream, "sparse attention", began)?;
+            let began = profile::begin(gpu, stream)?;
+            // Quantize, and project out: each group of heads through its own
+            // block of wo_a, then this part's columns of wo_b, unrounded.
+            ops::fp8_quant_dequant(
+                gpu,
+                k.cache.fp8_quant_dequant,
+                attended,
+                attended,
+                heads * HEAD_DIM,
+                stream,
+            )?;
+            for group in part * groups..(part + 1) * groups {
+                let block = Mxfp8Weight {
+                    data: w.wo_a.w.data.offset(group * s.o_rank * group_in),
+                    scales: w.wo_a.w.scales.offset(group * s.o_rank * group_in / 32),
+                    tiled: false,
+                };
+                mxfp8_gemv_rows(
+                    gpu,
+                    &k.tiers,
+                    &block,
+                    sc.attended.offset(group * group_in * 2),
+                    sc.o_low.offset(group * s.o_rank * 2),
+                    1,
+                    s.o_rank,
+                    group_in,
+                    s.o_rank,
+                    stream,
+                )?;
+            }
+            let (low, width) = (part * groups * s.o_rank, groups * s.o_rank);
+            ops::fp8_quant_dequant(
+                gpu,
+                k.cache.fp8_quant_dequant,
+                sc.o_low.offset(low * 2),
+                sc.o_low_quantized.offset(low * 2),
+                width,
+                stream,
+            )?;
+            let wo = w.wo_b[part].context("a held part of wo_b")?;
+            parts::project(
+                gpu,
+                k.parts.fp8_f32,
+                sc.o_low_quantized.offset(low * 2),
+                wo.data,
+                wo.scales,
+                sc.attn_parts.offset(part * s.hidden * 4),
+                s.hidden,
+                width,
+                stream,
+            )?;
+            profile::end(gpu, stream, "output projections", began)?;
         }
-        self.fp8(
+        profile::stage(gpu, stream, "gather", || {
+            parts::gather(
+                gpu,
+                comm,
+                held,
+                sc.attn_parts,
+                sc.gather_recv,
+                s.hidden * 4,
+                stream,
+            )
+        })?;
+        parts::round(
             gpu,
-            &w.wo_b,
-            sc.o_low,
-            sc.o_low_quantized,
+            k.parts.round,
+            sc.attn_parts,
             sc.sublayer_out,
+            1,
+            s.hidden,
             stream,
-        )?;
-        profile::end(gpu, stream, "output projections", began)
+        )
     }
 }

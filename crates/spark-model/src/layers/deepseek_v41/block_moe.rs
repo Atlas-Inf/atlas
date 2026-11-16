@@ -2,42 +2,33 @@
 
 //! The MoE sublayer of a DeepSeek-V4.1 block on one token.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result};
 use spark_comm::CommBackend;
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::GpuBackend;
 
 use super::block::Block;
 use super::moe;
 use super::ops;
+use super::parts::{self, PARTS};
 use super::profile;
-use super::weights::Fp8Proj;
-use crate::layers::ops::mxfp8_gemv_rows;
+use super::weights::row_part;
 
 impl Block {
-    /// One expert on the FP8 input in `scratch.quantized`: its output
-    /// (`[hidden]` BF16) into `out`.
-    fn expert(
-        &self,
-        gpu: &dyn GpuBackend,
-        gate_up: impl Fn(DevicePtr, DevicePtr) -> Result<()>,
-        down: impl Fn(DevicePtr, DevicePtr) -> Result<()>,
-        weight: f32,
-        out: DevicePtr,
-        stream: u64,
-    ) -> Result<()> {
+    /// SwiGLU of `rows` gate and up values in scratch, times `weight`, as the
+    /// FP8 activation the down projection reads, in `scratch.inner`.
+    fn activate(&self, gpu: &dyn GpuBackend, rows: usize, weight: f32, stream: u64) -> Result<()> {
         let (s, k, sc) = (
             &self.shared.shape,
             &self.shared.kernels,
             &self.shared.scratch,
         );
-        gate_up(sc.gate, sc.up)?;
         moe::swiglu(
             gpu,
             k.moe.swiglu,
             sc.gate,
             sc.up,
             sc.inner,
-            s.inter,
+            rows,
             weight,
             s.swiglu_limit,
             stream,
@@ -47,20 +38,19 @@ impl Block {
             k.cache.fp8_quant_dequant,
             sc.inner,
             sc.inner,
-            s.inter,
+            rows,
             stream,
-        )?;
-        down(sc.inner, out)
+        )
     }
 
     /// The MoE of the normed input in `scratch.normed` into
     /// `scratch.sublayer_out`.
     ///
-    /// With the routed experts split over ranks (`comm`), a rank computes
-    /// the chosen experts it holds, each into its own slot, and the slots
-    /// are summed across ranks: every slot is one rank's output plus zeros,
-    /// so every rank ends with the same six outputs, bit for bit, and adds
-    /// them in the order one rank would.
+    /// Every expert is in four parts: a quarter of its hidden rows, and the
+    /// columns of its down projection that read them. A part's output is an
+    /// FP32 partial per expert. A rank computes the parts it holds for the
+    /// six chosen experts and the shared one, the ranks gather each other's
+    /// (`comm`), and every rank adds them in the same order.
     pub(super) fn moe(
         &self,
         gpu: &dyn GpuBackend,
@@ -73,13 +63,7 @@ impl Block {
             &self.shared.scratch,
             &self.weights.moe,
         );
-        let held = w.first_expert..w.first_expert + w.experts.len();
-        ensure!(
-            comm.is_some() || held == (0..s.experts),
-            "layer {}: experts {held:?} of {} are loaded and there are no other ranks",
-            self.index,
-            s.experts
-        );
+        let held = self.shared.held;
         let began = profile::begin(gpu, stream)?;
         moe::route_fast(
             gpu,
@@ -105,8 +89,6 @@ impl Block {
             s.hidden,
             stream,
         )?;
-        gpu.memset_zero_async(sc.acc, s.hidden * 4, stream)?;
-        gpu.memset_zero_async(sc.expert_out, s.top_k * s.hidden * 2, stream)?;
         gpu.synchronize(stream)?;
         let (mut chosen, mut weights) = (vec![0u8; s.top_k * 4], vec![0u8; s.top_k * 4]);
         gpu.copy_d2h(sc.chosen, &mut chosen)?;
@@ -123,91 +105,81 @@ impl Block {
         // The reference adds the experts' outputs in expert order.
         routed.sort_unstable_by_key(|&(expert, _)| expert);
         profile::end(gpu, stream, "route", began)?;
-        let began = profile::begin(gpu, stream)?;
-        for (slot, (expert, weight)) in routed.into_iter().enumerate() {
-            if !held.contains(&expert) {
-                continue;
+
+        // One slot per chosen expert, then the shared expert's.
+        let (slots, rows) = (s.top_k + 1, s.inter / PARTS);
+        let p = &k.parts;
+        for part in held.range() {
+            let began = profile::begin(gpu, stream)?;
+            let out = |slot: usize| sc.moe_parts.offset((part * slots + slot) * s.hidden * 4);
+            let slab = w.experts[part].context("a held part of the routed experts")?;
+            for (slot, &(expert, weight)) in routed.iter().enumerate() {
+                let (w1, w3, w2) = (slab.w1(expert), slab.w3(expert), slab.w2(expert));
+                let x = sc.quantized;
+                parts::project(
+                    gpu, p.fp4, x, w1.data, w1.scales, sc.gate, rows, s.hidden, stream,
+                )?;
+                parts::project(
+                    gpu, p.fp4, x, w3.data, w3.scales, sc.up, rows, s.hidden, stream,
+                )?;
+                self.activate(gpu, rows, weight, stream)?;
+                parts::project(
+                    gpu,
+                    p.fp4_f32,
+                    sc.inner,
+                    w2.data,
+                    w2.scales,
+                    out(slot),
+                    s.hidden,
+                    rows,
+                    stream,
+                )?;
             }
-            let e = &w.experts[expert - held.start];
-            self.expert(
+            profile::end(gpu, stream, "routed experts", began)?;
+            let began = profile::begin(gpu, stream)?;
+            // The shared expert: FP8 weights, no routing weight.
+            let (w1, w3) = (row_part(&w.shared_w1, part), row_part(&w.shared_w3, part));
+            let w2 = w.shared_w2[part].context("a held part of the shared expert")?;
+            let x = sc.quantized;
+            parts::project(
+                gpu, p.fp8, x, w1.data, w1.scales, sc.gate, rows, s.hidden, stream,
+            )?;
+            parts::project(
+                gpu, p.fp8, x, w3.data, w3.scales, sc.up, rows, s.hidden, stream,
+            )?;
+            self.activate(gpu, rows, 1.0, stream)?;
+            parts::project(
                 gpu,
-                |gate, up| {
-                    moe::fp4_project(
-                        gpu,
-                        &k.moe,
-                        sc.quantized,
-                        e.w1.w4,
-                        e.w1.scales,
-                        gate,
-                        s.inter,
-                        s.hidden,
-                        stream,
-                    )?;
-                    moe::fp4_project(
-                        gpu,
-                        &k.moe,
-                        sc.quantized,
-                        e.w3.w4,
-                        e.w3.scales,
-                        up,
-                        s.inter,
-                        s.hidden,
-                        stream,
-                    )
-                },
-                |inner, down| {
-                    moe::fp4_project(
-                        gpu,
-                        &k.moe,
-                        inner,
-                        e.w2.w4,
-                        e.w2.scales,
-                        down,
-                        s.hidden,
-                        s.inter,
-                        stream,
-                    )
-                },
-                weight,
-                sc.expert_out.offset(slot * s.hidden * 2),
+                p.fp8_f32,
+                sc.inner,
+                w2.data,
+                w2.scales,
+                out(s.top_k),
+                s.hidden,
+                rows,
                 stream,
             )?;
+            profile::end(gpu, stream, "shared expert", began)?;
         }
-        profile::end(gpu, stream, "routed experts", began)?;
-        if let Some(comm) = comm {
-            profile::stage(gpu, stream, "expert all-reduce", || {
-                comm.all_reduce_async(sc.expert_out.0, s.top_k * s.hidden * 2, stream)
-            })?;
-        }
-        let began = profile::begin(gpu, stream)?;
-        let add =
-            |x: DevicePtr| moe::accumulate(gpu, k.moe.accumulate, sc.acc, x, s.hidden, stream);
-        for slot in 0..s.top_k {
-            add(sc.expert_out.offset(slot * s.hidden * 2))?;
-        }
-        let gemv = |p: &Fp8Proj, x, out| {
-            mxfp8_gemv_rows(gpu, &k.tiers, &p.w, x, out, 1, p.n, p.k, p.n, stream)
-        };
-        self.expert(
+        profile::stage(gpu, stream, "gather", || {
+            parts::gather(
+                gpu,
+                comm,
+                held,
+                sc.moe_parts,
+                sc.gather_recv,
+                slots * s.hidden * 4,
+                stream,
+            )
+        })?;
+        parts::combine(
             gpu,
-            |gate, up| {
-                gemv(&w.shared_w1, sc.quantized, gate)?;
-                gemv(&w.shared_w3, sc.quantized, up)
-            },
-            |inner, down| gemv(&w.shared_w2, inner, down),
-            1.0,
-            sc.down,
-            stream,
-        )?;
-        add(sc.down)?;
-        moe::round_bf16(
-            gpu,
-            k.moe.round_bf16,
-            sc.acc,
+            p.combine,
+            sc.moe_parts,
             sc.sublayer_out,
+            slots,
             s.hidden,
             stream,
-        )?;
-        profile::end(gpu, stream, "shared expert and sum", began)
+        )
     }
 }

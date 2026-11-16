@@ -107,7 +107,6 @@ pub(crate) fn block(
         0 => rope_freqs(SHAPE.rope, 0, 10_000.0, 16.0, 32.0, 1.0),
         _ => compressed_ladder(),
     };
-    let held = if experts { 0..SHAPE.experts } else { 0..0 };
     let block = Block {
         index: layer,
         ratio: role.ratio,
@@ -116,10 +115,14 @@ pub(crate) fn block(
         weights: BlockWeights::load(
             &store,
             gpu,
+            &shared.kernels.parts,
+            &SHAPE,
             layer,
             role.compresses(),
             role.index_source,
-            held,
+            shared.held,
+            experts,
+            gpu.default_stream(),
         )?,
         shared,
     };

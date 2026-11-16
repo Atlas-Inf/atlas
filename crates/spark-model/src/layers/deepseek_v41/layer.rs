@@ -25,6 +25,7 @@ use super::engram_table::{EngramHash, EngramTable};
 use super::hc::{self, IDENTITY_PRE};
 use super::index::INDEX_DIM;
 use super::ops::HEAD_DIM;
+use super::parts::Held;
 use super::profile;
 use super::weights::BlockWeights;
 use crate::layer::{ForwardContext, LayerState, TransformerLayer};
@@ -222,8 +223,13 @@ pub fn load_layers(
 ) -> Result<Vec<Box<dyn TransformerLayer>>> {
     let shape = Shape::from_config(config)?;
     let layers = config.num_hidden_layers;
+    // The ranks of an expert-parallel world each hold some of the four parts
+    // of every wide projection.
+    let held = Held::of_rank(config.ep_rank, config.ep_world_size.max(1))?;
+    let stream = gpu.default_stream();
     let shared = Shared {
         shape,
+        held,
         kernels: BlockKernels::load(gpu)?,
         // At ratio 1 a query scores one compressed position a token.
         scratch: Arc::new(Scratch::alloc(gpu, &shape, config.max_position_embeddings)?),
@@ -253,11 +259,10 @@ pub fn load_layers(
         config.yarn_original_max_position_embeddings,
         config.rope_theta,
     )?;
-    let (first_expert, end_expert) = config.local_expert_range();
     let geometry = config.deepseek_v41_engram(config.engram_pad_id)?;
     tracing::info!(
-        "DeepSeek-V4.1: {layers} layers, experts {first_expert}..{end_expert} of {}, key sources {:?}, index sources {:?}, Engram at {:?}",
-        shape.experts,
+        "DeepSeek-V4.1: {layers} layers, parts {:?} of every wide projection, key sources {:?}, index sources {:?}, Engram at {:?}",
+        held.range(),
         config.kv_source_layer_ids,
         config.index_source_layer_ids,
         config.engram_layer_ids
@@ -283,10 +288,14 @@ pub fn load_layers(
             weights: BlockWeights::load(
                 store,
                 gpu,
+                &shared.kernels.parts,
+                &shape,
                 layer,
                 compresses,
                 index_source,
-                first_expert..end_expert,
+                held,
+                true,
+                stream,
             )
             .with_context(|| format!("layer {layer}"))?,
             shared: shared.clone(),

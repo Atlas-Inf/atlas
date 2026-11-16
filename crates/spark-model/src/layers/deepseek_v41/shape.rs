@@ -11,6 +11,7 @@ use super::hc::{HcKernels, HcShape};
 use super::index::{INDEX_DIM, IndexKernels};
 use super::moe::MoeKernels;
 use super::ops::{HEAD_DIM, Kernels, MAX_KEYS};
+use super::parts::{PARTS, PartKernels};
 use super::side::SideKernels;
 
 /// The dimensions and constants of a block.
@@ -48,6 +49,15 @@ impl Shape {
             "deepseek_v41: head_dim {} and window {} are not the 512 and 128 the kernels are built for",
             c.head_dim,
             c.sliding_window
+        );
+        ensure!(
+            c.num_attention_heads.is_multiple_of(PARTS)
+                && c.o_groups.is_multiple_of(PARTS)
+                && c.moe_intermediate_size.is_multiple_of(PARTS * 32),
+            "deepseek_v41: {} heads, {} output groups and {} expert rows do not split in {PARTS} parts",
+            c.num_attention_heads,
+            c.o_groups,
+            c.moe_intermediate_size
         );
         ensure!(
             c.index_head_dim == INDEX_DIM,
@@ -99,6 +109,7 @@ pub struct BlockKernels {
     pub hc: HcKernels,
     pub index: IndexKernels,
     pub moe: MoeKernels,
+    pub parts: PartKernels,
     pub side: SideKernels,
     pub tiers: [KernelHandle; 3],
     pub rms_norm: KernelHandle,
@@ -111,6 +122,7 @@ impl BlockKernels {
             hc: HcKernels::load(gpu)?,
             index: IndexKernels::load(gpu)?,
             moe: MoeKernels::load(gpu)?,
+            parts: PartKernels::load(gpu)?,
             side: SideKernels::load(gpu)?,
             tiers: [
                 gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc8")?,
@@ -143,10 +155,13 @@ pub struct Scratch {
     pub(super) gate: DevicePtr,
     pub(super) up: DevicePtr,
     pub(super) inner: DevicePtr,
-    pub(super) down: DevicePtr,
-    /// `[top_k, hidden]` BF16: each chosen expert's output, in expert order.
-    pub(super) expert_out: DevicePtr,
-    pub(super) acc: DevicePtr,
+    /// `[PARTS, hidden]` FP32: the parts of the attention's output.
+    pub(super) attn_parts: DevicePtr,
+    /// `[PARTS, top_k + 1, hidden]` FP32: the parts of each chosen expert's
+    /// output, in expert order, then of the shared expert's.
+    pub(super) moe_parts: DevicePtr,
+    /// Scratch as large as `moe_parts`, for a gather that is not in place.
+    pub(super) gather_recv: DevicePtr,
     /// `[experts]` FP32: the routing score of every expert.
     pub(super) route_scores: DevicePtr,
     pub(super) chosen: DevicePtr,
@@ -192,9 +207,9 @@ impl Scratch {
             gate: bf16(s.inter)?,
             up: bf16(s.inter)?,
             inner: bf16(s.inter)?,
-            down: bf16(s.hidden)?,
-            expert_out: bf16(s.top_k * s.hidden)?,
-            acc: f32s(s.hidden)?,
+            attn_parts: f32s(PARTS * s.hidden)?,
+            moe_parts: f32s(PARTS * (s.top_k + 1) * s.hidden)?,
+            gather_recv: f32s(PARTS * (s.top_k + 1) * s.hidden)?,
             route_scores: f32s(s.experts)?,
             chosen: f32s(s.top_k)?,
             weights: f32s(s.top_k)?,
