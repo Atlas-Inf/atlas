@@ -9,7 +9,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use super::block::Block;
 use super::block_index::Chosen;
 use super::cache_recipe::{WINDOW, visible_groups, window_row, window_slot};
-use super::gemm::{GEMM_ROWS, Input};
+use super::gemm::{GEMM_ROWS, Input, Sent};
 use super::index;
 use super::ops::{self, HEAD_DIM, MAX_KEYS, Turn};
 use super::parts::{self, PARTS};
@@ -282,8 +282,11 @@ impl Block {
             let (low, width) = (part * groups * s.o_rank, groups * s.o_rank);
             let o_low = sc.o_low.offset(part * rows * width * 2);
             match gemm {
-                // A group a GEMM, and a group's rows together.
+                // A group a GEMM, and a group's rows together: left as the
+                // codes wo_b reads, which are half the bytes to gather.
                 Some(g) => {
+                    let sent = Sent::new(rows, groups, s.o_rank);
+                    let (to, values) = (sc.o_low.offset(part * sent.bytes), sc.gather_recv);
                     for group in 0..groups {
                         let block = g.wo_a[part * groups + group]
                             .as_ref()
@@ -292,8 +295,19 @@ impl Block {
                             gpu,
                             Input::rows(attended.offset(group * group_in * 2), groups * group_in),
                             block,
-                            o_low.offset(group * rows * s.o_rank * 2),
+                            values,
                             rows,
+                            stream,
+                        )?;
+                        let at = group * rows * s.o_rank;
+                        let scales = to.offset(sent.scales + at / 32);
+                        sc.gemm.codes(
+                            gpu,
+                            values,
+                            to.offset(at),
+                            scales,
+                            rows,
+                            s.o_rank,
                             stream,
                         )?;
                     }
@@ -323,36 +337,26 @@ impl Block {
             w.wo_b.n,
             w.wo_b.k
         );
+        // A part of the low-rank output: values, or from the GEMMs codes.
+        let sent = gemm.map(|_| Sent::new(rows, groups, s.o_rank));
+        let part_bytes = sent.map_or(rows * width * 2, |sent| sent.bytes);
         profile::stage(gpu, stream, "gather", || {
+            let recv = sc.gather_recv;
             parts::gather(
-                gpu,
-                comm,
-                held,
-                sc.o_low,
-                sc.gather_recv,
-                rows * width * 2,
-                rows * width * 2,
-                stream,
+                gpu, comm, held, sc.o_low, recv, part_bytes, part_bytes, stream,
             )
         })?;
         let began = profile::begin(gpu, stream)?;
         for part in held.range() {
             let out = sc.attn_out.offset(part * rows * part_n * 2);
             match gemm {
-                // The groups' rows are a piece each.
-                Some(g) => sc.gemm.project(
-                    gpu,
-                    Input {
-                        x: sc.o_low,
-                        stride: s.o_rank,
-                        piece: s.o_rank,
-                        piece_stride: rows * s.o_rank,
-                    },
-                    g.wo_b[part].as_ref().context("a held part of wo_b")?,
-                    out,
-                    rows,
-                    stream,
-                )?,
+                // Every rank's codes, a row's together.
+                Some(g) => {
+                    let sent = sent.context("the low-rank output in codes")?;
+                    let act = sc.gemm.gathered(gpu, sc.o_low, sent, rows, stream)?;
+                    let block = g.wo_b[part].as_ref().context("a held part of wo_b")?;
+                    block.gemm(act, out, rows, stream)?
+                }
                 // A part's rows are a piece, a row its groups.
                 None => parts::project_pieces(
                     gpu,

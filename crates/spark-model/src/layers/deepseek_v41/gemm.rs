@@ -60,11 +60,38 @@ impl Input {
     }
 }
 
+/// One part of a batch as a rank sends it in codes: `groups` pieces of
+/// `piece` values a row, each piece's codes `[rows, piece]` one after
+/// another, and then each piece's scales `[rows, piece / 32]`.
+#[derive(Clone, Copy)]
+pub struct Sent {
+    pub groups: usize,
+    pub piece: usize,
+    /// Bytes of a part, and from one part to the next.
+    pub bytes: usize,
+    /// Where the scales start in a part.
+    pub scales: usize,
+}
+
+impl Sent {
+    pub fn new(rows: usize, groups: usize, piece: usize) -> Self {
+        let scales = groups * rows * piece;
+        Self {
+            groups,
+            piece,
+            // On a 16-byte boundary, which the copies want.
+            bytes: (scales + groups * rows * piece / 32).next_multiple_of(16),
+            scales,
+        }
+    }
+}
+
 /// Where a batch's activation is rounded for its GEMMs: one at a time, in
 /// stream order.
 #[derive(Clone, Copy)]
 pub struct GemmScratch {
     quant: KernelHandle,
+    gathered: KernelHandle,
     q: DevicePtr,
     sf: DevicePtr,
     rows: usize,
@@ -76,6 +103,7 @@ impl GemmScratch {
     pub fn alloc(gpu: &dyn GpuBackend, rows: usize, k: usize) -> Result<Self> {
         Ok(Self {
             quant: gpu.kernel("dsv41_mx", "dsv41_mx_quant")?,
+            gathered: gpu.kernel("dsv41_mx", "dsv41_mx_gathered")?,
             q: gpu.alloc(rows * k)?,
             sf: gpu.alloc(mx_lt_scale_bytes(rows, k))?,
             rows,
@@ -111,6 +139,75 @@ impl GemmScratch {
             .arg_u32(x.stride as u32)
             .arg_u32(x.piece as u32)
             .arg_u64(x.piece_stride as u64)
+            .arg_u32(mx_lt_inner_pad(k) as u32)
+            .launch(stream)?;
+        Ok(MxAct {
+            q: self.q,
+            sf: self.sf,
+        })
+    }
+
+    /// `rows` rows of `k` values of `x` (in one run a row) as the ranks
+    /// send them: `codes` (`[rows, k]` E4M3) and `scales` (`[rows, k / 32]`
+    /// E8M0), half the bytes of the values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn codes(
+        &self,
+        gpu: &dyn GpuBackend,
+        x: DevicePtr,
+        codes: DevicePtr,
+        scales: DevicePtr,
+        rows: usize,
+        k: usize,
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(k.is_multiple_of(32), "dsv41_mx_quant: rows of {k}");
+        KernelLaunch::new(gpu, self.quant)
+            .grid([div_ceil((rows * k / 32) as u32, 256), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(x)
+            .arg_ptr(codes)
+            .arg_ptr(scales)
+            .arg_u32(rows as u32)
+            .arg_u32(k as u32)
+            .arg_u32(k as u32)
+            .arg_u32(0)
+            .arg_u64(0)
+            .arg_u32(0)
+            .launch(stream)
+    }
+
+    /// What the ranks gathered of [`Self::codes`] as a GEMM operand: `parts`
+    /// is every part's `sent` ([`Sent`]) one after another, `rows` rows of
+    /// `sent.groups` pieces of `sent.piece` values a part. It holds until the
+    /// next call.
+    pub fn gathered(
+        &self,
+        gpu: &dyn GpuBackend,
+        parts: DevicePtr,
+        sent: Sent,
+        rows: usize,
+        stream: u64,
+    ) -> Result<MxAct> {
+        let k = PARTS * sent.groups * sent.piece;
+        ensure!(
+            rows <= self.rows && k <= self.k && sent.piece.is_multiple_of(32),
+            "dsv41_mx_gathered: {rows} rows of {k} in pieces of {}, room for {} of {}",
+            sent.piece,
+            self.rows,
+            self.k
+        );
+        KernelLaunch::new(gpu, self.gathered)
+            .grid([div_ceil((rows * k / 32) as u32, 256), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(parts)
+            .arg_ptr(self.q)
+            .arg_ptr(self.sf)
+            .arg_u32(rows as u32)
+            .arg_u32(k as u32)
+            .arg_u32(sent.piece as u32)
+            .arg_u32(sent.groups as u32)
+            .arg_u64(sent.bytes as u64)
             .arg_u32(mx_lt_inner_pad(k) as u32)
             .launch(stream)?;
         Ok(MxAct {

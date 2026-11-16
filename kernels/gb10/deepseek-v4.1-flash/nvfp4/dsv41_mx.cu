@@ -82,6 +82,41 @@ extern "C" __global__ void dsv41_mx_quant(
     if (b + 1u == blocks) mx_sf_zero_pad(sf, m, blocks, inner_pad);
 }
 
+// Codes the ranks gathered as one GEMM operand. Each rank rounds its own
+// part of a batch (this file's `dsv41_mx_quant`, scales as they come) and the
+// ranks gather the codes and scales, half the bytes of the values; this lays
+// them out as the GEMM reads them: q [M, K] a row's K codes together, and sf
+// tiled as `dsv41_mx_quant` tiles it.
+//
+// A part is `region` bytes after the last: its `groups` pieces' codes, each
+// [M, piece], then their scales, each [M, piece / 32]. K = parts * groups *
+// piece. One thread a block of 32 codes.
+extern "C" __global__ void dsv41_mx_gathered(
+    const unsigned char* __restrict__ parts,
+    unsigned char* __restrict__ q,
+    unsigned char* __restrict__ sf,
+    unsigned int M,
+    unsigned int K,
+    unsigned int piece,
+    unsigned int groups,
+    unsigned long long region,
+    unsigned int inner_pad) {
+    const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int blocks = K / 32u;
+    if (t >= (size_t)M * blocks) return;
+    const unsigned int m = (unsigned int)(t / blocks), b = (unsigned int)(t % blocks);
+    const unsigned int kb = b * 32u, of = kb / piece, in = kb % piece;
+    const unsigned char* part = parts + (size_t)(of / groups) * region;
+    const size_t group = of % groups;
+    const uint4* from = (const uint4*)(part + (group * M + m) * piece + in);
+    uint4* to = (uint4*)(q + (size_t)m * K + kb);
+    to[0] = from[0];
+    to[1] = from[1];
+    const unsigned char* scales = part + (size_t)groups * M * piece;
+    sf[mx_sf_offset(m, b, inner_pad)] = scales[(group * M + m) * (piece / 32u) + in / 32u];
+    if (b + 1u == blocks) mx_sf_zero_pad(sf, m, blocks, inner_pad);
+}
+
 // Scales the ranks gathered, a part each, as one run a row: out[m, part *
 // blocks + b] = sf[part * piece_stride + m * blocks + b], where a part's
 // `blocks` scales of a row are `piece_stride` bytes after the part's before.
