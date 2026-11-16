@@ -8,6 +8,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use super::cache_recipe::WINDOW;
 use super::hc::{HcKernels, HcShape};
+use super::index::{INDEX_DIM, IndexKernels};
 use super::moe::MoeKernels;
 use super::ops::{HEAD_DIM, Kernels, MAX_KEYS};
 use super::side::SideKernels;
@@ -28,6 +29,11 @@ pub struct Shape {
     pub swiglu_limit: f32,
     pub norm_eps: f32,
     pub index_topk: usize,
+    pub index_heads: usize,
+    /// The two-level top-k keeps this many blocks of this many compressed
+    /// positions.
+    pub candidate_blocks: usize,
+    pub candidate_block_size: usize,
     pub hc: HcShape,
 }
 
@@ -43,6 +49,21 @@ impl Shape {
             c.head_dim,
             c.sliding_window
         );
+        ensure!(
+            c.index_head_dim == INDEX_DIM,
+            "deepseek_v41: index_head_dim {} is not the {INDEX_DIM} the kernels are built for",
+            c.index_head_dim
+        );
+        // Below `index_topk` positions every one is chosen and no candidates
+        // are looked at, which holds only if candidates cover that many.
+        ensure!(
+            c.candidate_source_layer_id.is_none()
+                || c.candidate_topk_blocks * c.candidate_block_size >= c.index_topk,
+            "deepseek_v41: {} candidate blocks of {} hold fewer than index_topk {}",
+            c.candidate_topk_blocks,
+            c.candidate_block_size,
+            c.index_topk
+        );
         Ok(Self {
             hidden: c.hidden_size,
             heads: c.num_attention_heads,
@@ -57,6 +78,9 @@ impl Shape {
             swiglu_limit: SWIGLU_LIMIT,
             norm_eps: c.rms_norm_eps as f32,
             index_topk: c.index_topk,
+            index_heads: c.index_n_heads,
+            candidate_blocks: c.candidate_topk_blocks,
+            candidate_block_size: c.candidate_block_size,
             hc: HcShape {
                 hidden: c.hidden_size,
                 copies: c.hc_mult,
@@ -73,6 +97,7 @@ impl Shape {
 pub struct BlockKernels {
     pub cache: Kernels,
     pub hc: HcKernels,
+    pub index: IndexKernels,
     pub moe: MoeKernels,
     pub side: SideKernels,
     pub tiers: [KernelHandle; 3],
@@ -84,6 +109,7 @@ impl BlockKernels {
         Ok(Self {
             cache: Kernels::load(gpu)?,
             hc: HcKernels::load(gpu)?,
+            index: IndexKernels::load(gpu)?,
             moe: MoeKernels::load(gpu)?,
             side: SideKernels::load(gpu)?,
             tiers: [
@@ -126,10 +152,20 @@ pub struct Scratch {
     pub(super) next_pre: DevicePtr,
     pub(super) post: DevicePtr,
     pub(super) comb: DevicePtr,
+    pub(super) index_q: DevicePtr,
+    pub(super) index_weights_f32: DevicePtr,
+    pub(super) index_weights: DevicePtr,
+    pub(super) index_key_f32: DevicePtr,
+    pub(super) index_key: DevicePtr,
+    pub(super) scores_f32: DevicePtr,
+    pub(super) scores: DevicePtr,
+    /// The compressed positions `scores` has room for.
+    pub(super) max_groups: usize,
 }
 
 impl Scratch {
-    pub fn alloc(gpu: &dyn GpuBackend, s: &Shape) -> Result<Self> {
+    /// `max_groups` bounds the compressed positions one query scores.
+    pub fn alloc(gpu: &dyn GpuBackend, s: &Shape, max_groups: usize) -> Result<Self> {
         let bf16 = |values: usize| gpu.alloc(values * 2);
         let f32s = |values: usize| gpu.alloc(values * 4);
         let copies = s.hc.copies;
@@ -161,6 +197,14 @@ impl Scratch {
             next_pre: f32s(copies)?,
             post: f32s(copies)?,
             comb: f32s(copies * copies)?,
+            index_q: bf16(s.index_heads * INDEX_DIM)?,
+            index_weights_f32: f32s(s.index_heads)?,
+            index_weights: bf16(s.index_heads)?,
+            index_key_f32: f32s(INDEX_DIM)?,
+            index_key: bf16(INDEX_DIM)?,
+            scores_f32: f32s(max_groups.max(1))?,
+            scores: bf16(max_groups.max(1))?,
+            max_groups,
         })
     }
 }

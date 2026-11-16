@@ -59,6 +59,23 @@ pub struct CompressorWeights {
     pub norm: DevicePtr,
 }
 
+/// An index source's indexer: the projection of its query heads and the
+/// weight each head's score is given.
+pub struct IndexerWeights {
+    pub wq_b: Fp8Proj,
+    /// `[index heads, hidden]` BF16.
+    pub head_weights: DevicePtr,
+    /// On a layer that also produces the index keys.
+    pub key: Option<IndexKeyWeights>,
+}
+
+/// What turns a compressed key, before its rotation, into its index key:
+/// a BF16 `[128, 512]` projection and the norm after it.
+pub struct IndexKeyWeights {
+    pub wk: DevicePtr,
+    pub norm: DevicePtr,
+}
+
 pub struct MoeWeights {
     pub norm: DevicePtr,
     /// `[experts, hidden]` BF16.
@@ -76,6 +93,7 @@ pub struct BlockWeights {
     pub hc_ffn: HcSite,
     pub attn: AttentionWeights,
     pub compressor: Option<CompressorWeights>,
+    pub indexer: Option<IndexerWeights>,
     pub moe: MoeWeights,
 }
 
@@ -142,13 +160,14 @@ fn hc_site(store: &WeightStore, layer: &str, site: &str) -> Result<HcSite> {
 
 impl BlockWeights {
     /// Layer `index` from `store`. `compress_ratio` is the layer's ratio when
-    /// it produces compressed keys itself, 0 otherwise. `experts` are the
-    /// routed experts this rank holds.
+    /// it produces compressed keys itself, 0 otherwise; `index_source` says
+    /// it runs an indexer. `experts` are the routed experts this rank holds.
     pub fn load(
         store: &WeightStore,
         gpu: &dyn GpuBackend,
         index: usize,
         compress_ratio: usize,
+        index_source: bool,
         experts: std::ops::Range<usize>,
     ) -> Result<Self> {
         let layer = format!("layers.{index}");
@@ -179,6 +198,20 @@ impl BlockWeights {
                 })
             }
         };
+        let indexer = match index_source {
+            false => None,
+            true => Some(IndexerWeights {
+                wq_b: fp8(store, gpu, &format!("{layer}.attn.indexer.wq_b"))?,
+                head_weights: bf16("attn.indexer.weights_proj.weight")?,
+                key: match compress_ratio {
+                    0 => None,
+                    _ => Some(IndexKeyWeights {
+                        wk: bf16("attn.indexer.wk.weight")?,
+                        norm: bf16("attn.indexer.k_norm.weight")?,
+                    }),
+                },
+            }),
+        };
         let moe = MoeWeights {
             norm: bf16("ffn_norm.weight")?,
             gate: bf16("ffn.gate.weight")?,
@@ -202,6 +235,7 @@ impl BlockWeights {
             hc_ffn: hc_site(store, &layer, "ffn")?,
             attn,
             compressor,
+            indexer,
             moe,
         })
     }

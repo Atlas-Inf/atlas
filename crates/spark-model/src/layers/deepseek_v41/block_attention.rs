@@ -2,13 +2,12 @@
 
 //! The attention sublayer of a DeepSeek-V4.1 block on one token.
 
-use anyhow::{Context, Result, bail, ensure};
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use anyhow::{Context, Result, ensure};
+use spark_runtime::gpu::GpuBackend;
 
 use super::block::Block;
-use super::cache_recipe::{
-    WINDOW, completed_group, group_position, visible_groups, window_row, window_slot,
-};
+use super::cache_recipe::{WINDOW, completed_group, group_position, window_row, window_slot};
+use super::index::INDEX_DIM;
 use super::ops::{self, Fp4Scale, HEAD_DIM};
 use super::side;
 use super::state::SeqState;
@@ -17,7 +16,8 @@ use crate::weight_map::Mxfp8Weight;
 
 impl Block {
     /// The compressor at `position`: project, hold in the group's slot, and
-    /// when the group completes write its key into `keys`.
+    /// when the group completes write its key into `keys` and, on a layer
+    /// that makes them, its index key.
     fn compress(
         &self,
         gpu: &dyn GpuBackend,
@@ -87,6 +87,11 @@ impl Block {
             group_position(group, w.ratio),
             stream,
         )?;
+        // The index key comes from the key as it is before its rotation.
+        if let Some(index) = self.weights.indexer.as_ref().and_then(|i| i.key.as_ref()) {
+            let index_key = held.index_keys.offset(group * INDEX_DIM * 2);
+            self.index_key(gpu, index, key, index_key, at, stream)?;
+        }
         ops::rotate(
             gpu,
             k.cache.rotate,
@@ -188,35 +193,17 @@ impl Block {
             stream,
         )?;
 
-        // Compressed keys: a source writes its own; the layers after it read them.
+        // Compressed keys: a source writes its own and chooses which a query
+        // reads; the layers after it read the same keys at the same choice.
         let mut idx = window_row(position);
         let mut compressed = state.window;
         if self.ratio > 0 {
             if self.weights.compressor.is_some() {
                 self.compress(gpu, state, position, stream)?;
             }
-            let mut handoff = self.shared.handoff.lock().expect("handoff");
-            if handoff.compressed.len() <= row {
-                handoff.compressed.resize(row + 1, DevicePtr::NULL);
-            }
-            if let Some(held) = &state.compressed {
-                handoff.compressed[row] = held.keys;
-            }
-            compressed = handoff.compressed[row];
-            ensure!(
-                !compressed.is_null(),
-                "layer {}: no source layer has run for row {row}",
-                self.index
-            );
-            let visible = visible_groups(position, self.ratio);
-            if visible > s.index_topk {
-                bail!(
-                    "layer {}: position {position} sees {visible} compressed groups, and the indexer that would choose {} of them is not built yet",
-                    self.index,
-                    s.index_topk
-                );
-            }
-            idx.extend(0..visible as i32);
+            let (keys, chosen) = self.compressed_row(gpu, row, state, position, at, stream)?;
+            compressed = keys;
+            idx.extend(chosen);
         }
         gpu.synchronize(stream)?;
         let bytes: Vec<u8> = idx.iter().flat_map(|i| i.to_le_bytes()).collect();

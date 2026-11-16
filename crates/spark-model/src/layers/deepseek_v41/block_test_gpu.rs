@@ -14,32 +14,9 @@ use anyhow::Result;
 
 use super::*;
 use crate::layers::deepseek_v41::cache_recipe::rope_freqs;
-use crate::layers::deepseek_v41::hc::HcShape;
 use crate::layers::deepseek_v41::test_support::{
-    Recording, backend, bf16s, closeness, download, layer_store, le_bytes, rows_of, upload,
-};
-
-const SHAPE: Shape = Shape {
-    hidden: 5120,
-    heads: 64,
-    q_rank: 1280,
-    o_groups: 8,
-    o_rank: 1024,
-    rope: 64,
-    inter: 2304,
-    experts: 384,
-    top_k: 6,
-    route_scale: 1.5,
-    swiglu_limit: 10.0,
-    norm_eps: 1e-20,
-    index_topk: 512,
-    hc: HcShape {
-        hidden: 5120,
-        copies: 4,
-        sinkhorn_iters: 20,
-        norm_eps: 1e-20,
-        hc_eps: 1e-6,
-    },
+    Recording, SHAPE, backend, bf16s, closeness, compressed_ladder, download, layer_store,
+    le_bytes, rows_of, upload,
 };
 
 #[test]
@@ -51,7 +28,7 @@ fn blocks_replay_the_reference_token_by_token() -> Result<()> {
     let shared = Shared {
         shape: SHAPE,
         kernels: BlockKernels::load(gpu)?,
-        scratch: Arc::new(Scratch::alloc(gpu, &SHAPE)?),
+        scratch: Arc::new(Scratch::alloc(gpu, &SHAPE, 1024)?),
         handoff: Arc::new(Mutex::new(Handoff::default())),
     };
     let (copies, hidden) = (SHAPE.hc.copies, SHAPE.hidden);
@@ -65,13 +42,14 @@ fn blocks_replay_the_reference_token_by_token() -> Result<()> {
         let ladder = if ratio == 0 {
             rope_freqs(SHAPE.rope, 0, 10_000.0, 16.0, 32.0, 1.0)
         } else {
-            rope_freqs(SHAPE.rope, 65536, 160_000.0, 16.0, 32.0, 1.0)
+            compressed_ladder()
         };
         let block = Block {
             index: layer,
             ratio,
+            candidates: Candidates::None,
             freqs: upload(gpu, &le_bytes(&ladder, f32::to_le_bytes))?,
-            weights: BlockWeights::load(&store, gpu, layer, ratio, 0..SHAPE.experts)?,
+            weights: BlockWeights::load(&store, gpu, layer, ratio, ratio > 0, 0..SHAPE.experts)?,
             shared: shared.clone(),
         };
         let mut state = SeqState::alloc(gpu, ratio, 2048)?;

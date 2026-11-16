@@ -4,9 +4,7 @@
 //! design. It defines what the block computes, and the faster paths are held
 //! to its bytes.
 //!
-//! Not built yet: the indexer (so a query may see at most `index_topk`
-//! compressed groups, all of which it attends to), a compressor at ratio 1,
-//! Engram, and more than one rank.
+//! Not built yet: a compressor at ratio 1, Engram, and more than one rank.
 
 use std::sync::{Arc, Mutex};
 
@@ -30,10 +28,21 @@ pub struct Shared {
     pub handoff: Arc<Mutex<Handoff>>,
 }
 
+/// A layer's part in the two-level top-k: the candidate source keeps the
+/// best blocks of compressed positions, and the index sources after it
+/// choose only inside them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Candidates {
+    None,
+    Source,
+    Reader,
+}
+
 pub struct Block {
     pub index: usize,
     /// This layer's compression ratio: 0 for a window-only layer.
     pub ratio: usize,
+    pub candidates: Candidates,
     /// `[rope / 2]` FP32 radians per position: the base ladder on a
     /// window-only layer, the compressed one elsewhere.
     pub freqs: DevicePtr,

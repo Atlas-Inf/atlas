@@ -9,8 +9,43 @@ use anyhow::{Context, Result};
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
+use super::cache_recipe::rope_freqs;
+use super::hc::HcShape;
+use super::shape::Shape;
 use crate::weight_map::test_checkpoint::{read_checkpoint_tensor, read_safetensors_tensor};
 use crate::weight_map::{Mxfp8Weight, fp8_block_scales_to_rows};
+
+/// The 1017 release's block.
+pub(crate) const SHAPE: Shape = Shape {
+    hidden: 5120,
+    heads: 64,
+    q_rank: 1280,
+    o_groups: 8,
+    o_rank: 1024,
+    rope: 64,
+    inter: 2304,
+    experts: 384,
+    top_k: 6,
+    route_scale: 1.5,
+    swiglu_limit: 10.0,
+    norm_eps: 1e-20,
+    index_topk: 512,
+    index_heads: 32,
+    candidate_blocks: 2048,
+    candidate_block_size: 8,
+    hc: HcShape {
+        hidden: 5120,
+        copies: 4,
+        sinkhorn_iters: 20,
+        norm_eps: 1e-20,
+        hc_eps: 1e-6,
+    },
+};
+
+/// The rotary ladder of a layer that reads compressed keys.
+pub(crate) fn compressed_ladder() -> Vec<f32> {
+    rope_freqs(SHAPE.rope, 65536, 160_000.0, 16.0, 32.0, 1.0)
+}
 
 pub(crate) fn backend() -> Result<&'static AtlasCudaBackend> {
     static GPU: std::sync::OnceLock<AtlasCudaBackend> = std::sync::OnceLock::new();
@@ -103,6 +138,12 @@ impl Recording {
     /// `(shape, bytes)` of a tensor of run A's prefill.
     pub(crate) fn prefill(&self, name: &str) -> Result<(Vec<usize>, Vec<u8>)> {
         self.tensor("A_prefill.safetensors", name)
+    }
+
+    /// `(shape, bytes)` of a tensor of the index replay of run A
+    /// (`index_replay.py`): `prefill.q`, `decode.score`, ...
+    pub(crate) fn index(&self, name: &str) -> Result<(Vec<usize>, Vec<u8>)> {
+        self.tensor("A_index.safetensors", name)
     }
 
     /// `(shape, bytes)` of one of run A's caches, e.g.

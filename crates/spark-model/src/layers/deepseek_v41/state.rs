@@ -7,14 +7,17 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::cache_recipe::WINDOW;
+use super::index::INDEX_DIM;
 use super::ops::HEAD_DIM;
 use crate::layer::LayerState;
 
-/// A source layer's compressed keys for one sequence, and the group its
-/// compressor is filling.
+/// A source layer's compressed keys for one sequence, their index keys, and
+/// the group its compressor is filling.
 pub struct CompressedKeys {
     /// `[capacity, 512]` BF16, one row a completed group.
     pub keys: DevicePtr,
+    /// `[capacity, 128]` BF16: what the indexer scores each group by.
+    pub index_keys: DevicePtr,
     pub capacity: usize,
     /// `[ratio, 512]` FP32: the key and gate projections of the group being
     /// filled.
@@ -41,6 +44,7 @@ impl SeqState {
                 let capacity = max_positions / ratio;
                 Some(CompressedKeys {
                     keys: gpu.alloc(capacity.max(1) * HEAD_DIM * 2)?,
+                    index_keys: gpu.alloc(capacity.max(1) * INDEX_DIM * 2)?,
                     capacity,
                     kv_state: gpu.alloc(ratio * HEAD_DIM * 4)?,
                     score_state: gpu.alloc(ratio * HEAD_DIM * 4)?,
@@ -53,7 +57,7 @@ impl SeqState {
     pub fn free(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
         gpu.free(self.window)?;
         if let Some(c) = self.compressed.take() {
-            for p in [c.keys, c.kv_state, c.score_state] {
+            for p in [c.keys, c.index_keys, c.kv_state, c.score_state] {
                 gpu.free(p)?;
             }
         }
@@ -70,10 +74,34 @@ impl LayerState for SeqState {
     }
 }
 
-/// What source layers hand down the stack within one pass: per row of the
-/// pass, the compressed keys the layers after a source read. Layers run in
-/// order, so a source has written before its readers ask.
+/// What source layers hand down the stack for one row of a pass. Layers run
+/// in order, so a source has written before its readers ask.
+#[derive(Clone)]
+pub(super) struct RowHandoff {
+    /// The latest key source's compressed keys and index keys.
+    pub(super) compressed: DevicePtr,
+    pub(super) index_keys: DevicePtr,
+    /// The compressed positions the latest index source chose for the row's
+    /// query, in ascending order.
+    pub(super) chosen: Vec<i32>,
+    /// One flag per compressed position, from the candidate source: the
+    /// positions the index sources after it may choose from.
+    pub(super) candidates: Vec<bool>,
+}
+
+impl Default for RowHandoff {
+    fn default() -> Self {
+        Self {
+            compressed: DevicePtr::NULL,
+            index_keys: DevicePtr::NULL,
+            chosen: Vec::new(),
+            candidates: Vec::new(),
+        }
+    }
+}
+
+/// What source layers hand down the stack within one pass, per row.
 #[derive(Default)]
 pub struct Handoff {
-    pub(super) compressed: Vec<DevicePtr>,
+    pub(super) rows: Vec<RowHandoff>,
 }
