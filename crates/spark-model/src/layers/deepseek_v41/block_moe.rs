@@ -237,7 +237,7 @@ impl Block {
                 stream,
             )?;
         }
-        profile::end(gpu, stream, "experts", began)?;
+        profile::end(gpu, stream, "experts in", began)?;
         profile::stage(gpu, stream, "gather", || {
             parts::gather(
                 gpu,
@@ -344,7 +344,7 @@ impl Block {
                 )?,
             }
         }
-        profile::end(gpu, stream, "experts", began)?;
+        profile::end(gpu, stream, "experts out", began)?;
         profile::stage(gpu, stream, "gather", || {
             parts::gather(
                 gpu,

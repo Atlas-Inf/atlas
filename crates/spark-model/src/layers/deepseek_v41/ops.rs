@@ -7,6 +7,8 @@ use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
+use super::profile;
+
 /// Values in one key, and in one head's query.
 pub const HEAD_DIM: usize = 512;
 /// The most keys one query attends to: the window and the selected
@@ -220,6 +222,7 @@ pub fn sparse_attn(
             ],
         ),
     };
+    let began = profile::begin(gpu, stream)?;
     turned(
         KernelLaunch::new(gpu, logits)
             .grid([across[0], groups, 1])
@@ -234,6 +237,8 @@ pub fn sparse_attn(
             .arg_u32(split as u32)
             .arg_f32((HEAD_DIM as f32).powf(-0.5)),
     )?;
+    profile::end(gpu, stream, "attention: logits", began)?;
+    let began = profile::begin(gpu, stream)?;
     KernelLaunch::new(gpu, kernels.attn_schedule)
         .grid([queries as u32, heads as u32, 1])
         .block([ATTN_THREADS, 1, 1])
@@ -242,6 +247,8 @@ pub fn sparse_attn(
         .arg_u32(heads as u32)
         .arg_u32(keys as u32)
         .launch(stream)?;
+    profile::end(gpu, stream, "attention: schedule", began)?;
+    let began = profile::begin(gpu, stream)?;
     turned(
         KernelLaunch::new(gpu, output)
             .grid([across[1], groups, 1])
@@ -254,7 +261,8 @@ pub fn sparse_attn(
             .arg_u32(heads as u32)
             .arg_u32(keys as u32)
             .arg_u32(split as u32),
-    )
+    )?;
+    profile::end(gpu, stream, "attention: output", began)
 }
 
 /// Rotate the last `rope` values of every vector of `x` (`[rows, vectors,
