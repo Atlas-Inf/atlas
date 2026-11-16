@@ -46,8 +46,17 @@ fn engram_layers_replay_the_reference_from_hash_ids() -> Result<()> {
     let (copies, hidden) = (SHAPE.hc.copies, SHAPE.hidden);
     let picks = picks(&rec, 64);
     for layer in rec.sample(&[1], &[14]) {
-        let weights = EngramWeights::load(&store(gpu, dir, layer)?, gpu, layer, &SHAPE)?;
-        let engram = Engram::new(gpu, BlockKernels::load(gpu)?, &SHAPE, weights)?;
+        let kernels = BlockKernels::load(gpu)?;
+        let weights = EngramWeights::load(
+            &store(gpu, dir, layer)?,
+            gpu,
+            &kernels.parts,
+            layer,
+            &SHAPE,
+            Held::ALL,
+            stream,
+        )?;
+        let engram = Engram::new(gpu, kernels, &SHAPE, Held::ALL, weights)?;
         let columns = engram.weights.columns;
         let table = format!("layers.{layer}.engram.embed");
         let mut rows = CheckpointRows::open(dir, &format!("{table}.weight"))?;
@@ -99,7 +108,7 @@ fn engram_layers_replay_the_reference_from_hash_ids() -> Result<()> {
                 &inputs[at * copies * hidden * 2..(at + 1) * copies * hidden * 2],
                 streams,
             )?;
-            engram.apply(gpu, row_dev, scale_dev, slots, slots, streams, stream)?;
+            engram.apply(gpu, row_dev, scale_dev, slots, slots, streams, None, stream)?;
             values.extend(download(gpu, engram.values, read)?);
             projected.extend(download(gpu, engram.kv, kv)?);
             got.extend(download(gpu, streams, copies * hidden)?);

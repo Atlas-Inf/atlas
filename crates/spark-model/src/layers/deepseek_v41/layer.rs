@@ -20,8 +20,8 @@ use spark_runtime::weights::WeightStore;
 
 use super::block::{Block, BlockKernels, Candidates, Handoff, Scratch, SeqState, Shape, Shared};
 use super::cache_recipe::rope_freqs;
-use super::engram::{Engram, EngramWeights};
-use super::engram_table::{EngramHash, EngramTable};
+use super::engram::{Engram, EngramWeights, held_columns};
+use super::engram_table::{EngramHash, EngramTable, Prefetcher};
 use super::hc::{self, IDENTITY_PRE};
 use super::index::INDEX_DIM;
 use super::ops::HEAD_DIM;
@@ -36,14 +36,26 @@ const FIRST_POSITIONS: usize = 8192;
 /// An Engram in front of a block.
 struct Lookup {
     engram: Engram,
-    table: EngramTable,
+    table: Arc<EngramTable>,
     /// The compressed id of every token id.
     token_map: Arc<Vec<u32>>,
+}
+
+/// What the first layer does for the Engram layers: as soon as a token is
+/// known, the rows they will read for it are fetched in the background. A
+/// row comes off the disk in about the time a layer takes.
+struct Ahead {
+    tables: Vec<Arc<EngramTable>>,
+    prefetcher: Prefetcher,
+    token_map: Arc<Vec<u32>>,
+    /// The columns of a lookup this rank reads.
+    columns: std::ops::Range<usize>,
 }
 
 pub struct Layer {
     block: Block,
     lookup: Option<Lookup>,
+    ahead: Option<Ahead>,
     /// The ratio the layer compresses keys at itself, 0 if it does not.
     compresses: usize,
     first: bool,
@@ -82,20 +94,19 @@ impl Layer {
             .with_context(|| format!("deepseek_v41: no token id for row {row}"))
     }
 
-    /// Add the Engram lookup of the token at `position` into its stream.
-    fn look_up(
+    /// Add the token of row `row` at `position` to the sequence's history,
+    /// as the id the Engram hashes.
+    fn remember(
         &self,
-        lookup: &Lookup,
+        token_map: &[u32],
         row: usize,
-        streams: DevicePtr,
         state: &mut SeqState,
         position: usize,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
         let token = self.token(row, ctx, stream)? as usize;
-        let compressed = *lookup
-            .token_map
+        let compressed = *token_map
             .get(token)
             .with_context(|| format!("token {token} is outside the Engram token map"))?;
         // A sequence that was rolled back hashes its new tokens over the
@@ -107,20 +118,70 @@ impl Layer {
             state.history.len()
         );
         state.history.push(compressed);
-        let hash = &lookup.table.hash;
-        let from = (position + 1).saturating_sub(hash.reach());
-        let rows = hash.rows(&state.history[from..]);
-        let found = lookup.table.find(ctx.gpu, &rows, stream)?;
-        lookup.engram.apply(
-            ctx.gpu,
-            found.rows,
-            found.scales,
-            found.row_slots,
-            found.scale_slots,
-            streams,
-            stream,
-        )?;
-        ctx.gpu.synchronize(stream)?;
+        Ok(())
+    }
+
+    /// The rows `table` holds for the last token of `state`'s history.
+    fn rows(table: &EngramTable, state: &SeqState) -> Vec<u64> {
+        let from = state.history.len().saturating_sub(table.hash.reach());
+        table.hash.rows(&state.history[from..])
+    }
+
+    /// Start fetching what the Engram layers will read for this token.
+    fn look_ahead(
+        &self,
+        ahead: &Ahead,
+        row: usize,
+        state: &mut SeqState,
+        position: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.remember(&ahead.token_map, row, state, position, ctx, stream)?;
+        for table in &ahead.tables {
+            let rows = Self::rows(table, state);
+            ahead
+                .prefetcher
+                .ask(table, rows[ahead.columns.clone()].to_vec());
+        }
+        Ok(())
+    }
+
+    /// Add the Engram lookup of the token at `position` into its stream.
+    #[allow(clippy::too_many_arguments)]
+    fn look_up(
+        &self,
+        lookup: &Lookup,
+        row: usize,
+        streams: DevicePtr,
+        state: &mut SeqState,
+        position: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        // The first layer keeps its own history when it is also an Engram.
+        if self.ahead.is_none() {
+            self.remember(&lookup.token_map, row, state, position, ctx, stream)?;
+        }
+        let rows = Self::rows(&lookup.table, state);
+        let held = lookup.engram.columns();
+        let found = profile::stage(ctx.gpu, stream, "engram rows", || {
+            lookup.table.find(ctx.gpu, &rows, held, stream)
+        })?;
+        let comm = ctx.comm.filter(|_| ctx.config.ep_world_size > 1);
+        profile::stage(ctx.gpu, stream, "engram", || {
+            lookup.engram.apply(
+                ctx.gpu,
+                found.rows,
+                found.scales,
+                found.row_slots,
+                found.scale_slots,
+                streams,
+                comm,
+                stream,
+            )?;
+            ctx.gpu.synchronize(stream)
+        })?;
         lookup.table.done();
         Ok(())
     }
@@ -159,10 +220,11 @@ impl TransformerLayer for Layer {
             let identity: Vec<u8> = IDENTITY_PRE.iter().flat_map(|v| v.to_le_bytes()).collect();
             gpu.copy_h2d(&identity, pre)?;
         }
+        if let Some(ahead) = &self.ahead {
+            self.look_ahead(ahead, row, state, seq_len, ctx, stream)?;
+        }
         if let Some(lookup) = &self.lookup {
-            profile::stage(gpu, stream, "engram", || {
-                self.look_up(lookup, row, streams, state, seq_len, ctx, stream)
-            })?;
+            self.look_up(lookup, row, streams, state, seq_len, ctx, stream)?;
         }
         let comm = ctx.comm.filter(|_| ctx.config.ep_world_size > 1);
         self.block
@@ -267,6 +329,25 @@ pub fn load_layers(
         config.index_source_layer_ids,
         config.engram_layer_ids
     );
+    // Every Engram layer's table, so that one can fetch for those after it.
+    let mut tables: Vec<Arc<EngramTable>> = Vec::new();
+    if let Some(geometry) = &geometry {
+        for (index, &layer) in config.engram_layer_ids.iter().enumerate() {
+            tables.push(Arc::new(EngramTable::open(
+                store,
+                gpu,
+                layer,
+                EngramHash::new(geometry, index),
+                geometry.num_embeddings[index],
+            )?));
+        }
+    }
+    let token_map = || {
+        config
+            .engram_token_map
+            .clone()
+            .context("deepseek_v41: the Engram token map was not derived from the tokenizer")
+    };
     let mut out: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(layers);
     for layer in 0..layers {
         let ratio = config.compress_ratios.get(layer).copied().unwrap_or(0);
@@ -300,38 +381,50 @@ pub fn load_layers(
             .with_context(|| format!("layer {layer}"))?,
             shared: shared.clone(),
         };
-        let lookup = match (
-            &geometry,
-            config.engram_layer_ids.iter().position(|&l| l == layer),
-        ) {
-            (Some(geometry), Some(index)) => {
-                let weights = EngramWeights::load(store, gpu, layer, &shape)?;
-                let hash = EngramHash::new(geometry, index);
+        let lookup = match config
+            .engram_layer_ids
+            .iter()
+            .position(|&l| l == layer)
+            .filter(|&index| index < tables.len())
+        {
+            Some(index) => {
+                let weights = EngramWeights::load(
+                    store,
+                    gpu,
+                    &shared.kernels.parts,
+                    layer,
+                    &shape,
+                    held,
+                    stream,
+                )?;
+                let table = tables[index].clone();
                 ensure!(
-                    hash.columns() == weights.columns,
+                    table.hash.columns() == weights.columns,
                     "layer {layer}: Engram hashes {} rows a token and projects {}",
-                    hash.columns(),
+                    table.hash.columns(),
                     weights.columns
                 );
                 Some(Lookup {
-                    engram: Engram::new(gpu, shared.kernels, &shape, weights)?,
-                    table: EngramTable::open(
-                        store,
-                        gpu,
-                        layer,
-                        hash,
-                        geometry.num_embeddings[index],
-                    )?,
-                    token_map: config.engram_token_map.clone().context(
-                        "deepseek_v41: the Engram token map was not derived from the tokenizer",
-                    )?,
+                    engram: Engram::new(gpu, shared.kernels, &shape, held, weights)?,
+                    table,
+                    token_map: token_map()?,
                 })
             }
+            None => None,
+        };
+        let ahead = match (layer, tables.first()) {
+            (0, Some(table)) => Some(Ahead {
+                columns: held_columns(table.hash.columns(), held),
+                tables: tables.clone(),
+                prefetcher: Prefetcher::start()?,
+                token_map: token_map()?,
+            }),
             _ => None,
         };
         out.push(Box::new(Layer {
             block,
             lookup,
+            ahead,
             compresses,
             first: layer == 0,
             last: layer + 1 == layers,

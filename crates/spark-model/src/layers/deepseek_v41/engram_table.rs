@@ -5,7 +5,10 @@
 //! into a pinned row cache, whose memory the GPU reads in place, and the
 //! lookup is handed their slots.
 
-use std::sync::Mutex;
+use std::ops::Range;
+use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use atlas_core::config::DeepseekV41Engram;
@@ -17,6 +20,10 @@ use super::engram::{ENGRAM_DIM, ENGRAM_SCALE_GROUP};
 
 /// Rows of a table kept in memory: 64 MB of values and 2 MB of scales.
 const CACHED_ROWS: usize = 1 << 18;
+/// One small read of the table's drive this often, for this long after the
+/// last lookup (`NgramRowCache::start_keepalive`).
+const KEEPALIVE_PERIOD: Duration = Duration::from_millis(10);
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(2);
 
 /// How one Engram layer hashes the n-grams ending at a token into table
 /// rows (`NgramHashState` in the release's `inference/engram.py`, and
@@ -122,7 +129,7 @@ impl EngramTable {
             NgramRowCache::open_at(&d.path, d.offset, None, rows_total, width, CACHED_ROWS)
                 .with_context(|| name)
         };
-        let caches = Caches {
+        let mut caches = Caches {
             rows: open("weight", WeightDtype::FP8E4M3, ENGRAM_DIM)?,
             scales: open(
                 "scale",
@@ -130,6 +137,12 @@ impl EngramTable {
                 ENGRAM_DIM / ENGRAM_SCALE_GROUP,
             )?,
         };
+        // A drive left alone for a token's time answers its next read in
+        // half a millisecond more: keep it awake while tokens are arriving.
+        caches
+            .rows
+            .start_keepalive(KEEPALIVE_PERIOD, KEEPALIVE_IDLE)
+            .context("Engram table: NVMe keepalive")?;
         Ok(Self {
             slots: gpu.alloc(2 * hash.columns() * 4)?,
             hash,
@@ -137,28 +150,46 @@ impl EngramTable {
         })
     }
 
-    /// Bring `rows` into memory and say where they are. They stay there
-    /// until [`Self::done`], which the caller calls once the kernels that
-    /// read them have run.
-    pub fn find(&self, gpu: &dyn GpuBackend, rows: &[u64], stream: u64) -> Result<Found> {
+    /// Bring columns `held` of a token's `rows` into memory and say where
+    /// they are. They stay there until [`Self::done`], which the caller
+    /// calls once the kernels that read them have run.
+    pub fn find(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: &[u64],
+        held: Range<usize>,
+        stream: u64,
+    ) -> Result<Found> {
         let mut caches = self.caches.lock().expect("engram table");
+        let columns = rows.len();
         let (mut row_slots, mut scale_slots) = (Vec::new(), Vec::new());
-        caches.rows.resolve(rows, &mut row_slots)?;
-        caches.scales.resolve(rows, &mut scale_slots)?;
-        let bytes: Vec<u8> = row_slots
-            .iter()
-            .chain(&scale_slots)
-            .flat_map(|slot| slot.to_le_bytes())
-            .collect();
-        // The last token's lookup may still be reading the slots.
-        gpu.synchronize(stream)?;
-        gpu.copy_h2d(&bytes, self.slots)?;
+        caches.rows.resolve(&rows[held.clone()], &mut row_slots)?;
+        caches
+            .scales
+            .resolve(&rows[held.clone()], &mut scale_slots)?;
+        // In stream order, behind the last token's lookup, which reads them.
+        for (slots, at) in [
+            (&row_slots, held.start),
+            (&scale_slots, columns + held.start),
+        ] {
+            let bytes: Vec<u8> = slots.iter().flat_map(|slot| slot.to_le_bytes()).collect();
+            gpu.copy_h2d_async(&bytes, self.slots.offset(at * 4), stream)?;
+        }
         Ok(Found {
             rows: DevicePtr(caches.rows.table_dev_va()?),
             scales: DevicePtr(caches.scales.table_dev_va()?),
             row_slots: self.slots,
-            scale_slots: self.slots.offset(rows.len() * 4),
+            scale_slots: self.slots.offset(columns * 4),
         })
+    }
+
+    /// Bring `rows` into memory ahead of the [`Self::find`] that will ask
+    /// for them, without holding them there.
+    fn prefetch(&self, rows: &[u64]) -> Result<()> {
+        let mut caches = self.caches.lock().expect("engram table");
+        caches.rows.prefetch(rows)?;
+        caches.scales.prefetch(rows)?;
+        Ok(())
     }
 
     /// Let the rows of the last [`Self::find`] be evicted again.
@@ -166,6 +197,40 @@ impl EngramTable {
         let mut caches = self.caches.lock().expect("engram table");
         caches.rows.end_batch();
         caches.scales.end_batch();
+    }
+}
+
+/// Fetches the rows a later Engram layer of the same token will read, off
+/// the thread that launches kernels: a row comes off the disk in about the
+/// time a layer takes, and the layers between are that time.
+pub struct Prefetcher {
+    jobs: SyncSender<(Arc<EngramTable>, Vec<u64>)>,
+}
+
+impl Prefetcher {
+    /// Requests kept waiting; more are dropped, and their rows are fetched
+    /// when they are asked for.
+    const BACKLOG: usize = 64;
+
+    pub fn start() -> Result<Self> {
+        let (jobs, asked) = sync_channel::<(Arc<EngramTable>, Vec<u64>)>(Self::BACKLOG);
+        std::thread::Builder::new()
+            .name("engram-prefetch".into())
+            .spawn(move || {
+                for (table, rows) in asked {
+                    if let Err(e) = table.prefetch(&rows) {
+                        tracing::warn!("Engram prefetch: {e:#}");
+                    }
+                }
+            })
+            .context("the Engram prefetch thread")?;
+        Ok(Self { jobs })
+    }
+
+    /// Fetch `rows` of `table` in the background.
+    pub fn ask(&self, table: &Arc<EngramTable>, rows: Vec<u64>) {
+        // A full backlog only means the rows are fetched when they are read.
+        let _ = self.jobs.try_send((table.clone(), rows));
     }
 }
 
