@@ -117,6 +117,7 @@ impl Qwen3AttentionLayer {
             Some(super::rows128::Tiles::gqa(
                 &batched_meta.kv_lens_host,
                 &batched_meta.cu_seqlens_host,
+                &batched_meta.pack_streams_host,
             ))
         } else {
             use_br64.then_some(super::rows128::Tiles::PerHead)
@@ -137,7 +138,15 @@ impl Qwen3AttentionLayer {
                 pools,
                 [q_contiguous, attn_out, block_table_ptrs],
                 batch_size,
-                [cu_seqlens, kv_lens, batched_meta.state_end],
+                [
+                    cu_seqlens,
+                    kv_lens,
+                    batched_meta.state_end,
+                    match tiles {
+                        super::rows128::Tiles::PerHead => DevicePtr::NULL,
+                        super::rows128::Tiles::Gqa { .. } => batched_meta.pack_streams,
+                    },
+                ],
                 [chunk_len, kv_len, q_offset_u32],
                 [nq, nkv, hd, bs_u, self.sliding_window.unwrap_or(0)],
                 inv_sqrt_d,

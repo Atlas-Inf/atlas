@@ -38,7 +38,7 @@ use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
 use super::super::super::ssm_batched_copy::{StateCopy, run_state_copies};
 use super::super::super::types::TransformerModel;
 use super::score_plan::ScorePlan;
-use crate::layer::SsmLayerState;
+use crate::layer::{BatchedAttnMetadata, SsmLayerState};
 use crate::traits::{ScorePackInfo, SequenceState};
 
 /// One held pack.
@@ -157,6 +157,33 @@ fn block_copies(kv: &PagedKvCache, src: u32, dst: u32) -> [Vec<StateCopy>; 2] {
 }
 
 impl TransformerModel {
+    /// Upload the per-stream knowledge-pack reader markers for rows128 GQA.
+    /// Returns the scratch cursor past the aligned staging array.
+    pub(super) fn score_stage_packs(
+        &self,
+        plan: &ScorePlan,
+        meta: &mut BatchedAttnMetadata,
+        cursor: usize,
+        stream: u64,
+    ) -> Result<usize> {
+        let n = plan.streams();
+        let off = (cursor + 63) & !63;
+        ensure!(
+            off + n * 4 <= self.buffers.scratch_bytes(),
+            "score: pack-stream staging exceeds scratch ({n} streams)"
+        );
+        let host: Vec<bool> = plan.pack_of.iter().map(Option::is_some).collect();
+        let bytes: Vec<u8> = host
+            .iter()
+            .flat_map(|&r| (r as i32).to_le_bytes())
+            .collect();
+        let dst = self.buffers.scratch().offset(off);
+        self.gpu.copy_h2d_async_retained(&bytes, dst, stream)?;
+        meta.pack_streams = dst;
+        meta.pack_streams_host = host;
+        Ok(off + ((n * 4 + 63) & !63))
+    }
+
     /// See [`crate::traits::Model::score_pack`].
     pub(in crate::model) fn score_pack_impl(
         &self,

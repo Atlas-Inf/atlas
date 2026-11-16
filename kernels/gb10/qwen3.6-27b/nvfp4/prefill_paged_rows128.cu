@@ -36,13 +36,14 @@ constexpr int BR = 128;           // query rows a CTA
 constexpr int HP = HD + 8;        // smem row pitch (as HDIM_PAD)
 constexpr int NT_O = HD / 8;      // output n-tiles a warp
 constexpr int KV_CHUNKS = BC * (HD / 8);
-// In the split entries, a stream with more than SPLIT_MIN_KEYS keys and at
-// least SPLIT_KEYS_PER_ROW keys a row (a knowledge pack under a short state)
-// shares each tile's KV range across the cluster; any other stream gives
-// each rank whole tiles of its own, computed exactly as the unsplit entry
-// does. The rule reads the stream alone, so a merged pass scores as each
-// request alone. A split stream's tiles each read over 3,072 keys (its state
-// ends at least 3/4 of the way through its KV), so no chunk is empty.
+// In the split entries, only a pack-reading stream with more than
+// SPLIT_MIN_KEYS keys and at least SPLIT_KEYS_PER_ROW keys a row (a knowledge
+// pack under a short state) shares each tile's KV range across the cluster;
+// every other stream gives each rank whole tiles of its own, computed exactly
+// as the unsplit entry does. The rule reads the stream alone, so a merged pass
+// scores as each request alone. A split stream's tiles each read over 3,072
+// keys (its state ends at least 3/4 of the way through its KV), so no chunk is
+// empty.
 constexpr unsigned SPLIT_MIN_KEYS = 4096, SPLIT_KEYS_PER_ROW = 4;
 __device__ __forceinline__ bool stream_splits(unsigned kv_len, unsigned rows) {
     return kv_len > SPLIT_MIN_KEYS && kv_len >= SPLIT_KEYS_PER_ROW * rows;
@@ -282,6 +283,7 @@ __device__ __forceinline__ void rows128_body(
     const int* __restrict__ cu_seqlens,
     const int* __restrict__ kv_lens,
     const int* __restrict__ state_end,
+    const int* __restrict__ pack_streams,
     const unsigned int q_len,
     unsigned int kv_len,
     unsigned int q_offset,
@@ -320,7 +322,8 @@ __device__ __forceinline__ void rows128_body(
     // Split entries: rank r of the cluster takes chunk r of a split stream's
     // tile, or whole tile CS y + r of another stream.
     [[maybe_unused]] const unsigned rank = blockIdx.x % CS;
-    const bool split = CS > 1 && stream_splits(kv_len, q_len_eff);
+    const bool split = CS > 1 && pack_streams != nullptr && pack_streams[b] != 0
+        && stream_splits(kv_len, q_len_eff);
     const unsigned q_block = CS > 1 && !split ? blockIdx.y * CS + rank : blockIdx.y;
     const unsigned tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
     const unsigned grp = lane >> 2, tq = lane & 3;
@@ -623,14 +626,15 @@ __device__ __forceinline__ void rows128_body(
         const __nv_bfloat16* __restrict__ V_cache, __nv_bfloat16* __restrict__ O,                   \
         const int* const* __restrict__ block_table_ptrs, const unsigned int batch_size,             \
         const int* __restrict__ cu_seqlens, const int* __restrict__ kv_lens,                        \
-        const int* __restrict__ state_end, const unsigned int q_len, unsigned int kv_len,           \
+        const int* __restrict__ state_end, const int* __restrict__ pack_streams,                    \
+        const unsigned int q_len, unsigned int kv_len,                                               \
         unsigned int q_offset, const unsigned int num_q_heads, const unsigned int num_kv_heads,     \
         const unsigned int head_dim, const unsigned int cache_block_size,                           \
         const unsigned int sliding_window, const unsigned int causal_mask_enabled, const float inv_sqrt_d
 #define ROWS128_ARGS                                                                                \
-    Q, K_cache, V_cache, O, block_table_ptrs, batch_size, cu_seqlens, kv_lens, state_end, q_len,   \
-        kv_len, q_offset, num_q_heads, num_kv_heads, head_dim, cache_block_size, sliding_window,    \
-        causal_mask_enabled, inv_sqrt_d
+    Q, K_cache, V_cache, O, block_table_ptrs, batch_size, cu_seqlens, kv_lens, state_end,           \
+        pack_streams, q_len, kv_len, q_offset, num_q_heads, num_kv_heads, head_dim, cache_block_size, \
+        sliding_window, causal_mask_enabled, inv_sqrt_d
 
 extern "C" __global__ void __launch_bounds__(256, 1) prefill_paged_bf16_rows128(ROWS128_PARAMS) {
     rows128_body<false, false>(ROWS128_ARGS, nullptr, nullptr);
@@ -651,8 +655,9 @@ prefill_paged_bf16_rows128_tma(ROWS128_PARAMS, const __grid_constant__ CUtensorM
 // unsplit entry's arithmetic is the per-head entry's (a taller row span only
 // adds tiles fully masked for the rows that end earlier), so its output is
 // bit-identical. The split entry (clusters of 2 along x, rank = blockIdx.x %
-// 2) splits the streams `stream_splits` picks, within bf16 rounding of the
-// unsplit entry, and computes every other stream exactly as that entry.
+// 2) splits only the pack-reading streams `stream_splits` picks, within bf16
+// rounding of the unsplit entry, and computes every other stream exactly as
+// that entry.
 // Clusters of four were 5-10% faster for one long-pack request but 13%
 // slower than unsplit with eight merged; two stay within 2% there.
 extern "C" __global__ void __launch_bounds__(256, 1) prefill_paged_bf16_rows128_gqa(ROWS128_PARAMS) {

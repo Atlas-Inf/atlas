@@ -132,6 +132,13 @@ pub struct BatchedAttnMetadata {
     /// `prefill_paged_compute.cuh`. `DevicePtr::NULL` (every stream causal)
     /// everywhere except the score path's `prefix_bidir` requests.
     pub state_end: DevicePtr,
+    /// Per-stream knowledge-pack reader marker `[batch_size]` i32 on device
+    /// (`1` = reads a pack, `0` = does not), read by the rows128 GQA kernel.
+    /// `DevicePtr::NULL` (no stream reads a pack) everywhere except score
+    /// passes that carry a pack.
+    pub pack_streams: DevicePtr,
+    /// Host copy of `pack_streams`. Empty when `pack_streams` is NULL.
+    pub pack_streams_host: Vec<bool>,
     /// Score pass: the BF16 HDIM-256 layers run GQA-packed 128-row tiles at
     /// any length (`rows128.rs`), so every request of a pass takes the same
     /// kernel alone or merged. False everywhere else.

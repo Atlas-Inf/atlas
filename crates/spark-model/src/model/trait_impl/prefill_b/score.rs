@@ -341,6 +341,9 @@ impl TransformerModel {
         if plan.any_bidir() {
             cursor = self.score_stage_bidir(plan, &mut meta, cursor, stream)?;
         }
+        if plan.pack_of.iter().any(Option::is_some) {
+            cursor = self.score_stage_packs(plan, &mut meta, cursor, stream)?;
+        }
         let ptrs_off = (cursor + 63) & !63;
         // h_state_ptrs[n] then the branches' rebased cu_seqlens[n+1].
         let branch_cu_off = ptrs_off + ((n * 8 + 63) & !63);

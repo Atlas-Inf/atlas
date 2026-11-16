@@ -8,8 +8,10 @@
 //!
 //! Score passes take the `_gqa` entries instead, lever or not ([`Tiles::Gqa`]):
 //! each tile is one KV head's query heads over a stream's rows, so the short
-//! streams of a score pass fill tiles, and a long KV range (a knowledge pack)
-//! is split across a 2-CTA cluster.
+//! streams of a score pass fill tiles. Only streams that read a knowledge pack
+//! may split their long KV range across a 2-CTA cluster; every other stream,
+//! and every pass without a pack, takes the unsplit entry, whose per-row
+//! arithmetic is the per-head kernel's.
 //!
 //! The handles are resolved on first use, the per-head ones only with the
 //! lever set (only the 27B dense targets ship the module), so other boot
@@ -24,8 +26,8 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 /// Query rows a CTA (`rows128::BR` in the kernel).
 const ROWS: u32 = 128;
-/// The kernel's `stream_splits`: a GQA stream with more keys than this, and
-/// at least `SPLIT_KEYS_PER_ROW` keys a row, splits its tiles' KV ranges.
+/// The kernel's `stream_splits`: a pack-reading GQA stream with more keys than
+/// this, and at least `SPLIT_KEYS_PER_ROW` keys a row, splits its tiles' KV ranges.
 const SPLIT_MIN_KEYS: i32 = 4096;
 const SPLIT_KEYS_PER_ROW: i32 = 4;
 /// CTAs a split entry's cluster.
@@ -38,20 +40,26 @@ pub(super) enum Tiles {
     /// 128 rows of one query head (the lever's replacement of `_64`).
     PerHead,
     /// 128 rows of one KV head's query heads (score passes); the split entry
-    /// when any stream splits (it computes the others as the unsplit entry).
+    /// when a pack-reading stream splits (it computes every other stream as
+    /// the unsplit entry).
     Gqa { split: bool },
 }
 
 impl Tiles {
-    /// A VARLEN pass's GQA layout, from its streams' KV extents and
-    /// `cu_seqlens` (host copies). Each stream's entry is fixed by the stream
-    /// alone, so a merged pass scores as each request alone.
-    pub(super) fn gqa(kv_lens: &[i32], cu_seqlens: &[i32]) -> Self {
+    /// A VARLEN pass's GQA layout, from its streams' KV extents,
+    /// `cu_seqlens` and pack-reader mask (host copies). Only pack-reading
+    /// streams may split, so a merged pass scores as each request alone.
+    pub(super) fn gqa(kv_lens: &[i32], cu_seqlens: &[i32], reads_pack: &[bool]) -> Self {
         Tiles::Gqa {
             split: kv_lens
                 .iter()
                 .zip(cu_seqlens.windows(2))
-                .any(|(&k, c)| k > SPLIT_MIN_KEYS && k >= SPLIT_KEYS_PER_ROW * (c[1] - c[0])),
+                .enumerate()
+                .any(|(i, (&k, c))| {
+                    reads_pack.get(i) == Some(&true)
+                        && k > SPLIT_MIN_KEYS
+                        && k >= SPLIT_KEYS_PER_ROW * (c[1] - c[0])
+                }),
         }
     }
 }
@@ -115,7 +123,7 @@ pub(super) fn launch(
     pools: Pools,
     [q, output, block_table_ptrs]: [DevicePtr; 3],
     batch_size: u32,
-    [cu_seqlens, kv_lens, state_end]: [DevicePtr; 3],
+    [cu_seqlens, kv_lens, state_end, pack_streams]: [DevicePtr; 4],
     [q_len, kv_len, q_offset]: [u32; 3],
     [
         num_q_heads,
@@ -162,6 +170,7 @@ pub(super) fn launch(
         .arg_ptr(cu_seqlens)
         .arg_ptr(kv_lens)
         .arg_ptr(state_end)
+        .arg_ptr(pack_streams)
         .arg_u32(q_len)
         .arg_u32(kv_len)
         .arg_u32(q_offset)
@@ -196,8 +205,11 @@ fn tensor_maps(_: &Pools, _: usize) -> Result<Option<[[u8; 128]; 2]>> {
 mod tests {
     use super::Tiles;
 
-    fn splits(kv_lens: &[i32], cu_seqlens: &[i32]) -> bool {
-        matches!(Tiles::gqa(kv_lens, cu_seqlens), Tiles::Gqa { split: true })
+    fn splits(kv_lens: &[i32], cu_seqlens: &[i32], reads_pack: &[bool]) -> bool {
+        matches!(
+            Tiles::gqa(kv_lens, cu_seqlens, reads_pack),
+            Tiles::Gqa { split: true }
+        )
     }
 
     #[test]
@@ -205,20 +217,38 @@ mod tests {
         // 12K pack: head of 237 state rows, three 20-row branches.
         assert!(splits(
             &[12291, 12308, 12308, 12308],
-            &[0, 237, 257, 277, 297]
+            &[0, 237, 257, 277, 297],
+            &[true; 4]
         ));
         // 6K pack, branches alone.
-        assert!(splits(&[6257], &[0, 20]));
+        assert!(splits(&[6257], &[0, 20], &[true]));
     }
 
     #[test]
     fn short_packs_and_long_states_do_not_split() {
         // 1.2K and 3.2K packs: at most 4,096 keys.
-        assert!(!splits(&[1419, 1436], &[0, 229, 249]));
-        assert!(!splits(&[3512, 3529], &[0, 232, 252]));
+        assert!(!splits(&[1419, 1436], &[0, 229, 249], &[true; 2]));
+        assert!(!splits(&[3512, 3529], &[0, 232, 252], &[true; 2]));
         // A 2,450-token state without a pack: its rows fill the GPU.
-        assert!(!splits(&[2450, 2467], &[0, 2448, 2468]));
+        assert!(!splits(&[2450, 2467], &[0, 2448, 2468], &[false; 2]));
         // 16K of state: fewer than 4 keys a row.
-        assert!(!splits(&[16384], &[0, 16384]));
+        assert!(!splits(&[16384], &[0, 16384], &[false]));
+    }
+
+    #[test]
+    fn long_plain_state_streams_do_not_split_without_a_pack() {
+        let kv_lens = [14996; 6];
+        let cu_seqlens = [0, 20, 40, 60, 80, 100, 120];
+        assert!(!splits(&kv_lens, &cu_seqlens, &[false; 6]));
+        assert!(!splits(&kv_lens, &cu_seqlens, &[]));
+        assert!(splits(&kv_lens, &cu_seqlens, &[true; 6]));
+    }
+
+    #[test]
+    fn mixed_pass_splits_only_when_a_stream_reads_a_pack() {
+        let kv_lens = [6257, 6257];
+        let cu_seqlens = [0, 20, 40];
+        assert!(splits(&kv_lens, &cu_seqlens, &[true, false]));
+        assert!(!splits(&kv_lens, &cu_seqlens, &[false, false]));
     }
 }
