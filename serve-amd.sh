@@ -214,12 +214,14 @@ echo "serving $MODEL on ${GFX:-AMD} via $HW"
 # unsloth checkpoint use LM_HEAD=bf16 — its lm_head ships per-row FP8 and the
 # frozen accuracy recipe preserves it to BF16.
 # Flash-Next's FP8 GDN decode copy (the gfx1151 default since #275) costs
-# ~1.9 GB on top of the BF16 projections kept for prefill. At MAX_BATCH 1 that
-# is +17% decode for nothing; at MAX_BATCH 8 it left 0.1 GB of KV on a 96 GB
-# GPU and C4/C8 requests ran one at a time (framework f114). So above batch 1
-# the recipe keeps BF16 unless ATLAS_QWEN4EXP_FP8_GDN is set explicitly.
+# ~1.9 GB on top of the BF16 projections kept for prefill. It used to be forced
+# off above batch 1: at MAX_BATCH 8 it left 0.1 GB of KV and C4/C8 requests ran
+# one at a time (framework f114, before the Linux-fit fixes and util 0.96). It
+# now stays on: the batched GDN projections are bytes-bound (BF16 qkvz ~234 GB/s
+# on strix), and the exact lane reads the FP8 copy single-row decode reads
+# (w8a16_gemv_batch4/16). Strix, main 502777590, util 0.96: C8 42.4 -> 45.8,
+# C4 -> 43.7 tok/s. ATLAS_QWEN4EXP_FP8_GDN=0 still opts out.
 if [ "${MAX_BATCH:-1}" -gt 1 ]; then
-  export ATLAS_QWEN4EXP_FP8_GDN="${ATLAS_QWEN4EXP_FP8_GDN:-0}"
   # The qwen4_exp exact batching lane is what batches a Flash-Next multi-sequence
   # decode step on gfx1151 (without it the mHC multi-seq paths run the MoE a row at
   # a time). Framework f128/f132: C4 15.3 -> 24.3, C8 15.1 -> 27.9 tok/s (AR), C4
