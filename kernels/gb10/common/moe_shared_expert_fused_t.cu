@@ -858,6 +858,17 @@ extern "C" __global__ void moe_expert_union_t(
 #define T_ROWS_TAIL_GUARD(col, N)
 #endif
 
+// Rows-kernel k tile. gfx1151: 32. At 64 the double-buffered tiles + scales + activations
+// take ~43 KB of LDS a 256-thread block, so one block (8 waves) fits per CU, and with
+// ~80 unique experts these kernels are memory-latency bound (in situ ~120 GB/s). 32 halves
+// the LDS: kbench U=80, cold weights, gate_up r8 1744 -> 1308 us, bit-identical (the per-output
+// sum order over k does not depend on the tile size). gb10 keeps TILE_KH.
+#if defined(__HIP_PLATFORM_AMD__)
+#define ROWS_TKH 32u
+#else
+#define ROWS_TKH TILE_KH
+#endif
+
 template<int ROWS, int BS = 32, int COLS = 1, bool VEC = false>
 __device__ __forceinline__ void gate_up_shared_t_rows_impl(
     const __nv_bfloat16* __restrict__ A,               // [ROWS, h]
@@ -913,9 +924,9 @@ __device__ __forceinline__ void gate_up_shared_t_rows_impl(
     for (unsigned int c = 0; c < COLS; c++) { col[c] = ns0 + lane + c * BS; vc[c] = col[c] < N; any |= vc[c]; }
     __shared__ float s_lut[16];
     if (lane < 16) s_lut[lane] = E2M1_LUT_T[lane];
-    __shared__ unsigned char s_pk[2][TILE_KH * STRIDE];
-    __shared__ unsigned char s_sc[2][(TILE_KH / 8) * STRIDE];
-    __shared__ __nv_bfloat16 s_a[2][ROWS * TILE_KH * 2];
+    __shared__ unsigned char s_pk[2][ROWS_TKH * STRIDE];
+    __shared__ unsigned char s_sc[2][(ROWS_TKH / 8) * STRIDE];
+    __shared__ __nv_bfloat16 s_a[2][ROWS * ROWS_TKH * 2];
     __syncthreads();
 
     unsigned int mask = is_shared ? ((1u << ROWS) - 1u) : u_rowmask[u];
@@ -939,16 +950,16 @@ __device__ __forceinline__ void gate_up_shared_t_rows_impl(
     }
 
     auto stage = [&](unsigned int tg, unsigned int buf) {
-        const unsigned int r0 = tg * TILE_KH;
+        const unsigned int r0 = tg * ROWS_TKH;
         _Pragma("unroll")
-        for (unsigned int j = lane; j < TILE_KH * (COLW / 16u); j += BS) {
+        for (unsigned int j = lane; j < ROWS_TKH * (COLW / 16u); j += BS) {
             const unsigned int rr = j / (COLW / 16u);
             const unsigned int cb = (j % (COLW / 16u)) * 16u;
             T_ROWS_TAIL_GUARD(ns0 + cb, N)
             *(uint4*)&s_pk[buf][rr * STRIDE + cb] =
                 *(const uint4*)&B_packed[(unsigned long long)(r0 + rr) * N + ns0 + cb];
         }
-        const unsigned int ng = TILE_KH / 8u;
+        const unsigned int ng = ROWS_TKH / 8u;
         _Pragma("unroll")
         for (unsigned int j = lane; j < ng * (COLW / 16u); j += BS) {
             const unsigned int sg = j / (COLW / 16u);
@@ -958,11 +969,11 @@ __device__ __forceinline__ void gate_up_shared_t_rows_impl(
                 *(const uint4*)&B_scale[(unsigned long long)(tg * ng + sg) * N + ns0 + cb];
         }
         _Pragma("unroll")
-        for (unsigned int j = lane; j < ROWS * (TILE_KH * 2 / 8u); j += BS) {
-            const unsigned int row = j / (TILE_KH * 2 / 8u);
-            const unsigned int chunk = j % (TILE_KH * 2 / 8u);
-            *(uint4*)&s_a[buf][row * TILE_KH * 2 + chunk * 8] =
-                *(const uint4*)&A[(unsigned long long)row * h + tg * TILE_KH * 2 + chunk * 8];
+        for (unsigned int j = lane; j < ROWS * (ROWS_TKH * 2 / 8u); j += BS) {
+            const unsigned int row = j / (ROWS_TKH * 2 / 8u);
+            const unsigned int chunk = j % (ROWS_TKH * 2 / 8u);
+            *(uint4*)&s_a[buf][row * ROWS_TKH * 2 + chunk * 8] =
+                *(const uint4*)&A[(unsigned long long)row * h + tg * ROWS_TKH * 2 + chunk * 8];
         }
     };
 
@@ -971,7 +982,7 @@ __device__ __forceinline__ void gate_up_shared_t_rows_impl(
     for (unsigned int c = 0; c < COLS; c++)
         _Pragma("unroll")
         for (unsigned int r = 0; r < ROWS; r++) acc[c][r] = 0.0f;
-    const unsigned int ntg = (K / 2u) / TILE_KH;
+    const unsigned int ntg = (K / 2u) / ROWS_TKH;
     stage(0, 0);
     for (unsigned int tg = 0; tg < ntg; tg++) {
         __syncthreads();
@@ -980,11 +991,11 @@ __device__ __forceinline__ void gate_up_shared_t_rows_impl(
         if (any) {
             if constexpr (VEC) {
                 _Pragma("unroll")
-                for (unsigned int rr4 = 0; rr4 < TILE_KH / 4u; rr4++) {
+                for (unsigned int rr4 = 0; rr4 < ROWS_TKH / 4u; rr4++) {
                     __nv_bfloat16 av[ROWS][8];
                     _Pragma("unroll")
                     for (unsigned int r = 0; r < ROWS; r++)
-                        *(uint4*)&av[r][0] = *(const uint4*)&s_a[buf][r * TILE_KH * 2 + rr4 * 8];
+                        *(uint4*)&av[r][0] = *(const uint4*)&s_a[buf][r * ROWS_TKH * 2 + rr4 * 8];
                     _Pragma("unroll")
                     for (unsigned int j = 0; j < 4; j++) {
                         const unsigned int rr = rr4 * 4 + j;
@@ -1008,7 +1019,7 @@ __device__ __forceinline__ void gate_up_shared_t_rows_impl(
                 }
             } else {
                 _Pragma("unroll 8")
-                for (unsigned int rr = 0; rr < TILE_KH; rr++) {
+                for (unsigned int rr = 0; rr < ROWS_TKH; rr++) {
                     float w_lo[COLS], w_hi[COLS];
                     _Pragma("unroll")
                     for (unsigned int c = 0; c < COLS; c++) {
@@ -1019,8 +1030,8 @@ __device__ __forceinline__ void gate_up_shared_t_rows_impl(
                     }
                     _Pragma("unroll")
                     for (unsigned int r = 0; r < ROWS; r++) {
-                        const float a_lo = __bfloat162float(s_a[buf][r * TILE_KH * 2 + rr * 2]);
-                        const float a_hi = __bfloat162float(s_a[buf][r * TILE_KH * 2 + rr * 2 + 1]);
+                        const float a_lo = __bfloat162float(s_a[buf][r * ROWS_TKH * 2 + rr * 2]);
+                        const float a_hi = __bfloat162float(s_a[buf][r * ROWS_TKH * 2 + rr * 2 + 1]);
                         _Pragma("unroll")
                         for (unsigned int c = 0; c < COLS; c++)
                             acc[c][r] += a_lo * w_lo[c] + a_hi * w_hi[c];
@@ -1094,12 +1105,12 @@ __device__ __forceinline__ void silu_down_shared_t_rows_impl(
     for (unsigned int c = 0; c < COLS; c++) { col[c] = ns0 + lane + c * BS; vc[c] = col[c] < N; any |= vc[c]; }
     __shared__ float s_lut[16];
     if (lane < 16) s_lut[lane] = E2M1_LUT_T[lane];
-    __shared__ unsigned char s_pk[2][TILE_KH * STRIDE];
-    __shared__ unsigned char s_sc[2][(TILE_KH / 8) * STRIDE];
+    __shared__ unsigned char s_pk[2][ROWS_TKH * STRIDE];
+    __shared__ unsigned char s_sc[2][(ROWS_TKH / 8) * STRIDE];
     // Activation staged per k-tile as fp32, computed once per element per
     // CTA (the single-row kernel's s_act precompute, tiled) instead of per
     // element per column thread. Same bytes budget as the s_g/s_u pair.
-    __shared__ float s_act[2][ROWS * TILE_KH * 2];
+    __shared__ float s_act[2][ROWS * ROWS_TKH * 2];
     __syncthreads();
 
     unsigned int mask = is_shared ? ((1u << ROWS) - 1u) : u_rowmask[u];
@@ -1137,16 +1148,16 @@ __device__ __forceinline__ void silu_down_shared_t_rows_impl(
     }
 
     auto stage = [&](unsigned int tg, unsigned int buf) {
-        const unsigned int r0 = tg * TILE_KH;
+        const unsigned int r0 = tg * ROWS_TKH;
         _Pragma("unroll")
-        for (unsigned int j = lane; j < TILE_KH * (COLW / 16u); j += BS) {
+        for (unsigned int j = lane; j < ROWS_TKH * (COLW / 16u); j += BS) {
             const unsigned int rr = j / (COLW / 16u);
             const unsigned int cb = (j % (COLW / 16u)) * 16u;
             T_ROWS_TAIL_GUARD(ns0 + cb, N)
             *(uint4*)&s_pk[buf][rr * STRIDE + cb] =
                 *(const uint4*)&B_packed[(unsigned long long)(r0 + rr) * N + ns0 + cb];
         }
-        const unsigned int ng = TILE_KH / 8u;
+        const unsigned int ng = ROWS_TKH / 8u;
         _Pragma("unroll")
         for (unsigned int j = lane; j < ng * (COLW / 16u); j += BS) {
             const unsigned int sg = j / (COLW / 16u);
@@ -1156,13 +1167,13 @@ __device__ __forceinline__ void silu_down_shared_t_rows_impl(
                 *(const uint4*)&B_scale[(unsigned long long)(tg * ng + sg) * N + ns0 + cb];
         }
         _Pragma("unroll")
-        for (unsigned int j = lane; j < ROWS * (TILE_KH * 2 / 8u); j += BS) {
-            const unsigned int row = j / (TILE_KH * 2 / 8u);
-            const unsigned int chunk = j % (TILE_KH * 2 / 8u);
+        for (unsigned int j = lane; j < ROWS * (ROWS_TKH * 2 / 8u); j += BS) {
+            const unsigned int row = j / (ROWS_TKH * 2 / 8u);
+            const unsigned int chunk = j % (ROWS_TKH * 2 / 8u);
             const __nv_bfloat16* g8 =
-                (const __nv_bfloat16*)&g_base[row][tg * TILE_KH * 2 + chunk * 8];
+                (const __nv_bfloat16*)&g_base[row][tg * ROWS_TKH * 2 + chunk * 8];
             const __nv_bfloat16* u8 =
-                (const __nv_bfloat16*)&u_base[row][tg * TILE_KH * 2 + chunk * 8];
+                (const __nv_bfloat16*)&u_base[row][tg * ROWS_TKH * 2 + chunk * 8];
             float a8[8];
             _Pragma("unroll")
             for (unsigned int i = 0; i < 8; i++) {
@@ -1170,9 +1181,9 @@ __device__ __forceinline__ void silu_down_shared_t_rows_impl(
                 const float uf = __bfloat162float(u8[i]);
                 a8[i] = (gf / (1.0f + __expf(-gf))) * uf;
             }
-            *(float4*)&s_act[buf][row * TILE_KH * 2 + chunk * 8] =
+            *(float4*)&s_act[buf][row * ROWS_TKH * 2 + chunk * 8] =
                 make_float4(a8[0], a8[1], a8[2], a8[3]);
-            *(float4*)&s_act[buf][row * TILE_KH * 2 + chunk * 8 + 4] =
+            *(float4*)&s_act[buf][row * ROWS_TKH * 2 + chunk * 8 + 4] =
                 make_float4(a8[4], a8[5], a8[6], a8[7]);
         }
     };
@@ -1182,7 +1193,7 @@ __device__ __forceinline__ void silu_down_shared_t_rows_impl(
     for (unsigned int c = 0; c < COLS; c++)
         _Pragma("unroll")
         for (unsigned int r = 0; r < ROWS; r++) acc[c][r] = 0.0f;
-    const unsigned int ntg = (K / 2u) / TILE_KH;
+    const unsigned int ntg = (K / 2u) / ROWS_TKH;
     stage(0, 0);
     for (unsigned int tg = 0; tg < ntg; tg++) {
         __syncthreads();
@@ -1191,12 +1202,12 @@ __device__ __forceinline__ void silu_down_shared_t_rows_impl(
         if (any) {
             if constexpr (VEC) {
                 _Pragma("unroll")
-                for (unsigned int rr4 = 0; rr4 < TILE_KH / 4u; rr4++) {
+                for (unsigned int rr4 = 0; rr4 < ROWS_TKH / 4u; rr4++) {
                     float a8[ROWS][8];
                     _Pragma("unroll")
                     for (unsigned int r = 0; r < ROWS; r++) {
-                        *(float4*)&a8[r][0] = *(const float4*)&s_act[buf][r * TILE_KH * 2 + rr4 * 8];
-                        *(float4*)&a8[r][4] = *(const float4*)&s_act[buf][r * TILE_KH * 2 + rr4 * 8 + 4];
+                        *(float4*)&a8[r][0] = *(const float4*)&s_act[buf][r * ROWS_TKH * 2 + rr4 * 8];
+                        *(float4*)&a8[r][4] = *(const float4*)&s_act[buf][r * ROWS_TKH * 2 + rr4 * 8 + 4];
                     }
                     _Pragma("unroll")
                     for (unsigned int j = 0; j < 4; j++) {
@@ -1221,7 +1232,7 @@ __device__ __forceinline__ void silu_down_shared_t_rows_impl(
                 }
             } else {
                 _Pragma("unroll 8")
-                for (unsigned int rr = 0; rr < TILE_KH; rr++) {
+                for (unsigned int rr = 0; rr < ROWS_TKH; rr++) {
                     float w_lo[COLS], w_hi[COLS];
                     _Pragma("unroll")
                     for (unsigned int c = 0; c < COLS; c++) {
@@ -1232,8 +1243,8 @@ __device__ __forceinline__ void silu_down_shared_t_rows_impl(
                     }
                     _Pragma("unroll")
                     for (unsigned int r = 0; r < ROWS; r++) {
-                        const float act0 = s_act[buf][r * TILE_KH * 2 + rr * 2];
-                        const float act1 = s_act[buf][r * TILE_KH * 2 + rr * 2 + 1];
+                        const float act0 = s_act[buf][r * ROWS_TKH * 2 + rr * 2];
+                        const float act1 = s_act[buf][r * ROWS_TKH * 2 + rr * 2 + 1];
                         _Pragma("unroll")
                         for (unsigned int c = 0; c < COLS; c++)
                             acc[c][r] += act0 * w_lo[c] + act1 * w_hi[c];
