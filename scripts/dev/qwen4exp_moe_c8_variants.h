@@ -137,8 +137,8 @@ static Variant tc3_units(const std::string& tag = "") {
     Variant v;
     v.name = "tc3 " + (tag.empty() ? std::string("") : tag + " ") + "fused";
     v.plan = [=](Pool& p, Bufs& b, unsigned rows) {
-        unsigned topk = TOPK, R = rows;
-        launch(pl, dim3(1), dim3(1024), {&b.ids, &p.gp, &b.ws, &topk, &R});
+        unsigned topk = TOPK, R = rows, has_shared = 1;
+        launch(pl, dim3(1), dim3(1024), {&b.ids, &p.gp, &b.ws, &topk, &R, &has_shared});
     };
     v.gate_up = [=](Pool& p, Bufs& b, unsigned rows) {
         unsigned topk = TOPK, R = rows;

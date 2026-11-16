@@ -132,12 +132,19 @@ static void run_time(Pool& pool, const std::string& only) {
         // LAYER_PASSES=p: only plan + gate/up + down, the variants interleaved
         // p times (03 is shared: min and median of the passes).
         if (const char* lp = getenv("LAYER_PASSES")) {
+            // POOLS=p: launch i reads pool i % p (p separate 256-expert pools,
+            // as a step's 48 layers do), not one pool over and over.
+            static std::vector<Pool*> pools;
+            const int np = getenv("POOLS") ? std::max(1, atoi(getenv("POOLS"))) : 1;
+            while ((int)pools.size() < np) pools.push_back(pools.empty() ? &pool : new Pool(256));
+            const auto P = [&](int i) -> Pool& { return *pools[i % np]; };
+            if (np > 1) printf("           %d pools, %.1f GB of expert weights\n", np, np * pool.bytes() / 1e9);
             std::vector<std::vector<double>> t(vs.size());
             for (int pass = 0; pass < atoi(lp); pass++)
                 for (size_t k = 0; k < vs.size(); k++) {
                     Variant& v = vs[k];
                     const auto layer = [&](int i) {
-                        v.plan(pool, bs[i], c.rows); v.gate_up(pool, bs[i], c.rows); v.silu_down(pool, bs[i], c.rows);
+                        v.plan(P(i), bs[i], c.rows); v.gate_up(P(i), bs[i], c.rows); v.silu_down(P(i), bs[i], c.rows);
                     };
                     tm.once(n, layer);  // the previous variant's wake (order bias at 1 row ~10%)
                     t[k].push_back(tm.once(n, layer));
