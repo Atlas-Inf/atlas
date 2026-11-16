@@ -79,11 +79,28 @@ static std::vector<unsigned short> rand_bf16(size_t n, float scale) {
 }
 
 struct Proj { unsigned char* packed; unsigned char* scale; float s2; };
+// SLAB=1: every projection is carved from 1 GiB allocations instead of its
+// own cudaMalloc (an expert's packed weights are 0.8 MB: below a 2 MB page).
+static unsigned char* slab_put(const std::vector<unsigned char>& h) {
+    static unsigned char* base = nullptr;
+    static size_t off = 0, cap = 0;
+    const size_t need = (h.size() + 511) & ~(size_t)255;
+    if (off + need > cap) {
+        cap = (size_t)1 << 30; off = 0;
+        CK(cudaMalloc(&base, cap));
+    }
+    unsigned char* p = base + off;
+    off += need;
+    CK(cudaMemcpy(p, h.data(), h.size(), cudaMemcpyHostToDevice));
+    return p;
+}
 static Proj make_proj(unsigned n, unsigned k) {
     std::vector<unsigned char> c((size_t)n * k / 2), s((size_t)n * k / 16);
     for (auto& x : c) x = (unsigned char)g_rng();
     for (auto& x : s) { x = (unsigned char)(g_rng() & 0x7F); if (x == 0x7F) x = 0x7E; }
     std::uniform_real_distribution<float> d(0.5f, 2.0f);
+    static const bool slab = getenv("SLAB") && atoi(getenv("SLAB"));
+    if (slab) return {slab_put(c), slab_put(s), d(g_rng) / 448.f};
     return {dput(c), dput(s), d(g_rng) / 448.f};
 }
 
