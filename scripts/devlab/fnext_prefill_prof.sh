@@ -116,13 +116,21 @@ KT=$(find "$OUT/prof" -name '*kernel_trace.csv' | head -1)
 python3 - "$KT" <<'EOF' | tee -a "$RES"
 import csv, sys, collections
 tot, cnt = collections.Counter(), collections.Counter()
+gt, gc = collections.Counter(), collections.Counter()
 for r in csv.DictReader(open(sys.argv[1])):
     n = r.get("Kernel_Name") or r.get("KernelName") or "?"
     n = n.split("(")[0][:90]
-    tot[n] += int(r["End_Timestamp"]) - int(r["Start_Timestamp"]); cnt[n] += 1
+    d = int(r["End_Timestamp"]) - int(r["Start_Timestamp"])
+    tot[n] += d; cnt[n] += 1
+    g = "x".join(r.get(k, "?") for k in ("Grid_Size_X", "Grid_Size_Y", "Grid_Size_Z")) + "/" + r.get("Workgroup_Size_X", "?")
+    gt[(n, g)] += d; gc[(n, g)] += 1
 s = sum(tot.values())
 print(f"  [prof] {len(tot)} kernels, {s / 1e9:.2f} s GPU total")
 for n, t in tot.most_common(40):
     print(f"  [prof] {t / 1e6:10.1f} ms {100 * t / s:5.1f}% x{cnt[n]:<7} {n}")
+top = [n for n, _ in tot.most_common(8)]
+for (n, g), t in sorted(gt.items(), key=lambda kv: -kv[1]):
+    if n in top and t > 0.01 * s:
+        print(f"  [grid] {t / 1e6:10.1f} ms {100 * t / s:5.1f}% x{gc[(n, g)]:<7} {t / 1e3 / gc[(n, g)]:8.1f} us/call  grid {g:<18} {n[:60]}")
 EOF
 log DONE
