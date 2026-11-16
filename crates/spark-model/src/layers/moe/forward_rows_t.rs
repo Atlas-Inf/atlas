@@ -126,6 +126,21 @@ impl MoeLayer {
                     stream,
                 )?;
             }
+        }
+        // ATLAS_QWEN4EXP_BATCH_SMALL: every row's top-k in one launch, each
+        // row the single-row kernel's bytes (as `forward_rows`); else a row each.
+        let k = &self.qwen4exp_moe_rows;
+        let topk_once = ctx.levers.qwen4exp_batch_small
+            && k.topk_rows(
+                ctx.gpu,
+                gate_logits,
+                indices,
+                weights,
+                (num_experts, top_k, rows as u32, router_n),
+                ctx.config.norm_topk_prob,
+                stream,
+            )?;
+        for r in (0..rows).filter(|_| !topk_once) {
             ops::moe_topk_softmax(
                 ctx.gpu,
                 self.moe_topk,
@@ -247,7 +262,25 @@ impl MoeLayer {
         } else {
             DevicePtr::NULL
         };
-        for r in 0..rows {
+        // ATLAS_QWEN4EXP_BATCH_SMALL: the rows' blends in one launch (the EP
+        // zero row shared at stride 0), each row the single-row blend's bytes.
+        let blend_once = ctx.levers.qwen4exp_batch_small
+            && self.qwen4exp_moe_rows.blend_rows(
+                ctx.gpu,
+                output,
+                expert_down_out,
+                weights,
+                if is_ep && !shared_out.is_null() {
+                    (zero_row, 0)
+                } else {
+                    (shared_out, h)
+                },
+                input,
+                self.weights.shared_expert_gate.weight,
+                (h, top_k, rows as u32),
+                stream,
+            )?;
+        for r in (0..rows).filter(|_| !blend_once) {
             let shared_for_blend = if is_ep && !shared_out.is_null() {
                 zero_row
             } else {
