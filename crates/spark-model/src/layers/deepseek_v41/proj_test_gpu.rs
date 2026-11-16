@@ -14,12 +14,15 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::*;
 use crate::layers::deepseek_v41::cache_recipe as recipe;
+use crate::layers::deepseek_v41::parts::{PartKernels, project, project_groups};
 use crate::layers::deepseek_v41::test_support::{
     Recording, backend, bf16s, checkpoint, closeness, download, le_bytes, load_fp8, picks, rows_of,
-    tiers, upload,
+    upload,
 };
+use crate::layers::deepseek_v41::weights::Slice;
 use crate::layers::ops::rms_norm;
 use crate::weight_map::DenseWeight;
+use crate::weight_map::Mxfp8Weight;
 use crate::weight_map::test_checkpoint::read_checkpoint_tensor;
 
 #[test]
@@ -27,7 +30,15 @@ use crate::weight_map::test_checkpoint::read_checkpoint_tensor;
 fn fp8_projections_replay_the_reference() -> Result<()> {
     let rec = Recording::open()?;
     let gpu = backend()?;
-    let (k, tiers, stream) = (Kernels::load(gpu)?, tiers(gpu)?, gpu.default_stream());
+    let (fp8_q, stream) = (PartKernels::load(gpu)?.fp8_q, gpu.default_stream());
+    // The projection as the block runs it: a row a launch, its input rounded
+    // to FP8 on the way in.
+    let linear = |w: &Mxfp8Weight, x: DevicePtr, y: DevicePtr, rows: usize, n, width| {
+        (0..rows).try_for_each(|row| {
+            let (x, y) = (x.offset(row * width * 2), y.offset(row * n * 2));
+            project(gpu, fp8_q, x, w.data, w.scales, y, n, width, stream)
+        })
+    };
     for (layer, op) in [
         (0, "attn.wq_a"),
         (0, "attn.wq_b"),
@@ -45,24 +56,10 @@ fn fp8_projections_replay_the_reference() -> Result<()> {
         let name = format!("L{layer}.op.{op}");
         let (_, input) = rec.prefill(&format!("{name}.in"))?;
         let (_, output) = rec.prefill(&format!("{name}.out"))?;
-        // 40 rows: one launch of 32 and one of 8.
         let picks = picks(&rec, 40);
         let x = upload(gpu, &rows_of(&input, width, &picks))?;
-        let quantized = gpu.alloc(picks.len() * width * 2)?;
         let y = gpu.alloc(picks.len() * n * 2)?;
-        fp8_linear(
-            gpu,
-            &k,
-            &tiers,
-            &w,
-            x,
-            quantized,
-            y,
-            picks.len(),
-            n,
-            width,
-            stream,
-        )?;
+        linear(&w, x, y, picks.len(), n, width)?;
         let got = download(gpu, y, picks.len() * n)?;
         let (same, distance) = closeness(&got, &bf16s(&rows_of(&output, n, &picks)));
         println!(
@@ -78,13 +75,13 @@ fn fp8_projections_replay_the_reference() -> Result<()> {
         let (_, input) = rec.step(&format!("{name}.in"), 7)?;
         let (_, output) = rec.step(&format!("{name}.out"), 7)?;
         gpu.copy_h2d(&input, x)?;
-        fp8_linear(gpu, &k, &tiers, &w, x, quantized, y, 1, n, width, stream)?;
+        linear(&w, x, y, 1, n, width)?;
         let (same, distance) = closeness(&download(gpu, y, n)?, &bf16s(&output));
         assert!(
             same > 0.99 && distance < 4e-4,
             "{name} decode: {same} equal, {distance:e} away"
         );
-        for p in [x, quantized, y, w.data, w.scales] {
+        for p in [x, y, w.data, w.scales] {
             gpu.free(p)?;
         }
     }
@@ -244,7 +241,11 @@ fn queries_and_window_keys_replay_the_reference() -> Result<()> {
 fn the_output_projection_replays_the_reference() -> Result<()> {
     let rec = Recording::open()?;
     let gpu = backend()?;
-    let (k, tiers, stream) = (Kernels::load(gpu)?, tiers(gpu)?, gpu.default_stream());
+    let (k, groups_q, stream) = (
+        Kernels::load(gpu)?,
+        PartKernels::load(gpu)?.fp8_groups_q,
+        gpu.default_stream(),
+    );
     const GROUPS: usize = 8;
     const RANK: usize = 1024;
     let group_in = 64 / GROUPS * HEAD_DIM;
@@ -263,8 +264,8 @@ fn the_output_projection_replays_the_reference() -> Result<()> {
         let o = upload(gpu, &rows_of(&attended, 64 * HEAD_DIM, &picks))?;
         let low = gpu.alloc(picks.len() * GROUPS * RANK * 2)?;
 
-        // Undo the query's rotation, quantize to FP8, then each group of 8
-        // heads through its own [1024, 4096] block of wo_a.
+        // Undo the query's rotation, then each group of 8 heads through its
+        // own [1024, 4096] block of wo_a, which rounds them to FP8.
         rotate(
             gpu,
             k.rotate,
@@ -278,34 +279,22 @@ fn the_output_projection_replays_the_reference() -> Result<()> {
             true,
             stream,
         )?;
-        fp8_quant_dequant(
-            gpu,
-            k.fp8_quant_dequant,
-            o,
-            o,
-            picks.len() * 64 * HEAD_DIM,
-            stream,
-        )?;
+        let w = Slice {
+            data: wo_a.data,
+            scales: wo_a.scales,
+        };
         for row in 0..picks.len() {
-            for group in 0..GROUPS {
-                let block = Mxfp8Weight {
-                    data: wo_a.data.offset(group * RANK * group_in),
-                    scales: wo_a.scales.offset(group * RANK * group_in / 32),
-                    tiled: false,
-                };
-                crate::layers::ops::mxfp8_gemv_rows(
-                    gpu,
-                    &tiers,
-                    &block,
-                    o.offset((row * GROUPS + group) * group_in * 2),
-                    low.offset((row * GROUPS + group) * RANK * 2),
-                    1,
-                    RANK,
-                    group_in,
-                    RANK,
-                    stream,
-                )?;
-            }
+            project_groups(
+                gpu,
+                groups_q,
+                o.offset(row * GROUPS * group_in * 2),
+                w,
+                low.offset(row * GROUPS * RANK * 2),
+                GROUPS,
+                RANK,
+                group_in,
+                stream,
+            )?;
         }
         let got = download(gpu, low, picks.len() * GROUPS * RANK)?;
         let (same, distance) = closeness(&got, &bf16s(&rows_of(&want, GROUPS * RANK, &picks)));

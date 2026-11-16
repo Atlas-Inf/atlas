@@ -10,14 +10,11 @@ use super::block::Block;
 use super::cache_recipe::{WINDOW, completed_group, group_position, window_row, window_slot};
 use super::index::INDEX_DIM;
 use super::moe;
-use super::ops::{self, Fp4Scale, HEAD_DIM, MAX_KEYS};
+use super::ops::{self, Fp4Scale, HEAD_DIM, MAX_KEYS, Turn};
 use super::parts::{self, PARTS};
 use super::profile;
 use super::side;
 use super::state::SeqState;
-use super::weights::row_part;
-use crate::layers::ops::mxfp8_gemv_rows;
-use crate::weight_map::Mxfp8Weight;
 
 impl Block {
     /// The device word holding `position`, for a rotation to read.
@@ -159,64 +156,36 @@ impl Block {
         );
         let held = self.shared.held;
         let began = profile::begin(gpu, stream)?;
-        // The low-rank query, normed, and its FP8 form, which every head's
-        // projection and the indexer's read.
-        mxfp8_gemv_rows(
+        // The low-rank query and the window key, both from the input's FP8
+        // form; then the query normed, and the key normed, turned to the
+        // token's position and rounded into the window's ring.
+        parts::project_two(
             gpu,
-            &k.tiers,
-            &w.wq_a.w,
+            k.parts.fp8_two,
             sc.quantized,
+            (w.wq_a.rows_from(0), w.wq_a.n, sc.q_low),
+            (w.wkv.rows_from(0), w.wkv.n, sc.key),
+            s.hidden,
+            stream,
+        )?;
+        let turn = Turn {
+            positions: self.at(position)?,
+            freqs: self.freqs,
+            rope: s.rope,
+        };
+        let at = turn.positions;
+        ops::front(
+            gpu,
+            k.cache.front,
             sc.q_low,
-            1,
-            w.wq_a.n,
-            w.wq_a.k,
-            w.wq_a.n,
-            stream,
-        )?;
-        self.norm(gpu, sc.q_low, w.q_norm, sc.q_low_normed, s.q_rank, stream)?;
-        ops::fp8_quant_dequant(
-            gpu,
-            k.cache.fp8_quant_dequant,
+            w.q_norm,
             sc.q_low_normed,
-            sc.q_low_quantized,
-            s.q_rank,
-            stream,
-        )?;
-        // The window key, from the same FP8 input, into the ring.
-        mxfp8_gemv_rows(
-            gpu,
-            &k.tiers,
-            &w.wkv.w,
-            sc.quantized,
             sc.key,
-            1,
-            w.wkv.n,
-            w.wkv.k,
-            w.wkv.n,
-            stream,
-        )?;
-        let slot = state.window.offset(window_slot(position) * HEAD_DIM * 2);
-        self.norm(gpu, sc.key, w.kv_norm, sc.pooled, HEAD_DIM, stream)?;
-        let at = self.at(position)?;
-        ops::rotate(
-            gpu,
-            k.cache.rotate,
-            sc.pooled,
-            at,
-            self.freqs,
-            1,
-            1,
-            HEAD_DIM,
-            s.rope,
-            false,
-            stream,
-        )?;
-        ops::fp8_quant_dequant(
-            gpu,
-            k.cache.fp8_quant_dequant,
-            sc.pooled,
-            slot,
-            HEAD_DIM,
+            w.kv_norm,
+            state.window.offset(window_slot(position) * HEAD_DIM * 2),
+            turn,
+            s.q_rank,
+            s.norm_eps,
             stream,
         )?;
         profile::end(gpu, stream, "query and window key", began)?;
@@ -258,15 +227,15 @@ impl Block {
         );
         for part in held.range() {
             let began = profile::begin(gpu, stream)?;
-            // This part's heads: project, rotate, attend, and undo the
-            // rotation.
+            // This part's heads: projected from the query's FP8 form, and
+            // attended, turned to the position and back inside the kernel.
             let q = sc.q.offset(part * heads * HEAD_DIM * 2);
             let attended = sc.attended.offset(part * heads * HEAD_DIM * 2);
-            let wq = row_part(&w.wq_b, part);
+            let wq = w.wq_b.rows_from(part * heads * HEAD_DIM);
             parts::project(
                 gpu,
-                k.parts.fp8,
-                sc.q_low_quantized,
+                k.parts.fp8_q,
+                sc.q_low_normed,
                 wq.data,
                 wq.scales,
                 q,
@@ -274,92 +243,45 @@ impl Block {
                 w.wq_b.k,
                 stream,
             )?;
-            ops::rotate(
-                gpu,
-                k.cache.rotate,
-                q,
-                at,
-                self.freqs,
-                1,
-                heads,
-                HEAD_DIM,
-                s.rope,
-                false,
-                stream,
-            )?;
             ops::sparse_attn(
                 gpu,
-                k.cache.sparse_attn,
+                &k.cache,
                 q,
                 state.window,
                 compressed,
                 sc.idx,
                 w.sink.offset(part * heads * 4),
                 attended,
+                sc.attn_records,
                 1,
                 heads,
                 idx.len(),
                 WINDOW,
-                stream,
-            )?;
-            ops::rotate(
-                gpu,
-                k.cache.rotate,
-                attended,
-                at,
-                self.freqs,
-                1,
-                heads,
-                HEAD_DIM,
-                s.rope,
-                true,
+                Some(turn),
                 stream,
             )?;
             profile::end(gpu, stream, "sparse attention", began)?;
             let began = profile::begin(gpu, stream)?;
-            // Quantize, and project out: each group of heads through its own
-            // block of wo_a, then this part's columns of wo_b, unrounded.
-            ops::fp8_quant_dequant(
-                gpu,
-                k.cache.fp8_quant_dequant,
-                attended,
-                attended,
-                heads * HEAD_DIM,
-                stream,
-            )?;
-            for group in part * groups..(part + 1) * groups {
-                let block = Mxfp8Weight {
-                    data: w.wo_a.w.data.offset(group * s.o_rank * group_in),
-                    scales: w.wo_a.w.scales.offset(group * s.o_rank * group_in / 32),
-                    tiled: false,
-                };
-                mxfp8_gemv_rows(
-                    gpu,
-                    &k.tiers,
-                    &block,
-                    sc.attended.offset(group * group_in * 2),
-                    sc.o_low.offset(group * s.o_rank * 2),
-                    1,
-                    s.o_rank,
-                    group_in,
-                    s.o_rank,
-                    stream,
-                )?;
-            }
+            // Project out, each projection rounding its input to FP8: this
+            // part's groups of heads through their blocks of wo_a, then its
+            // columns of wo_b, unrounded.
             let (low, width) = (part * groups * s.o_rank, groups * s.o_rank);
-            ops::fp8_quant_dequant(
+            parts::project_groups(
                 gpu,
-                k.cache.fp8_quant_dequant,
+                k.parts.fp8_groups_q,
+                attended,
+                w.wo_a.rows_from(low),
                 sc.o_low.offset(low * 2),
-                sc.o_low_quantized.offset(low * 2),
-                width,
+                groups,
+                s.o_rank,
+                group_in,
                 stream,
             )?;
             let wo = w.wo_b[part].context("a held part of wo_b")?;
             parts::project(
                 gpu,
-                k.parts.fp8_f32,
-                sc.o_low_quantized.offset(low * 2),
+                k.parts.fp8_f32_q,
+                sc.o_low.offset(low * 2),
                 wo.data,
                 wo.scales,
                 sc.attn_parts.offset(part * s.hidden * 4),

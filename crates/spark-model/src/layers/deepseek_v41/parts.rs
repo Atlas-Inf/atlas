@@ -21,6 +21,8 @@ use spark_comm::CommBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
+use super::weights::Slice;
+
 pub const PARTS: usize = 4;
 
 /// The parts one rank computes.
@@ -66,6 +68,13 @@ pub struct PartKernels {
     /// FP8 weights with a scale per row and 32 columns.
     pub fp8: KernelHandle,
     pub fp8_f32: KernelHandle,
+    /// The same, rounding their input to FP8 on the way in.
+    pub fp8_q: KernelHandle,
+    pub fp8_f32_q: KernelHandle,
+    /// Two FP8 projections of one vector in a launch, and a block-diagonal
+    /// one that rounds its input.
+    pub fp8_two: KernelHandle,
+    pub fp8_groups_q: KernelHandle,
     pub round: KernelHandle,
     pub combine: KernelHandle,
     pub slice: KernelHandle,
@@ -80,6 +89,10 @@ impl PartKernels {
             fp4_f32: tc("dsv41_fp4_gemv_tc8_f32")?,
             fp8: tc("dsv41_fp8_gemv_tc8")?,
             fp8_f32: tc("dsv41_fp8_gemv_tc8_f32")?,
+            fp8_q: tc("dsv41_fp8_gemv_tc8_q")?,
+            fp8_f32_q: tc("dsv41_fp8_gemv_tc8_f32_q")?,
+            fp8_two: tc("dsv41_fp8_gemv_two")?,
+            fp8_groups_q: tc("dsv41_fp8_gemv_groups_q")?,
             round: parts("dsv41_parts_round")?,
             combine: parts("dsv41_moe_combine")?,
             slice: parts("dsv41_slice_columns")?,
@@ -89,7 +102,8 @@ impl PartKernels {
 
 /// One vector `x` (`[k]` BF16) through a tensor-core projection `w` (`[n,
 /// k]`, FP4 or FP8 by `kernel`) under `scales` (`[n, k / 32]` E8M0), into
-/// `out` (`[n]`, BF16 or FP32 by `kernel`).
+/// `out` (`[n]`, BF16 or FP32 by `kernel`). `x` is FP8-rounded already, or
+/// with a `_q` kernel as it was computed.
 #[allow(clippy::too_many_arguments)]
 pub fn project(
     gpu: &dyn GpuBackend,
@@ -114,6 +128,71 @@ pub fn project(
         .arg_u32(n as u32)
         .arg_u32(k as u32)
         .arg_u32(n as u32)
+        .launch(stream)
+}
+
+/// A projection's weights, rows and output, as `dsv41_fp8_gemv_two` takes
+/// each of its two.
+fn projection<'a>(
+    launch: KernelLaunch<'a>,
+    (w, n, out): (Slice, usize, DevicePtr),
+) -> KernelLaunch<'a> {
+    launch
+        .arg_ptr(w.data)
+        .arg_ptr(w.scales)
+        .arg_ptr(out)
+        .arg_u32(n as u32)
+}
+
+/// Two FP8 projections of one FP8-rounded vector `x` (`[k]` BF16) in one
+/// launch, each as [`project`] would compute it: `a` and `b` are `(weights,
+/// rows, output)`.
+pub fn project_two(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    x: DevicePtr,
+    a: (Slice, usize, DevicePtr),
+    b: (Slice, usize, DevicePtr),
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    ensure!(k.is_multiple_of(32), "dsv41_fp8_gemv_two: k {k}");
+    let blocks = div_ceil(a.1 as u32, 16) + div_ceil(b.1 as u32, 16);
+    let launch = KernelLaunch::new(gpu, kernel)
+        .grid([blocks, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(x);
+    projection(projection(launch, a), b)
+        .arg_u32(k as u32)
+        .launch(stream)
+}
+
+/// A block-diagonal FP8 projection in one launch: group `g` of `groups` is
+/// `out[g]` (`[n]` BF16) = `w[g]` (`[n, k]`) times the FP8 rounding of
+/// `x[g]` (`[k]` BF16, as it was computed). `x`, `w` and `out` hold the
+/// groups one after another.
+#[allow(clippy::too_many_arguments)]
+pub fn project_groups(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    x: DevicePtr,
+    w: Slice,
+    out: DevicePtr,
+    groups: usize,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    ensure!(k.is_multiple_of(32), "dsv41_fp8_gemv_groups_q: k {k}");
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n as u32, 16), groups as u32, 1])
+        .block([256, 1, 1])
+        .arg_ptr(x)
+        .arg_ptr(w.data)
+        .arg_ptr(w.scales)
+        .arg_ptr(out)
+        .arg_u32(n as u32)
+        .arg_u32(k as u32)
         .launch(stream)
 }
 
@@ -209,3 +288,7 @@ pub fn gather(
     comm.all_gather(base.offset(held.first * part_bytes).0, recv.0, mine)?;
     gpu.copy_d2d(recv, base, PARTS * part_bytes)
 }
+
+#[cfg(test)]
+#[path = "parts_test_gpu.rs"]
+mod test_gpu;

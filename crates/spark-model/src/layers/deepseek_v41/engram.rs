@@ -22,7 +22,6 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use super::cache_recipe::bf16_to_f32;
-use super::ops;
 use super::parts::{self, Held, PARTS, PartKernels};
 use super::shape::{BlockKernels, Shape};
 use super::side;
@@ -110,7 +109,6 @@ pub struct Engram {
     held: Held,
     /// `[columns * 256]` BF16: the rows as values.
     pub(super) values: DevicePtr,
-    quantized: DevicePtr,
     /// `[PARTS, rows]` FP32: the parts of the projection, and scratch as
     /// large for a gather that is not in place.
     kv_parts: DevicePtr,
@@ -130,7 +128,6 @@ impl Engram {
         let read = weights.columns * ENGRAM_DIM * 2;
         Ok(Self {
             values: gpu.alloc(read)?,
-            quantized: gpu.alloc(read)?,
             kv_parts: gpu.alloc(PARTS * weights.rows * 4)?,
             gather_recv: gpu.alloc(PARTS * weights.rows * 4)?,
             kv: gpu.alloc(weights.rows * 2)?,
@@ -168,10 +165,7 @@ impl Engram {
         let per = w.columns / PARTS;
         let width = per * ENGRAM_DIM;
         for part in self.held.range() {
-            let (values, quantized) = (
-                self.values.offset(part * width * 2),
-                self.quantized.offset(part * width * 2),
-            );
+            let values = self.values.offset(part * width * 2);
             side::engram_rows(
                 gpu,
                 k.side.engram_rows,
@@ -183,19 +177,12 @@ impl Engram {
                 per,
                 stream,
             )?;
-            ops::fp8_quant_dequant(
-                gpu,
-                k.cache.fp8_quant_dequant,
-                values,
-                quantized,
-                width,
-                stream,
-            )?;
+            // The projection rounds the values to FP8 on the way in.
             let wkv = w.wkv[part].context("a held part of the Engram projection")?;
             parts::project(
                 gpu,
-                k.parts.fp8_f32,
-                quantized,
+                k.parts.fp8_f32_q,
+                values,
                 wkv.data,
                 wkv.scales,
                 self.kv_parts.offset(part * w.rows * 4),

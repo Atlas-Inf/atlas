@@ -52,3 +52,56 @@ DSV41_TC(dsv41_fp8_gemv_tc32, 4, false, false, __nv_bfloat16)
 DSV41_TC(dsv41_fp8_gemv_tc8_f32, 1, false, true, float)
 DSV41_TC(dsv41_fp8_gemv_tc16_f32, 2, false, true, float)
 DSV41_TC(dsv41_fp8_gemv_tc32_f32, 4, false, true, float)
+
+// The same with the input rounded to FP8 on the way in (`F4_QUANT` in
+// `dsv41_tc.cuh`): `A` is BF16 as it was computed, and the bytes are those
+// of `dsv41_fp8_quant_dequant` and then the entry above.
+#define DSV41_TC_Q(NAME, F32OUT, CTYPE)                                                    \
+    extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) NAME(                 \
+        const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,           \
+        const unsigned char* __restrict__ S, CTYPE* __restrict__ C, unsigned int M,         \
+        unsigned int N, unsigned int K, unsigned int out_stride) {                          \
+        dsv41_gemv_tc_impl<1, false, F32OUT, F4_QUANT>(A, W, S, C, M, N, K, out_stride,     \
+                                                       blockIdx.x);                         \
+    }
+
+DSV41_TC_Q(dsv41_fp8_gemv_tc8_q, false, __nv_bfloat16)
+DSV41_TC_Q(dsv41_fp8_gemv_tc8_f32_q, true, float)
+
+// Two FP8 projections of one vector in one launch: C0 [N0] = W0 . A and
+// C1 [N1] = W1 . A, A [K] FP8-rounded BF16. A block computes what the same
+// block of `dsv41_fp8_gemv_tc8` computes. Grid (ceil(N0 / 16) + ceil(N1 / 16)).
+extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_two(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W0,
+    const unsigned char* __restrict__ S0,
+    __nv_bfloat16* __restrict__ C0,
+    unsigned int N0,
+    const unsigned char* __restrict__ W1,
+    const unsigned char* __restrict__ S1,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int N1,
+    unsigned int K) {
+    const unsigned int first = (N0 + 15u) / 16u;
+    if (blockIdx.x < first) {
+        dsv41_gemv_tc_impl<1, false, false>(A, W0, S0, C0, 1, N0, K, N0, blockIdx.x);
+    } else {
+        dsv41_gemv_tc_impl<1, false, false>(A, W1, S1, C1, 1, N1, K, N1, blockIdx.x - first);
+    }
+}
+
+// A block-diagonal FP8 projection in one launch: group y of the grid is
+// C[y] [N] = W[y] [N, K] . fp8(A[y] [K]), with A, W, S and C each the
+// groups' one after another. A block computes what the same block of
+// `dsv41_fp8_gemv_tc8_q` computes for its group. Grid (ceil(N / 16), groups).
+extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_groups_q(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int N,
+    unsigned int K) {
+    const unsigned long long y = blockIdx.y;
+    dsv41_gemv_tc_impl<1, false, false, F4_QUANT>(
+        A + y * K, W + y * N * K, S + y * N * (K / F4_BLOCK), C + y * N, 1, N, K, N, blockIdx.x);
+}

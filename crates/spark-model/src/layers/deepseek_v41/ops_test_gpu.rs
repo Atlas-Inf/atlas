@@ -139,23 +139,26 @@ fn run(gpu: &dyn GpuBackend, k: &Kernels, case: &Case, sink: DevicePtr) -> Resul
     let keys = upload(gpu, &bytes_of(&case.keys, u16::to_le_bytes))?;
     let idx = upload(gpu, &bytes_of(&case.idx, i32::to_le_bytes))?;
     let out = gpu.alloc(case.q.len() * 2)?;
+    let records = gpu.alloc(attn_records(case.m, HEADS))?;
     sparse_attn(
         gpu,
-        k.sparse_attn,
+        k,
         q,
         keys,
         keys,
         idx,
         sink,
         out,
+        records,
         case.m,
         HEADS,
         case.k,
         case.k,
+        None,
         gpu.default_stream(),
     )?;
     let got = download(gpu, out, case.q.len())?;
-    for p in [q, keys, idx, out] {
+    for p in [q, keys, idx, out, records] {
         gpu.free(p)?;
     }
     Ok(got)

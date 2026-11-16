@@ -39,16 +39,43 @@ __device__ __forceinline__ float dsv41_round_fp4(float v) {
     return copysignf(rintf(mag / step) * step, v);
 }
 
-// FP8 (E4M3) under one power-of-two scale: the 32 values of `v`, written to
-// `dst` as the BF16 values their FP8 form decodes to.
+// FP8 (E4M3) under one power-of-two scale per 32 values: the scale of a
+// block whose largest magnitude is `amax`, and a value under it, as the
+// number its FP8 form decodes to (exact in BF16).
+__device__ __forceinline__ float dsv41_fp8_scale(float amax) {
+    return dsv41_pow2_ceil(fmaxf(amax, 1e-4f) * (1.0f / 448.0f));
+}
+
+__device__ __forceinline__ float dsv41_fp8_value(float v, float scale) {
+    const float scaled = fminf(fmaxf(v / scale, -448.0f), 448.0f);
+    return dsv41_round_e4m3(scaled) * scale;
+}
+
+// The 32 values of `v`, written to `dst` as that.
 __device__ __forceinline__ void dsv41_fp8_block(const float* v, __nv_bfloat16* dst) {
     float amax = 0.0f;
     for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(v[i]));
-    const float scale = dsv41_pow2_ceil(fmaxf(amax, 1e-4f) * (1.0f / 448.0f));
-    for (int i = 0; i < 32; ++i) {
-        const float scaled = fminf(fmaxf(v[i] / scale, -448.0f), 448.0f);
-        dst[i] = __float2bfloat16(dsv41_round_e4m3(scaled) * scale);
-    }
+    const float scale = dsv41_fp8_scale(amax);
+    for (int i = 0; i < 32; ++i) dst[i] = __float2bfloat16(dsv41_fp8_value(v[i], scale));
+}
+
+// Two BF16 values in a word.
+__device__ __forceinline__ void dsv41_unpack2(unsigned int packed, float& v0, float& v1) {
+    v0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed & 0xFFFFu)));
+    v1 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed >> 16)));
+}
+
+__device__ __forceinline__ unsigned int dsv41_pack2(float v0, float v1) {
+    return (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v0)) |
+           ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(v1)) << 16);
+}
+
+// One rotary pair turned by `angle` radians, or back, rounded to BF16.
+__device__ __forceinline__ void dsv41_rotate_pair(
+    float re, float im, float angle, bool inverse, float& out_re, float& out_im) {
+    const float c = cosf(angle), s = inverse ? -sinf(angle) : sinf(angle);
+    out_re = dsv41_bf16(re * c - im * s);
+    out_im = dsv41_bf16(re * s + im * c);
 }
 
 // Value `i` of a projection computed in four parts (`dsv41_parts.cu`):

@@ -10,7 +10,7 @@ use super::cache_recipe::WINDOW;
 use super::hc::{HcKernels, HcShape};
 use super::index::{INDEX_DIM, IndexKernels};
 use super::moe::MoeKernels;
-use super::ops::{HEAD_DIM, Kernels, MAX_KEYS};
+use super::ops::{HEAD_DIM, Kernels, MAX_KEYS, attn_records};
 use super::parts::{PARTS, PartKernels};
 use super::side::SideKernels;
 
@@ -111,7 +111,6 @@ pub struct BlockKernels {
     pub moe: MoeKernels,
     pub parts: PartKernels,
     pub side: SideKernels,
-    pub tiers: [KernelHandle; 3],
     pub rms_norm: KernelHandle,
 }
 
@@ -124,11 +123,6 @@ impl BlockKernels {
             moe: MoeKernels::load(gpu)?,
             parts: PartKernels::load(gpu)?,
             side: SideKernels::load(gpu)?,
-            tiers: [
-                gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc8")?,
-                gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc16")?,
-                gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc32")?,
-            ],
             rms_norm: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
         })
     }
@@ -141,8 +135,9 @@ pub struct Scratch {
     pub(super) normed: DevicePtr,
     pub(super) quantized: DevicePtr,
     pub(super) q_low: DevicePtr,
+    /// The low-rank query, normed: what the heads' projection and the
+    /// indexer's read, rounding it to FP8 on the way in.
     pub(super) q_low_normed: DevicePtr,
-    pub(super) q_low_quantized: DevicePtr,
     pub(super) q: DevicePtr,
     pub(super) key: DevicePtr,
     pub(super) idx: DevicePtr,
@@ -150,8 +145,9 @@ pub struct Scratch {
     /// for a position, with nothing to upload.
     pub(super) positions: DevicePtr,
     pub(super) attended: DevicePtr,
+    /// What the attention keeps of one part's heads between its launches.
+    pub(super) attn_records: DevicePtr,
     pub(super) o_low: DevicePtr,
-    pub(super) o_low_quantized: DevicePtr,
     /// A sublayer's output rounded from its parts, for a test to read.
     #[cfg(test)]
     pub(super) sublayer_out: DevicePtr,
@@ -202,7 +198,6 @@ impl Scratch {
             quantized: bf16(s.hidden)?,
             q_low: bf16(s.q_rank)?,
             q_low_normed: bf16(s.q_rank)?,
-            q_low_quantized: bf16(s.q_rank)?,
             q: bf16(s.heads * HEAD_DIM)?,
             key: bf16(HEAD_DIM)?,
             idx: f32s(MAX_KEYS)?,
@@ -215,8 +210,8 @@ impl Scratch {
                 table
             },
             attended: bf16(s.heads * HEAD_DIM)?,
+            attn_records: gpu.alloc(attn_records(1, s.heads / PARTS))?,
             o_low: bf16(s.o_groups * s.o_rank)?,
-            o_low_quantized: bf16(s.o_groups * s.o_rank)?,
             #[cfg(test)]
             sublayer_out: bf16(s.hidden)?,
             gate_up: bf16((s.top_k + 1) * 2 * s.inter / PARTS)?,

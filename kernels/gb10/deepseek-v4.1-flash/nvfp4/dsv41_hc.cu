@@ -299,16 +299,6 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_site_sum
 
 #define DSV41_FINISH_THREADS 1024
 
-__device__ __forceinline__ void dsv41_unpack2(unsigned int packed, float& v0, float& v1) {
-    v0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed & 0xFFFFu)));
-    v1 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed >> 16)));
-}
-
-__device__ __forceinline__ unsigned int dsv41_pack2(float v0, float v1) {
-    return (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v0)) |
-           ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(v1)) << 16);
-}
-
 // A site of one token, second launch, one block of 1,024 threads:
 //
 //   4. `normed` = the RMS norm of `collapsed` under `norm_weight`

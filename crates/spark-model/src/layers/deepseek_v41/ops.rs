@@ -7,9 +7,6 @@ use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
-use crate::layers::ops::mxfp8_gemv_rows;
-use crate::weight_map::Mxfp8Weight;
-
 /// Values in one key, and in one head's query.
 pub const HEAD_DIM: usize = 512;
 /// The most keys one query attends to: the window and the selected
@@ -19,11 +16,21 @@ pub const MAX_KEYS: usize = 640;
 const THREADS: u32 = 256;
 /// `dsv41_sparse_attn` runs a head on one block this wide: a thread a key.
 const ATTN_THREADS: u32 = 640;
+/// Heads a block of the shared form takes together, and the FP32 values it
+/// keeps of a (query, head) between its launches (`dsv41_attn.cu`).
+const ATTN_GROUP: usize = 16;
+const ATTN_RECORD: usize = 656;
 
 /// The kernels of the V4.1 attention cache.
 #[derive(Clone, Copy)]
 pub struct Kernels {
+    pub front: KernelHandle,
+    /// The attention with a block a head, and with the heads sharing the
+    /// keys they read, in three launches.
     pub sparse_attn: KernelHandle,
+    attn_logits: KernelHandle,
+    attn_schedule: KernelHandle,
+    attn_output: KernelHandle,
     pub rotate: KernelHandle,
     pub fp8_quant_dequant: KernelHandle,
     pub fp4_quant_dequant: KernelHandle,
@@ -32,7 +39,11 @@ pub struct Kernels {
 impl Kernels {
     pub fn load(gpu: &dyn GpuBackend) -> Result<Self> {
         Ok(Self {
+            front: gpu.kernel("dsv41_front", "dsv41_attn_front")?,
             sparse_attn: gpu.kernel("dsv41_attn", "dsv41_sparse_attn")?,
+            attn_logits: gpu.kernel("dsv41_attn", "dsv41_attn_logits")?,
+            attn_schedule: gpu.kernel("dsv41_attn", "dsv41_attn_schedule")?,
+            attn_output: gpu.kernel("dsv41_attn", "dsv41_attn_output")?,
             rotate: gpu.kernel("dsv41_cache", "dsv41_rotate")?,
             fp8_quant_dequant: gpu.kernel("dsv41_cache", "dsv41_fp8_quant_dequant")?,
             fp4_quant_dequant: gpu.kernel("dsv41_cache", "dsv41_fp4_quant_dequant")?,
@@ -40,15 +51,68 @@ impl Kernels {
     }
 }
 
+/// A turn of rotary pairs: `positions` (`[rows]` u32), `freqs` (`[rope / 2]`
+/// FP32, radians per position), over the last `rope` values of a vector.
+#[derive(Clone, Copy)]
+pub struct Turn {
+    pub positions: DevicePtr,
+    pub freqs: DevicePtr,
+    pub rope: usize,
+}
+
+/// What one token's attention does between its first two projections and
+/// its heads, in one launch (`dsv41_front.cu`): `q_normed` (`[q_rank]` BF16)
+/// = the norm of `q_low` under `q_weight`, and `slot` (`[512]` BF16) = the
+/// FP8 form of the norm of `key` under `key_weight` turned to the token's
+/// position. The bytes of [`rotate`], [`fp8_quant_dequant`] and the RMS norm
+/// launched one at a time.
+#[allow(clippy::too_many_arguments)]
+pub fn front(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q_low: DevicePtr,
+    q_weight: DevicePtr,
+    q_normed: DevicePtr,
+    key: DevicePtr,
+    key_weight: DevicePtr,
+    slot: DevicePtr,
+    turn: Turn,
+    q_rank: usize,
+    eps: f32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        q_rank.is_multiple_of(2) && q_rank <= 2048 && turn.rope <= HEAD_DIM,
+        "dsv41_attn_front: q_rank {q_rank}, rope {}",
+        turn.rope
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([1, 1, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(q_low)
+        .arg_ptr(q_weight)
+        .arg_ptr(q_normed)
+        .arg_ptr(key)
+        .arg_ptr(key_weight)
+        .arg_ptr(slot)
+        .arg_ptr(turn.positions)
+        .arg_ptr(turn.freqs)
+        .arg_u32(q_rank as u32)
+        .arg_u32(turn.rope as u32)
+        .arg_f32(eps)
+        .launch(stream)
+}
+
 /// Attention of `queries` queries of `heads` heads (`q`, `[queries, heads,
-/// 512]` BF16) over gathered keys, into `out` of the same shape. `idx`
-/// (`[queries, keys]` i32) holds row numbers, -1 for none: columns below
-/// `split` read `keys_a`, the rest `keys_b`. `sink` is `[heads]` FP32.
+/// 512]` BF16) over gathered keys, into `out` of the same shape, in the plain
+/// form: a block a head. `idx` (`[queries, keys]` i32) holds row numbers, -1
+/// for none: columns below `split` read `keys_a`, the rest `keys_b`. `sink`
+/// is `[heads]` FP32.
 ///
 /// A query's bytes depend only on its own q and on its index row, not on the
 /// other queries of the launch.
 #[allow(clippy::too_many_arguments)]
-pub fn sparse_attn(
+pub fn sparse_attn_plain(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
     q: DevicePtr,
@@ -78,6 +142,95 @@ pub fn sparse_attn(
         .arg_u32(split as u32)
         .arg_f32((HEAD_DIM as f32).powf(-0.5))
         .launch(stream)
+}
+
+/// Bytes of the scratch [`sparse_attn`] keeps between its launches.
+pub fn attn_records(queries: usize, heads: usize) -> usize {
+    queries * heads * ATTN_RECORD * 4
+}
+
+/// [`sparse_attn_plain`] with the heads of a query sharing the keys they
+/// read, in three launches: the same bytes, and at one token a fraction of
+/// the time, for the plain form reads every key twice a head. `records` is
+/// scratch of [`attn_records`] bytes, and `heads` a multiple of 16.
+///
+/// With `turn`, `q` is turned to each query's position before it scores
+/// and the output turned back, as [`rotate`] would in place before and
+/// after.
+#[allow(clippy::too_many_arguments)]
+pub fn sparse_attn(
+    gpu: &dyn GpuBackend,
+    kernels: &Kernels,
+    q: DevicePtr,
+    keys_a: DevicePtr,
+    keys_b: DevicePtr,
+    idx: DevicePtr,
+    sink: DevicePtr,
+    out: DevicePtr,
+    records: DevicePtr,
+    queries: usize,
+    heads: usize,
+    keys: usize,
+    split: usize,
+    turn: Option<Turn>,
+    stream: u64,
+) -> Result<()> {
+    let turn = turn.unwrap_or(Turn {
+        positions: DevicePtr::NULL,
+        freqs: DevicePtr::NULL,
+        rope: 0,
+    });
+    ensure!(
+        keys <= MAX_KEYS && heads.is_multiple_of(ATTN_GROUP) && turn.rope.is_multiple_of(32),
+        "dsv41_attn: {keys} keys, {heads} heads, rope {}",
+        turn.rope
+    );
+    // A block is 16 heads of a query, by 16 keys and then by 16 values.
+    let groups = (queries * heads / ATTN_GROUP) as u32;
+    let block = [(ATTN_GROUP * ATTN_GROUP) as u32, 1, 1];
+    let steps = keys.div_ceil(64) as u32;
+    let turned = |launch: KernelLaunch<'_>| {
+        launch
+            .arg_ptr(turn.positions)
+            .arg_ptr(turn.freqs)
+            .arg_u32(turn.rope as u32)
+            .launch(stream)
+    };
+    turned(
+        KernelLaunch::new(gpu, kernels.attn_logits)
+            .grid([steps * (64 / ATTN_GROUP) as u32, groups, 1])
+            .block(block)
+            .arg_ptr(q)
+            .arg_ptr(keys_a)
+            .arg_ptr(keys_b)
+            .arg_ptr(idx)
+            .arg_ptr(records)
+            .arg_u32(heads as u32)
+            .arg_u32(keys as u32)
+            .arg_u32(split as u32)
+            .arg_f32((HEAD_DIM as f32).powf(-0.5)),
+    )?;
+    KernelLaunch::new(gpu, kernels.attn_schedule)
+        .grid([queries as u32, heads as u32, 1])
+        .block([ATTN_THREADS, 1, 1])
+        .arg_ptr(records)
+        .arg_ptr(sink)
+        .arg_u32(heads as u32)
+        .arg_u32(keys as u32)
+        .launch(stream)?;
+    turned(
+        KernelLaunch::new(gpu, kernels.attn_output)
+            .grid([(HEAD_DIM / ATTN_GROUP) as u32, groups, 1])
+            .block(block)
+            .arg_ptr(keys_a)
+            .arg_ptr(keys_b)
+            .arg_ptr(idx)
+            .arg_ptr(records)
+            .arg_ptr(out)
+            .arg_u32(heads as u32)
+            .arg_u32(keys as u32)
+            .arg_u32(split as u32),
+    )
 }
 
 /// Rotate the last `rope` values of every vector of `x` (`[rows, vectors,
@@ -140,35 +293,6 @@ pub fn fp8_quant_dequant(
         .launch(stream)
 }
 
-/// A projection with FP8 weights, as the reference runs it: `rows` rows of
-/// `input` (`[rows, k]` BF16) are quantized to FP8 into `quantized` (the same
-/// size, left holding them) and multiplied by `w` (`[n, k]`) into `output`
-/// (`[rows, n]` BF16). `tiers` holds `mxfp8_gemv_tc{8,16,32}`.
-#[allow(clippy::too_many_arguments)]
-pub fn fp8_linear(
-    gpu: &dyn GpuBackend,
-    kernels: &Kernels,
-    tiers: &[KernelHandle; 3],
-    w: &Mxfp8Weight,
-    input: DevicePtr,
-    quantized: DevicePtr,
-    output: DevicePtr,
-    rows: usize,
-    n: usize,
-    k: usize,
-    stream: u64,
-) -> Result<()> {
-    fp8_quant_dequant(
-        gpu,
-        kernels.fp8_quant_dequant,
-        input,
-        quantized,
-        rows * k,
-        stream,
-    )?;
-    mxfp8_gemv_rows(gpu, tiers, w, quantized, output, rows, n, k, n, stream)
-}
-
 /// The scale an FP4 group is quantized under.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Fp4Scale {
@@ -212,3 +336,7 @@ mod test_gpu;
 #[cfg(test)]
 #[path = "proj_test_gpu.rs"]
 mod proj_test_gpu;
+
+#[cfg(test)]
+#[path = "front_test_gpu.rs"]
+mod front_test_gpu;

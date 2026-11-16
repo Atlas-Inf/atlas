@@ -38,6 +38,16 @@ pub struct Slice {
     pub scales: DevicePtr,
 }
 
+impl Fp8Proj {
+    /// The projection from row `first` on.
+    pub fn rows_from(&self, first: usize) -> Slice {
+        Slice {
+            data: self.w.data.offset(first * self.k),
+            scales: self.w.scales.offset(first * self.k / 32),
+        }
+    }
+}
+
 /// A projection in four parts, of which a rank holds some.
 pub type Parted = [Option<Slice>; PARTS];
 
@@ -197,11 +207,7 @@ pub(super) fn fp8(store: &WeightStore, gpu: &dyn GpuBackend, prefix: &str) -> Re
 /// Part `part` of the rows of a whole FP8 projection: a quarter of its
 /// output.
 pub fn row_part(whole: &Fp8Proj, part: usize) -> Slice {
-    let rows = whole.n / PARTS;
-    Slice {
-        data: whole.w.data.offset(part * rows * whole.k),
-        scales: whole.w.scales.offset(part * rows * whole.k / 32),
-    }
+    whole.rows_from(part * whole.n / PARTS)
 }
 
 /// The held column parts of FP8 projection `prefix`, each `[n, k / 4]`. The

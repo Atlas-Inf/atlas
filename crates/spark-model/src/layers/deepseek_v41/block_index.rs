@@ -13,10 +13,10 @@ use super::index::{self, INDEX_DIM, head_weight_scale};
 use super::index_recipe::{candidate_blocks, keep_candidates, top_positions};
 use super::moe;
 use super::ops::{self, Fp4Scale, HEAD_DIM};
+use super::parts;
 use super::side;
 use super::state::SeqState;
 use super::weights::{IndexKeyWeights, IndexerWeights};
-use crate::layers::ops::mxfp8_gemv_rows;
 
 impl Block {
     /// `key` (`[128]` BF16) = the index key of the group whose compressed
@@ -79,8 +79,8 @@ impl Block {
     }
 
     /// What each of the first `visible` index keys scores for the token whose
-    /// attention input is in `scratch.normed` and whose low-rank query, in
-    /// FP8, is in `scratch.q_low_quantized`. `at` holds the token's position.
+    /// attention input is in `scratch.normed` and whose low-rank query,
+    /// normed, is in `scratch.q_low_normed`. `at` holds the token's position.
     fn index_scores(
         &self,
         gpu: &dyn GpuBackend,
@@ -107,17 +107,17 @@ impl Block {
             w.wq_b.n,
             w.wq_b.k
         );
-        // The query heads: projected, rotated, rounded to FP4.
-        mxfp8_gemv_rows(
+        // The query heads: projected from the query's FP8 form, rotated,
+        // rounded to FP4.
+        parts::project(
             gpu,
-            &k.tiers,
-            &w.wq_b.w,
-            sc.q_low_quantized,
+            k.parts.fp8_q,
+            sc.q_low_normed,
+            w.wq_b.w.data,
+            w.wq_b.w.scales,
             sc.index_q,
-            1,
             w.wq_b.n,
             w.wq_b.k,
-            w.wq_b.n,
             stream,
         )?;
         ops::rotate(

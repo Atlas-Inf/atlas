@@ -29,11 +29,11 @@ extern "C" __global__ void dsv41_rotate(
     const unsigned int pair = (unsigned int)(i % pairs);
     const size_t vector = i / pairs;
     const float angle = (float)positions[vector / vectors] * freqs[pair];
-    const float c = cosf(angle), s = inverse ? -sinf(angle) : sinf(angle);
     __nv_bfloat16* p = x + vector * dim + (dim - rope) + 2 * pair;
-    const float re = __bfloat162float(p[0]), im = __bfloat162float(p[1]);
-    p[0] = __float2bfloat16(re * c - im * s);
-    p[1] = __float2bfloat16(re * s + im * c);
+    float re, im;
+    dsv41_rotate_pair(__bfloat162float(p[0]), __bfloat162float(p[1]), angle, inverse != 0u, re, im);
+    p[0] = __float2bfloat16(re);
+    p[1] = __float2bfloat16(im);
 }
 
 // FP8 (E4M3) under one power-of-two scale per 32 values, written as BF16:

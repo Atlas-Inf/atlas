@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use spark_runtime::cuda_backend::AtlasCudaBackend;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::block::{Block, Candidates, Shared};
 use super::cache_recipe::rope_freqs;
@@ -399,14 +399,6 @@ pub(crate) fn picks(rec: &Recording, count: usize) -> Vec<usize> {
 
 pub(crate) fn checkpoint() -> Result<String> {
     std::env::var("ATLAS_DSV41_CKPT").context("ATLAS_DSV41_CKPT=<checkpoint dir>")
-}
-
-pub(crate) fn tiers(gpu: &dyn GpuBackend) -> Result<[KernelHandle; 3]> {
-    Ok([
-        gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc8")?,
-        gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc16")?,
-        gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc32")?,
-    ])
 }
 
 /// An FP8 projection of the release, with its 32 x 32 block scales repeated

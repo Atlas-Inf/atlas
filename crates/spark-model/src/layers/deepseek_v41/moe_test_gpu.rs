@@ -13,11 +13,10 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::*;
 use crate::layers::deepseek_v41::ops::{self, Kernels};
+use crate::layers::deepseek_v41::parts::{PartKernels, project};
 use crate::layers::deepseek_v41::test_support::{
-    Recording, backend, bf16s, checkpoint, closeness, download, load_fp8, picks, rows_of, tiers,
-    upload,
+    Recording, backend, bf16s, checkpoint, closeness, download, load_fp8, picks, rows_of, upload,
 };
-use crate::layers::ops::mxfp8_gemv_rows;
 use crate::weight_map::test_checkpoint::read_checkpoint_tensor;
 
 const HIDDEN: usize = 5120;
@@ -199,10 +198,10 @@ impl Expert {
 fn the_moe_replays_the_reference() -> Result<()> {
     let rec = Recording::open()?;
     let gpu = backend()?;
-    let (k, cache, tiers, stream) = (
+    let (k, cache, fp8, stream) = (
         MoeKernels::load(gpu)?,
         Kernels::load(gpu)?,
-        tiers(gpu)?,
+        PartKernels::load(gpu)?.fp8,
         gpu.default_stream(),
     );
     let picks = picks(&rec, 8);
@@ -295,11 +294,13 @@ fn the_moe_replays_the_reference() -> Result<()> {
                 e.free(gpu)?;
             }
             // The shared expert: FP8 weights, no routing weight.
-            mxfp8_gemv_rows(gpu, &tiers, &s1, xq, gate, 1, INTER, HIDDEN, INTER, stream)?;
-            mxfp8_gemv_rows(gpu, &tiers, &s3, xq, up, 1, INTER, HIDDEN, INTER, stream)?;
+            project(
+                gpu, fp8, xq, s1.data, s1.scales, gate, INTER, HIDDEN, stream,
+            )?;
+            project(gpu, fp8, xq, s3.data, s3.scales, up, INTER, HIDDEN, stream)?;
             swiglu(gpu, k.swiglu, gate, up, h, INTER, 1.0, SWIGLU_LIMIT, stream)?;
             ops::fp8_quant_dequant(gpu, cache.fp8_quant_dequant, h, h, INTER, stream)?;
-            mxfp8_gemv_rows(gpu, &tiers, &s2, h, down, 1, HIDDEN, INTER, HIDDEN, stream)?;
+            project(gpu, fp8, h, s2.data, s2.scales, down, HIDDEN, INTER, stream)?;
             accumulate(gpu, k.accumulate, acc, down, HIDDEN, stream)?;
             round_bf16(gpu, k.round_bf16, acc, y, HIDDEN, stream)?;
             got.extend(download(gpu, y, HIDDEN)?);
