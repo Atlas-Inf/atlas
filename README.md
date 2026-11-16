@@ -38,7 +38,7 @@
 Atlas is a high-performance, pure Rust & CUDA LLM inference engine purpose-built for prosumer workstations (NVIDIA DGX Spark / GB10 SM121 and AMD Strix Halo). No Python, no PyTorch, no bloated dependency trees—just one compact binary with hand-tuned micro-kernels.
 
 - **Precompiled Kernels**: Kernels ship inside the binary as PTX, so there is no `nvcc` and no Python at runtime; the driver JITs them for your GPU at launch.
-- **Default Flagship Qwen 3.8 27B**: Dense hybrid GDN + Attention running at 23.59 tok/s single-stream with MTP speculative decoding on a single GB10.
+- **Default Flagship Qwen 3.8 27B**: Dense hybrid GDN + Attention running at 26.3 tok/s single-stream with MTP speculative decoding on a single GB10.
 - **Nemotron 3.5 Lightning + DSpark**: Full bring-up of hybrid Mamba-2 SSM + MoE paired with NVIDIA's DSpark speculative decoding drafter.
 - **Qwen 3.8 Flash-Next Support**: Stream massive ~180B hybrid MoE models inside ~90 GB resident VRAM using direct parallel `pread` NVMe offloading.
 - **Turnkey Sparkrun Integration**: Launch any verified model recipe instantly with `sparkrun run @atlas/<recipe>`.
@@ -67,12 +67,12 @@ Atlas began as a solution to a widely known problem with Python inference engine
 
 One multi-model binary. The right kernel set is selected at startup from the model's `config.json`, so there is no swapping images and no rebuilding. Point Atlas at a HuggingFace ID, or launch a verified recipe with `sparkrun run @atlas/<recipe>`. The recipe SSOT is [sparkrun-recipes](https://github.com/Atlas-Inf/sparkrun-recipes) and the interactive browser lives at [atlasinference.dev/#models](https://atlasinference.dev/#models).
 
-Numbers are decode tok/s on a single GB10 unless the row says otherwise. Qwen3.8 rows quote the figure from their recipe; the rest were measured end-to-end through the HTTP API on a short prompt (`max_tokens = 30`, `temperature = 0.1`) with `scripts/sweep_all_models.sh`. Prompt length and timing method differ between the two, so compare rows with care.
+Numbers are decode tok/s unless the row says otherwise. The two Qwen3.8 rows quote the pinned decode-floor gate: the median server decode rate across three runs of one committed code prompt (temperature 0, `max_tokens = 1500`, `reasoning_effort: "none"`). The 27B figure is from one GB10; Flash-Next is FP4-Local on two GB10s (TP=EP=2). The other rows were measured end-to-end through the HTTP API on a short prompt (`max_tokens = 30`, `temperature = 0.1`) with `scripts/sweep_all_models.sh`. Prompt length and timing method differ between the two, so compare rows with care.
 
 | Model | HuggingFace ID | Params / active | Architecture | Recipe | tok/s |
 |---|---|---|---:|---|---:|
-| **Qwen3.8-27B flagship** | `nvidia/Qwen3.8-27B-NVFP4` | 27B dense | GDN + attention hybrid, MTP | `@atlas/qwen3.8-27b-nvfp4` | 23.59 |
-| **Qwen3.8-Flash-Next** | `nvidia/Qwen3.8-Flash-Next-NVFP4` | ~180B MoE | GDN + attention + MoE, PLE NVMe streaming | `@atlas/qwen3.8-flash-next-nvfp4` | 36.7 |
+| **Qwen3.8-27B flagship** | `nvidia/Qwen3.8-27B-NVFP4` | 27B dense | GDN + attention hybrid, MTP | `@atlas/qwen3.8-27b-nvfp4` | 26.3 |
+| **Qwen3.8-Flash-Next (FP4-Local)** | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | ~180B MoE | GDN + attention + MoE, PLE resident | `@atlas/qwen3.8-flash-next-fp4-local-tp2` | 83.6 (2× GB10, TP=EP=2) |
 | Nemotron-3.5-Lightning + DSpark | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` | 30B / 3B | Mamba-2 + attention + MoE + DSpark drafter | `@atlas/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark` | |
 | **Nemotron-3.5-Super-VL + LiLiCorr** | `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` | 120B / 12B | Mamba-2 + attention + LatentMoE, C-RADIO vision, LiLiCorr drafter (DFlash γ8) | `@atlas/nemotron-3.5-super-vl-120b-a12b-nvfp4-dflash2` | 28 (γ8); also Strix Halo Windows/Linux |
 | Qwen3.5-27B | `Kbenkhaled/Qwen3.5-27B-NVFP4` | 27B dense | Hybrid SSM + attention, dense FFN, MRoPE | `@atlas/qwen3.5-27b-dense-nvfp4` | 13 |
@@ -95,7 +95,7 @@ Numbers are decode tok/s on a single GB10 unless the row says otherwise. Qwen3.8
 | Ricursive Ripple-65B Preview | `ricursiveAI/Ripple-65B-Preview-NVFP4` | 65B dense | Sliding + full attention, DFlash2 drafter | `@atlas/ricursive-ripple-65b-nvfp4-dflash2` | |
 | DeepSeek-V4-Flash | `nvidia/DeepSeek-V4-Flash-NVFP4` | | Attention + MoE | `@atlas/deepseek-v4-flash-nvfp4-ep2` | EP=2, 2 Sparks |
 
-The flagship also ships `-concurrency` (batch serving), `-agentic` (thinking-on agentic coding) and `-dflash2` (DFlash2 drafter) recipe variants; Flash-Next ships a two-Spark `-tp2` variant and NVIDIA's `qwen3.8-flash-next-fp4-local` checkpoint recipes. The full list is in [sparkrun-recipes](https://github.com/Atlas-Inf/sparkrun-recipes). On Qwen3.5-35B-A3B with MTP speculative decoding, Atlas decodes faster than NVIDIA's own vLLM build on the same hardware, on numbers we can hand you the script for. If you reproduce a faster vLLM number, file an issue. We would rather be measured than congratulated. The kernel-by-kernel comparison against PyTorch eager lives in the [benchmarks chapter](book/src/operations/benchmarks.md).
+The flagship also ships `-concurrency` (batch serving), `-agentic` (thinking-on agentic coding) and `-dflash2` (DFlash2 drafter) recipe variants. Flash-Next ships single-GB10 NVFP4 (`@atlas/qwen3.8-flash-next-nvfp4`) and FP4-Local (`@atlas/qwen3.8-flash-next-fp4-local`) recipes, plus two-Spark TP=EP=2 variants (`-nvfp4-tp2`, `-fp4-local-tp2`). The full list is in [sparkrun-recipes](https://github.com/Atlas-Inf/sparkrun-recipes). On Qwen3.5-35B-A3B with MTP speculative decoding, Atlas decodes faster than NVIDIA's own vLLM build on the same hardware, on numbers we can hand you the script for. If you reproduce a faster vLLM number, file an issue. We would rather be measured than congratulated. The kernel-by-kernel comparison against PyTorch eager lives in the [benchmarks chapter](book/src/operations/benchmarks.md).
 
 And this is only the beginning. The plug-and-play design has already carried AMD into the garden, an experimental Apple Silicon backend has landed ([`METAL_BACKEND.md`](docs/METAL_BACKEND.md)), Intel is next, and next quarter's models will slot in the same way the Qwens did this quarter.
 
