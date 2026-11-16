@@ -127,6 +127,12 @@ impl TransformerModel {
     }
 
     pub(super) fn supports_chunked_mla_impl(&self) -> bool {
+        // DeepSeek-V4.1 keeps a sequence's window, compressed keys and
+        // Engram history in its layers' own state, which a later chunk reads
+        // as a decode step does.
+        if self.config.model_type == "deepseek_v41" {
+            return true;
+        }
         self.config.model_type == "glm5_next"
             && self.config.index_kpool > 0
             && self.config.index_topk > 0

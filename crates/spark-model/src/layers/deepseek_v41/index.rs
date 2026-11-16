@@ -22,6 +22,7 @@ pub struct IndexKernels {
     /// and a batch's index rows (`dsv41_choose.cu`).
     pub score_tc: KernelHandle,
     pub choose: KernelHandle,
+    pub candidates: KernelHandle,
     pub attn_index: KernelHandle,
 }
 
@@ -31,6 +32,7 @@ impl IndexKernels {
             score: gpu.kernel("dsv41_index", "dsv41_index_score")?,
             score_tc: gpu.kernel("dsv41_choose", "dsv41_index_score_tc")?,
             choose: gpu.kernel("dsv41_choose", "dsv41_index_choose")?,
+            candidates: gpu.kernel("dsv41_choose", "dsv41_index_candidates")?,
             attn_index: gpu.kernel("dsv41_choose", "dsv41_attn_index")?,
         })
     }
@@ -176,11 +178,67 @@ pub fn score_rows_tc(
         .launch(stream)
 }
 
+/// The blocks of compressed positions the index layers after the candidate
+/// source may choose from, a byte a block: `[queries, cols]` on the device,
+/// `block` positions a block.
+#[derive(Clone, Copy)]
+pub struct Flags {
+    pub flags: DevicePtr,
+    pub cols: usize,
+    pub block: usize,
+}
+
+impl Flags {
+    /// The same from query `first` on.
+    pub fn from(self, first: usize) -> Self {
+        Self {
+            flags: self.flags.offset(first * self.cols),
+            ..self
+        }
+    }
+}
+
+/// Level one of the two-level choice: `flags` = the `keep` best blocks of
+/// each query's scores (`partial`, as [`choose_rows`] takes it), the block
+/// of the newest position always among them; every block for a query with
+/// no more than `keep`, which `partial` is not read for.
+pub fn candidate_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    partial: DevicePtr,
+    flags: Flags,
+    keep: usize,
+    rows: Queries,
+    stream: u64,
+) -> Result<()> {
+    if rows.count == 0 {
+        return Ok(());
+    }
+    ensure!(
+        keep > 0 && flags.block > 0 && flags.cols > 0,
+        "dsv41_index_candidates: {keep} blocks of {}",
+        flags.block
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([1, rows.count as u32, 1])
+        .block([THREADS, 1, 1])
+        .arg_ptr(partial)
+        .arg_ptr(flags.flags)
+        .arg_u32(rows.stride as u32)
+        .arg_u32(flags.cols as u32)
+        .arg_u32(keep as u32)
+        .arg_u32(flags.block as u32)
+        .arg_u32(rows.position as u32)
+        .arg_u32(rows.ratio as u32)
+        .launch(stream)
+}
+
 /// `chosen` (`[count, topk]` i32) = the `topk` best compressed positions of
 /// each query by `partial` (`[count, stride]` FP32, rounded to BF16 to
 /// compare), ascending, the earliest among equals; every position, then -1,
 /// for a query that sees no more than `topk`, which `partial` is not read
-/// for.
+/// for. With `among`, only positions of flagged blocks are chosen.
+#[allow(clippy::too_many_arguments)]
 pub fn choose_rows(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -188,11 +246,17 @@ pub fn choose_rows(
     chosen: DevicePtr,
     topk: usize,
     rows: Queries,
+    among: Option<Flags>,
     stream: u64,
 ) -> Result<()> {
     if rows.count == 0 {
         return Ok(());
     }
+    let among = among.unwrap_or(Flags {
+        flags: DevicePtr::NULL,
+        cols: 0,
+        block: 1,
+    });
     KernelLaunch::new(gpu, kernel)
         .grid([1, rows.count as u32, 1])
         .block([THREADS, 1, 1])
@@ -202,6 +266,9 @@ pub fn choose_rows(
         .arg_u32(topk as u32)
         .arg_u32(rows.position as u32)
         .arg_u32(rows.ratio as u32)
+        .arg_ptr(among.flags)
+        .arg_u32(among.cols as u32)
+        .arg_u32(among.block as u32)
         .launch(stream)
 }
 

@@ -146,3 +146,116 @@ fn index_scores_and_choices_replay_the_reference() -> Result<()> {
     assert!(even > 0 && odd > 0 && least * 100 >= TOPK * 95);
     Ok(())
 }
+
+/// The device's two-level choice against the host's rules
+/// (`index_recipe.rs`), on scores that tie where the cuts fall: few distinct
+/// BF16 values over many positions, and queries that see fewer positions
+/// than there are to keep, a few more, and many more.
+#[test]
+#[ignore = "needs a GB10 GPU and the deepseek-v4.1-flash target"]
+fn the_device_chooses_what_the_hosts_rules_choose() -> Result<()> {
+    use crate::layers::deepseek_v41::index_recipe::{candidate_blocks, keep_candidates};
+    use crate::layers::deepseek_v41::test_support::le_bytes;
+    const KEEP: usize = 16;
+    const BLOCK: usize = 8;
+    const TOP: usize = 48;
+    const QUERIES: usize = 300;
+    let gpu = backend()?;
+    let (k, stream) = (IndexKernels::load(gpu)?, gpu.default_stream());
+    // Query y sees y + 1 positions.
+    let rows = Queries {
+        count: QUERIES,
+        position: 0,
+        ratio: 1,
+        stride: QUERIES,
+    };
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    // Negative, zero and positive, an eighth apart: BF16 holds each.
+    let scores: Vec<f32> = (0..QUERIES * QUERIES)
+        .map(|_| (next() % 41) as f32 / 8.0 - 2.0)
+        .collect();
+    let partial = upload(gpu, &le_bytes(&scores, f32::to_le_bytes))?;
+    let cols = QUERIES.div_ceil(BLOCK);
+    let flags = Flags {
+        flags: gpu.alloc(QUERIES * cols)?,
+        cols,
+        block: BLOCK,
+    };
+    let (source, reader) = (gpu.alloc(QUERIES * TOP * 4)?, gpu.alloc(QUERIES * TOP * 4)?);
+    candidate_rows(gpu, k.candidates, partial, flags, KEEP, rows, stream)?;
+    choose_rows(gpu, k.choose, partial, source, TOP, rows, None, stream)?;
+    choose_rows(
+        gpu,
+        k.choose,
+        partial,
+        reader,
+        TOP,
+        rows,
+        Some(flags),
+        stream,
+    )?;
+    gpu.synchronize(stream)?;
+    let mut got_flags = vec![0u8; QUERIES * cols];
+    gpu.copy_d2h(flags.flags, &mut got_flags)?;
+    let read = |p| -> Result<Vec<i32>> {
+        let mut bytes = vec![0u8; QUERIES * TOP * 4];
+        gpu.copy_d2h(p, &mut bytes)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    };
+    let (got_source, got_reader) = (read(source)?, read(reader)?);
+    let padded = |mut chosen: Vec<i32>| {
+        chosen.resize(TOP, -1);
+        chosen
+    };
+    for y in 0..QUERIES {
+        let visible = y + 1;
+        let mine = &scores[y * QUERIES..y * QUERIES + visible];
+        let kept = candidate_blocks(mine, KEEP, BLOCK);
+        let want_flags: Vec<u8> = kept.chunks(BLOCK).map(|b| u8::from(b[0])).collect();
+        assert_eq!(
+            &got_flags[y * cols..y * cols + want_flags.len()],
+            &want_flags[..],
+            "query {y}: candidate blocks"
+        );
+        // The candidate source chooses among every position.
+        let want = match visible <= TOP {
+            true => (0..visible as i32).collect(),
+            false => top_positions(mine, TOP),
+        };
+        assert_eq!(
+            got_source[y * TOP..(y + 1) * TOP],
+            padded(want)[..],
+            "query {y}: the source's choice"
+        );
+        // The layers after it, among the kept blocks.
+        let want = match visible <= TOP {
+            true => (0..visible as i32).collect(),
+            false => {
+                let mut masked = mine.to_vec();
+                keep_candidates(&mut masked, &kept);
+                top_positions(&masked, TOP)
+            }
+        };
+        assert_eq!(
+            got_reader[y * TOP..(y + 1) * TOP],
+            padded(want)[..],
+            "query {y}: a reader's choice"
+        );
+    }
+    println!(
+        "{QUERIES} queries over up to {QUERIES} positions: candidate blocks and both choices are the host's"
+    );
+    for p in [partial, flags.flags, source, reader] {
+        gpu.free(p)?;
+    }
+    Ok(())
+}

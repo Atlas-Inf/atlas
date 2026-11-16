@@ -10,7 +10,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use super::block::{Block, Candidates};
 use super::cache_recipe::{bf16_to_f32, visible_groups};
 use super::gemm::{GEMM_ROWS, Input};
-use super::index::{self, INDEX_DIM, Queries, head_weight_scale};
+use super::index::{self, Flags, INDEX_DIM, Queries, head_weight_scale};
 use super::index_recipe::{candidate_blocks, keep_candidates, top_positions};
 use super::moe;
 use super::ops::{self, Fp4Scale};
@@ -207,37 +207,6 @@ impl Block {
         Ok(top_positions(scores, s.index_topk))
     }
 
-    /// The positions each of `rows` queries from `position` reads, chosen
-    /// on the host as a row alone is, into `table`.
-    #[allow(clippy::too_many_arguments)]
-    fn choose_on_host(
-        &self,
-        gpu: &dyn GpuBackend,
-        w: &IndexerWeights,
-        index_keys: DevicePtr,
-        candidates: &mut [Vec<bool>],
-        table: DevicePtr,
-        rows: usize,
-        position: usize,
-        stream: u64,
-    ) -> Result<()> {
-        let (topk, score_rows) = (self.shared.shape.index_topk, self.shared.scratch.score_rows);
-        let visible = |r: usize| visible_groups(position + r, self.ratio);
-        let mut words: Vec<u8> = Vec::with_capacity(rows * topk * 4);
-        for first in (0..rows).step_by(score_rows) {
-            let count = (rows - first).min(score_rows);
-            let (mut scores, stride) =
-                self.index_scores(gpu, w, index_keys, first, count, position + first, stream)?;
-            for i in 0..count {
-                let of_row = &mut scores[i * stride..i * stride + visible(first + i)];
-                let chosen = self.choose(of_row, &mut candidates[first + i])?;
-                words.extend(chosen.iter().flat_map(|p| p.to_le_bytes()));
-                words.extend((chosen.len()..topk).flat_map(|_| (-1i32).to_le_bytes()));
-            }
-        }
-        gpu.copy_h2d_async(&words, table, stream)
-    }
-
     /// The compressed keys the queries of `rows` rows from row `row` at
     /// `position` read, and the positions among them each attends to. A
     /// source layer publishes its own for the layers after it; the others
@@ -273,6 +242,22 @@ impl Block {
             true => handoff
                 .table(gpu, row + rows, topk, stream)?
                 .offset(row * topk * 4),
+        };
+        // And so do the blocks the candidate source leaves the index layers
+        // after it to choose from.
+        let flags = match (self.candidates, s.candidate_block_size) {
+            (Candidates::None, _) | (_, 0) => None,
+            _ if !on_device => None,
+            (_, block) => {
+                let cols = sc.max_groups.div_ceil(block);
+                Some(Flags {
+                    flags: handoff
+                        .flags(gpu, row + rows, cols, stream)?
+                        .offset(row * cols),
+                    cols,
+                    block,
+                })
+            }
         };
         let batch = &mut handoff.rows[row..row + rows];
         if let Some(held) = &state.compressed {
@@ -329,39 +314,13 @@ impl Block {
             };
             return Ok((keys, Chosen::Host(mine.chosen.clone())));
         }
-        // While every position is a candidate, the device chooses. Past
-        // that the two-level choice is the host's.
-        let all_candidates = s.candidate_blocks * s.candidate_block_size;
-        if self.candidates != Candidates::None && visible(rows - 1) > all_candidates {
-            let mut candidates: Vec<Vec<bool>> = batch
-                .iter_mut()
-                .enumerate()
-                .map(|(r, mine)| match (self.candidates, r < scored) {
-                    (Candidates::Source, true) => vec![true; visible(r)],
-                    _ => std::mem::take(&mut mine.candidates),
-                })
-                .collect();
-            self.choose_on_host(
-                gpu,
-                w,
-                index_keys,
-                &mut candidates,
-                table,
-                rows,
-                position,
-                stream,
-            )?;
-            for (mine, flags) in batch.iter_mut().zip(candidates) {
-                mine.candidates = flags;
-            }
-            return Ok((keys, Chosen::Table(table)));
-        }
-        if self.candidates == Candidates::Source {
-            // What a row alone after this batch would be handed.
-            for (r, mine) in batch.iter_mut().enumerate() {
-                mine.candidates = vec![true; visible(r)];
-            }
-        }
+        // The candidate source flags blocks from its scores, and the index
+        // layers after it choose among the flagged.
+        let (source, among) = match self.candidates {
+            Candidates::Source => (flags, None),
+            Candidates::Reader => (None, flags),
+            Candidates::None => (None, None),
+        };
         if scored > 0 {
             let all = Queries {
                 count: scored,
@@ -369,15 +328,12 @@ impl Block {
                 ratio: self.ratio,
                 stride: 0,
             };
-            index::choose_rows(
-                gpu,
-                k.index.choose,
-                DevicePtr::NULL,
-                table,
-                topk,
-                all,
-                stream,
-            )?;
+            let none = DevicePtr::NULL;
+            if let Some(flags) = source {
+                let (kernel, keep) = (k.index.candidates, s.candidate_blocks);
+                index::candidate_rows(gpu, kernel, none, flags, keep, all, stream)?;
+            }
+            index::choose_rows(gpu, k.index.choose, none, table, topk, all, None, stream)?;
         }
         for first in (scored..rows).step_by(sc.score_rows) {
             let count = (rows - first).min(sc.score_rows);
@@ -394,6 +350,17 @@ impl Block {
                 head_weight_scale(s.index_heads),
                 stream,
             )?;
+            if let Some(flags) = source {
+                index::candidate_rows(
+                    gpu,
+                    k.index.candidates,
+                    sc.scores_f32,
+                    flags.from(first),
+                    s.candidate_blocks,
+                    queries,
+                    stream,
+                )?;
+            }
             index::choose_rows(
                 gpu,
                 k.index.choose,
@@ -401,6 +368,7 @@ impl Block {
                 table.offset(first * topk * 4),
                 topk,
                 queries,
+                among.map(|flags| flags.from(first)),
                 stream,
             )?;
         }

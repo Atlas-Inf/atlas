@@ -5,6 +5,8 @@
 //
 //   dsv41_index_score_tc  the indexer's scores (`dsv41_index.cu`) for a
 //                         batch of queries, on tensor cores.
+//   dsv41_index_candidates the blocks of compressed positions the index
+//                         layers after the candidate source choose from.
 //   dsv41_index_choose    the `topk` best compressed positions of each
 //                         query, earliest first among equals, ascending.
 //   dsv41_attn_index      a query's index row: its window, then its chosen.
@@ -174,12 +176,91 @@ static __device__ __forceinline__ void dsv41_cut(
     cut[1] = left;
 }
 
+// Level one of the two-level choice (`select_candidate_blocks` in the
+// release's `inference/model.py`): flags[y, b] = 1 for the `keep` best
+// blocks of `block` positions of query y's scores, a block scoring what its
+// best position scores, the earliest among equals, and the block that holds
+// the newest position always among them. With no more than `keep` blocks,
+// all of them, and `partial` is not read. partial as `dsv41_index_choose`
+// takes it; flags [.., flag_cols] bytes, row y of the grid first.
+// Grid (1, queries), block 256.
+extern "C" __global__ void __launch_bounds__(DSV41_CHOOSE_THREADS) dsv41_index_candidates(
+    const float* __restrict__ partial,
+    unsigned char* __restrict__ flags,
+    unsigned int stride,
+    unsigned int flag_cols,
+    unsigned int keep,
+    unsigned int block,
+    unsigned int position,
+    unsigned int ratio) {
+    __shared__ unsigned int hist[256];
+    __shared__ unsigned int cut[2];
+    __shared__ unsigned int equal[DSV41_CHOOSE_THREADS];
+    const unsigned int tid = threadIdx.x, y = blockIdx.y;
+    const unsigned int n = (position + y + 1u) / ratio;
+    const unsigned int blocks = (n + block - 1u) / block;
+    unsigned char* out = flags + (size_t)y * flag_cols;
+    if (blocks <= keep) {
+        for (unsigned int b = tid; b < blocks; b += DSV41_CHOOSE_THREADS) out[b] = 1;
+        return;
+    }
+    const float* s = partial + (size_t)y * stride;
+    // Every block but the newest is whole; the newest is kept whatever it
+    // scores, so `keep - 1` of the others are.
+    const unsigned int others = blocks - 1u;
+    auto block_key = [&](unsigned int b) {
+        unsigned int best = 0u;
+        for (unsigned int i = b * block; i < (b + 1u) * block; ++i)
+            best = max(best, dsv41_score_key(s[i]));
+        return best;
+    };
+    hist[tid] = 0u;
+    __syncthreads();
+    for (unsigned int b = tid; b < others; b += DSV41_CHOOSE_THREADS)
+        atomicAdd(&hist[block_key(b) >> 8], 1u);
+    __syncthreads();
+    if (tid == 0) dsv41_cut(hist, keep - 1u, cut);
+    __syncthreads();
+    const unsigned int high = cut[0];
+    hist[tid] = 0u;
+    __syncthreads();
+    for (unsigned int b = tid; b < others; b += DSV41_CHOOSE_THREADS) {
+        const unsigned int key = block_key(b);
+        if ((key >> 8) == high) atomicAdd(&hist[key & 255u], 1u);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        dsv41_cut(hist, cut[1], cut);
+        cut[0] |= high << 8;
+    }
+    __syncthreads();
+    const unsigned int at_cut = cut[0], need = cut[1];
+    const unsigned int run = (others + DSV41_CHOOSE_THREADS - 1u) / DSV41_CHOOSE_THREADS;
+    const unsigned int first = min(tid * run, others), end = min(first + run, others);
+    unsigned int mine_equal = 0u;
+    for (unsigned int b = first; b < end; ++b) mine_equal += block_key(b) == at_cut;
+    equal[tid] = mine_equal;
+    __syncthreads();
+    unsigned int before_equal = 0u;
+    for (unsigned int t = 0; t < tid; ++t) before_equal += equal[t];
+    for (unsigned int b = first; b < end; ++b) {
+        const unsigned int key = block_key(b);
+        unsigned char kept = key > at_cut;
+        if (key == at_cut) kept = before_equal++ < need;
+        out[b] = kept;
+    }
+    if (tid == 0) out[others] = 1;
+}
+
 // chosen[y] = the `topk` best positions of query y's scores, ascending;
 // among equal scores the earliest are taken, as the reference's top-k does.
 // A query that sees no more than `topk` positions takes them all, and the
 // rest of its row is -1. A score is BF16(partial); partial [.., stride]
 // FP32, row y of the grid at partial + y * stride (not read for a query that
-// takes all). Query y is the token at position + y.
+// takes all). Query y is the token at position + y. With `flags` (as
+// `dsv41_index_candidates` leaves them, row y of the grid first), only the
+// positions of flagged blocks of `block` can be chosen: the rest score
+// below everything.
 //
 // A block a query: the 16-bit keys are cut by two histograms of 8 bits, and
 // the positions kept are written in order by 256 threads that each own a run
@@ -190,7 +271,10 @@ extern "C" __global__ void __launch_bounds__(DSV41_CHOOSE_THREADS) dsv41_index_c
     unsigned int stride,
     unsigned int topk,
     unsigned int position,
-    unsigned int ratio) {
+    unsigned int ratio,
+    const unsigned char* __restrict__ flags,
+    unsigned int flag_cols,
+    unsigned int block) {
     __shared__ unsigned int hist[256];
     __shared__ unsigned int cut[2];
     __shared__ unsigned int above[DSV41_CHOOSE_THREADS], equal[DSV41_CHOOSE_THREADS];
@@ -202,10 +286,14 @@ extern "C" __global__ void __launch_bounds__(DSV41_CHOOSE_THREADS) dsv41_index_c
         return;
     }
     const float* s = partial + (size_t)y * stride;
+    const unsigned char* allowed = flags ? flags + (size_t)y * flag_cols : nullptr;
+    auto key_of = [&](unsigned int i) {
+        return allowed && !allowed[i / block] ? 0u : dsv41_score_key(s[i]);
+    };
     hist[tid] = 0u;
     __syncthreads();
     for (unsigned int i = tid; i < n; i += DSV41_CHOOSE_THREADS)
-        atomicAdd(&hist[dsv41_score_key(s[i]) >> 8], 1u);
+        atomicAdd(&hist[key_of(i) >> 8], 1u);
     __syncthreads();
     if (tid == 0) dsv41_cut(hist, topk, cut);
     __syncthreads();
@@ -213,7 +301,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_CHOOSE_THREADS) dsv41_index_c
     hist[tid] = 0u;
     __syncthreads();
     for (unsigned int i = tid; i < n; i += DSV41_CHOOSE_THREADS) {
-        const unsigned int key = dsv41_score_key(s[i]);
+        const unsigned int key = key_of(i);
         if ((key >> 8) == high) atomicAdd(&hist[key & 255u], 1u);
     }
     __syncthreads();
@@ -228,7 +316,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_CHOOSE_THREADS) dsv41_index_c
     const unsigned int first = min(tid * run, n), end = min(first + run, n);
     unsigned int mine_above = 0u, mine_equal = 0u;
     for (unsigned int i = first; i < end; ++i) {
-        const unsigned int key = dsv41_score_key(s[i]);
+        const unsigned int key = key_of(i);
         mine_above += key > at_cut;
         mine_equal += key == at_cut;
     }
@@ -242,7 +330,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_CHOOSE_THREADS) dsv41_index_c
     }
     unsigned int at = before_above + min(before_equal, need);
     for (unsigned int i = first; i < end; ++i) {
-        const unsigned int key = dsv41_score_key(s[i]);
+        const unsigned int key = key_of(i);
         if (key > at_cut) {
             out[at++] = (int)i;
         } else if (key == at_cut) {

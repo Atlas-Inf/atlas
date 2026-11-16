@@ -267,6 +267,12 @@ pub fn load_layers(
     // of every wide projection.
     let held = Held::of_rank(config.ep_rank, config.ep_world_size.max(1))?;
     let stream = gpu.default_stream();
+    // A sequence is bounded by what this server was started for, where it
+    // says, which is far below what the model allows.
+    let positions = match config.max_seq_len {
+        0 => config.max_position_embeddings,
+        served => served.min(config.max_position_embeddings),
+    };
     let shared = Shared {
         shape,
         held,
@@ -275,7 +281,7 @@ pub fn load_layers(
         scratch: Arc::new(Scratch::alloc_rows(
             gpu,
             &shape,
-            config.max_position_embeddings,
+            positions,
             batch_rows(),
             held,
         )?),

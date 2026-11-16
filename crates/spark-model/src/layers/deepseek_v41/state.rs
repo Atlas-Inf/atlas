@@ -150,6 +150,10 @@ pub struct Handoff {
     /// batches, the compressed positions the latest index source chose.
     table: DevicePtr,
     table_rows: usize,
+    /// `[flag_rows, flag_cols]` bytes: for the same rows, the blocks of
+    /// compressed positions the candidate source left to choose from.
+    flags: DevicePtr,
+    flag_rows: usize,
     /// Whether the pass reads every row of the last layer, as rank 0 said at
     /// its first layer (`tail.rs`).
     pub(super) whole: bool,
@@ -161,14 +165,39 @@ impl Default for Handoff {
             rows: Vec::new(),
             table: DevicePtr::NULL,
             table_rows: 0,
+            flags: DevicePtr::NULL,
+            flag_rows: 0,
             whole: true,
         }
     }
 }
 
+/// `buffer`, which holds `held` rows of `width` bytes, with room for `rows`:
+/// grown, keeping what it holds, when it has less.
+fn grown(
+    gpu: &dyn GpuBackend,
+    buffer: &mut DevicePtr,
+    held: &mut usize,
+    rows: usize,
+    width: usize,
+    stream: u64,
+) -> Result<DevicePtr> {
+    if rows > *held {
+        // Kernels still running may be writing the buffer being copied.
+        gpu.synchronize(stream)?;
+        let room = rows.max(2 * *held);
+        let larger = gpu.alloc(room * width)?;
+        if *held > 0 {
+            gpu.copy_d2d(*buffer, larger, *held * width)?;
+            gpu.free(*buffer)?;
+        }
+        (*buffer, *held) = (larger, room);
+    }
+    Ok(*buffer)
+}
+
 impl Handoff {
-    /// The table, with room for `rows` rows of `topk`; it keeps what it
-    /// holds when it grows.
+    /// The table of chosen positions, with room for `rows` rows of `topk`.
     pub(super) fn table(
         &mut self,
         gpu: &dyn GpuBackend,
@@ -176,17 +205,19 @@ impl Handoff {
         topk: usize,
         stream: u64,
     ) -> Result<DevicePtr> {
-        if rows > self.table_rows {
-            // Kernels still running may be writing the table being copied.
-            gpu.synchronize(stream)?;
-            let room = rows.max(2 * self.table_rows);
-            let grown = gpu.alloc(room * topk * 4)?;
-            if self.table_rows > 0 {
-                gpu.copy_d2d(self.table, grown, self.table_rows * topk * 4)?;
-                gpu.free(self.table)?;
-            }
-            (self.table, self.table_rows) = (grown, room);
-        }
-        Ok(self.table)
+        let (table, held) = (&mut self.table, &mut self.table_rows);
+        grown(gpu, table, held, rows, topk * 4, stream)
+    }
+
+    /// The candidate blocks' flags, with room for `rows` rows of `cols`.
+    pub(super) fn flags(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        rows: usize,
+        cols: usize,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        let (flags, held) = (&mut self.flags, &mut self.flag_rows);
+        grown(gpu, flags, held, rows, cols, stream)
     }
 }
