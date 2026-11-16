@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// KLOOP #174: ship is now TKH32 (#382). Twins: 128-thread blocks (5 x 128 cols tile N=640 exactly) and TKH 16 at BS128.
 // KLOOP #156 (Flash-Next C8): in situ the rows_v3 kernels run ~120 GB/s with ~80 unique experts (grid y 81) and every
 // compute-side twin (SGPR-A 1.32x, WMMA 1.36x in kbench) LOST in the model: they are memory-latency bound there. Ship
 // LDS is ~43 KB a 256-thread block (2 x TILE_KH 64 x 272 B tiles + scales + A), so ONE block (8 waves) fits per CU.
@@ -11,8 +12,8 @@
 #include <vector>
 #define CHECK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { printf("HIP %s at %s:%d\n", hipGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
 
-template<unsigned TKH, int MINB>
-__global__ void __launch_bounds__(256, MINB) gu_rows_tkh(const __nv_bfloat16* __restrict__ A, const unsigned long long* __restrict__ gpk,
+template<unsigned TKH, int MINB, unsigned BS_ = 256>
+__global__ void __launch_bounds__(BS_, MINB) gu_rows_tkh(const __nv_bfloat16* __restrict__ A, const unsigned long long* __restrict__ gpk,
     const unsigned long long* __restrict__ gsc, const float* __restrict__ gs2, __nv_bfloat16* __restrict__ gate_out,
     const unsigned long long* __restrict__ upk, const unsigned long long* __restrict__ usc, const float* __restrict__ us2,
     __nv_bfloat16* __restrict__ up_out, const unsigned int* __restrict__ u_experts, const unsigned int* __restrict__ u_rowmask,
@@ -20,7 +21,7 @@ __global__ void __launch_bounds__(256, MINB) gu_rows_tkh(const __nv_bfloat16* __
     const unsigned char* __restrict__ sgp, const unsigned char* __restrict__ sgs, float sg2, __nv_bfloat16* __restrict__ sh_gate_out,
     const unsigned char* __restrict__ sup, const unsigned char* __restrict__ sus, float su2, __nv_bfloat16* __restrict__ sh_up_out,
     unsigned int N, unsigned int K, unsigned int top_k, unsigned int h) {
-    constexpr unsigned int ROWS = 8, BS = 256, STRIDE = BS + 16;
+    constexpr unsigned int ROWS = 8, BS = BS_, STRIDE = BS + 16;
     const unsigned int u = blockIdx.y, proj = blockIdx.z;
     if (u > *u_count) return;
     const bool is_shared = (u == *u_count);
@@ -119,11 +120,12 @@ int main() {
     const dim3 g((N + 255) / 256, U + 1, 2), b(256);
     auto launch = [&](int v, int st, int ai) { unsigned long long** t = dtab[st];
 #define ARGS_(V) dA[ai], t[0], t[1], ds2, go[V], t[2], t[3], ds2, uo[V], due, dmask, dslot, dcnt, sgp, sgs, 0.01f, sgo[V], sup, sus, 0.01f, suo[V], N, K, TOPK, K
+        const dim3 g128((N + 127) / 128, U + 1, 2), b128(128);
         if (v == 0) hipLaunchKernelGGL(moe_expert_gate_up_shared_t_rows_v3_r8_b256, g, b, 0, 0, ARGS_(0), R);
-        else if (v == 1) hipLaunchKernelGGL((gu_rows_tkh<64, 1>), g, b, 0, 0, ARGS_(1));
-        else if (v == 2) hipLaunchKernelGGL((gu_rows_tkh<32, 2>), g, b, 0, 0, ARGS_(2));
-        else if (v == 3) hipLaunchKernelGGL((gu_rows_tkh<16, 2>), g, b, 0, 0, ARGS_(3));
-        else hipLaunchKernelGGL((gu_rows_tkh<32, 1>), g, b, 0, 0, ARGS_(4)); };
+        else if (v == 1) hipLaunchKernelGGL((gu_rows_tkh<32, 1>), g, b, 0, 0, ARGS_(1));
+        else if (v == 2) hipLaunchKernelGGL((gu_rows_tkh<32, 2, 128>), g128, b128, 0, 0, ARGS_(2));
+        else if (v == 3) hipLaunchKernelGGL((gu_rows_tkh<16, 2, 128>), g128, b128, 0, 0, ARGS_(3));
+        else hipLaunchKernelGGL((gu_rows_tkh<64, 2, 128>), g128, b128, 0, 0, ARGS_(4)); };
     hipEvent_t e0, e1; CHECK(hipEventCreate(&e0)); CHECK(hipEventCreate(&e1));
     const double bytes = (double)(U + 1) * 2 * (pb + sb);
     float t[NV];
@@ -134,7 +136,7 @@ int main() {
         for (auto pr : {std::make_pair(sgo[0], sgo[v]), std::make_pair(suo[0], suo[v])}) { CHECK(hipMemcpy(a0.data(), pr.first, R * N * 2, hipMemcpyDeviceToHost)); CHECK(hipMemcpy(a1.data(), pr.second, R * N * 2, hipMemcpyDeviceToHost)); same &= !memcmp(a0.data(), a1.data(), R * N * 2); }
         return same; };
     printf("-- rows_v3_r8 gate_up N=%u K=%u U=%u (+shared, 16 rotating A, cold weights): ship %7.1f us (%.0f GB/s)\n", N, K, U, t[0], bytes / 1e3 / t[0]);
-    const char* nm[NV] = {"", "TKH64 minb1 (=ship)", "TKH32 minb2", "TKH16 minb2", "TKH32 minb1"};
+    const char* nm[NV] = {"", "TKH32 b256 (=ship)", "TKH32 b128", "TKH16 b128", "TKH64 b128"};
     for (int v = 1; v < NV; v++) printf("-- rows %-20s %7.1f us (%.0f GB/s) x%.2f %s\n", nm[v], t[v], bytes / 1e3 / t[v], t[0] / t[v], eq(v) ? "bit-identical" : "DIFFERS");
     return 0;
 }
