@@ -220,18 +220,20 @@ echo "serving $MODEL on ${GFX:-AMD} via $HW"
 # the recipe keeps BF16 unless ATLAS_QWEN4EXP_FP8_GDN is set explicitly.
 if [ "${MAX_BATCH:-1}" -gt 1 ]; then
   export ATLAS_QWEN4EXP_FP8_GDN="${ATLAS_QWEN4EXP_FP8_GDN:-0}"
-  # The qwen4_exp exact batching lane is what batches a Flash-Next multi-sequence
-  # decode step on gfx1151 (without it the mHC multi-seq paths run the MoE a row at
-  # a time). Framework f128/f132: C4 15.3 -> 24.3, C8 15.1 -> 27.9 tok/s (AR), C4
-  # 15.2 -> 25.6, C8 15.0 -> 27.3 (MTP). It also takes over the single-sequence MTP
-  # verify, which costs a lone request ~15% (f132: C1 MTP 20.6 -> 17.5), so the
-  # recipe turns it on only for multi-request serving. Explicit values win.
-  export ATLAS_QWEN4EXP_BATCH_FAST="${ATLAS_QWEN4EXP_BATCH_FAST:-1}"
-  # On top of the lane, the per-row MoE top-k / blend and the GDN decode chain as one launch per
-  # layer (qwen4exp_gdn_decode_fused_rows: the strix-hip port of the gb10 cluster kernel). Framework
-  # f160 (Flash-Next, AR, x2): C4 34.0 -> 35.9, C8 38.2 -> 40.0 tok/s; solo text identical 8/8.
-  export ATLAS_QWEN4EXP_BATCH_SMALL="${ATLAS_QWEN4EXP_BATCH_SMALL:-1}"
 fi
+# The qwen4_exp exact batching lane is what batches a Flash-Next multi-sequence
+# decode step on gfx1151 (without it the mHC multi-seq paths run the MoE a row at
+# a time). Framework f128/f132: C4 15.3 -> 24.3, C8 15.1 -> 27.9 tok/s (AR). It also
+# takes over the single-sequence MTP verify; f132 measured that at -15% for a lone
+# request, but since the rows kernels' TILE_KH 32 (#382), parallel union (#381) and
+# one-launch top-k / blend (#389) it is a gain: strix, main acf072c71, MAX_BATCH 1,
+# MTP: 28.0 / 30.1 / 31.1 -> 29.9 / 32.6 / 34.4 tok/s, GPU total 26.6 -> 25.3 s. So
+# the recipe now turns it on at every batch size. Explicit values win.
+export ATLAS_QWEN4EXP_BATCH_FAST="${ATLAS_QWEN4EXP_BATCH_FAST:-1}"
+# On top of the lane, the per-row MoE top-k / blend and the GDN decode chain as one launch per
+# layer (qwen4exp_gdn_decode_fused_rows: the strix-hip port of the gb10 cluster kernel). Framework
+# f160 (Flash-Next, AR, x2): C4 34.0 -> 35.9, C8 38.2 -> 40.0 tok/s; solo text identical 8/8.
+export ATLAS_QWEN4EXP_BATCH_SMALL="${ATLAS_QWEN4EXP_BATCH_SMALL:-1}"
 exec "$BIN" serve "$MODEL" "${NAME_ARG[@]}" \
   --host "${HOST:-0.0.0.0}" --port "${PORT:-8081}" \
   --max-seq-len "$MAX_SEQ_LEN" \
