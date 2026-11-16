@@ -5,8 +5,8 @@
 //! the semantic indexer gives their outputs the whole chunk's bytes.
 //!
 //! - The per-token-group cast of each quarter and sixteenth of a chunk (a
-//!   rank's part, a seam block; each half and eighth too, the pair's under
-//!   `ATLAS_GLM_SP_QUANT_GATHER_PAIR`), placed at its rows, is the whole chunk's
+//!   rank's part, a seam block; each half and eighth too, the pair's),
+//!   placed at its rows, is the whole chunk's
 //!   cast, and the W8A8 block FP8 GEMM on those cast rows
 //!   (`Fp8bRows::Cast`) writes the BF16 rows' output: on the probed path
 //!   and on both of the in-tree hand paths, with an FP8 scratch that takes

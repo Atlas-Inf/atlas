@@ -5,7 +5,7 @@
 //! rank's rows -- the router GEMM on `ops::bf16_gemm_f32out`'s CUTLASS tiles
 //! (FP32 logits), the sigmoid top-k and the NVFP4 quantization -- leave, on
 //! each quarter of a chunk (a chain rank's part), on each half (a pair
-//! rank's, `ATLAS_GLM_SP_QUANT_GATHER_PAIR`) and on each of a half's four
+//! rank's) and on each of a half's four
 //! seam blocks, those rows' bytes of the whole chunk's run.
 //!
 //!   cargo test --release -p spark-model --lib sp_quant_gather -- --ignored --nocapture

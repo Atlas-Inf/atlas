@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! A four-rank sequence-parallel MoE gathers its input already routed and
-//! quantized (the chain always; the pair under
-//! `ATLAS_GLM_SP_QUANT_GATHER_PAIR`, else it gathers BF16 rows).
+//! quantized (the chain and the pair both).
 //!
 //! The seam before a chain MoE all-gathers the BF16 normed rows (8 KiB a row
 //! at hidden 4096) so that every rank can route and quantize all of them.

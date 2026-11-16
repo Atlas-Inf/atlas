@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! A four-rank sequence-parallel GLM MLA layer gathers its attention input
-//! already cast for the W8A8 q_a / kv_a (the chain always; the pair under
-//! `ATLAS_GLM_SP_QUANT_GATHER_PAIR`, else it gathers BF16 rows).
+//! already cast for the W8A8 q_a / kv_a (the chain and the pair both).
 //!
 //! The attention seam all-gathers the BF16 normed rows (8 KiB a row at
 //! hidden 4096). Their readers are q_a and kv_a, whose native FP8 block

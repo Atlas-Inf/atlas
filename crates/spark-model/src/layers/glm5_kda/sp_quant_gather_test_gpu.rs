@@ -7,7 +7,7 @@
 //! CUTLASS twin, and every head's beta on the CUTLASS twin of the pipelined
 //! GEMM -- leave, on each quarter of a chunk and on each of its sixteenths
 //! (the per-block gather's seam blocks), and on each half and eighth (the
-//! pair's parts and seam blocks, `ATLAS_GLM_SP_QUANT_GATHER_PAIR`), those
+//! pair's parts and seam blocks), those
 //! rows' bytes of the whole chunk's run.
 //!
 //!   cargo test --release -p spark-model --lib sp_kda_quant -- --ignored --nocapture

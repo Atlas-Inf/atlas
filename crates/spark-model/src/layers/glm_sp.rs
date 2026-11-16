@@ -99,10 +99,10 @@ impl SpRows {
 
     /// Whether this split may gather a block input quantized instead of as
     /// BF16 rows (`moe::sp_quant_gather`, `glm5_kda::sp_quant_gather`,
-    /// `qwen3_attention::prefill::paged_glm_sp_gather`): the chain always,
-    /// the pair under `ATLAS_GLM_SP_QUANT_GATHER_PAIR` ([`quant_gather_pair`]).
+    /// `qwen3_attention::prefill::paged_glm_sp_gather`): every SP split does,
+    /// the chain and the pair both.
     pub fn quant_gathers(self) -> bool {
-        quant_gather_serves(self.ranks, quant_gather_pair())
+        self.ranks >= 2
     }
 
     /// Whether [`Self::all_gather`] / [`Self::all_gather_block`] can move
@@ -403,52 +403,6 @@ pub fn enter(rows: SpRows) -> Scope {
 pub fn requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_PREFILL_SP").as_deref() == Ok("1"))
-}
-
-/// `ATLAS_GLM_SP_QUANT_GATHER_PAIR` (default 0, read once; the ranks compare
-/// it at startup, `model::startup_parity`): the two-rank pair gathers block
-/// inputs quantized, as the four-rank chain always does. `1`: the MoE and
-/// MLA inputs, on the pair's own chunks; KDA layers keep their BF16 gather.
-/// `2`: the pair's chunks are also cut to 128 rows a rank
-/// (`model::glm_prefill_sp`), the KDA cast's scale tile grid, and KDA layers
-/// gather quantized too.
-pub fn quant_gather_pair() -> usize {
-    static MODE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        let mode = parse_quant_gather_pair(
-            std::env::var("ATLAS_GLM_SP_QUANT_GATHER_PAIR")
-                .ok()
-                .as_deref(),
-        )
-        .unwrap_or_else(|e| panic!("{e:#}"));
-        if mode > 0 {
-            tracing::info!(
-                "ATLAS_GLM_SP_QUANT_GATHER_PAIR={mode}: a two-rank SP prefill gathers its MoE \
-                 and MLA inputs quantized{}",
-                if mode == 2 {
-                    ", and its KDA inputs on chunks cut to 128 rows a rank"
-                } else {
-                    ""
-                }
-            );
-        }
-        mode
-    })
-}
-
-fn parse_quant_gather_pair(value: Option<&str>) -> Result<usize> {
-    match value {
-        None | Some("") | Some("0") => Ok(0),
-        Some("1") => Ok(1),
-        Some("2") => Ok(2),
-        Some(v) => anyhow::bail!("ATLAS_GLM_SP_QUANT_GATHER_PAIR must be 0, 1 or 2, got {v:?}"),
-    }
-}
-
-/// [`SpRows::quant_gathers`] for a split over `ranks` with the pair's
-/// switch at `pair` ([`quant_gather_pair`]).
-fn quant_gather_serves(ranks: usize, pair: usize) -> bool {
-    ranks > 2 || (ranks == 2 && pair > 0)
 }
 
 #[cfg(test)]
