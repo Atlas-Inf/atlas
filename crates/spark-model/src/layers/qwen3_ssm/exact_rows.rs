@@ -82,6 +82,34 @@ impl Qwen3SsmLayer {
             if fp8.scale_format != crate::weight_map::WeightQuantFormat::Fp8BlockScaled {
                 return Ok(false);
             }
+            // 5..=8 rows: the Strix batch8 tiers are the same template (each row
+            // `w8a16_gemv`'s bytes) without batch16's 16-row accumulators.
+            // Strix kbench at M 5 / 8: qkvz 16384x2560 vl2_n2 1.26x / 1.27x,
+            // out_proj 2560x6144 batch8 1.11x / 1.04x. Wide N takes the n2 twin.
+            if (5..=8).contains(&rows) && self.w8a16_gemv_batch8_k.0 != 0 {
+                let (kernel, div) = ops::fp8_verify_gemv_tier(
+                    rows,
+                    n >= 8192,
+                    self.w8a16_gemv_batch8_k,
+                    self.w8a16_gemv_batch8_dyn_vl2_k,
+                    self.w8a16_gemv_batch8_dyn_vl2_n2_k,
+                    self.w8a16_gemv_batch16_k,
+                );
+                ops::w8a16_gemv_batch4_div(
+                    ctx.gpu,
+                    kernel,
+                    input,
+                    fp8.weight,
+                    fp8.row_scale,
+                    output,
+                    rows as u32,
+                    n as u32,
+                    k as u32,
+                    div,
+                    stream,
+                )?;
+                return Ok(true);
+            }
             // batch4 to 4 rows, batch16 past that: one template, each row
             // `w8a16_gemv`'s bytes. Past 16 rows (the batch lever's
             // multi-sequence steps) one call when the skinny kernels take it
