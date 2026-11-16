@@ -69,12 +69,15 @@ elif os.environ.get("PHASE") == "c8":
     def gen(i):
         body = {"model": "m", "messages": [{"role": "user", "content": f"[c8-{i}] Write a long story about a {words[i]}."}], "max_tokens": 256, "temperature": 0}
         req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
-        json.load(urllib.request.urlopen(req, timeout=1800))
+        r = json.load(urllib.request.urlopen(req, timeout=1800))
+        shas[i] = hashlib.sha1(r["choices"][0]["message"]["content"].encode()).hexdigest()[:8]
+    shas = {}
     NC = int(os.environ.get("CONC", "8"))   # CONC=4: the 27B DFlash2 C4 collapse (43586170039: C4 16.5 vs C8 54.4 tok/s)
     for rnd in range(2):
         t = time.time(); th = [threading.Thread(target=gen, args=(i,)) for i in range(NC)]
         [x.start() for x in th]; [x.join() for x in th]
         print(f"  [prof] c{NC} round {rnd}: {NC}x256 tok in {time.time() - t:.2f}s -> {256 * NC / (time.time() - t):.1f} tok/s agg", flush=True)
+        print(f"  [prof] c{NC} round {rnd} shas: {' '.join(shas[i] for i in range(NC))}", flush=True)
 elif os.environ.get("PHASE") == "decode":
     # C1 greedy decode on prose + code (Ripple DFlash2 verify-step attribution): 3 x 256 tokens, one at a time.
     for i, q in enumerate(["Write a 300-word essay on the history of the bicycle.", "Explain how a refrigerator works in detail.",
