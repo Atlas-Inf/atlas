@@ -150,18 +150,24 @@ fn hyper_connections_replay_the_reference() -> Result<()> {
                 gpu.free(p)?;
             }
         }
-        if layer == 2 {
-            // Before the head, the stream collapses with the last FFN site's `pre`.
-            collapse(
-                gpu, k.collapse, &SHAPE, streams, pre_in, collapsed, tokens, stream,
-            )?;
-            let got = download(gpu, collapsed, tokens * hidden)?;
-            let want = bf16s(&recorded("L2.op.hc.final.collapsed", hidden)?);
-            let (same, _) = closeness(&got, &want);
-            assert!(same > 0.999, "final collapse: {same}");
-        }
         gpu.free(pre_in)?;
         gpu.free(streams)?;
     }
+    // Before the head, the last block's stream collapses with its FFN
+    // site's `pre`.
+    let (last, want) = rec.final_collapse()?;
+    let l = format!("L{last}.");
+    let streams = upload(gpu, &recorded(&format!("{l}block_out"), copies * hidden)?)?;
+    let pre_in = upload(gpu, &recorded(&format!("{l}pre_mix_out"), copies * 2)?)?;
+    collapse(
+        gpu, k.collapse, &SHAPE, streams, pre_in, collapsed, tokens, stream,
+    )?;
+    let got = download(gpu, collapsed, tokens * hidden)?;
+    let (same, _) = closeness(&got, &bf16s(&rows_of(&want, hidden, &picks)));
+    println!(
+        "final collapse after layer {last}: {:.4}% of values equal",
+        100.0 * same
+    );
+    assert!(same > 0.999, "final collapse: {same}");
     Ok(())
 }

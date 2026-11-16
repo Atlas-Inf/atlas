@@ -38,7 +38,7 @@ fn blocks_replay_the_reference_token_by_token() -> Result<()> {
     let streams = gpu.alloc(copies * hidden * 2)?;
     let pre = gpu.alloc(copies * 4)?;
     for (layer, ratio) in [(0usize, 0usize), (1, 0), (2, 2)] {
-        let store = layer_store(gpu, layer)?;
+        let store = layer_store(gpu, layer, true)?;
         let ladder = if ratio == 0 {
             rope_freqs(SHAPE.rope, 0, 10_000.0, 16.0, 32.0, 1.0)
         } else {

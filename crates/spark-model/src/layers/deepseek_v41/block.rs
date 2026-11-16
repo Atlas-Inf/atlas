@@ -4,7 +4,7 @@
 //! design. It defines what the block computes, and the faster paths are held
 //! to its bytes.
 //!
-//! Not built yet: a compressor at ratio 1, Engram, and more than one rank.
+//! Not built yet: Engram, and more than one rank.
 
 use std::sync::{Arc, Mutex};
 

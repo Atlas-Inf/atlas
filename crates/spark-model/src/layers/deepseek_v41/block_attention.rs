@@ -8,6 +8,7 @@ use spark_runtime::gpu::GpuBackend;
 use super::block::Block;
 use super::cache_recipe::{WINDOW, completed_group, group_position, window_row, window_slot};
 use super::index::INDEX_DIM;
+use super::moe;
 use super::ops::{self, Fp4Scale, HEAD_DIM};
 use super::side;
 use super::state::SeqState;
@@ -50,16 +51,18 @@ impl Block {
             s.hidden,
             stream,
         )?;
-        side::gemv_f32(
-            gpu,
-            k.side.gemv_f32,
-            sc.normed,
-            w.wgate,
-            held.score_state.offset(slot),
-            HEAD_DIM,
-            s.hidden,
-            stream,
-        )?;
+        if let Some(wgate) = w.wgate {
+            side::gemv_f32(
+                gpu,
+                k.side.gemv_f32,
+                sc.normed,
+                wgate,
+                held.score_state.offset(slot),
+                HEAD_DIM,
+                s.hidden,
+                stream,
+            )?;
+        }
         let Some(group) = completed_group(position, w.ratio) else {
             return Ok(());
         };
@@ -70,16 +73,27 @@ impl Block {
             held.capacity
         );
         let key = held.keys.offset(group * HEAD_DIM * 2);
-        side::compress_pool(
-            gpu,
-            k.side.compress_pool,
-            held.kv_state,
-            held.score_state,
-            sc.pooled,
-            w.ratio,
-            HEAD_DIM,
-            stream,
-        )?;
+        match w.wgate {
+            Some(_) => side::compress_pool(
+                gpu,
+                k.side.compress_pool,
+                held.kv_state,
+                held.score_state,
+                sc.pooled,
+                w.ratio,
+                HEAD_DIM,
+                stream,
+            )?,
+            // One token a group: nothing to pool, the projection is the key.
+            None => moe::round_bf16(
+                gpu,
+                k.moe.round_bf16,
+                held.kv_state,
+                sc.pooled,
+                HEAD_DIM,
+                stream,
+            )?,
+        }
         self.norm(gpu, sc.pooled, w.norm, key, HEAD_DIM, stream)?;
         let at = self.at(
             gpu,

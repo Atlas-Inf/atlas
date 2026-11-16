@@ -50,12 +50,13 @@ pub struct AttentionWeights {
     pub sink: DevicePtr,
 }
 
-/// A source layer's compressor at ratio > 1: BF16 `[512, hidden]`
-/// projections and the norm of the pooled key.
+/// A source layer's compressor: a BF16 `[512, hidden]` key projection and
+/// the norm of the key. Above ratio 1 a gate projection of the same shape
+/// pools each group's tokens into one key.
 pub struct CompressorWeights {
     pub ratio: usize,
     pub wkv: DevicePtr,
-    pub wgate: DevicePtr,
+    pub wgate: Option<DevicePtr>,
     pub norm: DevicePtr,
 }
 
@@ -185,18 +186,15 @@ impl BlockWeights {
         };
         let compressor = match compress_ratio {
             0 => None,
-            ratio => {
-                ensure!(
-                    ratio > 1,
-                    "layer {index}: a compressor at ratio 1 is not built yet"
-                );
-                Some(CompressorWeights {
-                    ratio,
-                    wkv: bf16("attn.compressor.wkv.weight")?,
-                    wgate: bf16("attn.compressor.wgate.weight")?,
-                    norm: bf16("attn.compressor.norm.weight")?,
-                })
-            }
+            ratio => Some(CompressorWeights {
+                ratio,
+                wkv: bf16("attn.compressor.wkv.weight")?,
+                wgate: match ratio {
+                    1 => None,
+                    _ => Some(bf16("attn.compressor.wgate.weight")?),
+                },
+                norm: bf16("attn.compressor.norm.weight")?,
+            }),
         };
         let indexer = match index_source {
             false => None,

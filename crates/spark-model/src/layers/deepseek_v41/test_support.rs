@@ -111,8 +111,9 @@ pub(crate) fn activations(rng: &mut Rng, n: usize) -> Vec<u16> {
         .collect()
 }
 
-/// The reference recording (`sparkseek/results/2026-11-15-reference-layers`),
-/// at `ATLAS_DSV41_REC`.
+/// The reference recording at `ATLAS_DSV41_REC`: three layers in one set of
+/// files (`sparkseek/results/2026-11-15-reference-layers`), or the
+/// full-depth one, which keeps a set of files per layer.
 pub(crate) struct Recording {
     dir: PathBuf,
     pub(crate) prefill: usize,
@@ -135,9 +136,27 @@ impl Recording {
         })
     }
 
-    /// `(shape, bytes)` of a tensor of run A's prefill.
+    /// The file of part `part` (`prefill`, `decode`, `caches`) that holds
+    /// layer `layer`'s tensors.
+    fn file(&self, part: &str, layer: &str) -> String {
+        let number = layer.trim_start_matches('L');
+        match number.parse::<usize>() {
+            Ok(n)
+                if self
+                    .dir
+                    .join(format!("L{n:02}_{part}.safetensors"))
+                    .exists() =>
+            {
+                format!("L{n:02}_{part}.safetensors")
+            }
+            _ => format!("A_{part}.safetensors"),
+        }
+    }
+
+    /// `(shape, bytes)` of a tensor of run A's prefill, e.g. `L2.attn_in`.
     pub(crate) fn prefill(&self, name: &str) -> Result<(Vec<usize>, Vec<u8>)> {
-        self.tensor("A_prefill.safetensors", name)
+        let layer = name.split('.').next().unwrap_or_default();
+        self.tensor(&self.file("prefill", layer), name)
     }
 
     /// `(shape, bytes)` of a tensor of the index replay of run A
@@ -146,21 +165,41 @@ impl Recording {
         self.tensor("A_index.safetensors", name)
     }
 
+    /// The last recorded layer, and the prefill's stream as it is collapsed
+    /// before the head (`[tokens, hidden]` BF16): after layer 39 at full
+    /// depth, after layer 2 in the three-layer recording.
+    pub(crate) fn final_collapse(&self) -> Result<(usize, Vec<u8>)> {
+        let full = "final.safetensors";
+        if self.dir.join(full).exists() {
+            let last = (0..).find(|n| {
+                !self
+                    .dir
+                    .join(format!("L{:02}_prefill.safetensors", n + 1))
+                    .exists()
+            });
+            let (_, bytes) = self.tensor(full, "prefill.final.collapsed")?;
+            return Ok((last.context("layers")?, bytes));
+        }
+        Ok((2, self.prefill("L2.op.hc.final.collapsed")?.1))
+    }
+
     /// `(shape, bytes)` of one of run A's caches, e.g.
     /// `after_prefill.L2.compress_kv_cache`.
     pub(crate) fn caches(&self, name: &str) -> Result<(Vec<usize>, Vec<u8>)> {
-        self.tensor("A_caches.safetensors", name)
+        let layer = name.split('.').nth(1).unwrap_or_default();
+        self.tensor(&self.file("caches", layer), name)
     }
 
     /// One of run A's decode steps: steps of one shape were saved stacked,
     /// others one by one.
     pub(crate) fn step(&self, name: &str, step: usize) -> Result<(Vec<usize>, Vec<u8>)> {
-        if let Ok((shape, bytes)) = self.tensor("A_decode.safetensors", name) {
+        let file = self.file("decode", name.split('.').next().unwrap_or_default());
+        if let Ok((shape, bytes)) = self.tensor(&file, name) {
             let each = bytes.len() / self.decode;
             let bytes = bytes[step * each..(step + 1) * each].to_vec();
             return Ok((shape[1..].to_vec(), bytes));
         }
-        self.tensor("A_decode.safetensors", &format!("{name}.{step}"))
+        self.tensor(&file, &format!("{name}.{step}"))
     }
 
     fn tensor(&self, file: &str, name: &str) -> Result<(Vec<usize>, Vec<u8>)> {
@@ -227,11 +266,13 @@ pub(crate) fn load_fp8(gpu: &dyn GpuBackend, prefix: &str) -> Result<(Mxfp8Weigh
 }
 
 /// Every tensor of layer `layer` that sits in the layer's own shard of the
-/// checkpoint, uploaded into a store. (An Engram layer's table and
-/// projection are in another shard and are not loaded.)
+/// checkpoint, uploaded into a store; the routed experts, most of the
+/// layer, only with `experts`. (An Engram layer's table and projection are
+/// in another shard and are not loaded.)
 pub(crate) fn layer_store(
     gpu: &dyn GpuBackend,
     layer: usize,
+    experts: bool,
 ) -> Result<spark_runtime::weights::WeightStore> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -254,7 +295,7 @@ pub(crate) fn layer_store(
     let header: serde_json::Value = serde_json::from_slice(&header)?;
     let mut map = std::collections::HashMap::new();
     for (name, t) in header.as_object().context("header")? {
-        if !name.starts_with(&prefix) {
+        if !name.starts_with(&prefix) || (!experts && name.contains(".ffn.experts.")) {
             continue;
         }
         let [lo, hi]: [u64; 2] = serde_json::from_value(t["data_offsets"].clone())?;
