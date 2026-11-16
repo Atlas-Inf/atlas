@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// KLOOP #150: f32-A 0.86x, COLS2/4 0.13x/0.08x, BS128 1.07x (43787233238) -> LDS-read bound on the broadcast A reads.
+// Twin: A is wave-uniform, so read it through the constant address space (s_load into SGPRs, FMAs take it as the
+// scalar operand) and drop s_a entirely. Same values, same order -> bit-exact.
 // KLOOP #149: transposed rows twin was 0.85x/0.69x (43781471304) -> replaced by (a) the in-tree COLS=2/4 shapes on gfx1151,
 // (b) A converted to f32 once at staging (removes 16 bf16->f32 per k per thread; same float values -> bit-exact).
 // KLOOP #147 (G3 Flash-Next C4/C8 decode): moe_expert_gate_up_shared_t_rows_v3_r8_b256 is 30.8% of C8 decode GPU time
@@ -23,8 +26,10 @@ __global__ void __launch_bounds__(BS_) gu_rows_cols(FA_ARGS) {
     gate_up_shared_t_rows_impl<8, BS_, COLS_, true>(A, gpk, gsc, gs2, gate_out, upk, usc, us2, up_out, u_experts, u_rowmask, u_rowslot, u_count,
         sgp, sgs, sg2, sh_gate_out, sup, sus, su2, sh_up_out, N, K, top_k, h);
 }
-__global__ void __launch_bounds__(256) gu_rows_fa(FA_ARGS) {
-    constexpr unsigned int ROWS = 8, BS = 256, STRIDE = BS + 16;
+template<int BS_>
+__global__ void __launch_bounds__(BS_) gu_rows_sa(FA_ARGS) {
+    constexpr unsigned int ROWS = 8, BS = BS_, STRIDE = BS + (BS >= 256 ? 16 : BS / 2);
+    typedef __attribute__((address_space(4))) const uint4 cuint4;
     const unsigned int u = blockIdx.y, proj = blockIdx.z;
     if (u > *u_count) return;
     const bool is_shared = (u == *u_count);
@@ -37,7 +42,6 @@ __global__ void __launch_bounds__(256) gu_rows_fa(FA_ARGS) {
     __shared__ float s_lut[16]; if (lane < 16) s_lut[lane] = E2M1_LUT_T[lane];
     __shared__ unsigned char s_pk[2][TILE_KH * STRIDE];
     __shared__ unsigned char s_sc[2][(TILE_KH / 8) * STRIDE];
-    __shared__ __align__(16) float s_a[2][ROWS * TILE_KH * 2];
     __syncthreads();
     const unsigned int mask = is_shared ? ((1u << ROWS) - 1u) : u_rowmask[u];
     auto stage = [&](unsigned int tg, unsigned int buf) {
@@ -53,15 +57,6 @@ __global__ void __launch_bounds__(256) gu_rows_fa(FA_ARGS) {
             const unsigned int sg = j / (BS / 16u), cb = (j % (BS / 16u)) * 16u;
             if (ns0 + cb >= N) continue;
             *(uint4*)&s_sc[buf][sg * STRIDE + cb] = *(const uint4*)&B_scale[(unsigned long long)(tg * ng + sg) * N + ns0 + cb]; }
-        #pragma unroll
-        for (unsigned int j = lane; j < ROWS * (TILE_KH * 2 / 8u); j += BS) {
-            const unsigned int row = j / (TILE_KH * 2 / 8u), chunk = j % (TILE_KH * 2 / 8u);
-            const uint4 v = *(const uint4*)&A[(unsigned long long)row * h + tg * TILE_KH * 2 + chunk * 8];
-            const __nv_bfloat16* vb = (const __nv_bfloat16*)&v; float f[8];
-            #pragma unroll
-            for (int i = 0; i < 8; i++) f[i] = __bfloat162float(vb[i]);
-            *(float4*)&s_a[buf][row * TILE_KH * 2 + chunk * 8] = make_float4(f[0], f[1], f[2], f[3]);
-            *(float4*)&s_a[buf][row * TILE_KH * 2 + chunk * 8 + 4] = make_float4(f[4], f[5], f[6], f[7]); }
     };
     float acc[ROWS];
     #pragma unroll
@@ -73,19 +68,23 @@ __global__ void __launch_bounds__(256) gu_rows_fa(FA_ARGS) {
         if (tg + 1u < ntg) stage(tg + 1u, (tg + 1u) & 1u);
         const unsigned int buf = tg & 1u;
         if (vc) {
-            #pragma unroll
-            for (unsigned int rr2 = 0; rr2 < TILE_KH / 2u; rr2++) {
-                float av[ROWS][4];
+            #pragma unroll 4
+            for (unsigned int rr4 = 0; rr4 < TILE_KH / 4u; rr4++) {
+                uint4 av4[ROWS];
                 #pragma unroll
-                for (unsigned int r = 0; r < ROWS; r++) *(float4*)&av[r][0] = *(const float4*)&s_a[buf][r * TILE_KH * 2 + rr2 * 4];
+                for (unsigned int r = 0; r < ROWS; r++)
+                    av4[r] = *(cuint4*)(const void*)&A[(unsigned long long)r * h + tg * TILE_KH * 2 + rr4 * 8];
                 #pragma unroll
-                for (unsigned int j = 0; j < 2; j++) {
-                    const unsigned int rr = rr2 * 2 + j;
+                for (unsigned int jj = 0; jj < 4; jj++) {
+                    const unsigned int rr = rr4 * 4 + jj;
                     const float sc = mx_block_scale<false>(s_sc[buf][(rr >> 3) * STRIDE + lane], s2);
                     const unsigned char byte = s_pk[buf][rr * STRIDE + lane];
                     const float w_lo = s_lut[byte & 0xFu] * sc, w_hi = s_lut[(byte >> 4) & 0xFu] * sc;
                     #pragma unroll
-                    for (unsigned int r = 0; r < ROWS; r++) acc[r] += av[r][2 * j] * w_lo + av[r][2 * j + 1] * w_hi;
+                    for (unsigned int r = 0; r < ROWS; r++) {
+                        const __nv_bfloat16* ab = (const __nv_bfloat16*)&av4[r];
+                        acc[r] += __bfloat162float(ab[2 * jj]) * w_lo + __bfloat162float(ab[2 * jj + 1]) * w_hi;
+                    }
                 }
             }
         }
@@ -122,17 +121,16 @@ int main() {
     CHECK(hipMemcpy(due, hue.data(), U * 4, hipMemcpyHostToDevice)); CHECK(hipMemcpy(dmask, hmask.data(), U * 4, hipMemcpyHostToDevice));
     CHECK(hipMemcpy(dslot, hslot.data(), U * MOE_MAX_K, hipMemcpyHostToDevice)); CHECK(hipMemcpy(dcnt, &hU, 4, hipMemcpyHostToDevice));
     std::vector<__nv_bfloat16> ha(R * K); for (auto& a : ha) a = __float2bfloat16(((rand() % 2001) - 1000) / 1000.f); __nv_bfloat16* dA; CHECK(hipMalloc(&dA, ha.size() * 2)); CHECK(hipMemcpy(dA, ha.data(), ha.size() * 2, hipMemcpyHostToDevice));
-    const int NV = 5; __nv_bfloat16 *go[NV], *uo[NV], *sgo[NV], *suo[NV];
+    const int NV = 4; __nv_bfloat16 *go[NV], *uo[NV], *sgo[NV], *suo[NV];
     for (int v = 0; v < NV; v++) { CHECK(hipMalloc(&go[v], R * TOPK * N * 2)); CHECK(hipMalloc(&uo[v], R * TOPK * N * 2)); CHECK(hipMalloc(&sgo[v], R * N * 2)); CHECK(hipMalloc(&suo[v], R * N * 2));
         CHECK(hipMemset(go[v], 0, R * TOPK * N * 2)); CHECK(hipMemset(uo[v], 0, R * TOPK * N * 2)); }
     const dim3 g((N + 255) / 256, U + 1, 2), b(256);
     auto launch = [&](int v, int st) { unsigned long long** t = dtab[st];
 #define ARGS_(V) dA, t[0], t[1], ds2, go[V], t[2], t[3], ds2, uo[V], due, dmask, dslot, dcnt, sgp, sgs, 0.01f, sgo[V], sup, sus, 0.01f, suo[V], N, K, TOPK, K
         if (v == 0) hipLaunchKernelGGL(moe_expert_gate_up_shared_t_rows_v3_r8_b256, g, b, 0, 0, ARGS_(0), R);
-        else if (v == 1) hipLaunchKernelGGL(gu_rows_fa, g, b, 0, 0, ARGS_(1));
-        else if (v == 2) hipLaunchKernelGGL((gu_rows_cols<128, 2>), g, dim3(128), 0, 0, ARGS_(2));
-        else if (v == 3) hipLaunchKernelGGL((gu_rows_cols<64, 4>), g, dim3(64), 0, 0, ARGS_(3));
-        else hipLaunchKernelGGL((gu_rows_cols<128, 1>), dim3((N + 127) / 128, U + 1, 2), dim3(128), 0, 0, ARGS_(4)); };
+        else if (v == 1) hipLaunchKernelGGL((gu_rows_cols<128, 1>), dim3((N + 127) / 128, U + 1, 2), dim3(128), 0, 0, ARGS_(1));
+        else if (v == 2) hipLaunchKernelGGL((gu_rows_sa<256>), g, b, 0, 0, ARGS_(2));
+        else hipLaunchKernelGGL((gu_rows_sa<128>), dim3((N + 127) / 128, U + 1, 2), dim3(128), 0, 0, ARGS_(3)); };
     hipEvent_t e0, e1; CHECK(hipEventCreate(&e0)); CHECK(hipEventCreate(&e1));
     const double bytes = (double)(U + 1) * 2 * (pb + sb);
     float t[NV];
@@ -143,9 +141,8 @@ int main() {
         for (auto pr : {std::make_pair(sgo[0], sgo[v]), std::make_pair(suo[0], suo[v])}) { CHECK(hipMemcpy(a0.data(), pr.first, R * N * 2, hipMemcpyDeviceToHost)); CHECK(hipMemcpy(a1.data(), pr.second, R * N * 2, hipMemcpyDeviceToHost)); same &= !memcmp(a0.data(), a1.data(), R * N * 2); }
         return same; };
     printf("-- gate_up rows_v3_r8_b256 N=%u K=%u U=%u (+shared): ship %7.1f us (%.0f GB/s)\n", N, K, U, t[0], bytes / 1e3 / t[0]);
-    printf("-- rows f32-A staged:      %7.1f us x%.2f %s\n", t[1], t[0] / t[1], eq(1) ? "bit-identical" : "DIFFERS");
-    printf("-- rows BS128 COLS2:       %7.1f us x%.2f %s\n", t[2], t[0] / t[2], eq(2) ? "bit-identical" : "DIFFERS");
-    printf("-- rows BS64 COLS4:        %7.1f us x%.2f %s\n", t[3], t[0] / t[3], eq(3) ? "bit-identical" : "DIFFERS");
-    printf("-- rows BS128 COLS1:       %7.1f us x%.2f %s\n", t[4], t[0] / t[4], eq(4) ? "bit-identical" : "DIFFERS");
+    printf("-- rows BS128 COLS1:       %7.1f us x%.2f %s\n", t[1], t[0] / t[1], eq(1) ? "bit-identical" : "DIFFERS");
+    printf("-- rows SGPR-A BS256:      %7.1f us x%.2f %s\n", t[2], t[0] / t[2], eq(2) ? "bit-identical" : "DIFFERS");
+    printf("-- rows SGPR-A BS128:      %7.1f us x%.2f %s\n", t[3], t[0] / t[3], eq(3) ? "bit-identical" : "DIFFERS");
     return 0;
 }
