@@ -14,7 +14,7 @@ use anyhow::Result;
 use spark_comm::CommBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
-use super::gemm::GemmWeights;
+use super::gemm::{GEMM_ROWS, GemmWeights};
 use super::hc::{self, HcSite, SiteOut, SublayerParts};
 use super::parts::Held;
 use super::profile;
@@ -84,6 +84,29 @@ impl Block {
             self.shared.shape.norm_eps,
             stream,
         )
+    }
+
+    /// `out` (`[rows, n]` FP32, not rounded) = `x` (`[rows, k]` BF16) through
+    /// `w` (`[n, k]` BF16): a thread a product-run for a few rows, a GEMM
+    /// for a batch.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn project_f32(
+        &self,
+        gpu: &dyn GpuBackend,
+        x: DevicePtr,
+        w: DevicePtr,
+        out: DevicePtr,
+        rows: usize,
+        n: usize,
+        k: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if self.gemm.is_some() && rows >= GEMM_ROWS {
+            let (m, n, k) = (rows as u32, n as u32, k as u32);
+            return crate::layers::ops::bf16_gemm_f32out(x, w.0, out, m, n, k, stream);
+        }
+        let kernel = self.shared.kernels.side.gemv_f32;
+        super::side::gemv_f32_rows(gpu, kernel, x, w, out, rows, n, k, stream)
     }
 
     /// One Hyper-Connection site of `rows` tokens (`hc::site`): the sublayer

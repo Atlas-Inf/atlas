@@ -101,6 +101,15 @@ extern "C" __global__ void __launch_bounds__(DSV41_MOE_THREADS) dsv41_moe_scores
     score[(size_t)t * experts + e] = sqrtf(logit > 20.0f ? logit : log1pf(expf(logit)));
 }
 
+// score[i] = sqrt(softplus(score[i])), in place: a batch's scores from the
+// logits a GEMM left (x . gate^T in FP32), as `dsv41_moe_scores` leaves them.
+extern "C" __global__ void dsv41_moe_soften(float* __restrict__ score, unsigned int count) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float logit = score[i];
+    score[i] = sqrtf(logit > 20.0f ? logit : log1pf(expf(logit)));
+}
+
 // The top_k of score + bias and their weights, as `dsv41_moe_route` picks
 // them: best first, the lower expert first among equals. One block per
 // token, one thread per expert: a thread counts the experts ahead of its own.

@@ -15,7 +15,6 @@ use super::index_recipe::{candidate_blocks, keep_candidates, top_positions};
 use super::moe;
 use super::ops::{self, Fp4Scale};
 use super::parts;
-use super::side;
 use super::state::SeqState;
 use super::weights::IndexerWeights;
 
@@ -107,9 +106,8 @@ impl Block {
             stream,
         )?;
         // A weight per head, from the attention's input.
-        side::gemv_f32_rows(
+        self.project_f32(
             gpu,
-            k.side.gemv_f32,
             sc.normed.offset(first * s.hidden * 2),
             w.head_weights,
             sc.index_weights_f32,

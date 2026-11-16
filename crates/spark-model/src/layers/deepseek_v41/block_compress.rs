@@ -63,9 +63,8 @@ impl Block {
             if carried > 0 {
                 gpu.copy_d2d_async(kept, pool, carried * token, stream)?;
             }
-            side::gemv_f32_rows(
+            self.project_f32(
                 gpu,
-                k.side.gemv_f32,
                 sc.normed,
                 weights,
                 pool.offset(carried * token),
@@ -156,9 +155,8 @@ impl Block {
             &self.shared.kernels,
             &self.shared.scratch,
         );
-        side::gemv_f32_rows(
+        self.project_f32(
             gpu,
-            k.side.gemv_f32,
             latents,
             w.wk,
             sc.index_key_f32,

@@ -65,6 +65,7 @@ impl Block {
                 s.top_k,
                 s.route_scale,
                 true,
+                self.gemm.is_some() && rows >= GEMM_ROWS,
                 stream,
             )
         })?;

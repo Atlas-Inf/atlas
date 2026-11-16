@@ -86,6 +86,7 @@ fn routing_replays_the_reference() -> Result<()> {
             TOP_K,
             ROUTE_SCALE,
             false,
+            false,
             gpu.default_stream(),
         )?;
         gpu.synchronize(gpu.default_stream())?;

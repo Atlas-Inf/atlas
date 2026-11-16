@@ -21,6 +21,8 @@ pub struct MoeKernels {
     /// The same in two launches, a block per (expert, token).
     pub scores: KernelHandle,
     pub pick: KernelHandle,
+    /// A batch's scores from its logits.
+    pub soften: KernelHandle,
     /// Every expert of a token in three launches (`dsv41_expert.cu`).
     pub expert_in: KernelHandle,
     pub expert_act: KernelHandle,
@@ -47,6 +49,7 @@ impl MoeKernels {
             route: kernel("dsv41_moe_route")?,
             scores: kernel("dsv41_moe_scores")?,
             pick: kernel("dsv41_moe_pick")?,
+            soften: kernel("dsv41_moe_soften")?,
             expert_in: gpu.kernel("dsv41_expert", "dsv41_expert_in")?,
             expert_act: gpu.kernel("dsv41_expert", "dsv41_expert_act")?,
             expert_out: gpu.kernel("dsv41_expert", "dsv41_expert_out")?,
@@ -105,7 +108,8 @@ pub fn route(
 /// [`route`] as the block runs it: the same choice, the scores summed in
 /// another order. `scores` is `[tokens, experts]` FP32 scratch. `by_expert`
 /// leaves the chosen in ascending expert order, each with its weight, which
-/// is the order their outputs are added in.
+/// is the order their outputs are added in. `batch` takes the scores as one
+/// GEMM, in yet another order.
 #[allow(clippy::too_many_arguments)]
 pub fn route_fast(
     gpu: &dyn GpuBackend,
@@ -122,21 +126,33 @@ pub fn route_fast(
     top_k: usize,
     route_scale: f32,
     by_expert: bool,
+    batch: bool,
     stream: u64,
 ) -> Result<()> {
     ensure!(
         experts <= 512 && top_k <= 8,
         "dsv41_moe_pick: {experts} experts, top {top_k}"
     );
-    KernelLaunch::new(gpu, kernels.scores)
-        .grid([experts as u32, tokens as u32, 1])
-        .block([THREADS, 1, 1])
-        .arg_ptr(x)
-        .arg_ptr(gate)
-        .arg_ptr(scores)
-        .arg_u32(hidden as u32)
-        .arg_u32(experts as u32)
-        .launch(stream)?;
+    match batch {
+        // The logits as one GEMM, in FP32.
+        true => {
+            let (m, n, k) = (tokens as u32, experts as u32, hidden as u32);
+            crate::layers::ops::bf16_gemm_f32out(x, gate.0, scores, m, n, k, stream)?;
+            elementwise(gpu, kernels.soften, tokens * experts)
+                .arg_ptr(scores)
+                .arg_u32((tokens * experts) as u32)
+                .launch(stream)?;
+        }
+        false => KernelLaunch::new(gpu, kernels.scores)
+            .grid([experts as u32, tokens as u32, 1])
+            .block([THREADS, 1, 1])
+            .arg_ptr(x)
+            .arg_ptr(gate)
+            .arg_ptr(scores)
+            .arg_u32(hidden as u32)
+            .arg_u32(experts as u32)
+            .launch(stream)?,
+    }
     KernelLaunch::new(gpu, kernels.pick)
         .grid([tokens as u32, 1, 1])
         .block([512, 1, 1])
