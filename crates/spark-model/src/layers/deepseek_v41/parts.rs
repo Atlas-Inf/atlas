@@ -84,6 +84,7 @@ pub struct PartKernels {
     /// one that rounds its input.
     pub fp8_two: KernelHandle,
     pub fp8_groups_q: KernelHandle,
+    pub fp8_groups: KernelHandle,
     /// An FP8 projection of an input in pieces, and the same rounding it.
     pub fp8_pieces: KernelHandle,
     pub fp8_pieces_q: KernelHandle,
@@ -105,6 +106,7 @@ impl PartKernels {
             fp8_f32_q: tc("dsv41_fp8_gemv_tc8_f32_q")?,
             fp8_two: tc("dsv41_fp8_gemv_two")?,
             fp8_groups_q: tc("dsv41_fp8_gemv_groups_q")?,
+            fp8_groups: tc("dsv41_fp8_gemv_groups")?,
             fp8_pieces: tc("dsv41_fp8_gemv_pieces")?,
             fp8_pieces_q: tc("dsv41_fp8_gemv_pieces_q")?,
             round: parts("dsv41_parts_round")?,

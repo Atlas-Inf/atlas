@@ -223,6 +223,13 @@ impl Block {
             w.wq_b.n,
             w.wq_b.k
         );
+        if gemm.is_none() {
+            // The query rounded to FP8 once, where it lies, for the heads'
+            // projection: one that rounds its own input does it again in
+            // every block (512 of them a part).
+            let (quant, values) = (k.cache.fp8_quant_dequant, rows * s.q_rank);
+            ops::fp8_quant_dequant(gpu, quant, sc.q_low_normed, sc.q_low_normed, values, stream)?;
+        }
         for part in held.range() {
             let began = profile::begin(gpu, stream)?;
             // This part's heads: projected from the query's FP8 form, and
@@ -242,7 +249,7 @@ impl Block {
                     let wq = w.wq_b.rows_from(part * heads * HEAD_DIM);
                     parts::project_rows(
                         gpu,
-                        k.parts.fp8_q,
+                        k.parts.fp8,
                         sc.q_low_normed,
                         wq.data,
                         wq.scales,
@@ -312,18 +319,23 @@ impl Block {
                         )?;
                     }
                 }
-                None => parts::project_groups(
-                    gpu,
-                    k.parts.fp8_groups_q,
-                    attended,
-                    w.wo_a.rows_from(low),
-                    o_low,
-                    rows,
-                    groups,
-                    s.o_rank,
-                    group_in,
-                    stream,
-                )?,
+                // The heads' output rounded to FP8 once, where it lies.
+                None => {
+                    let (quant, values) = (k.cache.fp8_quant_dequant, rows * groups * group_in);
+                    ops::fp8_quant_dequant(gpu, quant, attended, attended, values, stream)?;
+                    parts::project_groups(
+                        gpu,
+                        k.parts.fp8_groups,
+                        attended,
+                        w.wo_a.rows_from(low),
+                        o_low,
+                        rows,
+                        groups,
+                        s.o_rank,
+                        group_in,
+                        stream,
+                    )?
+                }
             }
             profile::end(gpu, stream, "output projections", began)?;
         }
@@ -347,6 +359,13 @@ impl Block {
             )
         })?;
         let began = profile::begin(gpu, stream)?;
+        if gemm.is_none() {
+            // Rounded to FP8 once, where they lie: a block of the projection
+            // that rounds its own input does it again for every 16 rows of
+            // wo_b, which cost a decode step more than its weights did.
+            let (quant, values) = (k.cache.fp8_quant_dequant, PARTS * rows * width);
+            ops::fp8_quant_dequant(gpu, quant, sc.o_low, sc.o_low, values, stream)?;
+        }
         for part in held.range() {
             let out = sc.attn_out.offset(part * rows * part_n * 2);
             match gemm {
@@ -360,7 +379,7 @@ impl Block {
                 // A part's rows are a piece, a row its groups.
                 None => parts::project_pieces(
                     gpu,
-                    k.parts.fp8_pieces_q,
+                    k.parts.fp8_pieces,
                     sc.o_low,
                     row_part(&w.wo_b, part),
                     out,
