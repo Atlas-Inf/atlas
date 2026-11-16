@@ -111,9 +111,9 @@ pub(crate) fn load_weight_store(
     let weight_policy =
         spark_model::factory::loader_for_config(config).context("weight-load policy lookup")?;
     let dead_ns = weight_policy.dead_namespaces(config);
-    let slab_pack = weight_policy.slab_pack_weights(config)
-        && config.tp_world_size <= 1
-        && config.ep_world_size <= 1;
+    // The loader is the SSOT for its topology as well: it returns `false`
+    // on the TP/EP shapes whose frees it has not audited.
+    let slab_pack = weight_policy.slab_pack_weights(config);
 
     let store = if use_fast_load(args) {
         #[cfg(unix)]

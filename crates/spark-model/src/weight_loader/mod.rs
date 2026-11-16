@@ -231,7 +231,8 @@ pub trait ModelWeightLoader {
     /// Whether the fast weight loader may pack this model's shards into one
     /// slab allocation per shard (`FastSafetensorsLoader::pack_slab`). The
     /// opt-in requires the load path to never `gpu.free` a store-owned
-    /// tensor pointer; single-GPU only (TP/EP paths are not audited).
+    /// tensor pointer. The loader decides for its topology too: one whose
+    /// TP/EP paths are not audited returns `false` there.
     fn slab_pack_weights(&self, _config: &ModelConfig) -> bool {
         false
     }
