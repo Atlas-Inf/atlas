@@ -243,6 +243,7 @@ pub fn load_layers(
             &shape,
             config.max_position_embeddings,
             batch_rows(),
+            held,
         )?),
         handoff: Arc::new(std::sync::Mutex::new(Handoff::default())),
     };

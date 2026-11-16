@@ -192,6 +192,7 @@ fn build_cutlass_object(cutlass_home: std::path::PathBuf) {
         std::path::PathBuf::from("cuda/cutlass_nvfp4_gemm.cu"),
         std::path::PathBuf::from("cuda/cutlass_nvfp4_prequant.cu"),
         std::path::PathBuf::from("cuda/cutlass_nvfp4_grouped_gemm.cu"),
+        std::path::PathBuf::from("cuda/cutlass_mx84_grouped_gemm.cu"),
         std::path::PathBuf::from("cuda/cutlass_fp8_blockwise_gemm.cu"),
     ];
     for src in &sources {

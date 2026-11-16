@@ -11,9 +11,10 @@ use super::gemm::GemmScratch;
 use super::hc::{HcKernels, HcShape};
 use super::index::{INDEX_DIM, IndexKernels};
 use super::moe::MoeKernels;
+use super::moe_gemm::{ExpertGemm, expert_gemm_rows};
 use super::moe_grouped::GroupedScratch;
 use super::ops::{HEAD_DIM, Kernels, MAX_KEYS, attn_records};
-use super::parts::{PARTS, PartKernels};
+use super::parts::{Held, PARTS, PartKernels};
 use super::side::SideKernels;
 
 /// The dimensions and constants of a block.
@@ -167,6 +168,9 @@ pub struct Scratch {
     /// BF16: one part of the shared expert's output from one.
     pub(super) gemm: GemmScratch,
     pub(super) shared_out: DevicePtr,
+    /// The routed experts of a large batch as grouped GEMMs, where batches
+    /// are that large.
+    pub(super) expert_gemm: Option<ExpertGemm>,
     /// `[128 + rows, 512]` BF16: the window's keys in position order and
     /// then the batch's own, when a batch is more than one row.
     pub(super) chunk_keys: DevicePtr,
@@ -243,15 +247,17 @@ impl Scratch {
     /// `max_positions` bounds a sequence, and so the compressed positions one
     /// query scores.
     pub fn alloc(gpu: &dyn GpuBackend, s: &Shape, max_positions: usize) -> Result<Self> {
-        Self::alloc_rows(gpu, s, max_positions, ROWS)
+        Self::alloc_rows(gpu, s, max_positions, ROWS, Held::ALL)
     }
 
-    /// The same with room for batches of `rows` rows.
+    /// The same with room for batches of `rows` rows, on a rank that holds
+    /// `held` of the parts.
     pub fn alloc_rows(
         gpu: &dyn GpuBackend,
         s: &Shape,
         max_positions: usize,
         rows: usize,
+        held: Held,
     ) -> Result<Self> {
         ensure!(rows > 0, "deepseek_v41: batches of no rows");
         let max_groups = max_positions.max(1);
@@ -265,13 +271,18 @@ impl Scratch {
             shared_gate_up: bf16(rows * 2 * s.inter / PARTS)?,
             gemm: GemmScratch::alloc(gpu, rows, s.hidden.max(s.o_groups * s.o_rank))?,
             shared_out: bf16(rows * s.hidden / PARTS)?,
+            expert_gemm: match expert_gemm_rows() {
+                from if from > 0 && rows >= from => Some(ExpertGemm::alloc(gpu, s, rows)?),
+                _ => None,
+            },
             chunk_keys: bf16((WINDOW + rows) * HEAD_DIM)?,
             x: bf16(rows * (s.hidden))?,
             normed: bf16(rows * (s.hidden))?,
             quantized: bf16(rows * (s.hidden))?,
             q_low: bf16(rows * (s.q_rank))?,
             q_low_normed: bf16(rows * (s.q_rank))?,
-            q: bf16(rows * (s.heads * HEAD_DIM))?,
+            // The heads of the parts held, the first of them first.
+            q: bf16(rows * (s.heads / PARTS * held.count * HEAD_DIM))?,
             key: bf16(rows * (HEAD_DIM))?,
             idx: f32s(rows * (MAX_KEYS))?,
             positions: {
@@ -282,7 +293,7 @@ impl Scratch {
                 gpu.copy_h2d(&words, table)?;
                 table
             },
-            attended: bf16(rows * (s.heads * HEAD_DIM))?,
+            attended: bf16(rows * (s.heads / PARTS * held.count * HEAD_DIM))?,
             attn_records: gpu.alloc(attn_records(rows, s.heads / PARTS))?,
             o_low: bf16(rows * (s.o_groups * s.o_rank))?,
             gate_up: bf16((s.top_k + 1) * 2 * s.inter / PARTS)?,

@@ -10,6 +10,7 @@ use super::block::Block;
 use super::gemm::{GEMM_ROWS, Input};
 use super::hc::SublayerParts;
 use super::moe::{self, ExpertPart};
+use super::moe_gemm::Runs;
 use super::moe_grouped::{self, GateUp, Plan};
 use super::parts::{self, PARTS};
 use super::profile;
@@ -96,6 +97,16 @@ impl Block {
                 Some(plan)
             }
         };
+        // A large batch's experts go as grouped GEMMs, an expert's pairs a
+        // group.
+        let big = match (&plan, &sc.expert_gemm) {
+            (Some(plan), Some(big)) if self.gemm.is_some() && rows >= big.from => {
+                let runs = Runs::new(plan, rows, s.top_k, slots);
+                big.upload(gpu, &runs)?;
+                Some((big, runs))
+            }
+            _ => None,
+        };
         // The way in: a part of every slot's hidden activation. A token
         // alone has a slot an expert; a batch has its pairs in expert order
         // and then every row's shared expert.
@@ -132,19 +143,51 @@ impl Block {
                 )?;
                 continue;
             };
-            moe_grouped::experts_in(
-                gpu,
-                &k.moe,
-                &of.slab,
-                plan,
-                &sc.grouped,
-                sc.quantized,
-                inner,
-                part_rows,
-                s.hidden,
-                s.swiglu_limit,
-                stream,
-            )?;
+            match &big {
+                Some((big, runs)) => {
+                    big.project_in(
+                        gpu,
+                        &of.slab,
+                        runs,
+                        sc.quantized,
+                        sc.grouped.row_of,
+                        sc.grouped.gate_up,
+                        part_rows,
+                        s.hidden,
+                        stream,
+                    )?;
+                    // Every pair's gate values, then every pair's up values.
+                    let gate_up = GateUp {
+                        base: sc.grouped.gate_up,
+                        up_offset: plan.pairs() * part_rows,
+                        row_stride: part_rows,
+                    };
+                    moe_grouped::activate(
+                        gpu,
+                        &k.moe,
+                        gate_up,
+                        sc.grouped.weights,
+                        inner,
+                        plan.pairs(),
+                        part_rows,
+                        s.swiglu_limit,
+                        stream,
+                    )?;
+                }
+                None => moe_grouped::experts_in(
+                    gpu,
+                    &k.moe,
+                    &of.slab,
+                    plan,
+                    &sc.grouped,
+                    sc.quantized,
+                    inner,
+                    part_rows,
+                    s.hidden,
+                    s.swiglu_limit,
+                    stream,
+                )?,
+            }
             // The shared expert, every row through the same weights.
             let gate_up = match gemm.and_then(|g| g.shared[part].as_ref()) {
                 // Every row's gate values, then every row's up values.
@@ -228,19 +271,31 @@ impl Block {
                     stream,
                 )?,
                 Some(plan) => {
-                    moe_grouped::experts_out(
-                        gpu,
-                        &k.moe,
-                        &of.slab,
-                        plan,
-                        &sc.grouped,
-                        sc.inner_parts,
-                        room,
-                        sc.slot_out,
-                        part_rows,
-                        part_n,
-                        stream,
-                    )?;
+                    match &big {
+                        Some((big, runs)) => big.project_out(
+                            gpu,
+                            &of.slab,
+                            runs,
+                            sc.inner_parts,
+                            room,
+                            part_rows,
+                            s.hidden,
+                            stream,
+                        )?,
+                        None => moe_grouped::experts_out(
+                            gpu,
+                            &k.moe,
+                            &of.slab,
+                            plan,
+                            &sc.grouped,
+                            sc.inner_parts,
+                            room,
+                            sc.slot_out,
+                            part_rows,
+                            part_n,
+                            stream,
+                        )?,
+                    }
                     // The shared expert's: its rows of the hidden
                     // activations come after the pairs'.
                     let x = sc.inner_parts.offset(plan.pairs() * part_rows * 2);
@@ -273,17 +328,21 @@ impl Block {
                     }
                 }
             }
-            parts::slots_sum(
-                gpu,
-                k.parts.slots_sum,
-                sc.slot_out,
-                shared_out,
-                sc.moe_out.offset(part * rows * part_n * 2),
-                rows,
-                slots,
-                part_n,
-                stream,
-            )?;
+            let y = sc.moe_out.offset(part * rows * part_n * 2);
+            match &big {
+                Some((big, _)) => big.sum(gpu, shared_out, y, rows, s.top_k, part_n, stream)?,
+                None => parts::slots_sum(
+                    gpu,
+                    k.parts.slots_sum,
+                    sc.slot_out,
+                    shared_out,
+                    y,
+                    rows,
+                    slots,
+                    part_n,
+                    stream,
+                )?,
+            }
         }
         profile::end(gpu, stream, "experts", began)?;
         profile::stage(gpu, stream, "gather", || {

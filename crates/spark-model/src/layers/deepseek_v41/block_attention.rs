@@ -220,8 +220,8 @@ impl Block {
             let began = profile::begin(gpu, stream)?;
             // This part's heads: projected from the query's FP8 form, and
             // attended, turned to the position and back inside the kernel.
-            let q = sc.q.offset(part * sc.rows * heads * HEAD_DIM * 2);
-            let attended = sc.attended.offset(part * sc.rows * heads * HEAD_DIM * 2);
+            let of_held = (part - held.first) * sc.rows * heads * HEAD_DIM * 2;
+            let (q, attended) = (sc.q.offset(of_held), sc.attended.offset(of_held));
             match gemm {
                 Some(g) => sc.gemm.project(
                     gpu,
