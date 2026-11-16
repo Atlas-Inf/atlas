@@ -176,7 +176,7 @@ impl Block {
                 idx.len()
             }
             // A batch reads the window unrolled, and the shorter rows end in
-            // none.
+            // none; a row alone whose choice stayed on the device, the ring.
             Chosen::Table(table) => {
                 let most = match self.ratio {
                     0 => 0,
@@ -192,6 +192,7 @@ impl Block {
                     topk,
                     position,
                     rows,
+                    rows == 1,
                     stream,
                 )?;
                 keys

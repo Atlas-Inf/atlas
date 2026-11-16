@@ -207,7 +207,8 @@ pub fn choose_rows(
 
 /// `idx` (`[rows, keys]` i32) = the keys each query of a batch from
 /// `position` attends to: its window, as entries of the batch's unrolled
-/// window keys, then its row of `chosen` (`[rows, topk]`, or null).
+/// window keys (or, for a query alone, with `ring`, as slots of the
+/// window's ring), then its row of `chosen` (`[rows, topk]`, or null).
 #[allow(clippy::too_many_arguments)]
 pub fn attn_index(
     gpu: &dyn GpuBackend,
@@ -218,8 +219,13 @@ pub fn attn_index(
     topk: usize,
     position: usize,
     rows: usize,
+    ring: bool,
     stream: u64,
 ) -> Result<()> {
+    ensure!(
+        !ring || rows == 1,
+        "dsv41_attn_index: {rows} rows on a ring"
+    );
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil((rows * keys) as u32, THREADS), 1, 1])
         .block([THREADS, 1, 1])
@@ -229,6 +235,7 @@ pub fn attn_index(
         .arg_u32(topk as u32)
         .arg_u32(position as u32)
         .arg_u32(rows as u32)
+        .arg_u32(u32::from(ring))
         .launch(stream)
 }
 

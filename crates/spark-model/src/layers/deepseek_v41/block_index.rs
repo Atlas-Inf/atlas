@@ -22,8 +22,8 @@ use super::weights::IndexerWeights;
 pub(super) enum Chosen {
     /// One query's, on the host, ascending.
     Host(Vec<i32>),
-    /// A batch's, on the device: `[rows, index_topk]` i32, a row ascending
-    /// and then -1. Null on a layer that attends over its window only.
+    /// On the device: `[rows, index_topk]` i32, a row ascending and then
+    /// -1. Null on a layer that attends over its window only.
     Table(DevicePtr),
 }
 
@@ -262,10 +262,15 @@ impl Block {
         if handoff.rows.len() < row + rows {
             handoff.rows.resize_with(row + rows, Default::default);
         }
-        // A batch's choices stay on the device, a row of a table each.
-        let table = match rows {
-            1 => DevicePtr::NULL,
-            _ => handoff
+        // A batch's choices stay on the device, a row of a table each; and
+        // so do a row's alone where batches take the GEMMs, which is every
+        // decode step of a served model. A row alone otherwise, as the tests
+        // of one layer run it, is chosen for on the host, where they can
+        // hand it a choice.
+        let on_device = rows > 1 || self.gemm.is_some();
+        let table = match on_device {
+            false => DevicePtr::NULL,
+            true => handoff
                 .table(gpu, row + rows, topk, stream)?
                 .offset(row * topk * 4),
         };
@@ -284,8 +289,8 @@ impl Block {
         );
         let Some(w) = &self.weights.indexer else {
             // The latest index source chose for these rows.
-            return Ok(match rows {
-                1 => {
+            return Ok(match on_device {
+                false => {
                     ensure!(
                         batch[0].chosen.len() == visible(0).min(topk),
                         "layer {}: row {row} was handed {} compressed positions, and its query sees {}",
@@ -295,7 +300,7 @@ impl Block {
                     );
                     (keys, Chosen::Host(batch[0].chosen.clone()))
                 }
-                _ => (keys, Chosen::Table(table)),
+                true => (keys, Chosen::Table(table)),
             });
         };
         ensure!(
@@ -307,7 +312,7 @@ impl Block {
         // position is read, and all are candidates (`Shape::from_config`
         // checks that they would be). The rows that see more come last.
         let scored = (0..rows).find(|&r| visible(r) > topk).unwrap_or(rows);
-        if rows == 1 {
+        if !on_device {
             let mine = &mut batch[0];
             mine.chosen = match scored {
                 0 => {

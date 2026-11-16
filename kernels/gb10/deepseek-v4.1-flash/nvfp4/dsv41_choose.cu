@@ -256,15 +256,18 @@ extern "C" __global__ void __launch_bounds__(DSV41_CHOOSE_THREADS) dsv41_index_c
 // window, then the compressed positions chosen for it. The query at
 // position + r reads the positions of its window in order, of which
 // position q is entry q - position + 128 of the batch's unrolled window
-// keys, then -1 up to 128 entries. `chosen` is [rows, topk], and null on a
-// layer that attends over its window only. One thread an entry.
+// keys, then -1 up to 128 entries. With `ring`, for a query alone, position
+// q is where the window's ring holds it, slot q % 128. `chosen` is [rows,
+// topk], and null on a layer that attends over its window only. One thread
+// an entry.
 extern "C" __global__ void dsv41_attn_index(
     const int* __restrict__ chosen,
     int* __restrict__ idx,
     unsigned int keys,
     unsigned int topk,
     unsigned int position,
-    unsigned int rows) {
+    unsigned int rows,
+    unsigned int ring) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)rows * keys) return;
     const unsigned int r = (unsigned int)(i / keys), j = (unsigned int)(i % keys);
@@ -272,7 +275,9 @@ extern "C" __global__ void dsv41_attn_index(
     int entry = -1;
     if (j < DSV41_WINDOW) {
         const unsigned int first = at + 1u > DSV41_WINDOW ? at + 1u - DSV41_WINDOW : 0u;
-        if (first + j <= at) entry = (int)(first + j + DSV41_WINDOW - position);
+        if (first + j <= at)
+            entry = ring ? (int)((first + j) % DSV41_WINDOW)
+                         : (int)(first + j + DSV41_WINDOW - position);
     } else if (chosen) {
         entry = chosen[(size_t)r * topk + (j - DSV41_WINDOW)];
     }
