@@ -4,13 +4,13 @@
 
 use anyhow::{Context, Result, ensure};
 use spark_comm::CommBackend;
-use spark_runtime::gpu::GpuBackend;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::block::Block;
 use super::cache_recipe::{WINDOW, completed_group, group_position, window_row, window_slot};
 use super::index::INDEX_DIM;
 use super::moe;
-use super::ops::{self, Fp4Scale, HEAD_DIM};
+use super::ops::{self, Fp4Scale, HEAD_DIM, MAX_KEYS};
 use super::parts::{self, PARTS};
 use super::profile;
 use super::side;
@@ -20,6 +20,18 @@ use crate::layers::ops::mxfp8_gemv_rows;
 use crate::weight_map::Mxfp8Weight;
 
 impl Block {
+    /// The device word holding `position`, for a rotation to read.
+    fn at(&self, position: usize) -> Result<DevicePtr> {
+        let sc = &self.shared.scratch;
+        ensure!(
+            position < sc.max_groups,
+            "layer {}: position {position} of at most {}",
+            self.index,
+            sc.max_groups
+        );
+        Ok(sc.positions.offset(position * 4))
+    }
+
     /// The compressor at `position`: project, hold in the group's slot, and
     /// when the group completes write its key into `keys` and, on a layer
     /// that makes them, its index key.
@@ -97,12 +109,7 @@ impl Block {
             )?,
         }
         self.norm(gpu, sc.pooled, w.norm, key, HEAD_DIM, stream)?;
-        let at = self.at(
-            gpu,
-            sc.group_position,
-            group_position(group, w.ratio),
-            stream,
-        )?;
+        let at = self.at(group_position(group, w.ratio))?;
         // The index key comes from the key as it is before its rotation.
         if let Some(index) = self.weights.indexer.as_ref().and_then(|i| i.key.as_ref()) {
             let index_key = held.index_keys.offset(group * INDEX_DIM * 2);
@@ -131,10 +138,10 @@ impl Block {
         )
     }
 
-    /// Attention of the normed input in `scratch.normed` into
-    /// `scratch.sublayer_out`. The heads, and the output projections behind
-    /// them, are in four parts; `comm` reaches the ranks that hold the
-    /// others.
+    /// Attention of the input in `scratch.normed`, and in FP8 in
+    /// `scratch.quantized`, into the parts of [`Block::attention_parts`].
+    /// The heads, and the output projections behind them, are in four parts;
+    /// `comm` reaches the ranks that hold the others.
     pub(super) fn attention(
         &self,
         gpu: &dyn GpuBackend,
@@ -154,7 +161,18 @@ impl Block {
         let began = profile::begin(gpu, stream)?;
         // The low-rank query, normed, and its FP8 form, which every head's
         // projection and the indexer's read.
-        self.fp8(gpu, &w.wq_a, sc.normed, sc.quantized, sc.q_low, stream)?;
+        mxfp8_gemv_rows(
+            gpu,
+            &k.tiers,
+            &w.wq_a.w,
+            sc.quantized,
+            sc.q_low,
+            1,
+            w.wq_a.n,
+            w.wq_a.k,
+            w.wq_a.n,
+            stream,
+        )?;
         self.norm(gpu, sc.q_low, w.q_norm, sc.q_low_normed, s.q_rank, stream)?;
         ops::fp8_quant_dequant(
             gpu,
@@ -179,7 +197,7 @@ impl Block {
         )?;
         let slot = state.window.offset(window_slot(position) * HEAD_DIM * 2);
         self.norm(gpu, sc.key, w.kv_norm, sc.pooled, HEAD_DIM, stream)?;
-        let at = self.at(gpu, sc.position, position, stream)?;
+        let at = self.at(position)?;
         ops::rotate(
             gpu,
             k.cache.rotate,
@@ -216,9 +234,15 @@ impl Block {
             idx.extend(chosen);
         }
         profile::end(gpu, stream, "compress and choose", began)?;
-        gpu.synchronize(stream)?;
+        ensure!(
+            idx.len() <= MAX_KEYS,
+            "layer {}: {} keys for one query",
+            self.index,
+            idx.len()
+        );
+        // In stream order, behind the kernels of the token before.
         let bytes: Vec<u8> = idx.iter().flat_map(|i| i.to_le_bytes()).collect();
-        gpu.copy_h2d(&bytes, sc.idx)?;
+        gpu.copy_h2d_async(&bytes, sc.idx, stream)?;
 
         let (heads, groups) = (s.heads / PARTS, s.o_groups / PARTS);
         let group_in = s.heads / s.o_groups * HEAD_DIM;
@@ -355,15 +379,6 @@ impl Block {
                 s.hidden * 4,
                 stream,
             )
-        })?;
-        parts::round(
-            gpu,
-            k.parts.round,
-            sc.attn_parts,
-            sc.sublayer_out,
-            1,
-            s.hidden,
-            stream,
-        )
+        })
     }
 }

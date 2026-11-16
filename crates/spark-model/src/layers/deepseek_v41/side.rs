@@ -8,7 +8,6 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 const THREADS: u32 = 256;
-const MAX_K: usize = 5120;
 
 #[derive(Clone, Copy)]
 pub struct SideKernels {
@@ -42,14 +41,12 @@ pub fn gemv_f32(
     k: usize,
     stream: u64,
 ) -> Result<()> {
-    ensure!(k <= MAX_K, "dsv41_gemv_f32: k {k}");
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n as u32, THREADS), 1, 1])
+        .grid([n as u32, 1, 1])
         .block([THREADS, 1, 1])
         .arg_ptr(x)
         .arg_ptr(w)
         .arg_ptr(out)
-        .arg_u32(n as u32)
         .arg_u32(k as u32)
         .launch(stream)
 }

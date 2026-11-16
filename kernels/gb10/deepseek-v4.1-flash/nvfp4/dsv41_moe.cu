@@ -17,6 +17,8 @@
 
 #include <cuda_bf16.h>
 
+#include "dsv41_common.cuh"
+
 #define DSV41_MOE_THREADS 256
 #define DSV41_MAX_EXPERTS 512
 #define DSV41_MAX_TOPK 8
@@ -93,27 +95,17 @@ extern "C" __global__ void __launch_bounds__(DSV41_MOE_THREADS) dsv41_moe_scores
     float* __restrict__ score,
     unsigned int H,
     unsigned int experts) {
-    const unsigned int e = blockIdx.x, t = blockIdx.y, tid = threadIdx.x;
-    const __nv_bfloat16* xr = x + (size_t)t * H;
-    const __nv_bfloat16* row = gate + (size_t)e * H;
-    __shared__ float red[DSV41_MOE_THREADS];
-    float acc = 0.0f;
-    for (unsigned int d = tid; d < H; d += DSV41_MOE_THREADS)
-        acc += __bfloat162float(xr[d]) * __bfloat162float(row[d]);
-    red[tid] = acc;
-    __syncthreads();
-    for (unsigned int width = DSV41_MOE_THREADS / 2; width > 0; width >>= 1) {
-        if (tid < width) red[tid] += red[tid + width];
-        __syncthreads();
-    }
-    if (tid != 0) return;
-    const float logit = red[0];
+    const unsigned int e = blockIdx.x, t = blockIdx.y;
+    const float logit = dsv41_dot_wide(x + (size_t)t * H, gate + (size_t)e * H, H);
+    if (threadIdx.x != 0) return;
     score[(size_t)t * experts + e] = sqrtf(logit > 20.0f ? logit : log1pf(expf(logit)));
 }
 
 // The top_k of score + bias and their weights, as `dsv41_moe_route` picks
 // them: best first, the lower expert first among equals. One block per
 // token, one thread per expert: a thread counts the experts ahead of its own.
+// With `by_expert` the chosen leave in ascending expert order, the order the
+// reference adds their outputs in, each with its weight.
 extern "C" __global__ void __launch_bounds__(DSV41_MAX_EXPERTS) dsv41_moe_pick(
     const float* __restrict__ score,
     const float* __restrict__ bias,
@@ -121,7 +113,8 @@ extern "C" __global__ void __launch_bounds__(DSV41_MAX_EXPERTS) dsv41_moe_pick(
     float* __restrict__ weights,
     unsigned int experts,
     unsigned int top_k,
-    float route_scale) {
+    float route_scale,
+    unsigned int by_expert) {
     const unsigned int t = blockIdx.x, tid = threadIdx.x;
     __shared__ float value[DSV41_MAX_EXPERTS];
     __shared__ unsigned int pick[DSV41_MAX_TOPK];
@@ -139,9 +132,15 @@ extern "C" __global__ void __launch_bounds__(DSV41_MAX_EXPERTS) dsv41_moe_pick(
     if (tid != 0) return;
     float sum = 0.0f;
     for (unsigned int k = 0; k < top_k; ++k) sum += s[pick[k]];
+    unsigned int order[DSV41_MAX_TOPK];
     for (unsigned int k = 0; k < top_k; ++k) {
-        chosen[(size_t)t * top_k + k] = pick[k];
-        weights[(size_t)t * top_k + k] = s[pick[k]] / (sum + 1e-20f) * route_scale;
+        unsigned int at = k;
+        for (; by_expert && at > 0 && order[at - 1] > pick[k]; --at) order[at] = order[at - 1];
+        order[at] = pick[k];
+    }
+    for (unsigned int k = 0; k < top_k; ++k) {
+        chosen[(size_t)t * top_k + k] = order[k];
+        weights[(size_t)t * top_k + k] = s[order[k]] / (sum + 1e-20f) * route_scale;
     }
 }
 
@@ -185,10 +184,8 @@ extern "C" __global__ void dsv41_swiglu(
     float limit) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float g = fminf(__bfloat162float(gate[i]), limit);
-    const float u = fminf(fmaxf(__bfloat162float(up[i]), -limit), limit);
-    const float silu = g * (1.0f / (1.0f + expf(-g)));
-    h[i] = __float2bfloat16(weight * (silu * u));
+    h[i] = __float2bfloat16(
+        dsv41_swiglu_one(__bfloat162float(gate[i]), __bfloat162float(up[i]), weight, limit));
 }
 
 // acc += x, FP32 += BF16; and the rounding back.

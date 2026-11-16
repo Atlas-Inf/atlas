@@ -9,30 +9,7 @@
 
 #include <cuda_bf16.h>
 
-// 2^ceil(log2(ratio)), read off the float's exponent.
-__device__ __forceinline__ float dsv41_pow2_ceil(float ratio) {
-    const unsigned int bits = __float_as_uint(ratio);
-    const int exponent = (int)((bits >> 23) & 0xffu) - 127 + ((bits & 0x7fffffu) != 0u);
-    return __uint_as_float((unsigned int)(exponent + 127) << 23);
-}
-
-__device__ __forceinline__ int dsv41_exponent(float magnitude) {
-    return (int)((__float_as_uint(magnitude) >> 23) & 0xffu) - 127;
-}
-
-// Nearest E4M3 value: 3 mantissa bits, least exponent -6, at most 448.
-__device__ __forceinline__ float dsv41_round_e4m3(float v) {
-    const float mag = fabsf(v);
-    const float step = ldexpf(1.0f, max(dsv41_exponent(mag), -6) - 3);
-    return copysignf(fminf(rintf(mag / step) * step, 448.0f), v);
-}
-
-// Nearest E2M1 value: 0, 0.5, 1, 1.5, 2, 3, 4 or 6.
-__device__ __forceinline__ float dsv41_round_fp4(float v) {
-    const float mag = fabsf(v);
-    const float step = ldexpf(1.0f, min(max(dsv41_exponent(mag), 0), 2) - 1);
-    return copysignf(rintf(mag / step) * step, v);
-}
+#include "dsv41_common.cuh"
 
 // Rotate the last `rope` values of every vector to its row's position.
 // x [rows, vectors, dim] BF16, positions [rows], freqs [rope / 2] radians per
@@ -68,16 +45,8 @@ extern "C" __global__ void dsv41_fp8_quant_dequant(
     if (b >= blocks) return;
     const __nv_bfloat16* p = src + b * 32;
     float v[32];
-    float amax = 0.0f;
-    for (int i = 0; i < 32; ++i) {
-        v[i] = __bfloat162float(p[i]);
-        amax = fmaxf(amax, fabsf(v[i]));
-    }
-    const float scale = dsv41_pow2_ceil(fmaxf(amax, 1e-4f) * (1.0f / 448.0f));
-    for (int i = 0; i < 32; ++i) {
-        const float scaled = fminf(fmaxf(v[i] / scale, -448.0f), 448.0f);
-        dst[b * 32 + i] = __float2bfloat16(dsv41_round_e4m3(scaled) * scale);
-    }
+    for (int i = 0; i < 32; ++i) v[i] = __bfloat162float(p[i]);
+    dsv41_fp8_block(v, dst + b * 32);
 }
 
 // FP4 (E2M1) written back as BF16, one thread per group. `e4m3_scale` = 0:

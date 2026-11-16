@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! One DeepSeek-V4.1 block on one token, in the plain form: every step a
-//! launch of a kernel that replays the reference on its own. It is slow by
-//! design. It defines what the block computes, and the faster paths are held
-//! to its bytes.
-//!
-//! Not built yet: Engram, and more than one rank.
+//! One DeepSeek-V4.1 block on one token. A Hyper-Connection site is two
+//! launches and the experts are three (`hc::site`, `moe::experts`); each is
+//! held to the bytes of the plain kernels it stands for, which replay the
+//! reference a step at a time.
 
 use std::sync::{Arc, Mutex};
 
@@ -12,13 +10,12 @@ use anyhow::Result;
 use spark_comm::CommBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
-use super::hc::{self, HcSite};
-use super::ops;
+use super::hc::{self, HcSite, SiteOut, SublayerParts};
 use super::parts::Held;
 use super::profile;
 pub use super::shape::{BlockKernels, Scratch, Shape};
 pub use super::state::{CompressedKeys, Handoff, SeqState};
-use super::weights::{BlockWeights, Fp8Proj};
+use super::weights::BlockWeights;
 use crate::layers::ops::rms_norm;
 use crate::weight_map::DenseWeight;
 
@@ -79,61 +76,62 @@ impl Block {
         )
     }
 
-    /// `out` = `w` times the FP8 form of `x`, which is left in `quantized`.
-    pub(super) fn fp8(
-        &self,
-        gpu: &dyn GpuBackend,
-        w: &Fp8Proj,
-        x: DevicePtr,
-        quantized: DevicePtr,
-        out: DevicePtr,
-        stream: u64,
-    ) -> Result<()> {
-        let k = &self.shared.kernels;
-        ops::fp8_linear(
-            gpu, &k.cache, &k.tiers, &w.w, x, quantized, out, 1, w.n, w.k, stream,
-        )
-    }
-
-    /// `position` as the device word a rotation reads, in `word`.
-    pub(super) fn at(
-        &self,
-        gpu: &dyn GpuBackend,
-        word: DevicePtr,
-        position: usize,
-        stream: u64,
-    ) -> Result<DevicePtr> {
-        // The kernels of the previous token may still read this word.
-        gpu.synchronize(stream)?;
-        gpu.copy_h2d(&(position as u32).to_le_bytes(), word)?;
-        Ok(word)
-    }
-
+    /// One Hyper-Connection site of a token (`hc::site`): the sublayer
+    /// `before` into the stream, then the input of the next, collapsed with
+    /// `pre_in`, in `scratch.normed` and `scratch.quantized`.
+    #[allow(clippy::too_many_arguments)]
     fn site(
         &self,
         gpu: &dyn GpuBackend,
         weights: &HcSite,
+        before: Option<SublayerParts>,
         streams: DevicePtr,
-        pre: DevicePtr,
+        pre_in: DevicePtr,
+        pre_out: DevicePtr,
+        norm_weight: DevicePtr,
         stream: u64,
     ) -> Result<()> {
-        let (k, sc) = (&self.shared.kernels, &self.shared.scratch);
-        hc::mix(
-            gpu,
-            k.hc.mix,
-            &self.shared.shape.hc,
-            weights,
-            streams,
-            pre,
-            sc.post,
-            sc.comb,
-            1,
-            stream,
-        )
+        let (s, k, sc) = (
+            &self.shared.shape,
+            &self.shared.kernels,
+            &self.shared.scratch,
+        );
+        let out = SiteOut {
+            collapsed: sc.x,
+            normed: sc.normed,
+            quantized: sc.quantized,
+            partials: sc.hc_partials,
+        };
+        profile::stage(gpu, stream, "site", || {
+            hc::site(
+                gpu,
+                &k.hc,
+                &s.hc,
+                weights,
+                before,
+                streams,
+                pre_in,
+                pre_out,
+                sc.post,
+                sc.comb,
+                norm_weight,
+                out,
+                stream,
+            )
+        })
+    }
+
+    /// The attention's output, as the parts [`Block::attention`] leaves.
+    pub(super) fn attention_parts(&self) -> SublayerParts {
+        SublayerParts {
+            parts: self.shared.scratch.attn_parts,
+            slots: 1,
+        }
     }
 
     /// The attention sublayer of one token, up to its output in
-    /// `scratch.sublayer_out`; the site's post and comb are left in scratch.
+    /// [`Block::attention_parts`]. Its site collapses with `pre`, the
+    /// coefficients of the site before, and leaves its own in scratch.
     #[allow(clippy::too_many_arguments)]
     fn attend(
         &self,
@@ -146,24 +144,24 @@ impl Block {
         comm: Option<&dyn CommBackend>,
         stream: u64,
     ) -> Result<()> {
-        let (s, k, sc, w) = (
-            &self.shared.shape,
-            &self.shared.kernels,
-            &self.shared.scratch,
-            &self.weights,
-        );
-        // Its own site's post and comb, the previous site's pre.
-        profile::stage(gpu, stream, "mix, collapse, norm", || {
-            self.site(gpu, &w.hc_attn, streams, sc.site_pre, stream)?;
-            hc::collapse(gpu, k.hc.collapse, &s.hc, streams, pre, sc.x, 1, stream)?;
-            self.norm(gpu, sc.x, w.attn.norm, sc.normed, s.hidden, stream)
-        })?;
+        let (sc, w) = (&self.shared.scratch, &self.weights);
+        self.site(
+            gpu,
+            &w.hc_attn,
+            None,
+            streams,
+            pre,
+            sc.site_pre,
+            w.attn.norm,
+            stream,
+        )?;
         self.attention(gpu, row, state, position, comm, stream)
     }
 
-    /// The rest of the block: the attention output into the stream, then the
-    /// FFN, collapsed with the attention site's pre. `comm` reaches the other
-    /// ranks when the routed experts are split over them.
+    /// The rest of the block: the attention's output into the stream, the
+    /// FFN, collapsed with the attention site's pre, and its output into the
+    /// stream. `pre` is left holding the FFN site's. `comm` reaches the
+    /// other ranks when the routed experts are split over them.
     fn finish(
         &self,
         gpu: &dyn GpuBackend,
@@ -178,39 +176,29 @@ impl Block {
             &self.shared.scratch,
             &self.weights,
         );
-        let expand = |streams| {
-            hc::expand(
+        self.site(
+            gpu,
+            &w.hc_ffn,
+            Some(self.attention_parts()),
+            streams,
+            sc.site_pre,
+            pre,
+            w.moe.norm,
+            stream,
+        )?;
+        self.moe(gpu, comm, stream)?;
+        profile::stage(gpu, stream, "expand", || {
+            hc::expand_parts(
                 gpu,
-                k.hc.expand,
+                k.hc.expand_parts,
                 &s.hc,
-                sc.sublayer_out,
+                self.moe_parts(),
                 streams,
                 sc.post,
                 sc.comb,
-                streams,
-                1,
                 stream,
             )
-        };
-        profile::stage(gpu, stream, "expand", || expand(streams))?;
-        let began = profile::begin(gpu, stream)?;
-        self.site(gpu, &w.hc_ffn, streams, sc.next_pre, stream)?;
-        hc::collapse(
-            gpu,
-            k.hc.collapse,
-            &s.hc,
-            streams,
-            sc.site_pre,
-            sc.x,
-            1,
-            stream,
-        )?;
-        self.norm(gpu, sc.x, w.moe.norm, sc.normed, s.hidden, stream)?;
-        profile::end(gpu, stream, "mix, collapse, norm", began)?;
-        self.moe(gpu, comm, stream)?;
-        profile::stage(gpu, stream, "expand", || expand(streams))?;
-        gpu.synchronize(stream)?;
-        gpu.copy_d2d(sc.next_pre, pre, s.hc.copies * 4)
+        })
     }
 
     /// Run the block on one token of row `row` of a pass. `streams` is the
@@ -231,6 +219,41 @@ impl Block {
     ) -> Result<()> {
         self.attend(gpu, row, streams, pre, state, position, comm, stream)?;
         self.finish(gpu, streams, pre, comm, stream)
+    }
+}
+
+#[cfg(test)]
+impl Block {
+    /// The attention's output, rounded from its parts, in
+    /// `scratch.sublayer_out`.
+    pub(super) fn attention_out(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<DevicePtr> {
+        let (s, k, sc) = (
+            &self.shared.shape,
+            &self.shared.kernels,
+            &self.shared.scratch,
+        );
+        super::parts::round(
+            gpu,
+            k.parts.round,
+            sc.attn_parts,
+            sc.sublayer_out,
+            1,
+            s.hidden,
+            stream,
+        )?;
+        Ok(sc.sublayer_out)
+    }
+
+    /// Stand `output` (`[hidden]` BF16, as bytes) in for the attention's
+    /// parts: the first part holds it and the others nothing.
+    pub(super) fn set_attention_out(&self, gpu: &dyn GpuBackend, output: &[u8]) -> Result<()> {
+        let mut parts = vec![0u8; super::parts::PARTS * self.shared.shape.hidden * 4];
+        for (value, bits) in parts.chunks_exact_mut(4).zip(output.chunks_exact(2)) {
+            let bits = u16::from_le_bytes([bits[0], bits[1]]);
+            value.copy_from_slice(&super::cache_recipe::bf16_to_f32(bits).to_le_bytes());
+        }
+        gpu.synchronize(gpu.default_stream())?;
+        gpu.copy_h2d(&parts, self.shared.scratch.attn_parts)
     }
 }
 

@@ -53,8 +53,14 @@ pub struct ExpertSlab {
 }
 
 impl ExpertSlab {
-    fn stride(&self) -> usize {
+    /// Bytes from one expert to the next.
+    pub fn stride(&self) -> usize {
         3 * (self.data + self.scales)
+    }
+
+    /// Bytes of one projection's part, and of the scales after it.
+    pub fn layout(&self) -> (usize, usize) {
+        (self.data, self.scales)
     }
 
     fn slice(&self, expert: usize, projection: usize) -> Slice {
@@ -200,7 +206,7 @@ pub fn row_part(whole: &Fp8Proj, part: usize) -> Slice {
 
 /// The held column parts of FP8 projection `prefix`, each `[n, k / 4]`. The
 /// whole projection is read from the store and freed.
-fn column_parts(
+pub(super) fn column_parts(
     store: &WeightStore,
     gpu: &dyn GpuBackend,
     kernels: &PartKernels,

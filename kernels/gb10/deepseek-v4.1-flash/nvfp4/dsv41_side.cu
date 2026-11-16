@@ -9,31 +9,27 @@
 // BF16 and normed. Engram: an n-gram lookup's value added into every copy of
 // the stream through a gate that compares the copy with the lookup's key.
 //
-// Plain forms: one thread per output value, sums in input order.
+// Plain forms: one thread per output value, sums in input order; but for the
+// projections, which are a block per value.
 
 #include <cuda_bf16.h>
 
+#include "dsv41_common.cuh"
+
 #define DSV41_SIDE_THREADS 256
-#define DSV41_SIDE_MAX_K 5120
 
 // out[row] = sum_k w[row, k] * x[k] in FP32, not rounded. x [k] BF16,
 // w [n, k] BF16, out [n] FP32. The reference widens both to FP32 first,
-// which is exact.
-extern "C" __global__ void __launch_bounds__(DSV41_SIDE_THREADS) dsv41_gemv_f32(
+// which is exact. A block per row, its 256 threads adding the products in a
+// tree: a thread a row, adding them one after another, takes a millisecond
+// over 5,120 columns. Grid (n), block 256.
+extern "C" __global__ void __launch_bounds__(DSV41_DOT_THREADS) dsv41_gemv_f32(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ w,
     float* __restrict__ out,
-    unsigned int n,
     unsigned int k) {
-    __shared__ float xs[DSV41_SIDE_MAX_K];
-    for (unsigned int d = threadIdx.x; d < k; d += DSV41_SIDE_THREADS) xs[d] = __bfloat162float(x[d]);
-    __syncthreads();
-    const unsigned int row = blockIdx.x * DSV41_SIDE_THREADS + threadIdx.x;
-    if (row >= n) return;
-    const __nv_bfloat16* wr = w + (size_t)row * k;
-    float acc = 0.0f;
-    for (unsigned int d = 0; d < k; ++d) acc += xs[d] * __bfloat162float(wr[d]);
-    out[row] = acc;
+    const float sum = dsv41_dot_wide(x, w + (size_t)blockIdx.x * k, k);
+    if (threadIdx.x == 0) out[blockIdx.x] = sum;
 }
 
 // pooled[d] = BF16(sum_r kv[r, d] * softmax_r(score[r, d])) over the `ratio`

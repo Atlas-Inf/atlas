@@ -21,7 +21,7 @@ use spark_runtime::gpu::GpuBackend;
 use crate::layers::deepseek_v41::block::{BlockKernels, Handoff, Scratch, SeqState, Shared};
 use crate::layers::deepseek_v41::cache_recipe::{WINDOW, completed_group, visible_groups};
 use crate::layers::deepseek_v41::index::INDEX_DIM;
-use crate::layers::deepseek_v41::ops::HEAD_DIM;
+use crate::layers::deepseek_v41::ops::{self, HEAD_DIM};
 use crate::layers::deepseek_v41::parts::Held;
 use crate::layers::deepseek_v41::test_support::{
     Recording, SHAPE, backend, bf16s, block, chosen, closeness, download, free_store, hand_choice,
@@ -72,7 +72,7 @@ fn run(layer: usize) -> Result<Report> {
         shape: SHAPE,
         held: Held::ALL,
         kernels: BlockKernels::load(gpu)?,
-        scratch: Arc::new(Scratch::alloc(gpu, &SHAPE, total / ratio)?),
+        scratch: Arc::new(Scratch::alloc(gpu, &SHAPE, total)?),
         handoff: Arc::new(Mutex::new(Handoff::default())),
     };
     let (block, store) = block(gpu, layer, false, shared)?;
@@ -122,6 +122,14 @@ fn run(layer: usize) -> Result<Report> {
         hand_choice(&block, &role, &theirs, visible);
         gpu.synchronize(stream)?;
         gpu.copy_h2d(&input, sc.normed)?;
+        ops::fp8_quant_dequant(
+            gpu,
+            block.shared.kernels.cache.fp8_quant_dequant,
+            sc.normed,
+            sc.quantized,
+            hidden,
+            stream,
+        )?;
         block.attention(gpu, 0, &mut state, position, None, stream)?;
         let kind = match step {
             None => 0,
@@ -130,7 +138,7 @@ fn run(layer: usize) -> Result<Report> {
         };
         pairs[kind]
             .0
-            .extend(download(gpu, sc.sublayer_out, hidden)?);
+            .extend(download(gpu, block.attention_out(gpu, stream)?, hidden)?);
         pairs[kind].1.extend(bf16s(&output));
 
         let mine = block.shared.handoff.lock().expect("handoff").rows[0]

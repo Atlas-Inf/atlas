@@ -8,6 +8,8 @@ use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
+use super::weights::{ExpertSlab, Slice};
+
 const THREADS: u32 = 256;
 /// The widest activation a kernel here stages in shared memory.
 const MAX_K: usize = 5120;
@@ -19,6 +21,10 @@ pub struct MoeKernels {
     /// The same in two launches, a block per (expert, token).
     pub scores: KernelHandle,
     pub pick: KernelHandle,
+    /// Every expert of a token in three launches (`dsv41_expert.cu`).
+    pub expert_in: KernelHandle,
+    pub expert_act: KernelHandle,
+    pub expert_out: KernelHandle,
     /// The plain projection, one thread per row.
     pub fp4_gemv: KernelHandle,
     /// The same on tensor cores, for up to 8 rows (`dsv41_fp4_tc.cu`).
@@ -37,6 +43,9 @@ impl MoeKernels {
             route: kernel("dsv41_moe_route")?,
             scores: kernel("dsv41_moe_scores")?,
             pick: kernel("dsv41_moe_pick")?,
+            expert_in: gpu.kernel("dsv41_expert", "dsv41_expert_in")?,
+            expert_act: gpu.kernel("dsv41_expert", "dsv41_expert_act")?,
+            expert_out: gpu.kernel("dsv41_expert", "dsv41_expert_out")?,
             fp4_gemv: kernel("dsv41_fp4_gemv")?,
             fp4_gemv_tc: gpu.kernel("dsv41_tc", "dsv41_fp4_gemv_tc8")?,
             plain_fp4: std::env::var("ATLAS_DSV41_PLAIN_FP4").is_ok_and(|v| v == "1"),
@@ -87,7 +96,9 @@ pub fn route(
 }
 
 /// [`route`] as the block runs it: the same choice, the scores summed in
-/// another order. `scores` is `[tokens, experts]` FP32 scratch.
+/// another order. `scores` is `[tokens, experts]` FP32 scratch. `by_expert`
+/// leaves the chosen in ascending expert order, each with its weight, which
+/// is the order their outputs are added in.
 #[allow(clippy::too_many_arguments)]
 pub fn route_fast(
     gpu: &dyn GpuBackend,
@@ -103,6 +114,7 @@ pub fn route_fast(
     experts: usize,
     top_k: usize,
     route_scale: f32,
+    by_expert: bool,
     stream: u64,
 ) -> Result<()> {
     ensure!(
@@ -128,6 +140,7 @@ pub fn route_fast(
         .arg_u32(experts as u32)
         .arg_u32(top_k as u32)
         .arg_f32(route_scale)
+        .arg_u32(u32::from(by_expert))
         .launch(stream)
 }
 
@@ -266,6 +279,99 @@ pub fn round_bf16(
         .arg_ptr(out)
         .arg_u32(n as u32)
         .launch(stream)
+}
+
+/// One part of every expert a token runs: the layer's slab of routed
+/// experts, and the shared expert's w1 rows, w3 rows and w2 columns.
+#[derive(Clone, Copy)]
+pub struct ExpertPart {
+    pub slab: ExpertSlab,
+    pub shared: [Slice; 3],
+}
+
+/// Working buffers of [`experts`], for `top_k + 1` slots of `rows` values:
+/// `gate_up` `[slots, 2, rows]` and `inner` `[slots, rows]`, BF16.
+#[derive(Clone, Copy)]
+pub struct ExpertScratch {
+    pub gate_up: DevicePtr,
+    pub inner: DevicePtr,
+}
+
+/// One part of every expert of one token in three launches
+/// (`dsv41_expert.cu`): `out` (`[top_k + 1, hidden]` FP32) = the part's
+/// partial of each chosen expert's output, in the order of `chosen`
+/// (`[top_k]` u32, with `weights` `[top_k]` FP32, as [`route_fast`] leaves
+/// them by expert), then of the shared expert's. `x` is the token's input in
+/// FP8, `rows` the part's share of an expert's hidden rows.
+#[allow(clippy::too_many_arguments)]
+pub fn experts(
+    gpu: &dyn GpuBackend,
+    kernels: &MoeKernels,
+    part: &ExpertPart,
+    x: DevicePtr,
+    chosen: DevicePtr,
+    weights: DevicePtr,
+    scratch: ExpertScratch,
+    out: DevicePtr,
+    top_k: usize,
+    rows: usize,
+    hidden: usize,
+    limit: f32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        rows.is_multiple_of(32) && hidden.is_multiple_of(32),
+        "dsv41_expert: {rows} rows of {hidden}"
+    );
+    let slots = top_k as u32 + 1;
+    let (data, scales) = part.slab.layout();
+    let [w1, w3, w2] = part.shared;
+    let slab = |launch: KernelLaunch<'_>| {
+        launch
+            .arg_u64(part.slab.stride() as u64)
+            .arg_u32(data as u32)
+            .arg_u32(scales as u32)
+            .launch(stream)
+    };
+    slab(
+        KernelLaunch::new(gpu, kernels.expert_in)
+            .grid([div_ceil(rows as u32, 16), 2 * slots, 1])
+            .block([256, 1, 1])
+            .arg_ptr(x)
+            .arg_ptr(part.slab.base)
+            .arg_ptr(chosen)
+            .arg_ptr(w1.data)
+            .arg_ptr(w1.scales)
+            .arg_ptr(w3.data)
+            .arg_ptr(w3.scales)
+            .arg_ptr(scratch.gate_up)
+            .arg_u32(top_k as u32)
+            .arg_u32(rows as u32)
+            .arg_u32(hidden as u32),
+    )?;
+    elementwise(gpu, kernels.expert_act, slots as usize * rows / 32)
+        .arg_ptr(scratch.gate_up)
+        .arg_ptr(weights)
+        .arg_ptr(scratch.inner)
+        .arg_u32(top_k as u32)
+        .arg_u32(slots)
+        .arg_u32(rows as u32)
+        .arg_f32(limit)
+        .launch(stream)?;
+    slab(
+        KernelLaunch::new(gpu, kernels.expert_out)
+            .grid([div_ceil(hidden as u32, 16), slots, 1])
+            .block([256, 1, 1])
+            .arg_ptr(scratch.inner)
+            .arg_ptr(part.slab.base)
+            .arg_ptr(chosen)
+            .arg_ptr(w2.data)
+            .arg_ptr(w2.scales)
+            .arg_ptr(out)
+            .arg_u32(top_k as u32)
+            .arg_u32(hidden as u32)
+            .arg_u32(rows as u32),
+    )
 }
 
 #[cfg(test)]

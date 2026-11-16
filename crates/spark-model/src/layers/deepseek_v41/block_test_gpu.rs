@@ -75,7 +75,6 @@ fn blocks_replay_the_reference_token_by_token() -> Result<()> {
             }
         };
         hand_keys(gpu, &block, &role, &keys, &index_keys)?;
-        let scratch = &block.shared.scratch;
         let (mut got, mut attended, mut pre_gap) =
             (Vec::with_capacity(want.len()), Vec::new(), 0.0f32);
         let (mut key_differ, mut index_key_differ, mut groups) = (0usize, 0usize, 0usize);
@@ -95,7 +94,7 @@ fn blocks_replay_the_reference_token_by_token() -> Result<()> {
                 hand_choice(&block, &role, &theirs, visible_groups(position, ratio));
             }
             block.attend(gpu, 0, streams, pre, &mut state, position, None, stream)?;
-            attended.extend(download(gpu, scratch.sublayer_out, hidden)?);
+            attended.extend(download(gpu, block.attention_out(gpu, stream)?, hidden)?);
             // A key is FP4: one rounding step in it is a large step, and
             // every later token reads it. So once a group's keys have been
             // compared, the tokens after it read DeepSeek's.
@@ -125,9 +124,9 @@ fn blocks_replay_the_reference_token_by_token() -> Result<()> {
             }
             // The rest of the block from DeepSeek's own attention output, so
             // the attention's rounding is not read as the FFN's error.
-            gpu.copy_h2d(
+            block.set_attention_out(
+                gpu,
                 &attention[position * hidden * 2..(position + 1) * hidden * 2],
-                scratch.sublayer_out,
             )?;
             block.finish(gpu, streams, pre, None, stream)?;
             got.extend(download(gpu, streams, copies * hidden)?);

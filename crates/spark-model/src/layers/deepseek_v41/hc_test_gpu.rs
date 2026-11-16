@@ -76,6 +76,7 @@ fn hyper_connections_replay_the_reference() -> Result<()> {
         gpu.alloc(tokens * copies * copies * 4)?,
     );
     let collapsed = gpu.alloc(tokens * hidden * 2)?;
+    let partials = gpu.alloc(SHAPE.partials(tokens))?;
 
     for layer in 0..3 {
         let l = format!("L{layer}.");
@@ -91,7 +92,7 @@ fn hyper_connections_replay_the_reference() -> Result<()> {
             let weights = site(gpu, &ckpt, layer, name)?;
             let op = format!("{l}op.hc.{name}.");
             mix(
-                gpu, k.mix, &SHAPE, &weights, streams, pre, post, comb, tokens, stream,
+                gpu, &k, &SHAPE, &weights, streams, partials, pre, post, comb, tokens, stream,
             )?;
             let gaps = [
                 f32_gap(gpu, pre, &recorded(&format!("{op}pre"), copies * 2)?)?,
@@ -169,5 +170,274 @@ fn hyper_connections_replay_the_reference() -> Result<()> {
         100.0 * same
     );
     assert!(same > 0.999, "final collapse: {same}");
+    Ok(())
+}
+
+/// A site's buffers, for one token.
+#[derive(Clone, Copy)]
+struct SiteBuffers {
+    streams: DevicePtr,
+    pre: DevicePtr,
+    post: DevicePtr,
+    comb: DevicePtr,
+    out: SiteOut,
+}
+
+impl SiteBuffers {
+    fn alloc(gpu: &dyn GpuBackend) -> Result<Self> {
+        let (hidden, copies) = (SHAPE.hidden, SHAPE.copies);
+        Ok(Self {
+            streams: gpu.alloc(copies * hidden * 2)?,
+            pre: gpu.alloc(copies * 4)?,
+            post: gpu.alloc(copies * 4)?,
+            comb: gpu.alloc(copies * copies * 4)?,
+            out: SiteOut {
+                collapsed: gpu.alloc(hidden * 2)?,
+                normed: gpu.alloc(hidden * 2)?,
+                quantized: gpu.alloc(hidden * 2)?,
+                partials: gpu.alloc(SHAPE.partials(1))?,
+            },
+        })
+    }
+
+    /// Everything a site leaves, as bytes.
+    fn bytes(&self, gpu: &dyn GpuBackend) -> Result<Vec<u8>> {
+        let (hidden, copies) = (SHAPE.hidden, SHAPE.copies);
+        gpu.synchronize(gpu.default_stream())?;
+        let mut all = Vec::new();
+        for (p, bytes) in [
+            (self.streams, copies * hidden * 2),
+            (self.pre, copies * 4),
+            (self.post, copies * 4),
+            (self.comb, copies * copies * 4),
+            (self.out.collapsed, hidden * 2),
+            (self.out.normed, hidden * 2),
+            (self.out.quantized, hidden * 2),
+        ] {
+            let mut got = vec![0u8; bytes];
+            gpu.copy_d2h(p, &mut got)?;
+            all.extend(got);
+        }
+        Ok(all)
+    }
+}
+
+/// `site` is two launches for the seven a site was, and `expand_parts` one
+/// for two: each leaves the bytes of the plain kernels, with and without a
+/// sublayer to expand first, on DeepSeek's recorded streams.
+#[test]
+#[ignore = "needs a GB10 GPU, the deepseek-v4.1-flash target, ATLAS_DSV41_REC (--ops) and ATLAS_DSV41_CKPT"]
+fn a_site_in_two_launches_leaves_the_plain_kernels_bytes() -> Result<()> {
+    use crate::layers::deepseek_v41::ops::{Kernels, fp8_quant_dequant};
+    use crate::layers::deepseek_v41::parts::{self, PARTS, PartKernels};
+    use crate::layers::ops::rms_norm;
+    use crate::weight_map::DenseWeight;
+
+    const LAYER: usize = 1;
+    const SLOTS: usize = 3;
+    let rec = Recording::open()?;
+    let ckpt = std::env::var("ATLAS_DSV41_CKPT").context("ATLAS_DSV41_CKPT=<checkpoint dir>")?;
+    let gpu = backend()?;
+    let (k, stream) = (HcKernels::load(gpu)?, gpu.default_stream());
+    let (part_kernels, cache) = (PartKernels::load(gpu)?, Kernels::load(gpu)?);
+    let norm_kernel = gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?;
+    let (hidden, copies) = (SHAPE.hidden, SHAPE.copies);
+    let picks = picks(&rec, 24);
+    let l = format!("L{LAYER}.");
+    let recorded = |name: &str, width: usize| -> Result<Vec<u8>> {
+        Ok(rows_of(
+            &rec.prefill(&format!("{l}{name}"))?.1,
+            width,
+            &picks,
+        ))
+    };
+    let streams = recorded("block_in", copies * hidden)?;
+    let carried = recorded("pre_mix_in", copies * 2)?;
+    let outputs = bf16s(&recorded("attn_out", hidden)?);
+    let (attn, ffn) = (
+        site(gpu, &ckpt, LAYER, "attn")?,
+        site(gpu, &ckpt, LAYER, "ffn")?,
+    );
+    let (_, _, norm) =
+        read_checkpoint_tensor(Path::new(&ckpt), &format!("layers.{LAYER}.ffn_norm.weight"))?;
+    let norm = DenseWeight {
+        weight: upload(gpu, &norm)?,
+    };
+    let (plain, fused) = (SiteBuffers::alloc(gpu)?, SiteBuffers::alloc(gpu)?);
+    let (pre_in, x) = (gpu.alloc(copies * 4)?, gpu.alloc(hidden * 2)?);
+    let parts_dev = gpu.alloc(PARTS * SLOTS * hidden * 4)?;
+
+    for token in 0..picks.len() {
+        let stream_in = &streams[token * copies * hidden * 2..(token + 1) * copies * hidden * 2];
+        // A sublayer's output in four unequal parts, a slot or three.
+        let split = [0.5f32, 0.25, 0.125, 0.12501];
+        let mut host = vec![0f32; PARTS * SLOTS * hidden];
+        for (i, value) in host.iter_mut().enumerate() {
+            let (part, slot, d) = (i / (SLOTS * hidden), i / hidden % SLOTS, i % hidden);
+            let bits = outputs[token * hidden + d];
+            *value = f32::from_bits(u32::from(bits) << 16) * split[part] * (1 + slot) as f32;
+        }
+        let host: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        for slots in [0, 1, SLOTS] {
+            gpu.synchronize(stream)?;
+            gpu.copy_h2d(
+                &carried[token * copies * 4..(token + 1) * copies * 4],
+                pre_in,
+            )?;
+            // `slots` slots of the parts, each part's together.
+            for part in 0..PARTS {
+                let at = part * SLOTS * hidden * 4;
+                gpu.copy_h2d(
+                    &host[at..at + slots * hidden * 4],
+                    parts_dev.offset(part * slots * hidden * 4),
+                )?;
+            }
+            // Both start at the recorded stream, with the attention site's
+            // post and comb to expand under.
+            for set in [&plain, &fused] {
+                gpu.copy_h2d(stream_in, set.streams)?;
+                mix(
+                    gpu,
+                    &k,
+                    &SHAPE,
+                    &attn,
+                    set.streams,
+                    set.out.partials,
+                    set.pre,
+                    set.post,
+                    set.comb,
+                    1,
+                    stream,
+                )?;
+            }
+            let before = (slots > 0).then_some(SublayerParts {
+                parts: parts_dev,
+                slots,
+            });
+            // The plain kernels, a launch each.
+            if before.is_some() {
+                parts::combine(
+                    gpu,
+                    part_kernels.combine,
+                    parts_dev,
+                    x,
+                    slots,
+                    hidden,
+                    stream,
+                )?;
+                expand(
+                    gpu,
+                    k.expand,
+                    &SHAPE,
+                    x,
+                    plain.streams,
+                    plain.post,
+                    plain.comb,
+                    plain.streams,
+                    1,
+                    stream,
+                )?;
+            }
+            mix(
+                gpu,
+                &k,
+                &SHAPE,
+                &ffn,
+                plain.streams,
+                plain.out.partials,
+                plain.pre,
+                plain.post,
+                plain.comb,
+                1,
+                stream,
+            )?;
+            collapse(
+                gpu,
+                k.collapse,
+                &SHAPE,
+                plain.streams,
+                pre_in,
+                plain.out.collapsed,
+                1,
+                stream,
+            )?;
+            rms_norm(
+                gpu,
+                norm_kernel,
+                plain.out.collapsed,
+                &norm,
+                plain.out.normed,
+                1,
+                hidden as u32,
+                SHAPE.norm_eps,
+                stream,
+            )?;
+            fp8_quant_dequant(
+                gpu,
+                cache.fp8_quant_dequant,
+                plain.out.normed,
+                plain.out.quantized,
+                hidden,
+                stream,
+            )?;
+            // The site in two.
+            super::site(
+                gpu,
+                &k,
+                &SHAPE,
+                &ffn,
+                before,
+                fused.streams,
+                pre_in,
+                fused.pre,
+                fused.post,
+                fused.comb,
+                norm.weight,
+                fused.out,
+                stream,
+            )?;
+            assert!(
+                plain.bytes(gpu)? == fused.bytes(gpu)?,
+                "token {token}, {slots} slots: the site in two launches differs"
+            );
+
+            // And the expansion alone, from the same parts, under the FFN
+            // site's post and comb, which both sets now hold.
+            let Some(before) = before else { continue };
+            for set in [&plain, &fused] {
+                gpu.copy_h2d(stream_in, set.streams)?;
+            }
+            expand(
+                gpu,
+                k.expand,
+                &SHAPE,
+                x,
+                plain.streams,
+                plain.post,
+                plain.comb,
+                plain.streams,
+                1,
+                stream,
+            )?;
+            expand_parts(
+                gpu,
+                k.expand_parts,
+                &SHAPE,
+                before,
+                fused.streams,
+                fused.post,
+                fused.comb,
+                stream,
+            )?;
+            assert!(
+                plain.bytes(gpu)? == fused.bytes(gpu)?,
+                "token {token}, {slots} slots: the expansion from parts differs"
+            );
+        }
+    }
+    println!(
+        "layer {LAYER}: a site in two launches, and an expansion from parts, leave the plain kernels' bytes on {} tokens, with no sublayer before, the attention's and the MoE's",
+        picks.len()
+    );
     Ok(())
 }

@@ -146,14 +146,19 @@ pub struct Scratch {
     pub(super) q: DevicePtr,
     pub(super) key: DevicePtr,
     pub(super) idx: DevicePtr,
-    pub(super) position: DevicePtr,
-    pub(super) group_position: DevicePtr,
+    /// `[max_positions]` u32, each its own index: the word a rotation reads
+    /// for a position, with nothing to upload.
+    pub(super) positions: DevicePtr,
     pub(super) attended: DevicePtr,
     pub(super) o_low: DevicePtr,
     pub(super) o_low_quantized: DevicePtr,
+    /// A sublayer's output rounded from its parts, for a test to read.
+    #[cfg(test)]
     pub(super) sublayer_out: DevicePtr,
-    pub(super) gate: DevicePtr,
-    pub(super) up: DevicePtr,
+    /// `[top_k + 1, 2, inter / PARTS]` BF16: one part's gate and up rows of
+    /// each chosen expert, then of the shared expert.
+    pub(super) gate_up: DevicePtr,
+    /// `[top_k + 1, inter / PARTS]` BF16: their activations, in FP8.
     pub(super) inner: DevicePtr,
     /// `[PARTS, hidden]` FP32: the parts of the attention's output.
     pub(super) attn_parts: DevicePtr,
@@ -168,7 +173,8 @@ pub struct Scratch {
     pub(super) weights: DevicePtr,
     pub(super) pooled: DevicePtr,
     pub(super) site_pre: DevicePtr,
-    pub(super) next_pre: DevicePtr,
+    /// The mix's partial sums, a block of the token each.
+    pub(super) hc_partials: DevicePtr,
     pub(super) post: DevicePtr,
     pub(super) comb: DevicePtr,
     pub(super) index_q: DevicePtr,
@@ -183,8 +189,10 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    /// `max_groups` bounds the compressed positions one query scores.
-    pub fn alloc(gpu: &dyn GpuBackend, s: &Shape, max_groups: usize) -> Result<Self> {
+    /// `max_positions` bounds a sequence, and so the compressed positions one
+    /// query scores.
+    pub fn alloc(gpu: &dyn GpuBackend, s: &Shape, max_positions: usize) -> Result<Self> {
+        let max_groups = max_positions;
         let bf16 = |values: usize| gpu.alloc(values * 2);
         let f32s = |values: usize| gpu.alloc(values * 4);
         let copies = s.hc.copies;
@@ -198,15 +206,21 @@ impl Scratch {
             q: bf16(s.heads * HEAD_DIM)?,
             key: bf16(HEAD_DIM)?,
             idx: f32s(MAX_KEYS)?,
-            position: f32s(1)?,
-            group_position: f32s(1)?,
+            positions: {
+                let table = f32s(max_positions.max(1))?;
+                let words: Vec<u8> = (0..max_positions as u32)
+                    .flat_map(u32::to_le_bytes)
+                    .collect();
+                gpu.copy_h2d(&words, table)?;
+                table
+            },
             attended: bf16(s.heads * HEAD_DIM)?,
             o_low: bf16(s.o_groups * s.o_rank)?,
             o_low_quantized: bf16(s.o_groups * s.o_rank)?,
+            #[cfg(test)]
             sublayer_out: bf16(s.hidden)?,
-            gate: bf16(s.inter)?,
-            up: bf16(s.inter)?,
-            inner: bf16(s.inter)?,
+            gate_up: bf16((s.top_k + 1) * 2 * s.inter / PARTS)?,
+            inner: bf16((s.top_k + 1) * s.inter / PARTS)?,
             attn_parts: f32s(PARTS * s.hidden)?,
             moe_parts: f32s(PARTS * (s.top_k + 1) * s.hidden)?,
             gather_recv: f32s(PARTS * (s.top_k + 1) * s.hidden)?,
@@ -215,7 +229,7 @@ impl Scratch {
             weights: f32s(s.top_k)?,
             pooled: bf16(HEAD_DIM)?,
             site_pre: f32s(copies)?,
-            next_pre: f32s(copies)?,
+            hc_partials: gpu.alloc(s.hc.partials(1))?,
             post: f32s(copies)?,
             comb: f32s(copies * copies)?,
             index_q: bf16(s.index_heads * INDEX_DIM)?,

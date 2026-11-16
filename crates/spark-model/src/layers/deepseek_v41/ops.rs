@@ -17,6 +17,8 @@ pub const HEAD_DIM: usize = 512;
 pub const MAX_KEYS: usize = 640;
 
 const THREADS: u32 = 256;
+/// `dsv41_sparse_attn` runs a head on one block this wide: a thread a key.
+const ATTN_THREADS: u32 = 640;
 
 /// The kernels of the V4.1 attention cache.
 #[derive(Clone, Copy)]
@@ -64,7 +66,7 @@ pub fn sparse_attn(
     ensure!(keys <= MAX_KEYS, "dsv41_sparse_attn: {keys} keys");
     KernelLaunch::new(gpu, kernel)
         .grid([queries as u32, heads as u32, 1])
-        .block([THREADS, 1, 1])
+        .block([ATTN_THREADS, 1, 1])
         .arg_ptr(q)
         .arg_ptr(keys_a)
         .arg_ptr(keys_b)
