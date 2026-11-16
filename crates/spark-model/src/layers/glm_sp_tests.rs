@@ -1,31 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Tests of `glm_sp`: the rows each rank owns, and the pair's quantized
-//! gather switch.
+//! Tests of `glm_sp`: the rows each rank owns, and every SP split's
+//! quantized gathers.
 
 use super::*;
 
 #[test]
-fn the_pair_gathers_quantized_only_when_asked() {
-    // The chain always, whatever the pair's switch says.
-    for pair in 0..=2 {
-        assert!(quant_gather_serves(4, pair));
-        assert!(!quant_gather_serves(1, pair));
+fn every_sp_split_gathers_quantized() {
+    // The chain and the pair both; a lone rank has no peers to gather.
+    for ranks in [2, 4] {
+        for rank in 0..ranks {
+            assert!(SpRows::for_rank(8192, rank, ranks).quant_gathers());
+        }
     }
-    assert!(!quant_gather_serves(2, 0));
-    assert!(quant_gather_serves(2, 1));
-    assert!(quant_gather_serves(2, 2));
-}
-
-#[test]
-fn the_pair_switch_is_0_1_or_2() {
-    assert_eq!(parse_quant_gather_pair(None).unwrap(), 0);
-    assert_eq!(parse_quant_gather_pair(Some("")).unwrap(), 0);
-    assert_eq!(parse_quant_gather_pair(Some("0")).unwrap(), 0);
-    assert_eq!(parse_quant_gather_pair(Some("1")).unwrap(), 1);
-    assert_eq!(parse_quant_gather_pair(Some("2")).unwrap(), 2);
-    for junk in ["3", "true", "on", "-1"] {
-        assert!(parse_quant_gather_pair(Some(junk)).is_err(), "{junk}");
-    }
+    assert!(!SpRows::for_rank(8192, 0, 1).quant_gathers());
 }
 
 #[test]

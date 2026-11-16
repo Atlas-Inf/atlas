@@ -116,7 +116,7 @@ fn staged_rows(rows: std::ops::Range<usize>, width: usize, which: usize) -> Vec<
         .collect()
 }
 
-/// A pair seam under `ATLAS_GLM_SP_QUANT_GATHER_PAIR`: the reduce-scatter
+/// A pair seam's quantized gather: the reduce-scatter
 /// and the site as before, then, in place of the normed rows' gather, that
 /// of the [`STAGED`] tensors, whose local rows the site writes block by
 /// block (`group` blocks a gather; `None`: the whole seam's form). Each
