@@ -22,7 +22,7 @@ use super::block::{Block, BlockKernels, Candidates, Handoff, Scratch, SeqState, 
 use super::cache_recipe::rope_freqs;
 use super::engram::{Engram, EngramWeights, held_columns};
 use super::engram_table::{EngramHash, EngramTable, Prefetcher};
-use super::gemm::GemmWeights;
+use super::gemm::{GemmWeights, gemms};
 use super::hc::{self, IDENTITY_PRE};
 use super::index::INDEX_DIM;
 use super::ops::HEAD_DIM;
@@ -372,11 +372,9 @@ pub fn load_layers(
             stream,
         )
         .with_context(|| format!("layer {layer}"))?;
-        // ATLAS_DSV41_NO_GEMM keeps every batch on the row-at-a-time
-        // kernels, to compare the two.
-        let gemm = match std::env::var_os("ATLAS_DSV41_NO_GEMM") {
-            Some(_) => None,
-            None => Some(
+        let gemm = match gemms() {
+            false => None,
+            true => Some(
                 GemmWeights::load(gpu, &shape, &weights, held, stream)
                     .with_context(|| format!("layer {layer}: GEMM operands"))?,
             ),

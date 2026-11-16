@@ -24,7 +24,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use super::cache_recipe::bf16_to_f32;
-use super::gemm::{GEMM_ROWS, GemmScratch, Input, operand};
+use super::gemm::{GEMM_ROWS, GemmScratch, Input, gemms, operand};
 use super::parts::{self, Held, PARTS};
 use super::shape::{BlockKernels, Shape};
 use super::side;
@@ -86,7 +86,9 @@ impl EngramWeights {
             gpu.copy_d2d(from.data, slice.data, part_rows * k)?;
             gpu.copy_d2d(from.scales, slice.scales, part_rows * k / 32)?;
             wkv[at] = Some(slice);
-            gemm[at] = Some(operand(gpu, slice, part_rows, k, stream)?);
+            if gemms() {
+                gemm[at] = Some(operand(gpu, slice, part_rows, k, stream)?);
+            }
         }
         store.reclaim(gpu, &format!("{prefix}.wkv.weight"))?;
         gpu.free(whole.w.scales)?;

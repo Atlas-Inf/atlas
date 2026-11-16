@@ -362,6 +362,7 @@ impl TransformerModel {
             .collect_prompt_logprobs
             .is_some()
             .then(crate::layers::deepseek_v41::tail::whole);
+        let _rest = crate::layers::deepseek_v41::tail::before(total - (chunk_start + chunk_len));
         if !self.prefill_b_exact_direct(seq, chunk_start + chunk_len, is_last_chunk, proc_count) {
             let stopped = self.prefill_b_forward_layers(
                 seq,

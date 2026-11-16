@@ -8,9 +8,13 @@
 //! layer's stream is read at one row, the chunk's last. So layer `L` of
 //! `layers` needs correct outputs for the rows the next layer runs, and
 //! keys for 128 rows before those, which come from its inputs and not from
-//! its outputs: it runs the last `128 * (layers - L)` rows of a chunk, and
+//! its outputs: it runs the last `128 * (layers - L)` rows of a prompt, and
 //! the first 128 of them, which attend over keys it never made, leave
 //! outputs nothing reads. Nothing that is read changes.
+//!
+//! A prompt comes in chunks, and those rows are counted from its end, not
+//! a chunk's: a chunk with more of the prompt after it than a layer's rows
+//! is not run by that layer at all ([`before`] says how much comes after).
 //!
 //! That is true only while nothing reads the last layer's other rows. A
 //! request that wants the logits of every prompt position does, so the
@@ -29,6 +33,26 @@ use super::cache_recipe::WINDOW;
 
 thread_local! {
     static WHOLE: Cell<bool> = const { Cell::new(false) };
+    static AFTER: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Says how much of a prompt comes after the chunk until dropped.
+pub struct Before {
+    was: usize,
+}
+
+/// The chunk the prefill on this thread runs, until the guard drops, has
+/// `tokens` more of its prompt after it.
+pub fn before(tokens: usize) -> Before {
+    Before {
+        was: AFTER.with(|a| a.replace(tokens)),
+    }
+}
+
+impl Drop for Before {
+    fn drop(&mut self) {
+        AFTER.with(|a| a.set(self.was));
+    }
 }
 
 /// Keeps every row of the prefills on this thread until dropped.
@@ -63,18 +87,21 @@ pub fn whole_here() -> bool {
     WHOLE.with(Cell::get)
 }
 
-/// Where in a chunk of `tokens` rows a layer that may run its last `tail`
-/// alone starts, in a pass that reads every row (`whole`) or does not.
+/// Where in a chunk of `tokens` rows a layer that may run the last `tail`
+/// of a prompt alone starts, in a pass that reads every row (`whole`) or
+/// does not: `tokens` when it runs none of the chunk.
 pub fn first_row(tail: Option<usize>, tokens: usize, whole: bool) -> usize {
     match tail {
-        Some(tail) if !whole => tokens.saturating_sub(tail),
+        Some(tail) if !whole => (tokens + AFTER.with(Cell::get))
+            .saturating_sub(tail)
+            .min(tokens),
         _ => 0,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{first_row, rows_of_layer, whole, whole_here};
+    use super::{before, first_row, rows_of_layer, whole, whole_here};
 
     #[test]
     fn a_late_layer_runs_the_rows_the_layers_after_it_read() {
@@ -92,6 +119,23 @@ mod tests {
         assert_eq!(first_row(None, 8192, false), 0);
         // And a pass that reads every row runs every row.
         assert_eq!(first_row(tail, 8192, true), 0);
+    }
+
+    #[test]
+    fn the_rows_are_counted_from_the_prompts_end() {
+        let tail = Some(256);
+        // With a chunk still to come, 100 of its 256 are this chunk's.
+        {
+            let _more = before(156);
+            assert_eq!(first_row(tail, 8192, false), 8192 - 100);
+            assert_eq!(first_row(tail, 8192, true), 0);
+        }
+        // With more than that to come, none are.
+        {
+            let _more = before(4096);
+            assert_eq!(first_row(tail, 8192, false), 8192);
+        }
+        assert_eq!(first_row(tail, 8192, false), 8192 - 256);
     }
 
     #[test]

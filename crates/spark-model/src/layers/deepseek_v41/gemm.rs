@@ -26,6 +26,13 @@ use crate::weight_map::Mxfp8Weight;
 
 /// The fewest rows a batch goes through the GEMMs with.
 pub const GEMM_ROWS: usize = 64;
+
+/// Whether batches go through the GEMMs at all: `ATLAS_DSV41_NO_GEMM` keeps
+/// every batch on the row-at-a-time kernels, whose bytes do not depend on
+/// the rows a batch holds, to compare the two.
+pub fn gemms() -> bool {
+    std::env::var_os("ATLAS_DSV41_NO_GEMM").is_none()
+}
 /// The batch height a projection's kernel is chosen at.
 const REF_ROWS: usize = 512;
 
