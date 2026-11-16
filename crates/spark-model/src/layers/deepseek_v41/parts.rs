@@ -2,17 +2,20 @@
 
 //! The wide projections in four parts.
 //!
-//! Every projection that is large enough to matter is cut in four: its
-//! output rows where rows are independent (an expert's w1 and w3, the query
-//! heads, the output groups), its input columns where it sums over them (an
-//! expert's w2, wo_b). A column part's sum is an FP32 partial, and the four
-//! partials are added in part order before the one rounding
+//! Every projection that is large enough to matter is cut in four by its
+//! output rows: a part computes a quarter of the output from the whole
+//! input. Where the input is itself the output of parts (an expert's hidden
+//! activation into w2, the low-rank attention output into wo_b), the ranks
+//! gather it first, and the projection reads it in the pieces the parts
+//! left. The Engram's projection is cut by input columns, a part reading
+//! the table rows of a quarter of the hash columns: its sum is an FP32
+//! partial, and the four are added in part order before the one rounding
 //! (`dsv41_parts.cu`).
 //!
 //! A rank holds `PARTS / world` consecutive parts. One Spark computes all
-//! four, four Sparks one each and gather the partials. The kernels, their
-//! operands and the order of the sum are the same either way, so the bytes
-//! are too, and each of four Sparks reads a quarter of the weights.
+//! four, four Sparks one each and gather. The kernels, their operands and
+//! the order of every sum are the same either way, so the bytes are too,
+//! and each of four Sparks reads a quarter of the weights.
 
 use std::ops::Range;
 
@@ -29,7 +32,7 @@ pub const PARTS: usize = 4;
 pub const TILE: usize = 8;
 /// The widest row a kernel that stages its weights has room for
 /// (`F4_MAX_BLOCKS` scale blocks in `dsv41_tc.cuh`).
-pub const STAGED_K: usize = 5120;
+pub const STAGED_K: usize = 8192;
 
 /// The parts one rank computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,8 +84,11 @@ pub struct PartKernels {
     /// one that rounds its input.
     pub fp8_two: KernelHandle,
     pub fp8_groups_q: KernelHandle,
+    /// An FP8 projection of an input in pieces, and the same rounding it.
+    pub fp8_pieces: KernelHandle,
+    pub fp8_pieces_q: KernelHandle,
     pub round: KernelHandle,
-    pub combine: KernelHandle,
+    pub slots_sum: KernelHandle,
     pub slice: KernelHandle,
 }
 
@@ -99,8 +105,10 @@ impl PartKernels {
             fp8_f32_q: tc("dsv41_fp8_gemv_tc8_f32_q")?,
             fp8_two: tc("dsv41_fp8_gemv_two")?,
             fp8_groups_q: tc("dsv41_fp8_gemv_groups_q")?,
+            fp8_pieces: tc("dsv41_fp8_gemv_pieces")?,
+            fp8_pieces_q: tc("dsv41_fp8_gemv_pieces_q")?,
             round: parts("dsv41_parts_round")?,
-            combine: parts("dsv41_moe_combine")?,
+            slots_sum: parts("dsv41_slots_sum")?,
             slice: parts("dsv41_slice_columns")?,
         })
     }
@@ -269,28 +277,72 @@ pub fn round(
         .launch(stream)
 }
 
-/// The MoE's output `y` (`[n]` BF16): every slot of `parts` rounded as
-/// [`round`] rounds it, the slots added in FP32 in slot order, and the sum
-/// rounded.
+/// `rows` vectors through FP8 projection `w` (`[n, k]`) whose input the
+/// ranks gathered: `x` is in pieces of `piece` values a vector, a piece's
+/// vectors one after another and the next piece `piece_stride` values on.
+/// `out` is BF16, its rows `out_stride` values apart and `n` of each
+/// written. `kernel` says whether the input is rounded to FP8 on the way in.
 #[allow(clippy::too_many_arguments)]
-pub fn combine(
+pub fn project_pieces(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
-    parts: DevicePtr,
+    x: DevicePtr,
+    w: Slice,
+    out: DevicePtr,
+    out_stride: usize,
+    rows: usize,
+    n: usize,
+    k: usize,
+    piece: usize,
+    piece_stride: usize,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        k.is_multiple_of(32) && piece.is_multiple_of(64) && k.is_multiple_of(piece),
+        "dsv41_fp8_gemv_pieces: k {k} in pieces of {piece}"
+    );
+    for first in (0..rows).step_by(TILE) {
+        KernelLaunch::new(gpu, kernel)
+            .grid([div_ceil(n as u32, 16), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(x.offset(first * piece * 2))
+            .arg_ptr(w.data)
+            .arg_ptr(w.scales)
+            .arg_ptr(out.offset(first * out_stride * 2))
+            .arg_u32((rows - first).min(TILE) as u32)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .arg_u32(out_stride as u32)
+            .arg_u32(piece as u32)
+            .arg_u32(piece as u32)
+            .arg_u64(piece_stride as u64)
+            .launch(stream)?;
+    }
+    Ok(())
+}
+
+/// The MoE's output `y` (`[rows, n]` BF16) from its experts' (`out`, `[rows,
+/// slots, n]` BF16): the slots added in FP32 in slot order, and the sum
+/// rounded.
+#[allow(clippy::too_many_arguments)]
+pub fn slots_sum(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    out: DevicePtr,
     y: DevicePtr,
-    stride: usize,
+    rows: usize,
     slots: usize,
     n: usize,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n as u32, 256), 1, 1])
+        .grid([div_ceil((rows * n) as u32, 256), 1, 1])
         .block([256, 1, 1])
-        .arg_ptr(parts)
+        .arg_ptr(out)
         .arg_ptr(y)
         .arg_u32(slots as u32)
         .arg_u32(n as u32)
-        .arg_u32(stride as u32)
+        .arg_u32(rows as u32)
         .launch(stream)
 }
 

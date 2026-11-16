@@ -52,8 +52,8 @@ impl Fp8Proj {
 pub type Parted = [Option<Slice>; PARTS];
 
 /// One part of every routed expert of a layer, in one allocation: expert
-/// `e` at `base + e * stride`, as w1's rows of the part, w3's, and w2's
-/// columns of the part, each followed by its scales.
+/// `e` at `base + e * stride`, as the part's rows of w1, of w3 and of w2,
+/// each followed by its scales.
 #[derive(Clone, Copy)]
 pub struct ExpertSlab {
     pub base: DevicePtr,
@@ -91,7 +91,7 @@ impl ExpertSlab {
         self.slice(expert, 1)
     }
 
-    /// `[hidden, inter / 4]` FP4: the part's columns of the down projection.
+    /// `[hidden / 4, inter]` FP4: the part's rows of the down projection.
     pub fn w2(&self, expert: usize) -> Slice {
         self.slice(expert, 2)
     }
@@ -107,9 +107,8 @@ pub struct AttentionWeights {
     pub wkv: Fp8Proj,
     /// Whole on every rank; a part is a quarter of the groups.
     pub wo_a: Fp8Proj,
-    /// `[hidden, groups * o_rank / 4]` a part: a quarter of the groups'
-    /// columns.
-    pub wo_b: Parted,
+    /// Whole on every rank; a part is a quarter of its rows.
+    pub wo_b: Fp8Proj,
     /// `[heads]` FP32.
     pub sink: DevicePtr,
 }
@@ -149,11 +148,11 @@ pub struct MoeWeights {
     pub bias: DevicePtr,
     /// Every routed expert, a part at a time.
     pub experts: [Option<ExpertSlab>; PARTS],
-    /// The shared expert: w1 and w3 whole on every rank (a part is a quarter
-    /// of their rows), w2 in column parts.
+    /// The shared expert, whole on every rank: a part is a quarter of each
+    /// projection's rows.
     pub shared_w1: Fp8Proj,
     pub shared_w3: Fp8Proj,
-    pub shared_w2: Parted,
+    pub shared_w2: Fp8Proj,
 }
 
 pub struct BlockWeights {
@@ -331,7 +330,7 @@ fn expert_slab(
         "deepseek_v41: experts [{inter}, {hidden}] do not split in {PARTS} parts"
     );
     // A part of w1 or w3 is inter / 4 rows of hidden values; a part of w2 is
-    // hidden rows of inter / 4 values. Both are the same number of bytes.
+    // hidden / 4 rows of inter values. Both are the same number of bytes.
     let slab = ExpertSlab {
         base: gpu.alloc(shape.experts * 3 * (inter / PARTS) * (hidden / 2 + hidden / 32))?,
         data: inter / PARTS * hidden / 2,
@@ -342,7 +341,7 @@ fn expert_slab(
         for (projection, name, rows, columns, axis) in [
             (0, "w1", inter, hidden, SliceAxis::Rows),
             (1, "w3", inter, hidden, SliceAxis::Rows),
-            (2, "w2", hidden, inter, SliceAxis::Cols),
+            (2, "w2", hidden, inter, SliceAxis::Rows),
         ] {
             let slice = slab.slice(expert, projection);
             for (tensor, row_bytes, dst) in [
@@ -385,15 +384,11 @@ fn hc_site(store: &WeightStore, layer: &str, site: &str) -> Result<HcSite> {
 }
 
 impl BlockWeights {
-    /// Free the parts this made for itself: the routed experts and the
-    /// column parts. The rest belongs to the store it was loaded from.
+    /// Free the parts this made for itself: the routed experts. The rest
+    /// belongs to the store it was loaded from.
     pub fn free_parts(&self, gpu: &dyn GpuBackend) -> Result<()> {
         for slab in self.moe.experts.iter().flatten() {
             gpu.free(slab.base)?;
-        }
-        for part in self.attn.wo_b.iter().chain(&self.moe.shared_w2).flatten() {
-            gpu.free(part.data)?;
-            gpu.free(part.scales)?;
         }
         Ok(())
     }
@@ -426,15 +421,7 @@ impl BlockWeights {
             wq_b: fp8(store, gpu, &format!("{layer}.attn.wq_b"))?,
             wkv: fp8(store, gpu, &format!("{layer}.attn.wkv"))?,
             wo_a: fp8(store, gpu, &format!("{layer}.attn.wo_a"))?,
-            wo_b: column_parts(
-                store,
-                gpu,
-                kernels,
-                &format!("{layer}.attn.wo_b"),
-                held,
-                stream,
-            )?
-            .0,
+            wo_b: fp8(store, gpu, &format!("{layer}.attn.wo_b"))?,
             sink: tensor(store, &format!("{layer}.attn.attn_sink"), WeightDtype::FP32)?,
         };
         let compressor = match compress_ratio {
@@ -478,15 +465,7 @@ impl BlockWeights {
             },
             shared_w1: fp8(store, gpu, &format!("{layer}.ffn.shared_experts.w1"))?,
             shared_w3: fp8(store, gpu, &format!("{layer}.ffn.shared_experts.w3"))?,
-            shared_w2: column_parts(
-                store,
-                gpu,
-                kernels,
-                &format!("{layer}.ffn.shared_experts.w2"),
-                held,
-                stream,
-            )?
-            .0,
+            shared_w2: fp8(store, gpu, &format!("{layer}.ffn.shared_experts.w2"))?,
         };
         Ok(Self {
             hc_attn: hc_site(store, &layer, "attn")?,

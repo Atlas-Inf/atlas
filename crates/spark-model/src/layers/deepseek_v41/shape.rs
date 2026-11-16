@@ -150,11 +150,9 @@ pub struct Scratch {
     /// Rows there is room for.
     pub(super) rows: usize,
     /// The routed experts of a batch, grouped; and the shared expert's
-    /// `[rows, 2, inter / PARTS]` gate and up rows and `[rows, inter / PARTS]`
-    /// activations.
+    /// `[rows, 2, inter / PARTS]` gate and up rows.
     pub(super) grouped: GroupedScratch,
     pub(super) shared_gate_up: DevicePtr,
-    pub(super) shared_inner: DevicePtr,
     /// `[128 + rows, 512]` BF16: the window's keys in position order and
     /// then the batch's own, when a batch is more than one row.
     pub(super) chunk_keys: DevicePtr,
@@ -175,20 +173,25 @@ pub struct Scratch {
     /// What the attention keeps of one part's heads between its launches.
     pub(super) attn_records: DevicePtr,
     pub(super) o_low: DevicePtr,
-    /// A sublayer's output rounded from its parts, for a test to read.
+    /// One token's sublayer output in one run, for a test to read.
     #[cfg(test)]
     pub(super) sublayer_out: DevicePtr,
     /// `[top_k + 1, 2, inter / PARTS]` BF16: one part's gate and up rows of
     /// each chosen expert, then of the shared expert.
     pub(super) gate_up: DevicePtr,
-    /// `[top_k + 1, inter / PARTS]` BF16: their activations, in FP8.
-    pub(super) inner: DevicePtr,
-    /// `[PARTS, hidden]` FP32: the parts of the attention's output.
-    pub(super) attn_parts: DevicePtr,
-    /// `[PARTS, top_k + 1, hidden]` FP32: the parts of each chosen expert's
-    /// output, in expert order, then of the shared expert's.
-    pub(super) moe_parts: DevicePtr,
-    /// Scratch as large as `moe_parts`, for a gather that is not in place.
+    /// `[PARTS, rows * (top_k + 1), inter / PARTS]` BF16: the parts of the
+    /// experts' hidden activations, in FP8. A token alone has its chosen
+    /// experts' and then the shared expert's; a batch has its (row, expert)
+    /// pairs' in expert order and then every row's shared expert's.
+    pub(super) inner_parts: DevicePtr,
+    /// `[rows, top_k + 1, hidden / PARTS]` BF16: one part of each expert's
+    /// output.
+    pub(super) slot_out: DevicePtr,
+    /// `[PARTS, rows, hidden / PARTS]` BF16 each: the parts of the
+    /// attention's output and of the MoE's.
+    pub(super) attn_out: DevicePtr,
+    pub(super) moe_out: DevicePtr,
+    /// Scratch as large as the largest gather, for one that is not in place.
     pub(super) gather_recv: DevicePtr,
     /// `[experts]` FP32: the routing score of every expert.
     pub(super) route_scores: DevicePtr,
@@ -236,7 +239,6 @@ impl Scratch {
             rows: ROWS,
             grouped: GroupedScratch::alloc(gpu, ROWS, s.top_k, s.experts, s.inter / PARTS)?,
             shared_gate_up: bf16(ROWS * 2 * s.inter / PARTS)?,
-            shared_inner: bf16(ROWS * s.inter / PARTS)?,
             chunk_keys: bf16((WINDOW + ROWS) * HEAD_DIM)?,
             x: bf16(ROWS * (s.hidden))?,
             normed: bf16(ROWS * (s.hidden))?,
@@ -260,10 +262,11 @@ impl Scratch {
             #[cfg(test)]
             sublayer_out: bf16(s.hidden)?,
             gate_up: bf16((s.top_k + 1) * 2 * s.inter / PARTS)?,
-            inner: bf16((s.top_k + 1) * s.inter / PARTS)?,
-            attn_parts: f32s(ROWS * (PARTS * s.hidden))?,
-            moe_parts: f32s(ROWS * (PARTS * (s.top_k + 1) * s.hidden))?,
-            gather_recv: f32s(ROWS * (PARTS * (s.top_k + 1) * s.hidden))?,
+            inner_parts: bf16(ROWS * (s.top_k + 1) * s.inter)?,
+            slot_out: bf16(ROWS * (s.top_k + 1) * s.hidden / PARTS)?,
+            attn_out: bf16(ROWS * s.hidden)?,
+            moe_out: bf16(ROWS * s.hidden)?,
+            gather_recv: bf16(ROWS * ((s.top_k + 1) * s.inter).max(s.o_groups * s.o_rank))?,
             route_scores: f32s(ROWS * (s.experts))?,
             chosen: f32s(ROWS * (s.top_k))?,
             weights: f32s(ROWS * (s.top_k))?,

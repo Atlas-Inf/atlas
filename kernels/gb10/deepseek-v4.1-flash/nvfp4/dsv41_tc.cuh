@@ -43,10 +43,10 @@
 #define F4_WARP 32
 #define F4_BLOCK 32
 // Stages of weights in flight, a row's bytes of one (FP8; FP4 packs two
-// values a byte), and the scale blocks of the widest row (K = 5120).
+// values a byte), and the scale blocks of the widest row (K = 8192).
 #define F4_DEPTH 3
 #define F4_STAGE_BYTES 512
-#define F4_MAX_BLOCKS 160
+#define F4_MAX_BLOCKS 256
 
 // What a block keeps in shared memory: the weight codes and the warps'
 // sums; and, when it stages its weights, those and their scales.
@@ -67,6 +67,17 @@ __device__ __forceinline__ void f4_cp16(void* dst, const void* src) {
     asm volatile("cp.async.ca.shared.global [%0],[%1],16;\n" : : "r"(d), "l"(src));
 }
 
+// Where the activations of the K values from `kb` start, for the row at `A`.
+// An input the ranks gathered is in pieces: `piece` K values of every row,
+// and the next piece `piece_stride` values on. One that is whole has `piece`
+// 0. A piece is a multiple of 64, so a chunk never straddles two.
+__device__ __forceinline__ const __nv_bfloat16* f4_at(
+    const __nv_bfloat16* A, unsigned int kb, unsigned int piece,
+    unsigned long long piece_stride) {
+    if (piece == 0u) return A + kb;
+    return A + (unsigned long long)(kb / piece) * piece_stride + kb % piece;
+}
+
 template <int NT>
 struct F4Chunk {
     uint4 w0, w1;               // 16 values of rows g and g+8 (FP4: 8 bytes each)
@@ -76,7 +87,7 @@ struct F4Chunk {
 
 // Chunk `ch` of the lane's rows: values at w{0,1}p + ch * (FP4 ? 32 : 64)
 // (8 or 16 bytes each) and scales at s{0,1}p[ch * 2]; activations at k = kb
-// = ch * 64 + 16c.
+// = ch * 64 + 16c, which `A` points at for row 0 (`f4_at`).
 template <int NT, bool FP4>
 __device__ __forceinline__ void f4_load(
     F4Chunk<NT>& t, const unsigned char* w0p, const unsigned char* w1p,
@@ -105,7 +116,7 @@ __device__ __forceinline__ void f4_load(
         const unsigned int row = 8u * i + g;
         if (row < M) {
             const unsigned long long at = a_rows ? (unsigned long long)a_rows[row] : row;
-            const uint4* xp = (const uint4*)(A + at * a_stride + kb);
+            const uint4* xp = (const uint4*)(A + at * a_stride);
             t.x[i][0] = xp[0];
             t.x[i][1] = xp[1];
         }
@@ -139,7 +150,7 @@ __device__ __forceinline__ void f4_take(
         const unsigned int row = 8u * i + g;
         if (row < M) {
             const unsigned long long at = a_rows ? (unsigned long long)a_rows[row] : row;
-            const uint4* xp = (const uint4*)(A + at * a_stride + kb);
+            const uint4* xp = (const uint4*)(A + at * a_stride);
             t.x[i][0] = xp[0];
             t.x[i][1] = xp[1];
         }
@@ -323,7 +334,9 @@ __device__ __forceinline__ void dsv41_gemv_tc_impl(
     unsigned int cta,
     unsigned int a_stride,
     const int* a_rows = nullptr,
-    const int* c_rows = nullptr
+    const int* c_rows = nullptr,
+    unsigned int piece = 0,
+    unsigned long long piece_stride = 0
 ) {
     f4_codes<FP4>(sh.code);
     __syncthreads();
@@ -342,15 +355,17 @@ __device__ __forceinline__ void dsv41_gemv_tc_impl(
     F4Chunk<NT> cur, nxt;
     unsigned int ch = warp;
     if (ch < chunks) {
-        f4_load<NT, FP4>(cur, r.w0p, r.w1p, r.s0p, r.s1p, A, a_stride, a_rows, g, M, K, ch, ch * 64u + 16u * c,
-                         r.v0, r.v1);
+        const unsigned int kb = ch * 64u + 16u * c;
+        f4_load<NT, FP4>(cur, r.w0p, r.w1p, r.s0p, r.s1p, f4_at(A, kb, piece, piece_stride),
+                         a_stride, a_rows, g, M, K, ch, kb, r.v0, r.v1);
         f4_prepare<NT, IN>(cur, g, M);
     }
     for (; ch < chunks; ch += F4_WARPS) {
         const unsigned int next = ch + F4_WARPS;
         if (next < chunks) {
-            f4_load<NT, FP4>(nxt, r.w0p, r.w1p, r.s0p, r.s1p, A, a_stride, a_rows, g, M, K, next,
-                             next * 64u + 16u * c, r.v0, r.v1);
+            const unsigned int kb = next * 64u + 16u * c;
+            f4_load<NT, FP4>(nxt, r.w0p, r.w1p, r.s0p, r.s1p, f4_at(A, kb, piece, piece_stride),
+                             a_stride, a_rows, g, M, K, next, kb, r.v0, r.v1);
             f4_prepare<NT, IN>(nxt, g, M);
         }
         f4_chunk<NT, FP4>(acc, cur, sh.code);
@@ -393,7 +408,9 @@ __device__ __forceinline__ void dsv41_gemv_staged_impl(
     unsigned int cta,
     unsigned int a_stride,
     const int* a_rows = nullptr,
-    const int* c_rows = nullptr
+    const int* c_rows = nullptr,
+    unsigned int piece = 0,
+    unsigned long long piece_stride = 0
 ) {
     f4_codes<FP4>(sh.code);
     const unsigned int warp = threadIdx.x / F4_WARP;
@@ -456,9 +473,10 @@ __device__ __forceinline__ void dsv41_gemv_staged_impl(
             const unsigned int at = warp * chunk_bytes + lane_bytes * c;
             const unsigned int block = ch * 2u + (c >> 1);
             F4Chunk<NT> cur;
+            const unsigned int kb = ch * 64u + 16u * c;
             f4_take<NT, FP4>(cur, rows[g] + at, rows[g + 8u] + at, st_sh.s[g * blocks + block],
-                             st_sh.s[(g + 8u) * blocks + block], A, a_stride, a_rows, g, M, K, ch * 64u + 16u * c, v0,
-                             v1);
+                             st_sh.s[(g + 8u) * blocks + block], f4_at(A, kb, piece, piece_stride),
+                             a_stride, a_rows, g, M, K, kb, v0, v1);
             f4_prepare<NT, IN>(cur, g, M);
             f4_chunk<NT, FP4>(acc, cur, sh.code);
         }

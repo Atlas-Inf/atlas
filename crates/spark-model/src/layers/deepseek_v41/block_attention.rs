@@ -2,7 +2,7 @@
 
 //! The attention sublayer of a DeepSeek-V4.1 block on one token.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use spark_comm::CommBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
@@ -12,6 +12,7 @@ use super::ops::{self, HEAD_DIM, MAX_KEYS, Turn};
 use super::parts::{self, PARTS};
 use super::profile;
 use super::state::SeqState;
+use super::weights::row_part;
 
 impl Block {
     /// The device word holding `position`, for a rotation to read.
@@ -232,9 +233,8 @@ impl Block {
             )?;
             profile::end(gpu, stream, "sparse attention", began)?;
             let began = profile::begin(gpu, stream)?;
-            // Project out, each projection rounding its input to FP8: this
-            // part's groups of heads through their blocks of wo_a, then its
-            // columns of wo_b, unrounded.
+            // Project out, rounding the input to FP8: this part's groups of
+            // heads through their blocks of wo_a.
             let (low, width) = (part * groups * s.o_rank, groups * s.o_rank);
             let o_low = sc.o_low.offset(part * sc.rows * width * 2);
             parts::project_groups(
@@ -249,32 +249,57 @@ impl Block {
                 group_in,
                 stream,
             )?;
-            let wo = w.wo_b[part].context("a held part of wo_b")?;
-            parts::project_rows(
-                gpu,
-                k.parts.fp8_f32_q,
-                o_low,
-                wo.data,
-                wo.scales,
-                sc.attn_parts.offset(part * sc.rows * s.hidden * 4),
-                4,
-                s.hidden,
-                rows,
-                s.hidden,
-                width,
-                stream,
-            )?;
             profile::end(gpu, stream, "output projections", began)?;
         }
+        // wo_b reads every group, so the ranks gather their low-rank
+        // outputs, and a part computes a quarter of wo_b's rows from them
+        // all, rounding its input to FP8.
+        let (width, part_n) = (groups * s.o_rank, s.hidden / PARTS);
+        ensure!(
+            w.wo_b.n == s.hidden && w.wo_b.k == PARTS * width,
+            "wo_b [{}, {}]",
+            w.wo_b.n,
+            w.wo_b.k
+        );
         profile::stage(gpu, stream, "gather", || {
             parts::gather(
                 gpu,
                 comm,
                 held,
-                sc.attn_parts,
+                sc.o_low,
                 sc.gather_recv,
-                sc.rows * s.hidden * 4,
-                rows * s.hidden * 4,
+                sc.rows * width * 2,
+                rows * width * 2,
+                stream,
+            )
+        })?;
+        let began = profile::begin(gpu, stream)?;
+        for part in held.range() {
+            parts::project_pieces(
+                gpu,
+                k.parts.fp8_pieces_q,
+                sc.o_low,
+                row_part(&w.wo_b, part),
+                sc.attn_out.offset(part * sc.rows * part_n * 2),
+                part_n,
+                rows,
+                part_n,
+                w.wo_b.k,
+                width,
+                sc.rows * width,
+                stream,
+            )?;
+        }
+        profile::end(gpu, stream, "output projections", began)?;
+        profile::stage(gpu, stream, "gather", || {
+            parts::gather(
+                gpu,
+                comm,
+                held,
+                sc.attn_out,
+                sc.gather_recv,
+                sc.rows * part_n * 2,
+                rows * part_n * 2,
                 stream,
             )
         })

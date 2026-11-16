@@ -289,37 +289,39 @@ pub fn round_bf16(
 }
 
 /// One part of every expert a token runs: the layer's slab of routed
-/// experts, and the shared expert's w1 rows, w3 rows and w2 columns.
+/// experts, and the part's rows of the shared expert's w1, w3 and w2.
 #[derive(Clone, Copy)]
 pub struct ExpertPart {
     pub slab: ExpertSlab,
     pub shared: [Slice; 3],
 }
 
-/// Working buffers of [`experts`], for `top_k + 1` slots of `rows` values:
-/// `gate_up` `[slots, 2, rows]` and `inner` `[slots, rows]`, BF16.
-#[derive(Clone, Copy)]
-pub struct ExpertScratch {
-    pub gate_up: DevicePtr,
-    pub inner: DevicePtr,
+impl ExpertPart {
+    fn layout<'a>(&self, launch: KernelLaunch<'a>) -> KernelLaunch<'a> {
+        let (data, scales) = self.slab.layout();
+        launch
+            .arg_u64(self.slab.stride() as u64)
+            .arg_u32(data as u32)
+            .arg_u32(scales as u32)
+    }
 }
 
-/// One part of every expert of one token in three launches
-/// (`dsv41_expert.cu`): `out` (`[top_k + 1, hidden]` FP32) = the part's
-/// partial of each chosen expert's output, in the order of `chosen`
-/// (`[top_k]` u32, with `weights` `[top_k]` FP32, as [`route_fast`] leaves
-/// them by expert), then of the shared expert's. `x` is the token's input in
-/// FP8, `rows` the part's share of an expert's hidden rows.
+/// One part of the way into every expert of one token, in two launches
+/// (`dsv41_expert.cu`): `inner` (`[top_k + 1, rows]` BF16) = the part's
+/// `rows` of each chosen expert's hidden activation in FP8, in the order of
+/// `chosen` (`[top_k]` u32, with `weights` `[top_k]` FP32, as [`route_fast`]
+/// leaves them by expert), then of the shared expert's. `x` is the token's
+/// input in FP8, and `gate_up` scratch of `[top_k + 1, 2, rows]` BF16.
 #[allow(clippy::too_many_arguments)]
-pub fn experts(
+pub fn experts_in(
     gpu: &dyn GpuBackend,
     kernels: &MoeKernels,
     part: &ExpertPart,
     x: DevicePtr,
     chosen: DevicePtr,
     weights: DevicePtr,
-    scratch: ExpertScratch,
-    out: DevicePtr,
+    gate_up: DevicePtr,
+    inner: DevicePtr,
     top_k: usize,
     rows: usize,
     hidden: usize,
@@ -331,16 +333,8 @@ pub fn experts(
         "dsv41_expert: {rows} rows of {hidden}"
     );
     let slots = top_k as u32 + 1;
-    let (data, scales) = part.slab.layout();
-    let [w1, w3, w2] = part.shared;
-    let slab = |launch: KernelLaunch<'_>| {
-        launch
-            .arg_u64(part.slab.stride() as u64)
-            .arg_u32(data as u32)
-            .arg_u32(scales as u32)
-            .launch(stream)
-    };
-    slab(
+    let [w1, w3, _] = part.shared;
+    part.layout(
         KernelLaunch::new(gpu, kernels.expert_in)
             .grid([div_ceil(rows as u32, 16), 2 * slots, 1])
             .block([256, 1, 1])
@@ -351,34 +345,63 @@ pub fn experts(
             .arg_ptr(w1.scales)
             .arg_ptr(w3.data)
             .arg_ptr(w3.scales)
-            .arg_ptr(scratch.gate_up)
+            .arg_ptr(gate_up)
             .arg_u32(top_k as u32)
             .arg_u32(rows as u32)
             .arg_u32(hidden as u32),
-    )?;
+    )
+    .launch(stream)?;
     elementwise(gpu, kernels.expert_act, slots as usize * rows / 32)
-        .arg_ptr(scratch.gate_up)
+        .arg_ptr(gate_up)
         .arg_ptr(weights)
-        .arg_ptr(scratch.inner)
+        .arg_ptr(inner)
         .arg_u32(top_k as u32)
         .arg_u32(slots)
         .arg_u32(rows as u32)
         .arg_f32(limit)
-        .launch(stream)?;
-    slab(
+        .launch(stream)
+}
+
+/// One part of the way out of every expert of one token: `out` (`[top_k +
+/// 1, n]` BF16) = the part's `n` rows of each expert's output. `inner` is
+/// every part of the hidden activations, as [`experts_in`] left each and the
+/// ranks gathered them: `rows` values a slot, and a part `piece_stride`
+/// values after the last.
+#[allow(clippy::too_many_arguments)]
+pub fn experts_out(
+    gpu: &dyn GpuBackend,
+    kernels: &MoeKernels,
+    part: &ExpertPart,
+    chosen: DevicePtr,
+    inner: DevicePtr,
+    piece_stride: usize,
+    out: DevicePtr,
+    top_k: usize,
+    rows: usize,
+    n: usize,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        rows.is_multiple_of(64) && rows * super::parts::PARTS <= super::parts::STAGED_K,
+        "dsv41_expert_out: {rows} hidden rows a part"
+    );
+    let w2 = part.shared[2];
+    part.layout(
         KernelLaunch::new(gpu, kernels.expert_out)
-            .grid([div_ceil(hidden as u32, 16), slots, 1])
+            .grid([div_ceil(n as u32, 16), top_k as u32 + 1, 1])
             .block([256, 1, 1])
-            .arg_ptr(scratch.inner)
+            .arg_ptr(inner)
             .arg_ptr(part.slab.base)
             .arg_ptr(chosen)
             .arg_ptr(w2.data)
             .arg_ptr(w2.scales)
             .arg_ptr(out)
             .arg_u32(top_k as u32)
-            .arg_u32(hidden as u32)
+            .arg_u32(n as u32)
             .arg_u32(rows as u32),
     )
+    .arg_u64(piece_stride as u64)
+    .launch(stream)
 }
 
 #[cfg(test)]

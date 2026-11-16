@@ -17,8 +17,14 @@
 // A slot is an expert: the chosen in ascending expert order (`chosen`, as
 // `dsv41_moe_pick` leaves them with `by_expert`), then the shared expert.
 // The routed experts' weights are one part of the layer's slab: expert e at
-// `slab + e * stride`, as w1's rows of the part, w3's, and w2's columns of
-// the part, each `data` bytes followed by `scales` bytes of E8M0 scales.
+// `slab + e * stride`, as the part's rows of w1, of w3 and of w2, each
+// `data` bytes followed by `scales` bytes of E8M0 scales.
+//
+// A part is a quarter of an expert's hidden rows, and a quarter of its
+// output rows. The projections in leave a quarter of every slot's hidden
+// activation, the ranks gather the quarters, and the projection out reads
+// them all: it is in pieces (`f4_at` in `dsv41_tc.cuh`), a piece what one
+// part computed.
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -93,33 +99,36 @@ extern "C" __global__ void dsv41_expert_act(
     dsv41_fp8_block(v, inner + (size_t)slot * rows + at);
 }
 
-// out[slot] = this part's FP32 partial of w2 . inner[slot]: [slots, H].
-// Grid (ceil(H / 16), routed + 1), block 256.
+// out[slot] = BF16(w2 . inner[slot]) for the part's N rows of w2: [slots, N].
+// Slot s of piece p of `inner` is at inner[p * piece_stride + s * rows].
+// Grid (ceil(N / 16), routed + 1), block 256.
 extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_expert_out(
     const __nv_bfloat16* __restrict__ inner,
     const unsigned char* __restrict__ slab,
     const unsigned int* __restrict__ chosen,
     const unsigned char* __restrict__ shared_w2,
     const unsigned char* __restrict__ shared_s2,
-    float* __restrict__ out,
+    __nv_bfloat16* __restrict__ out,
     unsigned int routed,
-    unsigned int H,
+    unsigned int N,
     unsigned int rows,
     unsigned long long stride,
     unsigned int data,
-    unsigned int scales) {
+    unsigned int scales,
+    unsigned long long piece_stride) {
     __shared__ F4Shared<1> sh;
     __shared__ F4Staged staged;
-    const unsigned int slot = blockIdx.y;
+    const unsigned int slot = blockIdx.y, K = rows * DSV41_PARTS;
     const __nv_bfloat16* a = inner + (size_t)slot * rows;
-    float* c = out + (size_t)slot * H;
+    __nv_bfloat16* c = out + (size_t)slot * N;
     if (slot < routed) {
         const unsigned char* w = dsv41_expert_weights(slab, chosen, slot, stride, data, scales, 2);
-        dsv41_gemv_staged_impl<1, true, true>(sh, staged, a, w, w + data, c, 1, H, rows, H, blockIdx.x,
-                                              rows);
+        dsv41_gemv_staged_impl<1, true, false>(sh, staged, a, w, w + data, c, 1, N, K, N, blockIdx.x,
+                                               rows, nullptr, nullptr, rows, piece_stride);
     } else {
-        dsv41_gemv_staged_impl<1, false, true>(sh, staged, a, shared_w2, shared_s2, c, 1, H, rows, H,
-                                               blockIdx.x, rows);
+        dsv41_gemv_staged_impl<1, false, false>(sh, staged, a, shared_w2, shared_s2, c, 1, N, K, N,
+                                                blockIdx.x, rows, nullptr, nullptr, rows,
+                                                piece_stride);
     }
 }
 
@@ -183,25 +192,28 @@ extern "C" __global__ void dsv41_experts_act(
     dsv41_fp8_block(v, inner + r * rows + at);
 }
 
-// out[out_row[pair]] = this part's FP32 partial of w2 . inner[pair], [.., H].
-// Grid (ceil(H / 16), tiles), block 256.
+// out[out_row[pair]] = BF16(w2 . inner[pair]) for the part's N rows of w2.
+// Pair q of piece p of `inner` is at inner[p * piece_stride + q * rows].
+// Grid (ceil(N / 16), tiles), block 256.
 extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_out(
     const __nv_bfloat16* __restrict__ inner,
     const unsigned char* __restrict__ slab,
     const Dsv41Tile* __restrict__ tiles,
     const int* __restrict__ out_row,
-    float* __restrict__ out,
-    unsigned int H,
+    __nv_bfloat16* __restrict__ out,
+    unsigned int N,
     unsigned int rows,
     unsigned long long stride,
     unsigned int data,
-    unsigned int scales) {
+    unsigned int scales,
+    unsigned long long piece_stride) {
     __shared__ F4Shared<1> sh;
     __shared__ F4Staged staged;
     const Dsv41Tile tile = tiles[blockIdx.y];
     const unsigned char* w =
         slab + (unsigned long long)tile.expert * stride + 2ull * (data + scales);
-    dsv41_gemv_staged_impl<1, true, true>(
-        sh, staged, inner + (size_t)tile.first * rows, w, w + data, out, tile.count, H, rows, H,
-        blockIdx.x, rows, nullptr, out_row + tile.first);
+    dsv41_gemv_staged_impl<1, true, false>(
+        sh, staged, inner + (size_t)tile.first * rows, w, w + data, out, tile.count, N,
+        rows * DSV41_PARTS, N, blockIdx.x, rows, nullptr, out_row + tile.first, rows,
+        piece_stride);
 }

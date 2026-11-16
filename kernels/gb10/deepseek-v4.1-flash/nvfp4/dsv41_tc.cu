@@ -72,6 +72,24 @@ DSV41_TC(dsv41_fp8_gemv_tc32_f32, 4, false, true, float)
 DSV41_TC_Q(dsv41_fp8_gemv_tc8_q, false, __nv_bfloat16)
 DSV41_TC_Q(dsv41_fp8_gemv_tc8_f32_q, true, float)
 
+// An FP8 projection of an input the ranks gathered, which is in pieces
+// (`f4_at` in `dsv41_tc.cuh`): row m of piece p is at A[p * piece_stride +
+// m * a_stride]. `_q` rounds the input to FP8 on the way in. C [M, N] BF16.
+#define DSV41_TC_P(NAME, IN)                                                                \
+    extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) NAME(                 \
+        const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,           \
+        const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C, unsigned int M, \
+        unsigned int N, unsigned int K, unsigned int out_stride, unsigned int a_stride,     \
+        unsigned int piece, unsigned long long piece_stride) {                              \
+        __shared__ F4Shared<1> sh;                                                          \
+        dsv41_gemv_tc_impl<1, false, false, IN>(sh, A, W, S, C, M, N, K, out_stride,        \
+                                                blockIdx.x, a_stride, nullptr, nullptr,     \
+                                                piece, piece_stride);                       \
+    }
+
+DSV41_TC_P(dsv41_fp8_gemv_pieces, F4_ROUNDED)
+DSV41_TC_P(dsv41_fp8_gemv_pieces_q, F4_QUANT)
+
 // Two FP8 projections of the same rows in one launch: C0 [M, N0] = A . W0^T
 // and C1 [M, N1] = A . W1^T, A [M, K] FP8-rounded BF16, M at most 8. A block
 // computes what the same block of `dsv41_fp8_gemv_tc8` computes, from staged

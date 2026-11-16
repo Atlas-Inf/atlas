@@ -229,17 +229,18 @@ impl SiteBuffers {
 #[ignore = "needs a GB10 GPU, the deepseek-v4.1-flash target, ATLAS_DSV41_REC (--ops) and ATLAS_DSV41_CKPT"]
 fn a_site_in_two_launches_leaves_the_plain_kernels_bytes() -> Result<()> {
     use crate::layers::deepseek_v41::ops::{Kernels, fp8_quant_dequant};
-    use crate::layers::deepseek_v41::parts::{self, PARTS, PartKernels};
+    use crate::layers::deepseek_v41::parts::PARTS;
     use crate::layers::ops::rms_norm;
     use crate::weight_map::DenseWeight;
 
     const LAYER: usize = 1;
-    const SLOTS: usize = 3;
+    /// Tokens a part of the sublayer's output has room for.
+    const ROOM: usize = 3;
     let rec = Recording::open()?;
     let ckpt = std::env::var("ATLAS_DSV41_CKPT").context("ATLAS_DSV41_CKPT=<checkpoint dir>")?;
     let gpu = backend()?;
     let (k, stream) = (HcKernels::load(gpu)?, gpu.default_stream());
-    let (part_kernels, cache) = (PartKernels::load(gpu)?, Kernels::load(gpu)?);
+    let cache = Kernels::load(gpu)?;
     let norm_kernel = gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?;
     let (hidden, copies) = (SHAPE.hidden, SHAPE.copies);
     let picks = picks(&rec, 24);
@@ -253,7 +254,7 @@ fn a_site_in_two_launches_leaves_the_plain_kernels_bytes() -> Result<()> {
     };
     let streams = recorded("block_in", copies * hidden)?;
     let carried = recorded("pre_mix_in", copies * 2)?;
-    let outputs = bf16s(&recorded("attn_out", hidden)?);
+    let outputs = recorded("attn_out", hidden)?;
     let (attn, ffn) = (
         site(gpu, &ckpt, LAYER, "attn")?,
         site(gpu, &ckpt, LAYER, "ffn")?,
@@ -265,32 +266,22 @@ fn a_site_in_two_launches_leaves_the_plain_kernels_bytes() -> Result<()> {
     };
     let (plain, fused) = (SiteBuffers::alloc(gpu)?, SiteBuffers::alloc(gpu)?);
     let (pre_in, x) = (gpu.alloc(copies * 4)?, gpu.alloc(hidden * 2)?);
-    let parts_dev = gpu.alloc(PARTS * SLOTS * hidden * 4)?;
+    let quarter = hidden / PARTS * 2;
+    let parts_dev = gpu.alloc(PARTS * ROOM * quarter)?;
 
     for token in 0..picks.len() {
         let stream_in = &streams[token * copies * hidden * 2..(token + 1) * copies * hidden * 2];
-        // A sublayer's output in four unequal parts, a slot or three.
-        let split = [0.5f32, 0.25, 0.125, 0.12501];
-        let mut host = vec![0f32; PARTS * SLOTS * hidden];
-        for (i, value) in host.iter_mut().enumerate() {
-            let (part, slot, d) = (i / (SLOTS * hidden), i / hidden % SLOTS, i % hidden);
-            let bits = outputs[token * hidden + d];
-            *value = f32::from_bits(u32::from(bits) << 16) * split[part] * (1 + slot) as f32;
-        }
-        let host: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
-        for slots in [0, 1, SLOTS] {
+        let output = &outputs[token * hidden * 2..(token + 1) * hidden * 2];
+        for with in [false, true] {
             gpu.synchronize(stream)?;
             gpu.copy_h2d(
                 &carried[token * copies * 4..(token + 1) * copies * 4],
                 pre_in,
             )?;
-            // `slots` slots of the parts, each part's together.
-            for part in 0..PARTS {
-                let at = part * SLOTS * hidden * 4;
-                gpu.copy_h2d(
-                    &host[at..at + slots * hidden * 4],
-                    parts_dev.offset(part * slots * hidden * 4),
-                )?;
+            // A sublayer's output in one run, and as its four parts.
+            gpu.copy_h2d(output, x)?;
+            for (part, bytes) in output.chunks_exact(quarter).enumerate() {
+                gpu.copy_h2d(bytes, parts_dev.offset(part * ROOM * quarter))?;
             }
             // Both start at the recorded stream, with the attention site's
             // post and comb to expand under.
@@ -310,23 +301,12 @@ fn a_site_in_two_launches_leaves_the_plain_kernels_bytes() -> Result<()> {
                     stream,
                 )?;
             }
-            let before = (slots > 0).then_some(SublayerParts {
+            let before = with.then_some(SublayerParts {
                 parts: parts_dev,
-                slots,
-                rows: 1,
+                rows: ROOM,
             });
             // The plain kernels, a launch each.
             if before.is_some() {
-                parts::combine(
-                    gpu,
-                    part_kernels.combine,
-                    parts_dev,
-                    x,
-                    slots * hidden,
-                    slots,
-                    hidden,
-                    stream,
-                )?;
                 expand(
                     gpu,
                     k.expand,
@@ -401,7 +381,7 @@ fn a_site_in_two_launches_leaves_the_plain_kernels_bytes() -> Result<()> {
             )?;
             assert!(
                 plain.bytes(gpu)? == fused.bytes(gpu)?,
-                "token {token}, {slots} slots: the site in two launches differs"
+                "token {token}, sublayer {with}: the site in two launches differs"
             );
 
             // And the expansion alone, from the same parts, under the FFN
@@ -435,12 +415,12 @@ fn a_site_in_two_launches_leaves_the_plain_kernels_bytes() -> Result<()> {
             )?;
             assert!(
                 plain.bytes(gpu)? == fused.bytes(gpu)?,
-                "token {token}, {slots} slots: the expansion from parts differs"
+                "token {token}: the expansion from parts differs"
             );
         }
     }
     println!(
-        "layer {LAYER}: a site in two launches, and an expansion from parts, leave the plain kernels' bytes on {} tokens, with no sublayer before, the attention's and the MoE's",
+        "layer {LAYER}: a site in two launches, and an expansion from parts, leave the plain kernels' bytes on {} tokens, with and without a sublayer before",
         picks.len()
     );
     Ok(())

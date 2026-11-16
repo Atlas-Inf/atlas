@@ -131,8 +131,7 @@ impl Block {
     /// The attention's output, as the parts [`Block::attention`] leaves.
     pub(super) fn attention_parts(&self) -> SublayerParts {
         SublayerParts {
-            parts: self.shared.scratch.attn_parts,
-            slots: 1,
+            parts: self.shared.scratch.attn_out,
             rows: self.shared.scratch.rows,
         }
     }
@@ -246,43 +245,27 @@ impl Block {
 
 #[cfg(test)]
 impl Block {
-    /// The attention's output, rounded from its parts, in
+    /// The first token's attention output, its parts in one run, in
     /// `scratch.sublayer_out`.
     pub(super) fn attention_out(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<DevicePtr> {
-        let (s, k, sc) = (
-            &self.shared.shape,
-            &self.shared.kernels,
-            &self.shared.scratch,
-        );
-        super::parts::round(
-            gpu,
-            k.parts.round,
-            sc.attn_parts,
-            sc.sublayer_out,
-            sc.rows * s.hidden,
-            1,
-            s.hidden,
-            stream,
-        )?;
+        let sc = &self.shared.scratch;
+        let part = self.shared.shape.hidden / super::parts::PARTS * 2;
+        gpu.synchronize(stream)?;
+        for at in 0..super::parts::PARTS {
+            let from = sc.attn_out.offset(at * sc.rows * part);
+            gpu.copy_d2d(from, sc.sublayer_out.offset(at * part), part)?;
+        }
         Ok(sc.sublayer_out)
     }
 
-    /// Stand `output` (`[hidden]` BF16, as bytes) in for the attention's
-    /// parts: the first part holds it and the others nothing.
+    /// Stand `output` (`[hidden]` BF16, as bytes) in for the first token's
+    /// attention output.
     pub(super) fn set_attention_out(&self, gpu: &dyn GpuBackend, output: &[u8]) -> Result<()> {
-        let (sc, hidden) = (&self.shared.scratch, self.shared.shape.hidden);
-        let mut first = vec![0u8; hidden * 4];
-        for (value, bits) in first.chunks_exact_mut(4).zip(output.chunks_exact(2)) {
-            let bits = u16::from_le_bytes([bits[0], bits[1]]);
-            value.copy_from_slice(&super::cache_recipe::bf16_to_f32(bits).to_le_bytes());
-        }
+        let sc = &self.shared.scratch;
+        let part = self.shared.shape.hidden / super::parts::PARTS * 2;
         gpu.synchronize(gpu.default_stream())?;
-        for part in 0..super::parts::PARTS {
-            let at = sc.attn_parts.offset(part * sc.rows * hidden * 4);
-            match part {
-                0 => gpu.copy_h2d(&first, at)?,
-                _ => gpu.copy_h2d(&vec![0u8; hidden * 4], at)?,
-            }
+        for (at, bytes) in output.chunks_exact(part).enumerate() {
+            gpu.copy_h2d(bytes, sc.attn_out.offset(at * sc.rows * part))?;
         }
         Ok(())
     }

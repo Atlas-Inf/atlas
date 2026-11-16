@@ -86,20 +86,6 @@ __device__ __forceinline__ float dsv41_parts_sum(const float* parts, size_t stri
     return dsv41_bf16(sum);
 }
 
-// Value `d` of a sublayer's output from its parts: every slot rounded as
-// above, the slots added in FP32 in slot order, the sum rounded. One slot is
-// the attention's output; the MoE has a slot per expert. `parts` is the
-// first part's [slots, n] and `stride` the FP32 values from a part to the
-// next: slots * n for one token, more where the parts hold a row each of
-// several tokens.
-__device__ __forceinline__ float dsv41_parts_combine(
-    const float* parts, size_t stride, unsigned int slots, unsigned int n, unsigned int d) {
-    float total = 0.0f;
-    for (unsigned int slot = 0; slot < slots; ++slot)
-        total += dsv41_parts_sum(parts, stride, (size_t)slot * n + d);
-    return dsv41_bf16(total);
-}
-
 // weight * silu(min(gate, limit)) * clamp(up, -limit, limit), rounded to BF16.
 __device__ __forceinline__ float dsv41_swiglu_one(float gate, float up, float weight, float limit) {
     const float g = fminf(gate, limit);

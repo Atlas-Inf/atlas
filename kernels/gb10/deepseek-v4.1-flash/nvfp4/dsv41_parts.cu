@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// DeepSeek-V4.1-Flash: a projection whose input is split in four parts.
+// DeepSeek-V4.1-Flash: the projections in four parts.
 //
-// The wide projections that sum over their input (an expert's w2, the
-// attention's wo_b) are cut into four column parts, each a contiguous
-// quarter of the input. A part's sum is an FP32 partial. The four partials
-// are added in part order and rounded once:
+// Most of the wide projections are cut by output rows: a part computes a
+// quarter of the output from the whole input, and the ranks gather the
+// quarters. The Engram's is cut by input columns, each part reading the
+// table rows of a quarter of the hash columns. A column part's sum is an
+// FP32 partial, and the four are added in part order and rounded once:
 //
 //   out = BF16(((p0 + p1) + p2) + p3)
 //
@@ -30,18 +31,22 @@ extern "C" __global__ void dsv41_parts_round(
     out[i] = __float2bfloat16(dsv41_parts_sum(parts, stride, i));
 }
 
-// The MoE's output: every slot (the chosen experts in expert order, then the
-// shared expert) rounded to BF16 as above, then the slots added in FP32 in
-// slot order and rounded: y[d] = BF16(sum over slots of BF16(sum over parts)).
-extern "C" __global__ void dsv41_moe_combine(
-    const float* __restrict__ parts,
+// The MoE's output from its experts': y[row, d] = BF16(sum over slots of
+// out[row, slot, d]), added in FP32 in slot order (the chosen experts in
+// expert order, then the shared expert). out [rows, slots, n] BF16.
+extern "C" __global__ void dsv41_slots_sum(
+    const __nv_bfloat16* __restrict__ out,
     __nv_bfloat16* __restrict__ y,
     unsigned int slots,
     unsigned int n,
-    unsigned int stride) {
-    const unsigned int d = blockIdx.x * blockDim.x + threadIdx.x;
-    if (d >= n) return;
-    y[d] = __float2bfloat16(dsv41_parts_combine(parts, stride, slots, n, d));
+    unsigned int rows) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)rows * n) return;
+    const size_t row = i / n, d = i % n;
+    float total = 0.0f;
+    for (unsigned int slot = 0; slot < slots; ++slot)
+        total += __bfloat162float(out[(row * slots + slot) * n + d]);
+    y[i] = __float2bfloat16(total);
 }
 
 // dst[row, 0..width) = src[row, first..first + width), bytes: one part's

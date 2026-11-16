@@ -190,17 +190,15 @@ pub fn expand(
 }
 
 /// A sublayer's output as the four parts it was computed in (`parts.rs`):
-/// `[PARTS, rows, slots, hidden]` FP32, a slot per expert of the MoE and one
-/// for the attention, with room for `rows` tokens in a part.
+/// `[PARTS, rows, hidden / PARTS]` BF16, a part a quarter of every token's
+/// values, with room for `rows` tokens in a part.
 #[derive(Clone, Copy)]
 pub struct SublayerParts {
     pub parts: DevicePtr,
-    pub slots: usize,
     pub rows: usize,
 }
 
-/// [`expand`] of `tokens` tokens in place from a sublayer's parts, combined
-/// and rounded in the same launch.
+/// [`expand`] of `tokens` tokens in place from a sublayer's parts.
 #[allow(clippy::too_many_arguments)]
 pub fn expand_parts(
     gpu: &dyn GpuBackend,
@@ -222,7 +220,6 @@ pub fn expand_parts(
         .arg_ptr(comb)
         .arg_u32(shape.hidden as u32)
         .arg_u32(shape.copies as u32)
-        .arg_u32(x.slots as u32)
         .arg_u32(x.rows as u32)
         .launch(stream)
 }
@@ -268,7 +265,6 @@ pub fn site(
     );
     let before = before.unwrap_or(SublayerParts {
         parts: DevicePtr::NULL,
-        slots: 0,
         rows: 0,
     });
     KernelLaunch::new(gpu, kernels.site_sums)
@@ -284,7 +280,6 @@ pub fn site(
         .arg_ptr(out.partials)
         .arg_u32(shape.hidden as u32)
         .arg_u32(shape.copies as u32)
-        .arg_u32(before.slots as u32)
         .arg_u32(before.rows as u32)
         .launch(stream)?;
     // The norm and its rounding on one block, the coefficients on another.

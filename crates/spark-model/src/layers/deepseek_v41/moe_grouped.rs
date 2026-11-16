@@ -8,8 +8,9 @@
 //! same expert can share one read of it. The host sorts the batch's (row,
 //! slot) pairs by expert and cuts each expert's run into tiles of up to
 //! eight, and three launches take every tile: both projections in, the
-//! activation, the projection out. A row's bytes are those of
-//! [`super::moe::experts`] on it alone.
+//! activation, and, once the ranks have gathered the activations, the
+//! projection out. A row's bytes are those of [`super::moe::experts_in`]
+//! and [`super::moe::experts_out`] on it alone.
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -81,9 +82,8 @@ pub struct GroupedScratch {
     pub row_of: DevicePtr,
     pub out_row: DevicePtr,
     pub weights: DevicePtr,
-    /// `[pairs, 2, part rows]` and `[pairs, part rows]` BF16.
+    /// `[pairs, 2, part rows]` BF16.
     pub gate_up: DevicePtr,
-    pub inner: DevicePtr,
 }
 
 impl GroupedScratch {
@@ -102,7 +102,6 @@ impl GroupedScratch {
             out_row: gpu.alloc(pairs * 4)?,
             weights: gpu.alloc(pairs * 4)?,
             gate_up: gpu.alloc(pairs * 2 * part_rows * 2)?,
-            inner: gpu.alloc(pairs * part_rows * 2)?,
         })
     }
 
@@ -118,19 +117,27 @@ impl GroupedScratch {
     }
 }
 
-/// One part of the routed experts of every row of a batch: `out` (`[rows *
-/// slots, hidden]` FP32) gets, at each pair's output row, the part's partial
-/// of that expert's output. `x` is the rows' input in FP8 (`[rows, hidden]`
+fn layout<'a>(slab: &ExpertSlab, launch: KernelLaunch<'a>) -> KernelLaunch<'a> {
+    let (data, scales) = slab.layout();
+    launch
+        .arg_u64(slab.stride() as u64)
+        .arg_u32(data as u32)
+        .arg_u32(scales as u32)
+}
+
+/// One part of the way into the routed experts of every row of a batch:
+/// `inner` (`[pairs, part_rows]` BF16) = the part's rows of each pair's
+/// hidden activation in FP8. `x` is the rows' input in FP8 (`[rows, hidden]`
 /// BF16), `part_rows` the part's share of an expert's hidden rows.
 #[allow(clippy::too_many_arguments)]
-pub fn experts(
+pub fn experts_in(
     gpu: &dyn GpuBackend,
     kernels: &MoeKernels,
     slab: &ExpertSlab,
     plan: &Plan,
     scratch: &GroupedScratch,
     x: DevicePtr,
-    out: DevicePtr,
+    inner: DevicePtr,
     part_rows: usize,
     hidden: usize,
     limit: f32,
@@ -144,15 +151,8 @@ pub fn experts(
     if tiles == 0 {
         return Ok(());
     }
-    let (data, scales) = slab.layout();
-    let layout = |launch: KernelLaunch<'_>| {
-        launch
-            .arg_u64(slab.stride() as u64)
-            .arg_u32(data as u32)
-            .arg_u32(scales as u32)
-            .launch(stream)
-    };
     layout(
+        slab,
         KernelLaunch::new(gpu, kernels.experts_in)
             .grid([div_ceil(part_rows as u32, 16), 2 * tiles, 1])
             .block([256, 1, 1])
@@ -163,30 +163,63 @@ pub fn experts(
             .arg_ptr(scratch.gate_up)
             .arg_u32(part_rows as u32)
             .arg_u32(hidden as u32),
-    )?;
+    )
+    .launch(stream)?;
     activate(
         gpu,
         kernels,
         scratch.gate_up,
         scratch.weights,
-        scratch.inner,
+        inner,
         plan.pairs(),
         part_rows,
         limit,
         stream,
-    )?;
+    )
+}
+
+/// One part of the way out of them: `out` (`[rows * slots, n]` BF16) gets,
+/// at each pair's output row, the part's `n` rows of that expert's output.
+/// `inner` is every part of the pairs' hidden activations, as
+/// [`experts_in`] left each and the ranks gathered them: a part
+/// `piece_stride` values after the last.
+#[allow(clippy::too_many_arguments)]
+pub fn experts_out(
+    gpu: &dyn GpuBackend,
+    kernels: &MoeKernels,
+    slab: &ExpertSlab,
+    plan: &Plan,
+    scratch: &GroupedScratch,
+    inner: DevicePtr,
+    piece_stride: usize,
+    out: DevicePtr,
+    part_rows: usize,
+    n: usize,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        part_rows.is_multiple_of(64),
+        "dsv41_experts_out: {part_rows} hidden rows a part"
+    );
+    let tiles = plan.tile_count() as u32;
+    if tiles == 0 {
+        return Ok(());
+    }
     layout(
+        slab,
         KernelLaunch::new(gpu, kernels.experts_out)
-            .grid([div_ceil(hidden as u32, 16), tiles, 1])
+            .grid([div_ceil(n as u32, 16), tiles, 1])
             .block([256, 1, 1])
-            .arg_ptr(scratch.inner)
+            .arg_ptr(inner)
             .arg_ptr(slab.base)
             .arg_ptr(scratch.tiles)
             .arg_ptr(scratch.out_row)
             .arg_ptr(out)
-            .arg_u32(hidden as u32)
+            .arg_u32(n as u32)
             .arg_u32(part_rows as u32),
     )
+    .arg_u64(piece_stride as u64)
+    .launch(stream)
 }
 
 /// `inner` (`[count, part_rows]` BF16) = the FP8 activation of `gate_up`

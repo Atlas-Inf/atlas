@@ -234,23 +234,30 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_expand(
         o[j * H + d] = __float2bfloat16(dsv41_hc_expand_one(c, rv, p[j], xd, j, hc));
 }
 
-// The same expansion from the sublayer's output as its four parts
-// (`dsv41_parts.cu`), combined and rounded here, in place into the stream.
-// A part is [rows, slots, H] FP32 with room for `part_rows` rows, of which
-// the grid's T are in use. Grid (ceil(H / 256), T), block 256.
+// Value d of token t of a sublayer's output as the ranks gathered it: four
+// parts, each a quarter of the H values of every token, with room for
+// `part_rows` tokens.
+__device__ __forceinline__ float dsv41_hc_gathered(
+    const __nv_bfloat16* x, unsigned int t, unsigned int d, unsigned int H,
+    unsigned int part_rows) {
+    const unsigned int n = H / DSV41_PARTS;
+    return __bfloat162float(x[((size_t)(d / n) * part_rows + t) * n + d % n]);
+}
+
+// The same expansion from the sublayer's output in its four parts
+// (`dsv41_hc_gathered`), in place into the stream. Grid (ceil(H / 256), T),
+// block 256.
 extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_expand_parts(
-    const float* __restrict__ x_parts,
+    const __nv_bfloat16* __restrict__ x_parts,
     __nv_bfloat16* streams,
     const float* __restrict__ post,
     const float* __restrict__ comb,
     unsigned int H,
     unsigned int hc,
-    unsigned int slots,
     unsigned int part_rows) {
     const unsigned int t = blockIdx.y, d = blockIdx.x * DSV41_HC_THREADS + threadIdx.x;
     if (d >= H) return;
-    const size_t row = (size_t)slots * H;
-    const float xd = dsv41_parts_combine(x_parts + t * row, part_rows * row, slots, H, d);
+    const float xd = dsv41_hc_gathered(x_parts, t, d, H, part_rows);
     streams += (size_t)t * hc * H;
     post += (size_t)t * hc;
     comb += (size_t)t * hc * hc;
@@ -271,7 +278,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_expand_p
 //
 // Grid (H / 256, T), block 256.
 extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_site_sums(
-    const float* __restrict__ x_parts,
+    const __nv_bfloat16* __restrict__ x_parts,
     __nv_bfloat16* streams,
     const float* __restrict__ hc_fn,
     const float* __restrict__ pre_in,
@@ -281,7 +288,6 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_site_sum
     float* __restrict__ partials,
     unsigned int H,
     unsigned int hc,
-    unsigned int slots,
     unsigned int part_rows) {
     const unsigned int t = blockIdx.y, d = blockIdx.x * DSV41_HC_THREADS + threadIdx.x;
     streams += (size_t)t * hc * H;
@@ -295,9 +301,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_site_sum
         float rv[DSV41_HC_MAX];
         for (unsigned int j = 0; j < hc; ++j) rv[j] = __bfloat162float(streams[j * H + d]);
         if (x_parts) {
-            const size_t row = (size_t)slots * H;
-            const float xd =
-                dsv41_parts_combine(x_parts + t * row, part_rows * row, slots, H, d);
+            const float xd = dsv41_hc_gathered(x_parts, t, d, H, part_rows);
             for (unsigned int j = 0; j < hc; ++j) {
                 const __nv_bfloat16 out =
                     __float2bfloat16(dsv41_hc_expand_one(comb, rv, post[j], xd, j, hc));
