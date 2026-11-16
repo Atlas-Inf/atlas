@@ -957,6 +957,9 @@ __device__ __forceinline__ void gate_up_shared_t_rows_impl(
             *(uint4*)&s_sc[buf][sg * STRIDE + cb] =
                 *(const uint4*)&B_scale[(unsigned long long)(tg * ng + sg) * N + ns0 + cb];
         }
+#if defined(__HIP_PLATFORM_AMD__)
+        if constexpr (VEC) return;  // gfx1151 VEC reads A straight into SGPRs below
+#endif
         _Pragma("unroll")
         for (unsigned int j = lane; j < ROWS * (TILE_KH * 2 / 8u); j += BS) {
             const unsigned int row = j / (TILE_KH * 2 / 8u);
@@ -983,8 +986,19 @@ __device__ __forceinline__ void gate_up_shared_t_rows_impl(
                 for (unsigned int rr4 = 0; rr4 < TILE_KH / 4u; rr4++) {
                     __nv_bfloat16 av[ROWS][8];
                     _Pragma("unroll")
-                    for (unsigned int r = 0; r < ROWS; r++)
+                    for (unsigned int r = 0; r < ROWS; r++) {
+#if defined(__HIP_PLATFORM_AMD__)
+                        // A is wave-uniform: constant-space loads land in SGPRs and feed the FMAs as
+                        // the scalar operand, so the broadcast LDS reads (the gfx1151 limiter) go away.
+                        // Same values, same order: bit-exact (kbench rows_v3_r8 1136 -> 862 us).
+                        typedef __attribute__((address_space(4))) const unsigned int cu32;
+                        cu32* q = (cu32*)(const void*)&A[(unsigned long long)r * h + tg * TILE_KH * 2 + rr4 * 8];
+                        unsigned int* d = (unsigned int*)&av[r][0];
+                        d[0] = q[0]; d[1] = q[1]; d[2] = q[2]; d[3] = q[3];
+#else
                         *(uint4*)&av[r][0] = *(const uint4*)&s_a[buf][r * TILE_KH * 2 + rr4 * 8];
+#endif
+                    }
                     _Pragma("unroll")
                     for (unsigned int j = 0; j < 4; j++) {
                         const unsigned int rr = rr4 * 4 + j;
