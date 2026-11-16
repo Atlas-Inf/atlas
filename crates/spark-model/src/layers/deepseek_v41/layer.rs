@@ -81,111 +81,6 @@ impl Layer {
         );
         Ok(row)
     }
-
-    /// The token of row `row`, as the engine staged it.
-    fn token(&self, row: usize, ctx: &ForwardContext, stream: u64) -> Result<u32> {
-        if let Some(ids) = ctx.token_ids {
-            ctx.gpu.synchronize(stream)?;
-            let mut word = [0u8; 4];
-            ctx.gpu.copy_d2h(ids.offset(row * 4), &mut word)?;
-            return Ok(u32::from_le_bytes(word));
-        }
-        ctx.host_token_ids
-            .and_then(|ids| ids.get(row).copied())
-            .with_context(|| format!("deepseek_v41: no token id for row {row}"))
-    }
-
-    /// Add the token of row `row` at `position` to the sequence's history,
-    /// as the id the Engram hashes.
-    fn remember(
-        &self,
-        token_map: &[u32],
-        row: usize,
-        state: &mut SeqState,
-        position: usize,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        let token = self.token(row, ctx, stream)? as usize;
-        let compressed = *token_map
-            .get(token)
-            .with_context(|| format!("token {token} is outside the Engram token map"))?;
-        // A sequence that was rolled back hashes its new tokens over the
-        // ones kept.
-        state.history.truncate(position);
-        ensure!(
-            state.history.len() == position,
-            "deepseek_v41: Engram at position {position} of a sequence it has seen {} tokens of",
-            state.history.len()
-        );
-        state.history.push(compressed);
-        Ok(())
-    }
-
-    /// The rows `table` holds for the last token of `state`'s history.
-    fn rows(table: &EngramTable, state: &SeqState) -> Vec<u64> {
-        let from = state.history.len().saturating_sub(table.hash.reach());
-        table.hash.rows(&state.history[from..])
-    }
-
-    /// Start fetching what the Engram layers will read for this token.
-    fn look_ahead(
-        &self,
-        ahead: &Ahead,
-        row: usize,
-        state: &mut SeqState,
-        position: usize,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        self.remember(&ahead.token_map, row, state, position, ctx, stream)?;
-        for table in &ahead.tables {
-            let rows = Self::rows(table, state);
-            ahead
-                .prefetcher
-                .ask(table, rows[ahead.columns.clone()].to_vec());
-        }
-        Ok(())
-    }
-
-    /// Add the Engram lookup of the token at `position` into its stream.
-    #[allow(clippy::too_many_arguments)]
-    fn look_up(
-        &self,
-        lookup: &Lookup,
-        row: usize,
-        streams: DevicePtr,
-        state: &mut SeqState,
-        position: usize,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        // The first layer keeps its own history when it is also an Engram.
-        if self.ahead.is_none() {
-            self.remember(&lookup.token_map, row, state, position, ctx, stream)?;
-        }
-        let rows = Self::rows(&lookup.table, state);
-        let held = lookup.engram.columns();
-        let found = profile::stage(ctx.gpu, stream, "engram rows", || {
-            lookup.table.find(ctx.gpu, &rows, held, stream)
-        })?;
-        let comm = ctx.comm.filter(|_| ctx.config.ep_world_size > 1);
-        profile::stage(ctx.gpu, stream, "engram", || {
-            lookup.engram.apply(
-                ctx.gpu,
-                found.rows,
-                found.scales,
-                found.row_slots,
-                found.scale_slots,
-                streams,
-                comm,
-                stream,
-            )?;
-            ctx.gpu.synchronize(stream)
-        })?;
-        lookup.table.done();
-        Ok(())
-    }
 }
 
 impl Layer {
@@ -223,14 +118,11 @@ impl Layer {
                 gpu.copy_h2d(&identity, pre.offset(r * copies * 4))?;
             }
         }
-        for r in 0..rows {
-            let stream_of = streams.offset(r * copies * hidden_bytes);
-            if let Some(ahead) = &self.ahead {
-                self.look_ahead(ahead, row + r, state, position + r, ctx, stream)?;
-            }
-            if let Some(lookup) = &self.lookup {
-                self.look_up(lookup, row + r, stream_of, state, position + r, ctx, stream)?;
-            }
+        if let Some(ahead) = &self.ahead {
+            self.look_ahead(ahead, row, rows, state, position, ctx, stream)?;
+        }
+        if let Some(lookup) = &self.lookup {
+            self.look_up(lookup, row, rows, streams, state, position, ctx, stream)?;
         }
         let comm = ctx.comm.filter(|_| ctx.config.ep_world_size > 1);
         self.block
@@ -482,3 +374,6 @@ pub fn load_layers(
     }
     Ok(out)
 }
+
+#[path = "layer_lookup.rs"]
+mod lookup;

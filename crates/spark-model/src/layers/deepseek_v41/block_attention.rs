@@ -7,15 +7,10 @@ use spark_comm::CommBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::block::Block;
-use super::cache_recipe::{
-    WINDOW, completed_group, group_position, prefill_window, window_row, window_slot,
-};
-use super::index::INDEX_DIM;
-use super::moe;
-use super::ops::{self, Fp4Scale, HEAD_DIM, MAX_KEYS, Turn};
+use super::cache_recipe::{WINDOW, prefill_window, window_row, window_slot};
+use super::ops::{self, HEAD_DIM, MAX_KEYS, Turn};
 use super::parts::{self, PARTS};
 use super::profile;
-use super::side;
 use super::state::SeqState;
 
 impl Block {
@@ -29,113 +24,6 @@ impl Block {
             sc.max_groups
         );
         Ok(sc.positions.offset(position * 4))
-    }
-
-    /// The compressor at `position`: project, hold in the group's slot, and
-    /// when the group completes write its key into `keys` and, on a layer
-    /// that makes them, its index key.
-    fn compress(
-        &self,
-        gpu: &dyn GpuBackend,
-        state: &mut SeqState,
-        position: usize,
-        normed: DevicePtr,
-        stream: u64,
-    ) -> Result<()> {
-        let (s, k, sc) = (
-            &self.shared.shape,
-            &self.shared.kernels,
-            &self.shared.scratch,
-        );
-        let w = self
-            .weights
-            .compressor
-            .as_ref()
-            .context("a source layer has a compressor")?;
-        let held = state
-            .compressed
-            .as_mut()
-            .context("a source layer holds compressed keys")?;
-        if let Some(group) = completed_group(position, w.ratio) {
-            held.reserve(gpu, group + 1, stream)?;
-        }
-        let held = &*held;
-        let slot = (position % w.ratio) * HEAD_DIM * 4;
-        side::gemv_f32(
-            gpu,
-            k.side.gemv_f32,
-            normed,
-            w.wkv,
-            held.kv_state.offset(slot),
-            HEAD_DIM,
-            s.hidden,
-            stream,
-        )?;
-        if let Some(wgate) = w.wgate {
-            side::gemv_f32(
-                gpu,
-                k.side.gemv_f32,
-                normed,
-                wgate,
-                held.score_state.offset(slot),
-                HEAD_DIM,
-                s.hidden,
-                stream,
-            )?;
-        }
-        let Some(group) = completed_group(position, w.ratio) else {
-            return Ok(());
-        };
-        let key = held.keys.offset(group * HEAD_DIM * 2);
-        match w.wgate {
-            Some(_) => side::compress_pool(
-                gpu,
-                k.side.compress_pool,
-                held.kv_state,
-                held.score_state,
-                sc.pooled,
-                w.ratio,
-                HEAD_DIM,
-                stream,
-            )?,
-            // One token a group: nothing to pool, the projection is the key.
-            None => moe::round_bf16(
-                gpu,
-                k.moe.round_bf16,
-                held.kv_state,
-                sc.pooled,
-                HEAD_DIM,
-                stream,
-            )?,
-        }
-        self.norm(gpu, sc.pooled, w.norm, key, HEAD_DIM, stream)?;
-        let at = self.at(group_position(group, w.ratio))?;
-        // The index key comes from the key as it is before its rotation.
-        if let Some(index) = self.weights.indexer.as_ref().and_then(|i| i.key.as_ref()) {
-            let index_key = held.index_keys.offset(group * INDEX_DIM * 2);
-            self.index_key(gpu, index, key, index_key, at, stream)?;
-        }
-        ops::rotate(
-            gpu,
-            k.cache.rotate,
-            key,
-            at,
-            self.freqs,
-            1,
-            1,
-            HEAD_DIM,
-            s.rope,
-            false,
-            stream,
-        )?;
-        ops::fp4_quant_dequant(
-            gpu,
-            k.cache.fp4_quant_dequant,
-            key,
-            HEAD_DIM,
-            Fp4Scale::E4m3Per16,
-            stream,
-        )
     }
 
     /// The window's keys for a batch of more than one row from `position`,
@@ -252,40 +140,29 @@ impl Block {
         let began = profile::begin(gpu, stream)?;
         // Compressed keys: a source writes its own and chooses which a query
         // reads; the layers after it read the same keys at the same choice.
-        let mut compressed = state.window;
-        let mut index: Vec<Vec<i32>> = Vec::with_capacity(rows);
-        for r in 0..rows {
-            let at = position + r;
-            let mut idx = match rows {
-                1 => window_row(at),
+        let mut index: Vec<Vec<i32>> = (0..rows)
+            .map(|r| match rows {
+                1 => window_row(position),
                 // Position q is entry q - position + 128 of the unrolled keys.
                 _ => {
-                    let mut row: Vec<i32> = prefill_window(at)
+                    let mut row: Vec<i32> = prefill_window(position + r)
                         .map(|q| (q + WINDOW - position) as i32)
                         .collect();
                     row.resize(WINDOW, -1);
                     row
                 }
-            };
-            if self.ratio > 0 {
-                let normed = sc.normed.offset(r * s.hidden * 2);
-                if self.weights.compressor.is_some() {
-                    self.compress(gpu, state, at, normed, stream)?;
-                }
-                let (keys, chosen) = self.compressed_row(
-                    gpu,
-                    row + r,
-                    state,
-                    at,
-                    turn.positions.offset(r * 4),
-                    normed,
-                    sc.q_low_normed.offset(r * s.q_rank * 2),
-                    stream,
-                )?;
-                compressed = keys;
+            })
+            .collect();
+        let mut compressed = state.window;
+        if self.ratio > 0 {
+            if self.weights.compressor.is_some() {
+                self.compress(gpu, state, position, rows, stream)?;
+            }
+            let (keys, chosen) = self.compressed_rows(gpu, row, rows, state, position, stream)?;
+            compressed = keys;
+            for (idx, chosen) in index.iter_mut().zip(chosen) {
                 idx.extend(chosen);
             }
-            index.push(idx);
         }
         profile::end(gpu, stream, "compress and choose", began)?;
         // Every row's keys in one table, the shorter rows ending in none.

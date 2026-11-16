@@ -18,22 +18,24 @@
 
 #define DSV41_SIDE_THREADS 256
 
-// out[row] = sum_k w[row, k] * x[k] in FP32, not rounded. x [k] BF16,
-// w [n, k] BF16, out [n] FP32. The reference widens both to FP32 first,
-// which is exact. A block per row, its 256 threads adding the products in a
-// tree: a thread a row, adding them one after another, takes a millisecond
-// over 5,120 columns. Grid (n), block 256.
+// out[m, row] = sum_k w[row, k] * x[m, k] in FP32, not rounded. x [M, k]
+// BF16, w [n, k] BF16, out [M, n] FP32. The reference widens both to FP32
+// first, which is exact. A block per (row, m), its 256 threads adding the
+// products in a tree: a thread a row, adding them one after another, takes
+// a millisecond over 5,120 columns. Grid (n, M), block 256.
 extern "C" __global__ void __launch_bounds__(DSV41_DOT_THREADS) dsv41_gemv_f32(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ w,
     float* __restrict__ out,
     unsigned int k) {
-    const float sum = dsv41_dot_wide(x, w + (size_t)blockIdx.x * k, k);
-    if (threadIdx.x == 0) out[blockIdx.x] = sum;
+    const float sum =
+        dsv41_dot_wide(x + (size_t)blockIdx.y * k, w + (size_t)blockIdx.x * k, k);
+    if (threadIdx.x == 0) out[(size_t)blockIdx.y * gridDim.x + blockIdx.x] = sum;
 }
 
-// pooled[d] = BF16(sum_r kv[r, d] * softmax_r(score[r, d])) over the `ratio`
-// tokens of one group. kv and score [ratio, dim] FP32.
+// pooled[g, d] = BF16(sum_r kv[g, r, d] * softmax_r(score[g, r, d])) over the
+// `ratio` tokens of each group. kv and score [groups, ratio, dim] FP32.
+// Grid (ceil(dim / threads), groups).
 extern "C" __global__ void dsv41_compress_pool(
     const float* __restrict__ kv,
     const float* __restrict__ score,
@@ -42,6 +44,8 @@ extern "C" __global__ void dsv41_compress_pool(
     unsigned int dim) {
     const unsigned int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= dim) return;
+    kv += (size_t)blockIdx.y * ratio * dim;
+    score += (size_t)blockIdx.y * ratio * dim;
     float top = score[d];
     for (unsigned int r = 1; r < ratio; ++r) top = fmaxf(top, score[r * dim + d]);
     float total = 0.0f;
@@ -49,7 +53,7 @@ extern "C" __global__ void dsv41_compress_pool(
     float acc = 0.0f;
     for (unsigned int r = 0; r < ratio; ++r)
         acc += kv[r * dim + d] * (expf(score[r * dim + d] - top) / total);
-    pooled[d] = __float2bfloat16(acc);
+    pooled[(size_t)blockIdx.y * dim + d] = __float2bfloat16(acc);
 }
 
 // Engram table rows as the values a lookup reads. Column c of the lookup is

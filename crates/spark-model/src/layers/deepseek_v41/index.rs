@@ -53,15 +53,65 @@ pub fn score(
     weight_scale: f32,
     stream: u64,
 ) -> Result<()> {
+    if groups == 0 {
+        return Ok(());
+    }
+    // One query that sees `groups` keys.
+    let rows = Queries {
+        count: 1,
+        position: groups - 1,
+        ratio: 1,
+        stride: groups,
+    };
+    score_rows(
+        gpu,
+        kernel,
+        q,
+        keys,
+        weights,
+        partial,
+        heads,
+        rows,
+        weight_scale,
+        stream,
+    )
+}
+
+/// The queries of one launch of [`score_rows`]: `count` tokens from
+/// `position` on a layer of compression `ratio`, each seeing the keys of the
+/// groups complete at its position; `stride` values of `partial` a query.
+#[derive(Clone, Copy)]
+pub struct Queries {
+    pub count: usize,
+    pub position: usize,
+    pub ratio: usize,
+    pub stride: usize,
+}
+
+/// [`score`] for a row of queries: `q` `[count, heads, 128]`, `weights`
+/// `[count, heads]`, `partial` `[count, stride]`.
+#[allow(clippy::too_many_arguments)]
+pub fn score_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    keys: DevicePtr,
+    weights: DevicePtr,
+    partial: DevicePtr,
+    heads: usize,
+    rows: Queries,
+    weight_scale: f32,
+    stream: u64,
+) -> Result<()> {
     ensure!(
         heads <= MAX_HEADS && heads * INDEX_DIM <= MAX_Q,
         "dsv41_index_score: {heads} heads"
     );
-    if groups == 0 {
+    if rows.count == 0 || rows.stride == 0 {
         return Ok(());
     }
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(groups as u32, THREADS), 1, 1])
+        .grid([div_ceil(rows.stride as u32, THREADS), rows.count as u32, 1])
         .block([THREADS, 1, 1])
         .arg_ptr(q)
         .arg_ptr(keys)
@@ -69,8 +119,10 @@ pub fn score(
         .arg_ptr(partial)
         .arg_u32(heads as u32)
         .arg_u32(INDEX_DIM as u32)
-        .arg_u32(groups as u32)
+        .arg_u32(rows.stride as u32)
         .arg_f32(weight_scale)
+        .arg_u32(rows.position as u32)
+        .arg_u32(rows.ratio as u32)
         .launch(stream)
 }
 

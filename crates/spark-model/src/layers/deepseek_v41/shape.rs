@@ -135,6 +135,14 @@ impl BlockKernels {
 /// an expert has eight rows on average.
 pub const ROWS: usize = 512;
 
+/// The most tokens a compressor pools into one key that there is room for.
+pub const MAX_RATIO: usize = 8;
+
+/// Scores (query, compressed position) one launch of the indexer may leave:
+/// the queries of a batch are scored this many at a time, a sixth of a
+/// gigabyte of scratch.
+const SCORES: usize = 1 << 25;
+
 /// Working buffers for a batch of up to [`ROWS`] rows, shared by every block
 /// of a model: blocks run one after another. Unless it says otherwise a
 /// buffer is `[rows, ..]`, and those of the parts `[PARTS, rows, ..]`.
@@ -186,28 +194,41 @@ pub struct Scratch {
     pub(super) route_scores: DevicePtr,
     pub(super) chosen: DevicePtr,
     pub(super) weights: DevicePtr,
+    /// `[rows + MAX_RATIO, 512]` FP32 each: a compressor's key and gate
+    /// projections of the tokens a group was left open with and then of the
+    /// batch's; `[rows, 512]` BF16, the keys pooled from them; and `[rows]`
+    /// u32, the positions the groups are turned to.
+    pub(super) pool_kv: DevicePtr,
+    pub(super) pool_score: DevicePtr,
     pub(super) pooled: DevicePtr,
+    pub(super) group_positions: DevicePtr,
     pub(super) site_pre: DevicePtr,
     /// The mix's partial sums, a block of the token each.
     pub(super) hc_partials: DevicePtr,
     pub(super) post: DevicePtr,
     pub(super) comb: DevicePtr,
+    /// The indexer's query heads and head weights, `[score_rows, ..]`, and
+    /// the index keys of a batch's groups, `[rows, 128]`.
     pub(super) index_q: DevicePtr,
     pub(super) index_weights_f32: DevicePtr,
     pub(super) index_weights: DevicePtr,
     pub(super) index_key_f32: DevicePtr,
     pub(super) index_key: DevicePtr,
+    /// `[score_rows, max_groups]`: a row the scores of one query.
     pub(super) scores_f32: DevicePtr,
     pub(super) scores: DevicePtr,
-    /// The compressed positions `scores` has room for.
+    /// The compressed positions a row of `scores` has room for, and the
+    /// queries one launch scores.
     pub(super) max_groups: usize,
+    pub(super) score_rows: usize,
 }
 
 impl Scratch {
     /// `max_positions` bounds a sequence, and so the compressed positions one
     /// query scores.
     pub fn alloc(gpu: &dyn GpuBackend, s: &Shape, max_positions: usize) -> Result<Self> {
-        let max_groups = max_positions;
+        let max_groups = max_positions.max(1);
+        let score_rows = (SCORES / max_groups).clamp(1, ROWS);
         let bf16 = |values: usize| gpu.alloc(values * 2);
         let f32s = |values: usize| gpu.alloc(values * 4);
         let copies = s.hc.copies;
@@ -246,19 +267,23 @@ impl Scratch {
             route_scores: f32s(ROWS * (s.experts))?,
             chosen: f32s(ROWS * (s.top_k))?,
             weights: f32s(ROWS * (s.top_k))?,
-            pooled: bf16(HEAD_DIM)?,
+            pool_kv: f32s((ROWS + MAX_RATIO) * HEAD_DIM)?,
+            pool_score: f32s((ROWS + MAX_RATIO) * HEAD_DIM)?,
+            pooled: bf16(ROWS * HEAD_DIM)?,
+            group_positions: f32s(ROWS)?,
             site_pre: f32s(ROWS * (copies))?,
             hc_partials: gpu.alloc(s.hc.partials(ROWS))?,
             post: f32s(ROWS * (copies))?,
             comb: f32s(ROWS * (copies * copies))?,
-            index_q: bf16(s.index_heads * INDEX_DIM)?,
-            index_weights_f32: f32s(s.index_heads)?,
-            index_weights: bf16(s.index_heads)?,
-            index_key_f32: f32s(INDEX_DIM)?,
-            index_key: bf16(INDEX_DIM)?,
-            scores_f32: f32s(max_groups.max(1))?,
-            scores: bf16(max_groups.max(1))?,
+            index_q: bf16(score_rows * s.index_heads * INDEX_DIM)?,
+            index_weights_f32: f32s(score_rows * s.index_heads)?,
+            index_weights: bf16(score_rows * s.index_heads)?,
+            index_key_f32: f32s(ROWS * INDEX_DIM)?,
+            index_key: bf16(ROWS * INDEX_DIM)?,
+            scores_f32: f32s(score_rows * max_groups)?,
+            scores: bf16(score_rows * max_groups)?,
             max_groups,
+            score_rows,
         })
     }
 }

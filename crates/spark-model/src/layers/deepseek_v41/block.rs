@@ -63,6 +63,7 @@ impl Block {
         x: DevicePtr,
         weight: DevicePtr,
         out: DevicePtr,
+        rows: usize,
         width: usize,
         stream: u64,
     ) -> Result<()> {
@@ -73,7 +74,7 @@ impl Block {
             x,
             &weight,
             out,
-            1,
+            rows as u32,
             width as u32,
             self.shared.shape.norm_eps,
             stream,

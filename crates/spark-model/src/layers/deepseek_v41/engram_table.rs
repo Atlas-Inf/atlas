@@ -16,7 +16,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::{WeightDtype, WeightStore};
 use spark_storage::NgramRowCache;
 
-use super::engram::{ENGRAM_DIM, ENGRAM_SCALE_GROUP};
+use super::engram::{ENGRAM_DIM, ENGRAM_ROWS, ENGRAM_SCALE_GROUP};
 
 /// Rows of a table kept in memory: 64 MB of values and 2 MB of scales.
 const CACHED_ROWS: usize = 1 << 18;
@@ -102,7 +102,8 @@ struct Caches {
 pub struct EngramTable {
     pub hash: EngramHash,
     caches: Mutex<Caches>,
-    /// `[2, columns]` u32: the value rows' slots, then the scale rows'.
+    /// `[2, ENGRAM_ROWS * columns]` u32: the value rows' slots, then the
+    /// scale rows'.
     slots: DevicePtr,
 }
 
@@ -144,42 +145,50 @@ impl EngramTable {
             .start_keepalive(KEEPALIVE_PERIOD, KEEPALIVE_IDLE)
             .context("Engram table: NVMe keepalive")?;
         Ok(Self {
-            slots: gpu.alloc(2 * hash.columns() * 4)?,
+            slots: gpu.alloc(2 * ENGRAM_ROWS * hash.columns() * 4)?,
             hash,
             caches: Mutex::new(caches),
         })
     }
 
-    /// Bring columns `held` of a token's `rows` into memory and say where
-    /// they are. They stay there until [`Self::done`], which the caller
-    /// calls once the kernels that read them have run.
+    /// Bring columns `held` of each token's `rows` into memory and say where
+    /// they are: a part of the projection reads `per` columns, and the slots
+    /// are `[tokens, per]` for each part of `held`, one part after another.
+    /// They stay there until [`Self::done`], which the caller calls once the
+    /// kernels that read them have run.
     pub fn find(
         &self,
         gpu: &dyn GpuBackend,
-        rows: &[u64],
+        rows: &[Vec<u64>],
         held: Range<usize>,
+        per: usize,
         stream: u64,
     ) -> Result<Found> {
+        ensure!(
+            rows.len() <= ENGRAM_ROWS && per > 0,
+            "Engram table: {} tokens at once",
+            rows.len()
+        );
+        let ids: Vec<u64> = held
+            .step_by(per)
+            .flat_map(|part| rows.iter().flat_map(move |of| of[part..part + per].iter()))
+            .copied()
+            .collect();
         let mut caches = self.caches.lock().expect("engram table");
-        let columns = rows.len();
         let (mut row_slots, mut scale_slots) = (Vec::new(), Vec::new());
-        caches.rows.resolve(&rows[held.clone()], &mut row_slots)?;
-        caches
-            .scales
-            .resolve(&rows[held.clone()], &mut scale_slots)?;
-        // In stream order, behind the last token's lookup, which reads them.
-        for (slots, at) in [
-            (&row_slots, held.start),
-            (&scale_slots, columns + held.start),
-        ] {
+        caches.rows.resolve(&ids, &mut row_slots)?;
+        caches.scales.resolve(&ids, &mut scale_slots)?;
+        // In stream order, behind the last lookup, which reads them.
+        let scale_at = self.slots.offset(ENGRAM_ROWS * self.hash.columns() * 4);
+        for (slots, at) in [(&row_slots, self.slots), (&scale_slots, scale_at)] {
             let bytes: Vec<u8> = slots.iter().flat_map(|slot| slot.to_le_bytes()).collect();
-            gpu.copy_h2d_async(&bytes, self.slots.offset(at * 4), stream)?;
+            gpu.copy_h2d_async(&bytes, at, stream)?;
         }
         Ok(Found {
             rows: DevicePtr(caches.rows.table_dev_va()?),
             scales: DevicePtr(caches.scales.table_dev_va()?),
             row_slots: self.slots,
-            scale_slots: self.slots.offset(columns * 4),
+            scale_slots: scale_at,
         })
     }
 

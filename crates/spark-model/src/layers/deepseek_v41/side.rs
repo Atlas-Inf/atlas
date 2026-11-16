@@ -29,8 +29,32 @@ impl SideKernels {
     }
 }
 
-/// `out` (`[n]` FP32, not rounded) = `w` (`[n, k]` BF16) times `x` (`[k]`
-/// BF16): a compressor projection.
+/// `out` (`[rows, n]` FP32, not rounded) = `x` (`[rows, k]` BF16) through `w`
+/// (`[n, k]` BF16): a compressor projection.
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_f32_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    x: DevicePtr,
+    w: DevicePtr,
+    out: DevicePtr,
+    rows: usize,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([n as u32, rows as u32, 1])
+        .block([THREADS, 1, 1])
+        .arg_ptr(x)
+        .arg_ptr(w)
+        .arg_ptr(out)
+        .arg_u32(k as u32)
+        .launch(stream)
+}
+
+/// [`gemv_f32_rows`] of one vector.
+#[allow(clippy::too_many_arguments)]
 pub fn gemv_f32(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -41,18 +65,36 @@ pub fn gemv_f32(
     k: usize,
     stream: u64,
 ) -> Result<()> {
+    gemv_f32_rows(gpu, kernel, x, w, out, 1, n, k, stream)
+}
+
+/// Each of `groups` groups' pooled key (`[groups, dim]` BF16, before the
+/// norm) from its `ratio` tokens' key and gate projections (`[groups, ratio,
+/// dim]` FP32 each).
+#[allow(clippy::too_many_arguments)]
+pub fn compress_pool_groups(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    kv: DevicePtr,
+    score: DevicePtr,
+    pooled: DevicePtr,
+    groups: usize,
+    ratio: usize,
+    dim: usize,
+    stream: u64,
+) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([n as u32, 1, 1])
+        .grid([div_ceil(dim as u32, THREADS), groups as u32, 1])
         .block([THREADS, 1, 1])
-        .arg_ptr(x)
-        .arg_ptr(w)
-        .arg_ptr(out)
-        .arg_u32(k as u32)
+        .arg_ptr(kv)
+        .arg_ptr(score)
+        .arg_ptr(pooled)
+        .arg_u32(ratio as u32)
+        .arg_u32(dim as u32)
         .launch(stream)
 }
 
-/// One group's pooled key (`[dim]` BF16, before the norm) from its `ratio`
-/// tokens' key and gate projections (`[ratio, dim]` FP32 each).
+/// [`compress_pool_groups`] of one group.
 #[allow(clippy::too_many_arguments)]
 pub fn compress_pool(
     gpu: &dyn GpuBackend,
@@ -64,15 +106,7 @@ pub fn compress_pool(
     dim: usize,
     stream: u64,
 ) -> Result<()> {
-    KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(dim as u32, THREADS), 1, 1])
-        .block([THREADS, 1, 1])
-        .arg_ptr(kv)
-        .arg_ptr(score)
-        .arg_ptr(pooled)
-        .arg_u32(ratio as u32)
-        .arg_u32(dim as u32)
-        .launch(stream)
+    compress_pool_groups(gpu, kernel, kv, score, pooled, 1, ratio, dim, stream)
 }
 
 /// `out` (`[columns, 256]` BF16) = Engram table rows as the values a

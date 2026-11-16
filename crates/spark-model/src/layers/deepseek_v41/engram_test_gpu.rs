@@ -108,7 +108,9 @@ fn engram_layers_replay_the_reference_from_hash_ids() -> Result<()> {
                 &inputs[at * copies * hidden * 2..(at + 1) * copies * hidden * 2],
                 streams,
             )?;
-            engram.apply(gpu, row_dev, scale_dev, slots, slots, streams, None, stream)?;
+            engram.apply(
+                gpu, row_dev, scale_dev, slots, slots, streams, 1, None, stream,
+            )?;
             values.extend(download(gpu, engram.values, read)?);
             projected.extend(download(gpu, engram.kv, kv)?);
             got.extend(download(gpu, streams, copies * hidden)?);

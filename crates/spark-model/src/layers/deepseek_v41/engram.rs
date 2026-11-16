@@ -31,6 +31,9 @@ use super::weights::{Parted, column_parts, tensor};
 pub const ENGRAM_DIM: usize = 256;
 /// Values of a row under one scale.
 pub const ENGRAM_SCALE_GROUP: usize = 32;
+/// Tokens one lookup takes: their rows are held in memory together, and
+/// their projections are 400 KB a token and part.
+pub const ENGRAM_ROWS: usize = 64;
 
 /// An Engram layer's weights, apart from its table.
 pub struct EngramWeights {
@@ -101,19 +104,19 @@ pub fn held_columns(columns: usize, held: Held) -> Range<usize> {
     held.first * per..(held.first + held.count) * per
 }
 
-/// One Engram layer on one token at a time.
+/// One Engram layer on up to [`ENGRAM_ROWS`] tokens at a time.
 pub struct Engram {
     pub weights: EngramWeights,
     kernels: BlockKernels,
     shape: Shape,
     held: Held,
-    /// `[columns * 256]` BF16: the rows as values.
+    /// `[PARTS, tokens, columns / PARTS * 256]` BF16: the rows as values.
     pub(super) values: DevicePtr,
-    /// `[PARTS, rows]` FP32: the parts of the projection, and scratch as
-    /// large for a gather that is not in place.
+    /// `[PARTS, tokens, rows]` FP32: the parts of the projection, and
+    /// scratch as large for a gather that is not in place.
     kv_parts: DevicePtr,
     gather_recv: DevicePtr,
-    /// `[(copies + 1) * hidden]` BF16: the keys, then the value.
+    /// `[tokens, (copies + 1) * hidden]` BF16: the keys, then the value.
     pub(super) kv: DevicePtr,
 }
 
@@ -125,12 +128,12 @@ impl Engram {
         held: Held,
         weights: EngramWeights,
     ) -> Result<Self> {
-        let read = weights.columns * ENGRAM_DIM * 2;
+        let read = ENGRAM_ROWS * weights.columns * ENGRAM_DIM * 2;
         Ok(Self {
             values: gpu.alloc(read)?,
-            kv_parts: gpu.alloc(PARTS * weights.rows * 4)?,
-            gather_recv: gpu.alloc(PARTS * weights.rows * 4)?,
-            kv: gpu.alloc(weights.rows * 2)?,
+            kv_parts: gpu.alloc(ENGRAM_ROWS * PARTS * weights.rows * 4)?,
+            gather_recv: gpu.alloc(ENGRAM_ROWS * PARTS * weights.rows * 4)?,
+            kv: gpu.alloc(ENGRAM_ROWS * weights.rows * 2)?,
             kernels,
             shape: *shape,
             held,
@@ -143,12 +146,17 @@ impl Engram {
         held_columns(self.weights.columns, self.held)
     }
 
-    /// Add a token's lookup into its stream (`[copies, hidden]` BF16, in
-    /// place). The rows its hash ids name are, in the ids' order, rows
-    /// `row_slots` (`[columns]` u32) of `rows` (256 FP8 values a row) and
-    /// rows `scale_slots` of `scales` (8 E8M0 scales a row); only
-    /// [`Self::columns`] of them are read. `comm` reaches the ranks that
-    /// hold the other parts.
+    /// Columns of a lookup one part of the projection reads.
+    pub fn per_part(&self) -> usize {
+        self.weights.columns / PARTS
+    }
+
+    /// Add the lookups of `tokens` tokens into their streams (`[tokens,
+    /// copies, hidden]` BF16, in place). The rows their hash ids name are
+    /// rows `row_slots` of `rows` (256 FP8 values a row) and rows
+    /// `scale_slots` of `scales` (8 E8M0 scales a row). The slots are u32,
+    /// `[tokens, columns / PARTS]` for each part this rank holds, one part
+    /// after another. `comm` reaches the ranks that hold the other parts.
     #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &self,
@@ -158,34 +166,41 @@ impl Engram {
         row_slots: DevicePtr,
         scale_slots: DevicePtr,
         streams: DevicePtr,
+        tokens: usize,
         comm: Option<&dyn CommBackend>,
         stream: u64,
     ) -> Result<()> {
         let (k, w, s) = (&self.kernels, &self.weights, &self.shape);
-        let per = w.columns / PARTS;
+        ensure!(tokens <= ENGRAM_ROWS, "Engram: {tokens} tokens at once");
+        let per = self.per_part();
         let width = per * ENGRAM_DIM;
+        let part_bytes = tokens * w.rows * 4;
         for part in self.held.range() {
-            let values = self.values.offset(part * width * 2);
+            let slots = (part - self.held.first) * tokens * per * 4;
+            let values = self.values.offset(part * tokens * width * 2);
             side::engram_rows(
                 gpu,
                 k.side.engram_rows,
                 rows,
                 scales,
-                row_slots.offset(part * per * 4),
-                scale_slots.offset(part * per * 4),
+                row_slots.offset(slots),
+                scale_slots.offset(slots),
                 values,
-                per,
+                tokens * per,
                 stream,
             )?;
             // The projection rounds the values to FP8 on the way in.
             let wkv = w.wkv[part].context("a held part of the Engram projection")?;
-            parts::project(
+            parts::project_rows(
                 gpu,
                 k.parts.fp8_f32_q,
                 values,
                 wkv.data,
                 wkv.scales,
-                self.kv_parts.offset(part * w.rows * 4),
+                self.kv_parts.offset(part * part_bytes),
+                4,
+                w.rows,
+                tokens,
                 w.rows,
                 width,
                 stream,
@@ -197,8 +212,8 @@ impl Engram {
             self.held,
             self.kv_parts,
             self.gather_recv,
-            w.rows * 4,
-            w.rows * 4,
+            part_bytes,
+            part_bytes,
             stream,
         )?;
         parts::round(
@@ -206,9 +221,9 @@ impl Engram {
             k.parts.round,
             self.kv_parts,
             self.kv,
-            w.rows,
+            tokens * w.rows,
             1,
-            w.rows,
+            tokens * w.rows,
             stream,
         )?;
         side::engram_gate(
@@ -217,7 +232,7 @@ impl Engram {
             streams,
             self.kv,
             w.weight,
-            1,
+            tokens,
             s.hidden,
             s.hc.copies,
             s.norm_eps,

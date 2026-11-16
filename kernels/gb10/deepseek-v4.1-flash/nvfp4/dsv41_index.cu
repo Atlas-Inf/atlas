@@ -30,8 +30,11 @@ static __device__ __forceinline__ float dsv41_index_bf16(float v) {
     return __bfloat162float(__float2bfloat16(v));
 }
 
-// q [heads, width] BF16, keys [groups, width] BF16, weights [heads] BF16,
-// partial [groups] FP32. A head's weight is BF16(weights[h] * weight_scale).
+// A row of the grid is a query: q [rows, heads, width] BF16, weights [rows,
+// heads] BF16, partial [rows, stride] FP32, and keys [groups, width] BF16
+// shared. Query y is the token at `position + y`, which sees
+// (position + y + 1) / ratio of the keys. A head's weight is
+// BF16(weights[h] * weight_scale). Grid (ceil(stride / 256), rows).
 extern "C" __global__ void __launch_bounds__(DSV41_INDEX_THREADS) dsv41_index_score(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ keys,
@@ -39,17 +42,21 @@ extern "C" __global__ void __launch_bounds__(DSV41_INDEX_THREADS) dsv41_index_sc
     float* __restrict__ partial,
     unsigned int heads,
     unsigned int width,
-    unsigned int groups,
-    float weight_scale) {
+    unsigned int stride,
+    float weight_scale,
+    unsigned int position,
+    unsigned int ratio) {
     __shared__ float qs[DSV41_INDEX_MAX_Q];
     __shared__ float ws[DSV41_INDEX_MAX_HEADS];
+    q += (size_t)blockIdx.y * heads * width;
+    weights += (size_t)blockIdx.y * heads;
     for (unsigned int i = threadIdx.x; i < heads * width; i += DSV41_INDEX_THREADS)
         qs[i] = __bfloat162float(q[i]);
     for (unsigned int h = threadIdx.x; h < heads; h += DSV41_INDEX_THREADS)
         ws[h] = dsv41_index_bf16(__bfloat162float(weights[h]) * weight_scale);
     __syncthreads();
     const unsigned int t = blockIdx.x * DSV41_INDEX_THREADS + threadIdx.x;
-    if (t >= groups) return;
+    if (t >= (position + blockIdx.y + 1) / ratio || t >= stride) return;
     const __nv_bfloat16* key = keys + (size_t)t * width;
     float total = 0.0f;
     for (unsigned int h = 0; h < heads; ++h) {
@@ -59,5 +66,5 @@ extern "C" __global__ void __launch_bounds__(DSV41_INDEX_THREADS) dsv41_index_sc
         const float head = fmaxf(dsv41_index_bf16((float)dot), 0.0f);
         total += dsv41_index_bf16(head * ws[h]);
     }
-    partial[t] = total;
+    partial[(size_t)blockIdx.y * stride + t] = total;
 }
