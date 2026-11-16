@@ -29,7 +29,7 @@ __global__ void __launch_bounds__(BS_) gu_rows_cols(FA_ARGS) {
 template<int BS_>
 __global__ void __launch_bounds__(BS_) gu_rows_sa(FA_ARGS) {
     constexpr unsigned int ROWS = 8, BS = BS_, STRIDE = BS + (BS >= 256 ? 16 : BS / 2);
-    typedef __attribute__((address_space(4))) const uint4 cuint4;
+    typedef __attribute__((address_space(4))) const unsigned int cu32;
     const unsigned int u = blockIdx.y, proj = blockIdx.z;
     if (u > *u_count) return;
     const bool is_shared = (u == *u_count);
@@ -73,7 +73,10 @@ __global__ void __launch_bounds__(BS_) gu_rows_sa(FA_ARGS) {
                 uint4 av4[ROWS];
                 #pragma unroll
                 for (unsigned int r = 0; r < ROWS; r++)
-                    av4[r] = *(cuint4*)(const void*)&A[(unsigned long long)r * h + tg * TILE_KH * 2 + rr4 * 8];
+                {
+                    cu32* q = (cu32*)(const void*)&A[(unsigned long long)r * h + tg * TILE_KH * 2 + rr4 * 8];
+                    av4[r].x = q[0]; av4[r].y = q[1]; av4[r].z = q[2]; av4[r].w = q[3];
+                }
                 #pragma unroll
                 for (unsigned int jj = 0; jj < 4; jj++) {
                     const unsigned int rr = rr4 * 4 + jj;
