@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// KLOOP #185: NS-stage pipeline (prefetch NS-1 tiles ahead) at TKH32 / TKH16, bit-exact (same per-output k order).
 // KLOOP #174: ship is now TKH32 (#382). Twins: 128-thread blocks (5 x 128 cols tile N=640 exactly) and TKH 16 at BS128.
 // KLOOP #156 (Flash-Next C8): in situ the rows_v3 kernels run ~120 GB/s with ~80 unique experts (grid y 81) and every
 // compute-side twin (SGPR-A 1.32x, WMMA 1.36x in kbench) LOST in the model: they are memory-latency bound there. Ship
@@ -12,7 +13,7 @@
 #include <vector>
 #define CHECK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { printf("HIP %s at %s:%d\n", hipGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
 
-template<unsigned TKH, int MINB, unsigned BS_ = 256>
+template<unsigned TKH, int MINB, unsigned BS_ = 256, unsigned NS = 2>
 __global__ void __launch_bounds__(BS_, MINB) gu_rows_tkh(const __nv_bfloat16* __restrict__ A, const unsigned long long* __restrict__ gpk,
     const unsigned long long* __restrict__ gsc, const float* __restrict__ gs2, __nv_bfloat16* __restrict__ gate_out,
     const unsigned long long* __restrict__ upk, const unsigned long long* __restrict__ usc, const float* __restrict__ us2,
@@ -32,9 +33,9 @@ __global__ void __launch_bounds__(BS_, MINB) gu_rows_tkh(const __nv_bfloat16* __
         else { B_packed = (const unsigned char*)upk[eid]; B_scale = (const unsigned char*)usc[eid]; s2 = us2[eid]; } }
     const unsigned int lane = threadIdx.x, ns0 = blockIdx.x * BS, col = ns0 + lane; const bool vc = col < N;
     __shared__ float s_lut[16]; if (lane < 16) s_lut[lane] = E2M1_LUT_T[lane];
-    __shared__ unsigned char s_pk[2][TKH * STRIDE];
-    __shared__ unsigned char s_sc[2][(TKH / 8) * STRIDE];
-    __shared__ __align__(16) __nv_bfloat16 s_a[2][ROWS * TKH * 2];
+    __shared__ unsigned char s_pk[NS][TKH * STRIDE];
+    __shared__ unsigned char s_sc[NS][(TKH / 8) * STRIDE];
+    __shared__ __align__(16) __nv_bfloat16 s_a[NS][ROWS * TKH * 2];
     __syncthreads();
     const unsigned int mask = is_shared ? ((1u << ROWS) - 1u) : u_rowmask[u];
     auto stage = [&](unsigned int tg, unsigned int buf) {
@@ -57,11 +58,12 @@ __global__ void __launch_bounds__(BS_, MINB) gu_rows_tkh(const __nv_bfloat16* __
     #pragma unroll
     for (unsigned int r = 0; r < ROWS; r++) acc[r] = 0.0f;
     const unsigned int ntg = (K / 2u) / TKH;
-    stage(0, 0);
+    #pragma unroll
+    for (unsigned int p0 = 0; p0 + 1u < NS; p0++) if (p0 < ntg) stage(p0, p0);
     for (unsigned int tg = 0; tg < ntg; tg++) {
         __syncthreads();
-        if (tg + 1u < ntg) stage(tg + 1u, (tg + 1u) & 1u);
-        const unsigned int buf = tg & 1u;
+        if (tg + NS - 1u < ntg) stage(tg + NS - 1u, (tg + NS - 1u) % NS);
+        const unsigned int buf = tg % NS;
         if (vc) {
             #pragma unroll
             for (unsigned int rr4 = 0; rr4 < TKH / 4u; rr4++) {
@@ -120,12 +122,11 @@ int main() {
     const dim3 g((N + 255) / 256, U + 1, 2), b(256);
     auto launch = [&](int v, int st, int ai) { unsigned long long** t = dtab[st];
 #define ARGS_(V) dA[ai], t[0], t[1], ds2, go[V], t[2], t[3], ds2, uo[V], due, dmask, dslot, dcnt, sgp, sgs, 0.01f, sgo[V], sup, sus, 0.01f, suo[V], N, K, TOPK, K
-        const dim3 g128((N + 127) / 128, U + 1, 2), b128(128);
         if (v == 0) hipLaunchKernelGGL(moe_expert_gate_up_shared_t_rows_v3_r8_b256, g, b, 0, 0, ARGS_(0), R);
-        else if (v == 1) hipLaunchKernelGGL((gu_rows_tkh<32, 1>), g, b, 0, 0, ARGS_(1));
-        else if (v == 2) hipLaunchKernelGGL((gu_rows_tkh<32, 2, 128>), g128, b128, 0, 0, ARGS_(2));
-        else if (v == 3) hipLaunchKernelGGL((gu_rows_tkh<16, 2, 128>), g128, b128, 0, 0, ARGS_(3));
-        else hipLaunchKernelGGL((gu_rows_tkh<64, 2, 128>), g128, b128, 0, 0, ARGS_(4)); };
+        else if (v == 1) hipLaunchKernelGGL((gu_rows_tkh<32, 1, 256, 2>), g, b, 0, 0, ARGS_(1));
+        else if (v == 2) hipLaunchKernelGGL((gu_rows_tkh<32, 1, 256, 3>), g, b, 0, 0, ARGS_(2));
+        else if (v == 3) hipLaunchKernelGGL((gu_rows_tkh<32, 1, 256, 4>), g, b, 0, 0, ARGS_(3));
+        else hipLaunchKernelGGL((gu_rows_tkh<16, 2, 256, 4>), g, b, 0, 0, ARGS_(4)); };
     hipEvent_t e0, e1; CHECK(hipEventCreate(&e0)); CHECK(hipEventCreate(&e1));
     const double bytes = (double)(U + 1) * 2 * (pb + sb);
     float t[NV];
@@ -136,7 +137,7 @@ int main() {
         for (auto pr : {std::make_pair(sgo[0], sgo[v]), std::make_pair(suo[0], suo[v])}) { CHECK(hipMemcpy(a0.data(), pr.first, R * N * 2, hipMemcpyDeviceToHost)); CHECK(hipMemcpy(a1.data(), pr.second, R * N * 2, hipMemcpyDeviceToHost)); same &= !memcmp(a0.data(), a1.data(), R * N * 2); }
         return same; };
     printf("-- rows_v3_r8 gate_up N=%u K=%u U=%u (+shared, 16 rotating A, cold weights): ship %7.1f us (%.0f GB/s)\n", N, K, U, t[0], bytes / 1e3 / t[0]);
-    const char* nm[NV] = {"", "TKH32 b256 (=ship)", "TKH32 b128", "TKH16 b128", "TKH64 b128"};
+    const char* nm[NV] = {"", "TKH32 2-stage (=ship)", "TKH32 3-stage", "TKH32 4-stage", "TKH16 4-stage"};
     for (int v = 1; v < NV; v++) printf("-- rows %-20s %7.1f us (%.0f GB/s) x%.2f %s\n", nm[v], t[v], bytes / 1e3 / t[v], t[0] / t[v], eq(v) ? "bit-identical" : "DIFFERS");
     return 0;
 }
