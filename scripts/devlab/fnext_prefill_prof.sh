@@ -103,6 +103,9 @@ elif os.environ.get("PHASE") == "score":
     for tag, b in (("score-8br", br), ("score-1br", br[:1])):
         p50, eng = score(b, 15)
         print(f"  [prof] {tag}: wall p50 {1e3 * p50:.0f} ms (last engine_us {eng})", flush=True)
+elif os.environ.get("PHASE") == "p2k":
+    # The h2h pp row (~1.9k new tokens at depth 0): prefill-only attribution, no 16k QSA.
+    for i in range(6): ask(f"2k-{i}", 1900, 300 + i)
 else:
     for i in range(3): ask(f"2k-{i}", 1900, 100 + i)
     for i in range(2): ask(f"16k-{i}", 16000, 200 + i)
