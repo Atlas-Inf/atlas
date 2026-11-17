@@ -35,8 +35,8 @@ use super::ops::{self, HEAD_DIM};
 use super::parts::{self, Held, PARTS};
 use super::shape::ladder;
 use super::weights::{BlockWeights, Fp8Proj, fp8_held, row_part, tensor};
-use crate::layers::ops::{bf16_gemm_f32out, rms_norm};
-use crate::weight_map::DenseWeight;
+use crate::layers::ops::{mxfp8_quantize, rms_norm};
+use crate::weight_map::{DenseWeight, Mxfp8Weight};
 
 /// Rows a stage's scratch has room for: a block is five.
 const BLOCK_ROOM: usize = 8;
@@ -79,9 +79,11 @@ pub struct Draft {
     main_proj: Fp8Proj,
     main_norm: DevicePtr,
     norm: DevicePtr,
-    /// The model's embedding table and head, `[vocab, hidden]` BF16 each.
+    /// The model's embedding table, `[vocab, hidden]` BF16; and the parts of
+    /// its head this rank holds, in FP8: a draft is checked, not kept, and
+    /// the head is a third of what a pass reads.
     embed: DevicePtr,
-    head: DevicePtr,
+    head: Mxfp8Weight,
     vocab: usize,
     noise: u32,
     /// Rows of a block.
@@ -219,7 +221,17 @@ impl Draft {
             main_norm: tensor(store, "mtp.0.main_norm.weight", WeightDtype::BF16)?,
             norm: tensor(store, &format!("{last}.norm.weight"), WeightDtype::BF16)?,
             embed,
-            head,
+            head: {
+                let (first, rows) = (held.first * vocab / PARTS, held.count * vocab / PARTS);
+                let quantize = gpu.kernel("mxfp8_gemv", "mxfp8_quantize_bf16")?;
+                let fp8 = Mxfp8Weight::alloc(gpu, rows, hidden)?;
+                let bf16 = head.offset(first * hidden * 2);
+                mxfp8_quantize(
+                    gpu, quantize, bf16, fp8.data, fp8.scales, rows, hidden, stream,
+                )?;
+                gpu.synchronize(stream)?;
+                fp8
+            },
             vocab,
             noise: config.dspark_noise_token_id,
             rows,
@@ -423,11 +435,24 @@ impl Draft {
         self.norm(gpu, b.x, self.norm, b.normed, rows, stream)?;
         // The head a part at a time: its logits, and the largest of them.
         let part_n = self.vocab / PARTS;
-        let (bytes, shape) = (rows * KEEP * 8, [rows as u32, part_n as u32, hidden as u32]);
+        let bytes = rows * KEEP * 8;
         for part in self.held.range() {
-            let weights = self.head.offset(part * part_n * hidden * 2);
-            let [m, n, width] = shape;
-            bf16_gemm_f32out(b.normed, weights.0, b.logits, m, n, width, stream)?;
+            let at = (part - self.held.first) * part_n * hidden;
+            let (weights, scales) = (self.head.data.offset(at), self.head.scales.offset(at / 32));
+            parts::project_rows(
+                gpu,
+                k.parts.fp8_f32,
+                b.normed,
+                weights,
+                scales,
+                b.logits,
+                4,
+                part_n,
+                rows,
+                part_n,
+                hidden,
+                stream,
+            )?;
             let (best, first) = (b.best.offset(part * bytes), part * part_n);
             draft_ops::largest(gpu, &self.own, b.logits, best, rows, part_n, first, stream)?;
         }
