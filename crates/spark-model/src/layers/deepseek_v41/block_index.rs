@@ -5,6 +5,7 @@
 //! the host (`index_recipe.rs`); a batch on the device (`dsv41_choose.cu`).
 
 use anyhow::{Result, ensure};
+use spark_comm::CommBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::block::{Block, Candidates};
@@ -14,7 +15,8 @@ use super::index::{self, Flags, INDEX_DIM, Queries, head_weight_scale};
 use super::index_recipe::{candidate_blocks, keep_candidates, top_positions};
 use super::moe;
 use super::ops::{self, Fp4Scale};
-use super::parts;
+use super::owned::{self, Owned};
+use super::parts::{self, PARTS};
 use super::state::SeqState;
 use super::weights::IndexerWeights;
 
@@ -211,6 +213,11 @@ impl Block {
     /// `position` read, and the positions among them each attends to. A
     /// source layer publishes its own for the layers after it; the others
     /// read what the latest source published.
+    ///
+    /// With `own`, an index source scores the rows this rank keeps, a
+    /// quarter of the scoring, and the ranks gather each other's choices
+    /// (`comm`).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn compressed_rows(
         &self,
         gpu: &dyn GpuBackend,
@@ -218,6 +225,8 @@ impl Block {
         rows: usize,
         state: &SeqState,
         position: usize,
+        comm: Option<&dyn CommBackend>,
+        own: Option<Owned>,
         stream: u64,
     ) -> Result<(DevicePtr, Chosen)> {
         let (s, k, sc) = (
@@ -237,10 +246,12 @@ impl Block {
         // of one layer run it, is chosen for on the host, where they can
         // hand it a choice.
         let on_device = rows > 1 || self.gemm.is_some();
+        // Rows gathered a part each fill whole parts.
+        let room = row + own.map_or(rows, |own| rows.max(own.each * PARTS));
         let table = match on_device {
             false => DevicePtr::NULL,
             true => handoff
-                .table(gpu, row + rows, topk, stream)?
+                .table(gpu, room, topk, stream)?
                 .offset(row * topk * 4),
         };
         // And so do the blocks the candidate source leaves the index layers
@@ -251,9 +262,7 @@ impl Block {
             (_, block) => {
                 let cols = sc.max_groups.div_ceil(block);
                 Some(Flags {
-                    flags: handoff
-                        .flags(gpu, row + rows, cols, stream)?
-                        .offset(row * cols),
+                    flags: handoff.flags(gpu, room, cols, stream)?.offset(row * cols),
                     cols,
                     block,
                 })
@@ -335,8 +344,17 @@ impl Block {
             }
             index::choose_rows(gpu, k.index.choose, none, table, topk, all, None, stream)?;
         }
-        for first in (scored..rows).step_by(sc.score_rows) {
-            let count = (rows - first).min(sc.score_rows);
+        // The rows to score: every one, or with the rows shared out this
+        // rank's. A part's flags are gathered in whole words.
+        let own = own.filter(|own| {
+            on_device && source.is_none_or(|flags| (own.each * flags.cols).is_multiple_of(2))
+        });
+        let mine = match own {
+            Some(own) => own.first.max(scored)..(own.first + own.count).max(scored),
+            None => scored..rows,
+        };
+        for first in mine.clone().step_by(sc.score_rows) {
+            let count = (mine.end - first).min(sc.score_rows);
             let queries = self.index_queries(gpu, w, first, count, position + first, stream)?;
             index::score_rows_tc(
                 gpu,
@@ -371,6 +389,13 @@ impl Block {
                 among.map(|flags| flags.from(first)),
                 stream,
             )?;
+        }
+        if let Some(own) = own {
+            let (held, recv) = (self.shared.held, sc.gather_recv);
+            owned::gather_rows(gpu, comm, held, own, table, recv, topk * 4, stream)?;
+            if let Some(flags) = source {
+                owned::gather_rows(gpu, comm, held, own, flags.flags, recv, flags.cols, stream)?;
+            }
         }
         Ok((keys, Chosen::Table(table)))
     }

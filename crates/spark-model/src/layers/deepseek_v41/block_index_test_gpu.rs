@@ -15,14 +15,16 @@
 
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use spark_runtime::gpu::GpuBackend;
 
 use crate::layers::deepseek_v41::block::{BlockKernels, Handoff, Scratch, SeqState, Shared};
 use crate::layers::deepseek_v41::cache_recipe::{WINDOW, completed_group, visible_groups};
+use crate::layers::deepseek_v41::gemm::GemmWeights;
 use crate::layers::deepseek_v41::index::INDEX_DIM;
 use crate::layers::deepseek_v41::ops::{self, HEAD_DIM};
-use crate::layers::deepseek_v41::parts::Held;
+use crate::layers::deepseek_v41::owned::Owned;
+use crate::layers::deepseek_v41::parts::{Held, PARTS};
 use crate::layers::deepseek_v41::test_support::{
     Recording, SHAPE, backend, bf16s, block, chosen, closeness, download, free_store, hand_choice,
     hand_keys, role, source_keys,
@@ -280,4 +282,108 @@ fn layer_20_compresses_every_token_and_chooses() -> Result<()> {
 fn layer_24_chooses_among_layer_20s_keys() -> Result<()> {
     check(&run(24)?);
     Ok(())
+}
+
+/// With a batch's rows shared out, a rank scores the rows it keeps: it
+/// leaves them the choices and the candidate flags it leaves when it scores
+/// every row, and leaves the other ranks' rows alone. Layer 20, the
+/// candidate source, over the recorded prompt as one batch.
+#[test]
+#[ignore = "needs a GB10 GPU, the deepseek-v4.1-flash target, ATLAS_DSV41_REC (full depth) and ATLAS_DSV41_CKPT"]
+fn a_rank_chooses_for_the_rows_it_keeps_as_for_every_row() -> Result<()> {
+    const LAYER: usize = 20;
+    /// What a row no pass wrote holds.
+    const BLANK: u8 = 0xEE;
+    let rec = Recording::open()?;
+    let gpu = backend()?;
+    let stream = gpu.default_stream();
+    let (hidden, topk, rows) = (SHAPE.hidden, SHAPE.index_topk, rec.prefill);
+    let role = role(LAYER);
+    let each = rows.div_ceil(PARTS);
+    let shared = Shared {
+        shape: SHAPE,
+        held: Held::ALL,
+        kernels: BlockKernels::load(gpu)?,
+        scratch: Arc::new(Scratch::alloc_rows(
+            gpu,
+            &SHAPE,
+            rows,
+            each * PARTS,
+            Held::ALL,
+        )?),
+        handoff: Arc::new(Mutex::new(Handoff::default())),
+    };
+    let (mut block, store) = block(gpu, LAYER, false, shared)?;
+    block.gemm = Some(
+        GemmWeights::load(gpu, &SHAPE, &block.weights, Held::ALL, stream)
+            .context("the GEMM operands")?,
+    );
+    let sc = block.shared.scratch.clone();
+    let (_, inputs) = rec.prefill(&format!("L{LAYER}.attn_in"))?;
+    let cols = sc.max_groups.div_ceil(SHAPE.candidate_block_size);
+    // The batch's choices and flags after a pass over it from a new state.
+    let pass = |own: Option<Owned>| -> Result<(Vec<u8>, Vec<u8>)> {
+        let mut state = SeqState::alloc(gpu, role.compresses(), rows)?;
+        gpu.synchronize(stream)?;
+        gpu.copy_h2d(&inputs[..rows * hidden * 2], sc.normed)?;
+        let quant = block.shared.kernels.cache.fp8_quant_dequant;
+        ops::fp8_quant_dequant(gpu, quant, sc.normed, sc.quantized, rows * hidden, stream)?;
+        let (table, flags) = {
+            let mut handoff = block.shared.handoff.lock().expect("handoff");
+            (
+                handoff.table(gpu, each * PARTS, topk, stream)?,
+                handoff.flags(gpu, each * PARTS, cols, stream)?,
+            )
+        };
+        gpu.synchronize(stream)?;
+        gpu.memset(table, BLANK, rows * topk * 4)?;
+        gpu.memset(flags, BLANK, rows * cols)?;
+        block.attention(gpu, 0, rows, &mut state, 0, None, own, stream)?;
+        gpu.synchronize(stream)?;
+        let (mut chosen, mut flagged) = (vec![0u8; rows * topk * 4], vec![0u8; rows * cols]);
+        gpu.copy_d2h(table, &mut chosen)?;
+        gpu.copy_d2h(flags, &mut flagged)?;
+        Ok((chosen, flagged))
+    };
+    let every = pass(None).context("every row scored")?;
+    let own = Owned {
+        first: 600,
+        count: 300,
+        each,
+    };
+    let mine = pass(Some(own)).context("a rank's rows scored")?;
+    // Rows that see no more than they may read are every rank's.
+    let scored = (0..rows)
+        .find(|&row| visible_groups(row, role.ratio) > topk)
+        .context("no query chooses")?;
+    assert!(scored < own.first && own.first + own.count < rows);
+    let mut kept = 0usize;
+    for row in 0..rows {
+        let written = row < scored || (own.first..own.first + own.count).contains(&row);
+        for (name, width, all, part) in [
+            ("choices", topk * 4, &every.0, &mine.0),
+            ("flags", cols, &every.1, &mine.1),
+        ] {
+            let (all, part) = (
+                &all[row * width..(row + 1) * width],
+                &part[row * width..(row + 1) * width],
+            );
+            assert!(
+                all.iter().any(|&b| b != BLANK),
+                "row {row}: no {name} with every row scored"
+            );
+            match written {
+                true => assert!(all == part, "row {row}: its {name} differ"),
+                false => assert!(
+                    part.iter().all(|&b| b == BLANK),
+                    "row {row} is another rank's, and its {name} were written"
+                ),
+            }
+        }
+        kept += usize::from(written);
+    }
+    println!(
+        "layer {LAYER}: {kept} of {rows} rows hold the choices and flags of every row scored, the rest untouched"
+    );
+    free_store(gpu, &store)
 }

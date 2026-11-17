@@ -170,7 +170,8 @@ impl Block {
             if self.weights.compressor.is_some() {
                 self.compress(gpu, state, position, rows, stream)?;
             }
-            (compressed, chosen) = self.compressed_rows(gpu, row, rows, state, position, stream)?;
+            (compressed, chosen) =
+                self.compressed_rows(gpu, row, rows, state, position, comm, own, stream)?;
         }
         // The keys each query reads: its window, then its chosen.
         let keys = match chosen {
