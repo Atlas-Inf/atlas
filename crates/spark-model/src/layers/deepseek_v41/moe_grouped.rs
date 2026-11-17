@@ -21,7 +21,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 use super::moe::MoeKernels;
-use super::weights::ExpertSlab;
+use super::weights::{ExpertSlab, Slice};
 
 /// The pairs of one expert a launch takes together (`dsv41_expert.cu`).
 const TILE: usize = 32;
@@ -157,15 +157,17 @@ impl GroupedScratch {
         experts: usize,
         part_rows: usize,
     ) -> Result<Self> {
-        let pairs = rows * top_k;
+        // The shared expert's rows follow the pairs where a few rows take it
+        // beside the routed experts.
+        let (pairs, all) = (rows * top_k, rows * (top_k + 1));
         Ok(Self {
             // An expert's run ends in at most one tile that is not full; and
             // a few rows sorted on the device have a tile a pair.
             tiles: gpu.alloc((experts + pairs / TILE).max(pairs.min(1024)) * 3 * 4)?,
             row_of: gpu.alloc(pairs * 4)?,
-            out_row: gpu.alloc(pairs * 4)?,
-            weights: gpu.alloc(pairs * 4)?,
-            gate_up: gpu.alloc(pairs * 2 * part_rows * 2)?,
+            out_row: gpu.alloc(all * 4)?,
+            weights: gpu.alloc(all * 4)?,
+            gate_up: gpu.alloc(all * 2 * part_rows * 2)?,
         })
     }
 
@@ -193,6 +195,10 @@ fn layout<'a>(slab: &ExpertSlab, launch: KernelLaunch<'a>) -> KernelLaunch<'a> {
 /// `inner` (`[pairs, part_rows]` BF16) = the part's rows of each pair's
 /// hidden activation in FP8. `x` is the rows' input in FP8 (`[rows, hidden]`
 /// BF16), `part_rows` the part's share of an expert's hidden rows.
+///
+/// With `shared`, the part's rows of the shared expert's w1 and w3 and the
+/// batch's rows, of a batch [`plan_on_device`] sorted: the shared expert's
+/// activations follow the pairs' in `inner`, from the same launches.
 #[allow(clippy::too_many_arguments)]
 pub fn experts_in(
     gpu: &dyn GpuBackend,
@@ -205,6 +211,7 @@ pub fn experts_in(
     part_rows: usize,
     hidden: usize,
     limit: f32,
+    shared: Option<([Slice; 2], usize)>,
     stream: u64,
 ) -> Result<()> {
     ensure!(
@@ -215,10 +222,16 @@ pub fn experts_in(
     if tiles == 0 {
         return Ok(());
     }
+    let none = Slice {
+        data: DevicePtr::NULL,
+        scales: DevicePtr::NULL,
+    };
+    let ([w1, w3], shared_rows) = shared.unwrap_or(([none; 2], 0));
+    let own = if shared_rows > 0 { 2 } else { 0 };
     layout(
         slab,
         KernelLaunch::new(gpu, kernels.experts_in)
-            .grid([div_ceil(part_rows as u32, 16), 2 * tiles, 1])
+            .grid([div_ceil(part_rows as u32, 16), 2 * tiles + own, 1])
             .block([256, 1, 1])
             .arg_ptr(x)
             .arg_ptr(slab.base)
@@ -228,6 +241,12 @@ pub fn experts_in(
             .arg_u32(part_rows as u32)
             .arg_u32(hidden as u32),
     )
+    .arg_ptr(w1.data)
+    .arg_ptr(w1.scales)
+    .arg_ptr(w3.data)
+    .arg_ptr(w3.scales)
+    .arg_u32(plan.pairs as u32)
+    .arg_u32(shared_rows as u32)
     .launch(stream)?;
     activate(
         gpu,
@@ -235,7 +254,7 @@ pub fn experts_in(
         GateUp::paired(scratch.gate_up, part_rows),
         scratch.weights,
         inner,
-        plan.pairs,
+        plan.pairs + shared_rows,
         part_rows,
         limit,
         stream,
@@ -246,7 +265,9 @@ pub fn experts_in(
 /// at each pair's output row, the part's `n` rows of that expert's output.
 /// `inner` is every part of the pairs' hidden activations, as
 /// [`experts_in`] left each and the ranks gathered them: a part
-/// `piece_stride` values after the last.
+/// `piece_stride` values after the last. With `shared`, the part's rows of
+/// the shared expert's w2 and the batch's rows, as [`experts_in`] takes
+/// them: its output goes to each row's last slot.
 #[allow(clippy::too_many_arguments)]
 pub fn experts_out(
     gpu: &dyn GpuBackend,
@@ -259,6 +280,7 @@ pub fn experts_out(
     out: DevicePtr,
     part_rows: usize,
     n: usize,
+    shared: Option<(Slice, usize)>,
     stream: u64,
 ) -> Result<()> {
     ensure!(
@@ -269,10 +291,19 @@ pub fn experts_out(
     if tiles == 0 {
         return Ok(());
     }
+    let none = Slice {
+        data: DevicePtr::NULL,
+        scales: DevicePtr::NULL,
+    };
+    let (w2, shared_rows) = shared.unwrap_or((none, 0));
     layout(
         slab,
         KernelLaunch::new(gpu, kernels.experts_out)
-            .grid([div_ceil(n as u32, 16), tiles, 1])
+            .grid([
+                div_ceil(n as u32, 16),
+                tiles + u32::from(shared_rows > 0),
+                1,
+            ])
             .block([256, 1, 1])
             .arg_ptr(inner)
             .arg_ptr(slab.base)
@@ -283,6 +314,10 @@ pub fn experts_out(
             .arg_u32(part_rows as u32),
     )
     .arg_u64(piece_stride as u64)
+    .arg_ptr(w2.data)
+    .arg_ptr(w2.scales)
+    .arg_u32(plan.pairs as u32)
+    .arg_u32(shared_rows as u32)
     .launch(stream)
 }
 

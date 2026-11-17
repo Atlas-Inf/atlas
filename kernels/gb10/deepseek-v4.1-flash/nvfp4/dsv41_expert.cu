@@ -156,6 +156,10 @@ struct Dsv41Tile {
 // after them; row_of and out_row [pairs] i32 and sorted [pairs] FP32 by
 // place. One block, a thread a pair: at most 1,024 of them, and no expert
 // with more than a tile's.
+//
+// The shared expert's rows follow the pairs, a row of the batch each, for
+// the launches that take it beside the routed experts: out_row [pairs + r]
+// its slot of row r, the last, and sorted [pairs + r] the weight 1.
 extern "C" __global__ void dsv41_experts_plan(
     const unsigned int* __restrict__ chosen,
     const float* __restrict__ weights,
@@ -192,11 +196,20 @@ extern "C" __global__ void dsv41_experts_plan(
     sorted[at] = weights[p];
     if (leads[p]) tiles[tile] = Dsv41Tile{e, lesser, same};
     if (p >= all) tiles[p] = Dsv41Tile{0u, 0u, 0u};
+    if (p < pairs / top_k) {
+        out_row[pairs + p] = (int)(p * slots + top_k);
+        sorted[pairs + p] = 1.0f;
+    }
 }
 
 // gate_up[pair][0] = BF16(w1 . x[row_of[pair]]), [pair][1] the same of w3.
 // x [T, K] FP8-rounded BF16; gate_up [pairs, 2, rows]. A tile of no pairs is
 // none. Grid (ceil(rows / 16), 2 * tiles), block 256.
+//
+// With `shared_rows`, the grid's last two rows are the shared expert's w1
+// and w3 (FP8, `rows` rows of K each) for the batch's first `shared_rows`
+// rows, into gate_up[pairs + r]: the bytes of `dsv41_fp8_gemv_tc8` on them,
+// without its launches.
 extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_in(
     const __nv_bfloat16* __restrict__ x,
     const unsigned char* __restrict__ slab,
@@ -207,10 +220,24 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_i
     unsigned int K,
     unsigned long long stride,
     unsigned int data,
-    unsigned int scales) {
+    unsigned int scales,
+    const unsigned char* __restrict__ shared_w1,
+    const unsigned char* __restrict__ shared_s1,
+    const unsigned char* __restrict__ shared_w3,
+    const unsigned char* __restrict__ shared_s3,
+    unsigned int pairs,
+    unsigned int shared_rows) {
     atlas_pdl_enter();
     __shared__ F4Shared<4> sh;
     __shared__ F4Staged staged;
+    if (shared_rows != 0u && blockIdx.y + 2u >= gridDim.y) {
+        const unsigned int up = blockIdx.y + 1u == gridDim.y;
+        dsv41_gemv_staged_impl<4, false, false>(
+            sh, staged, x, up ? shared_w3 : shared_w1, up ? shared_s3 : shared_s1,
+            gate_up + ((size_t)pairs * 2 + up) * rows, shared_rows, rows, K, 2 * rows, blockIdx.x,
+            K);
+        return;
+    }
     const Dsv41Tile tile = tiles[blockIdx.y / 2];
     if (tile.count == 0u) return;
     const unsigned int which = blockIdx.y & 1u;
@@ -291,6 +318,10 @@ extern "C" __global__ void dsv41_experts_act_codes(
 // out[out_row[pair]] = BF16(w2 . inner[pair]) for the part's N rows of w2.
 // Pair q of piece p of `inner` is at inner[p * piece_stride + q * rows].
 // Grid (ceil(N / 16), tiles), block 256.
+//
+// With `shared_rows`, the grid's last row is the shared expert's w2 (FP8, N
+// rows) for the rows after the pairs, into the rows out_row[pairs + r]: the
+// bytes of `dsv41_fp8_gemv_pieces` on them.
 extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_out(
     const __nv_bfloat16* __restrict__ inner,
     const unsigned char* __restrict__ slab,
@@ -302,10 +333,20 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_o
     unsigned long long stride,
     unsigned int data,
     unsigned int scales,
-    unsigned long long piece_stride) {
+    unsigned long long piece_stride,
+    const unsigned char* __restrict__ shared_w2,
+    const unsigned char* __restrict__ shared_s2,
+    unsigned int pairs,
+    unsigned int shared_rows) {
     atlas_pdl_enter();
     __shared__ F4Shared<4> sh;
     __shared__ F4Staged staged;
+    if (shared_rows != 0u && blockIdx.y + 1u == gridDim.y) {
+        dsv41_gemv_staged_impl<4, false, false>(
+            sh, staged, inner + (size_t)pairs * rows, shared_w2, shared_s2, out, shared_rows, N,
+            rows * DSV41_PARTS, N, blockIdx.x, rows, nullptr, out_row + pairs, rows, piece_stride);
+        return;
+    }
     const Dsv41Tile tile = tiles[blockIdx.y];
     if (tile.count == 0u) return;
     const unsigned char* w =

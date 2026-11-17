@@ -99,6 +99,8 @@ impl Block {
                 Some(plan)
             }
         };
+        // A few rows take the shared expert in the routed experts' launches.
+        let fused = plan.is_none() && rows > 1;
         let grouped = match (rows, &plan) {
             (_, Some(plan)) => Some(plan.counts()),
             (1, None) => None,
@@ -212,8 +214,12 @@ impl Block {
                     part_rows,
                     s.hidden,
                     s.swiglu_limit,
+                    fused.then_some(([of.shared[0], of.shared[1]], rows)),
                     stream,
                 )?,
+            }
+            if fused {
+                continue;
             }
             // The shared expert, every row through the same weights.
             let gate_up = match gemm.and_then(|g| g.shared[part].as_ref()) {
@@ -320,40 +326,44 @@ impl Block {
                             sc.slot_out,
                             part_rows,
                             part_n,
+                            fused.then_some((of.shared[2], rows)),
                             stream,
                         )?,
                     }
-                    // The shared expert's: its rows of the hidden
-                    // activations come after the pairs'.
-                    let x = sc
-                        .inner_parts
-                        .offset(sent.map_or(grouped.pairs * part_rows * 2, |sent| sent.shared));
-                    match gemm.and_then(|g| g.shared[part].as_ref()) {
-                        Some([_, _, w2]) => {
-                            let x = Input {
+                    // The shared expert's, where it did not ride those
+                    // launches: its rows of the hidden activations come
+                    // after the pairs'.
+                    if !fused {
+                        let x = sc
+                            .inner_parts
+                            .offset(sent.map_or(grouped.pairs * part_rows * 2, |sent| sent.shared));
+                        match gemm.and_then(|g| g.shared[part].as_ref()) {
+                            Some([_, _, w2]) => {
+                                let x = Input {
+                                    x,
+                                    stride: part_rows,
+                                    piece: part_rows,
+                                    piece_stride: part_bytes / 2,
+                                };
+                                sc.gemm.project(gpu, x, w2, sc.shared_out, rows, stream)?;
+                                shared_out = sc.shared_out;
+                            }
+                            // Into each row's last slot.
+                            None => parts::project_pieces(
+                                gpu,
+                                k.parts.fp8_pieces,
                                 x,
-                                stride: part_rows,
-                                piece: part_rows,
-                                piece_stride: part_bytes / 2,
-                            };
-                            sc.gemm.project(gpu, x, w2, sc.shared_out, rows, stream)?;
-                            shared_out = sc.shared_out;
+                                of.shared[2],
+                                sc.slot_out.offset(s.top_k * part_n * 2),
+                                slots * part_n,
+                                rows,
+                                part_n,
+                                s.inter,
+                                part_rows,
+                                room,
+                                stream,
+                            )?,
                         }
-                        // Into each row's last slot.
-                        None => parts::project_pieces(
-                            gpu,
-                            k.parts.fp8_pieces,
-                            x,
-                            of.shared[2],
-                            sc.slot_out.offset(s.top_k * part_n * 2),
-                            slots * part_n,
-                            rows,
-                            part_n,
-                            s.inter,
-                            part_rows,
-                            room,
-                            stream,
-                        )?,
                     }
                 }
             }

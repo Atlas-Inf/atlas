@@ -100,6 +100,7 @@ fn the_tensor_cores_leave_what_the_tile_kernels_leave() -> Result<()> {
         part_rows,
         s.hidden,
         limit,
+        None,
         stream,
     )?;
     gpu.synchronize(stream)?;
@@ -169,6 +170,7 @@ fn the_tensor_cores_leave_what_the_tile_kernels_leave() -> Result<()> {
         out,
         part_rows,
         n,
+        None,
         stream,
     )?;
     big.project_out(gpu, &slab, &runs, coded, sent, part_rows, s.hidden, stream)?;
