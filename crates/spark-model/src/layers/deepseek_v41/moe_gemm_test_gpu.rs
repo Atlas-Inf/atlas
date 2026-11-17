@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, ensure};
 use spark_runtime::gpu::GpuBackend;
 
-use super::{ExpertGemm, Runs, Sent, Span};
+use super::{Act, ExpertGemm, Runs, Sent, Span};
 use crate::layers::deepseek_v41::block::{BlockKernels, Handoff, Scratch, Shared};
 use crate::layers::deepseek_v41::moe_grouped::{self, GateUp, Plan};
 use crate::layers::deepseek_v41::ops;
@@ -116,6 +116,7 @@ fn the_tensor_cores_leave_what_the_tile_kernels_leave() -> Result<()> {
         all.tiles.clone(),
         row_of,
         gate_up,
+        None,
         part_rows,
         s.hidden,
         stream,
@@ -139,6 +140,61 @@ fn the_tensor_cores_leave_what_the_tile_kernels_leave() -> Result<()> {
         want.len()
     );
     ensure!(same > 0.99 && distance < 1e-3, "the way in differs");
+
+    // The launch that leaves the activations itself leaves the codes and
+    // scales `activate_codes` makes of its gate and up values.
+    let room = Sent::new(pairs, ROWS, part_rows);
+    let (apart, fused) = (gpu.alloc(room.bytes)?, gpu.alloc(room.bytes)?);
+    moe_grouped::activate_codes(
+        gpu,
+        &k.moe,
+        GateUp {
+            base: gate_up,
+            up_offset: pairs * part_rows,
+            row_stride: part_rows,
+        },
+        sc.grouped.weights,
+        apart,
+        apart.offset(room.scales),
+        pairs,
+        part_rows,
+        limit,
+        stream,
+    )?;
+    let act = Act {
+        codes: fused,
+        scales: fused.offset(room.scales),
+        weights: sc.grouped.weights,
+        limit,
+    };
+    let tiles = all.tiles.clone();
+    big.project_in(
+        gpu,
+        &slab,
+        &runs,
+        tiles,
+        row_of,
+        gate_up,
+        Some(act),
+        part_rows,
+        s.hidden,
+        stream,
+    )?;
+    gpu.synchronize(stream)?;
+    let bytes = |p| -> Result<Vec<u8>> {
+        let mut out = vec![0u8; room.shared];
+        gpu.copy_d2h(p, &mut out)?;
+        Ok(out)
+    };
+    let (apart_bytes, fused_bytes) = (bytes(apart)?, bytes(fused)?);
+    let used = pairs * part_rows + pairs * part_rows / 32;
+    ensure!(
+        apart_bytes[..pairs * part_rows] == fused_bytes[..pairs * part_rows]
+            && apart_bytes[room.scales..][..pairs * part_rows / 32]
+                == fused_bytes[room.scales..][..pairs * part_rows / 32],
+        "the launch's own activations differ from the activation launch's"
+    );
+    println!("in: {used} codes and scales of the activations equal, from one launch or two");
 
     // The way out, every part of the hidden activations being the first's:
     // as values for the tile kernels, and for the tensor cores as the codes
@@ -206,7 +262,7 @@ fn the_tensor_cores_leave_what_the_tile_kernels_leave() -> Result<()> {
     );
     ensure!(same > 0.99 && distance < 1e-3, "the way out differs");
 
-    for p in [x, quantized, inner, gate_up, out, coded] {
+    for p in [x, quantized, inner, gate_up, out, coded, apart, fused] {
         gpu.free(p)?;
     }
     free_store(gpu, &store)

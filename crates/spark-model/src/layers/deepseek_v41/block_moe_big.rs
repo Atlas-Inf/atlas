@@ -22,7 +22,7 @@ use spark_runtime::gpu::GpuBackend;
 
 use super::block::Block;
 use super::gemm::Input;
-use super::moe_gemm::{ExpertGemm, Runs, Sent, Span};
+use super::moe_gemm::{Act, ExpertGemm, Runs, Sent, Span};
 use super::moe_grouped::{self, GateUp};
 use super::parts::{self, PARTS};
 use super::profile;
@@ -89,35 +89,24 @@ impl Block {
         for (at, span) in spans.iter().enumerate() {
             let last = at + 1 == spans.len();
             for part in held.range() {
-                let tiles = span.tiles.clone();
+                // The pairs' hidden activations in codes, from the launch
+                // that multiplies them.
+                let act = Act {
+                    codes: inner(part),
+                    scales: inner(part).offset(sent.scales),
+                    weights: sc.grouped.weights,
+                    limit: s.swiglu_limit,
+                };
                 big.project_in(
                     gpu,
                     &slab(part)?,
                     runs,
-                    tiles,
+                    span.tiles.clone(),
                     sc.grouped.row_of,
                     sc.grouped.gate_up,
+                    Some(act),
                     part_rows,
                     s.hidden,
-                    stream,
-                )?;
-                // Every pair's gate values, then every pair's up values.
-                let first = span.pairs.start;
-                let gate_up = GateUp {
-                    base: sc.grouped.gate_up.offset(first * part_rows * 2),
-                    up_offset: pairs * part_rows,
-                    row_stride: part_rows,
-                };
-                moe_grouped::activate_codes(
-                    gpu,
-                    &k.moe,
-                    gate_up,
-                    sc.grouped.weights.offset(first * 4),
-                    inner(part).offset(first * part_rows),
-                    inner(part).offset(sent.scales + first * part_rows / 32),
-                    span.pairs.len(),
-                    part_rows,
-                    s.swiglu_limit,
                     stream,
                 )?;
                 if !last {

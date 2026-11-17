@@ -44,6 +44,7 @@
 // a layer's 1.1 GB of gate and up rows a rank in 10 ms.
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 #include "dsv41_common.cuh"
 
@@ -146,6 +147,17 @@ static __device__ __forceinline__ void mxg_mma(
 // K / 32. out rows are `out_stride` values apart. K % (32 * MXG_STAGE) == 0.
 // Grid (weight rows / row_step, tiles), block MXG_THREADS, MXG_SHARED
 // bytes of shared memory.
+//
+// With `act_codes`, the two halves are an expert's gate and up projections
+// and nothing is written to out{0,1}: the block leaves the pairs' hidden
+// activations of its 64 rows instead, as `dsv41_experts_act_codes` leaves
+// them from out{0,1} (`dsv41_expert.cu`): act_codes[pair, row] the E4M3
+// code of BF16(weight * SiLU(min(gate, limit)) * clamp(up, limit)) under one
+// scale per 32 rows, act_sf[pair, row / 32], with a pair's `act_rows` codes
+// together and act_weights[pair] its weight. The values are the ones that
+// kernel reads, rounded to BF16 as the launch would have written them, so
+// the codes are its codes; the launch between, and the gate and up values'
+// trip to memory and back, are not made. row_step == 64, half_row == 0.
 extern "C" __global__ void __launch_bounds__(MXG_THREADS) dsv41_mxg(
     const unsigned char* __restrict__ codes,
     const unsigned char* __restrict__ sfa,
@@ -164,7 +176,12 @@ extern "C" __global__ void __launch_bounds__(MXG_THREADS) dsv41_mxg(
     unsigned int K,
     unsigned int out_stride,
     unsigned int run,
-    unsigned long long run_stride) {
+    unsigned long long run_stride,
+    unsigned char* __restrict__ act_codes,
+    unsigned char* __restrict__ act_sf,
+    const float* __restrict__ act_weights,
+    float act_limit,
+    unsigned int act_rows) {
     extern __shared__ __align__(16) unsigned char sm[];
     const unsigned int sm_at = (unsigned int)__cvta_generic_to_shared(sm);
 
@@ -332,21 +349,71 @@ extern "C" __global__ void __launch_bounds__(MXG_THREADS) dsv41_mxg(
         // Every warp is past the sets the next steps are copied into.
         __syncthreads();
     }
-    if (sets == 0u) return;
-    __nv_bfloat16* out = half ? out1 : out0;
-    #pragma unroll
-    for (int p = 0; p < 4; ++p) {
-        const unsigned int r0 = group * 64u + (unsigned int)p * 16u + g, r1 = r0 + 8u;
+    if (act_codes == nullptr) {
+        if (sets == 0u) return;
+        __nv_bfloat16* out = half ? out1 : out0;
         #pragma unroll
-        for (int c = 0; c < 8; ++c) {
-            const unsigned long long col =
-                block_row + half * half_row + (unsigned int)c * 8u + 2u * t;
-            if (r0 < tile.count)
-                *(__nv_bfloat162*)(out + (unsigned long long)(tile.first + r0) * out_stride +
-                                   col) = __floats2bfloat162_rn(acc[p][c][0], acc[p][c][1]);
-            if (r1 < tile.count)
-                *(__nv_bfloat162*)(out + (unsigned long long)(tile.first + r1) * out_stride +
-                                   col) = __floats2bfloat162_rn(acc[p][c][2], acc[p][c][3]);
+        for (int p = 0; p < 4; ++p) {
+            const unsigned int r0 = group * 64u + (unsigned int)p * 16u + g, r1 = r0 + 8u;
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                const unsigned long long col =
+                    block_row + half * half_row + (unsigned int)c * 8u + 2u * t;
+                if (r0 < tile.count)
+                    *(__nv_bfloat162*)(out + (unsigned long long)(tile.first + r0) * out_stride +
+                                       col) = __floats2bfloat162_rn(acc[p][c][0], acc[p][c][1]);
+                if (r1 < tile.count)
+                    *(__nv_bfloat162*)(out + (unsigned long long)(tile.first + r1) * out_stride +
+                                       col) = __floats2bfloat162_rn(acc[p][c][2], acc[p][c][3]);
+            }
         }
+        return;
+    }
+    // The gate's values and the up's meet in shared memory, which nothing
+    // reads any more: [half][pair][row] BF16, as the launch would write them.
+    asm volatile("cp.async.wait_all;\n" ::);
+    __syncthreads();
+    __nv_bfloat16* met = (__nv_bfloat16*)sm;
+    if (sets > 0u) {
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const unsigned int r0 = group * 64u + (unsigned int)p * 16u + g, r1 = r0 + 8u;
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                const unsigned int col = (unsigned int)c * 8u + 2u * t;
+                if (r0 < tile.count)
+                    *(__nv_bfloat162*)(met + (half * MXG_ROWS + r0) * 64u + col) =
+                        __floats2bfloat162_rn(acc[p][c][0], acc[p][c][1]);
+                if (r1 < tile.count)
+                    *(__nv_bfloat162*)(met + (half * MXG_ROWS + r1) * 64u + col) =
+                        __floats2bfloat162_rn(acc[p][c][2], acc[p][c][3]);
+            }
+        }
+    }
+    __syncthreads();
+    // A thread a pair: its two blocks of 32 rows, activated and rounded.
+    if (i >= tile.count) return;
+    const unsigned long long pair = tile.first + i;
+    const float weight = act_weights ? act_weights[pair] : 1.0f;
+    for (unsigned int block = 0; block < 2u; ++block) {
+        const __nv_bfloat16* gate = met + i * 64u + block * 32u;
+        const __nv_bfloat16* up = gate + MXG_ROWS * 64u;
+        float v[32];
+        float amax = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+            v[j] = dsv41_swiglu_one(__bfloat162float(gate[j]), __bfloat162float(up[j]), weight,
+                                    act_limit);
+            amax = fmaxf(amax, fabsf(v[j]));
+        }
+        const float scale = dsv41_fp8_scale(amax);
+        const unsigned long long row = block_row + block * 32u;
+        unsigned char* dst = act_codes + pair * act_rows + row;
+        for (int j = 0; j < 32; ++j) {
+            const float scaled = fminf(fmaxf(v[j] / scale, -448.0f), 448.0f);
+            dst[j] = (unsigned char)__nv_cvt_float_to_fp8(dsv41_round_e4m3(scaled),
+                                                          __NV_SATFINITE, __NV_E4M3);
+        }
+        act_sf[pair * (act_rows / 32u) + row / 32u] =
+            (unsigned char)(dsv41_exponent(scale) + 127);
     }
 }

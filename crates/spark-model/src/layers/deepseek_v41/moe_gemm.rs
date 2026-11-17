@@ -31,22 +31,6 @@ use super::weights::ExpertSlab;
 /// `ATLAS_DSV41_EXPERT_GEMM_ROWS` names another (0 for never).
 const EXPERT_GEMM_ROWS: usize = 2048;
 
-/// Eighths of a batch's pairs in the first of the two spans the ranks
-/// gather their hidden activations in (`block_moe_big.rs`), unless
-/// `ATLAS_DSV41_MOE_SPAN` names another; 0 for one span, gathered after
-/// every pair is in. The first span is the larger: its gather has the
-/// second's launches to hide under, and the second's only the first's way
-/// out.
-const FIRST_SPAN: usize = 5;
-
-fn first_span() -> usize {
-    std::env::var("ATLAS_DSV41_MOE_SPAN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&eighths| eighths < 8)
-        .unwrap_or(FIRST_SPAN)
-}
-
 /// A tile's pairs, a block's threads and its shared memory
 /// (`MXG_THREADS`, `MXG_SHARED` in `dsv41_mxg.cu`).
 const TILE: usize = 128;
@@ -109,47 +93,6 @@ impl Runs {
     pub fn pairs(&self) -> usize {
         self.pairs
     }
-
-    /// Every tile, and every pair.
-    pub fn whole(&self) -> Span {
-        Span {
-            tiles: 0..self.tile_count(),
-            pairs: 0..self.pairs,
-        }
-    }
-
-    /// The tiles in two spans, the first of about `eighths` eighths of the
-    /// pairs: cut at the tile nearest that which starts on a pair that is
-    /// a multiple of [`SPAN_PAIRS`]. None where no tile inside does.
-    pub fn halves(&self, eighths: usize) -> Option<[Span; 2]> {
-        let want = self.pairs * eighths / 8;
-        let (tile, pair) = (1..self.tile_count())
-            .map(|tile| (tile, self.tiles[tile * 3 + 1] as usize))
-            .filter(|&(_, pair)| pair.is_multiple_of(SPAN_PAIRS) && pair < self.pairs)
-            .min_by_key(|&(_, pair)| pair.abs_diff(want))?;
-        Some([
-            Span {
-                tiles: 0..tile,
-                pairs: 0..pair,
-            },
-            Span {
-                tiles: tile..self.tile_count(),
-                pairs: pair..self.pairs,
-            },
-        ])
-    }
-}
-
-/// A span starts on a pair whose scales start on a 16-byte boundary of a
-/// part ([`Sent`]), which the ranks' copies want: a pair's scales are a
-/// multiple of two bytes.
-const SPAN_PAIRS: usize = 8;
-
-/// A run of a launch's tiles, and the pairs in them.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Span {
-    pub tiles: Range<usize>,
-    pub pairs: Range<usize>,
 }
 
 /// One part of a batch's hidden activations as a rank sends it: the pairs'
@@ -185,6 +128,21 @@ struct Halves {
     row_step: usize,
     half_row: usize,
     out: [DevicePtr; 2],
+    /// The halves are a gate and an up projection, and the launch leaves
+    /// their activation in codes instead.
+    act: Option<Act>,
+}
+
+/// Where a launch leaves the pairs' hidden activations, and what it makes
+/// them with: `codes` (`[pairs, part_rows]` E4M3), `scales` (`[pairs,
+/// part_rows / 32]` E8M0), a pair's weight (`[pairs]` FP32) and the SwiGLU
+/// clamp.
+#[derive(Clone, Copy)]
+pub struct Act {
+    pub codes: DevicePtr,
+    pub scales: DevicePtr,
+    pub weights: DevicePtr,
+    pub limit: f32,
 }
 
 /// The kernels and working buffers of these launches, for batches of up to
@@ -237,7 +195,7 @@ impl ExpertGemm {
             pair_of: gpu.alloc(pairs * 4)?,
             pair_out: gpu.alloc(pairs * part_n * 2)?,
             from: expert_gemm_rows(),
-            first_span: first_span(),
+            first_span: spans::first_span(),
             pairs,
             max_tiles,
         })
@@ -323,6 +281,7 @@ impl ExpertGemm {
         let (data, scales) = slab.layout();
         let at = |projection: usize| (projection * (data + scales)) as u32;
         let [p0, p1] = halves.projections;
+        let act = halves.act;
         KernelLaunch::new(gpu, self.multiply)
             .grid([(n / halves.row_step) as u32, tiles.len() as u32, 1])
             .block([TILE as u32, 1, 1])
@@ -345,13 +304,21 @@ impl ExpertGemm {
             .arg_u32(out_stride as u32)
             .arg_u32(piece[0] as u32)
             .arg_u64(piece[1] as u64)
+            .arg_ptr(act.map_or(DevicePtr::NULL, |act| act.codes))
+            .arg_ptr(act.map_or(DevicePtr::NULL, |act| act.scales))
+            .arg_ptr(act.map_or(DevicePtr::NULL, |act| act.weights))
+            .arg_f32(act.map_or(0.0, |act| act.limit))
+            .arg_u32(n as u32)
             .launch(stream)
     }
 
     /// The way in, of the pairs of `tiles`: `gate_up` gets a pair's
     /// `part_rows` gate values and, `pairs * part_rows` values on, its up
     /// values (BF16), from the batch's input in codes
-    /// ([`Self::round_rows`]); `row_of` is each pair's row.
+    /// ([`Self::round_rows`]); `row_of` is each pair's row. With `act` the
+    /// launch leaves the pairs' activation in codes instead ([`Act`]),
+    /// those `moe_grouped::activate_codes` makes of `gate_up`, which it
+    /// then does not write.
     #[allow(clippy::too_many_arguments)]
     pub fn project_in(
         &self,
@@ -361,6 +328,7 @@ impl ExpertGemm {
         tiles: Range<usize>,
         row_of: DevicePtr,
         gate_up: DevicePtr,
+        act: Option<Act>,
         part_rows: usize,
         hidden: usize,
         stream: u64,
@@ -372,6 +340,7 @@ impl ExpertGemm {
             row_step: 64,
             half_row: 0,
             out: [gate_up, gate_up.offset(runs.pairs * part_rows * 2)],
+            act,
         };
         self.launch(
             gpu,
@@ -425,6 +394,7 @@ impl ExpertGemm {
             row_step: 128,
             half_row: 64,
             out: [self.pair_out, self.pair_out],
+            act: None,
         };
         self.launch(
             gpu,
@@ -469,6 +439,10 @@ impl ExpertGemm {
             .launch(stream)
     }
 }
+
+#[path = "moe_spans.rs"]
+mod spans;
+pub use spans::Span;
 
 #[cfg(test)]
 #[path = "moe_gemm_test_gpu.rs"]
