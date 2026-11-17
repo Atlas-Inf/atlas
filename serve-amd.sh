@@ -232,13 +232,19 @@ if [ "${MAX_BATCH:-1}" -gt 1 ]; then
   # f160 (Flash-Next, AR, x2): C4 34.0 -> 35.9, C8 38.2 -> 40.0 tok/s; solo text identical 8/8.
   export ATLAS_QWEN4EXP_BATCH_SMALL="${ATLAS_QWEN4EXP_BATCH_SMALL:-1}"
 fi
+# 27B above batch 1: the batched GDN recurrence (one launch for all sequences instead of one
+# per sequence per layer). Framework f338 (main, C8, 6 rounds): 59.2 -> 60.3 tok/s agg, every
+# round; runner C8 greedy shas identical (44084609986 vs 44084614601). Neutral on main-324
+# (s212d, C8 ~33); it pays now that the rest of the step is faster.
+SSM_BATCH_ARGS=()
+case "$MODEL" in *27B*|*27b*) [ "${MAX_BATCH:-1}" -gt 1 ] && SSM_BATCH_ARGS=(--ssm-batched-recurrent) ;; esac
 exec "$BIN" serve "$MODEL" "${NAME_ARG[@]}" \
   --host "${HOST:-0.0.0.0}" --port "${PORT:-8081}" \
   --max-seq-len "$MAX_SEQ_LEN" \
   --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
   --gpu-memory-utilization "$GPU_UTIL" \
   --kv-cache-dtype bf16 --lm-head-dtype "${LM_HEAD:-nvfp4}" --max-batch-size "${MAX_BATCH:-1}" \
-  "${SPEC_ARGS[@]}" "${DFLASH_ARGS[@]}" "${THINK_ARGS[@]}" \
+  "${SPEC_ARGS[@]}" "${DFLASH_ARGS[@]}" "${THINK_ARGS[@]}" "${SSM_BATCH_ARGS[@]}" \
   --ssm-cache-slots "$SSM_SLOTS" --ssm-checkpoint-interval "$SSM_CKPT_INTERVAL" \
   $ALLOW_FALLBACKS \
   "$@"
