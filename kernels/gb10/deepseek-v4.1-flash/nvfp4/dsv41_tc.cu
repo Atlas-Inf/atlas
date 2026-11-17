@@ -71,7 +71,8 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_
     unsigned int N,
     unsigned int K,
     unsigned int out_stride) {
-    atlas_pdl_enter();
+    atlas_pdl_enter_touch({W, K, K}, {S, K / F4_BLOCK, K / F4_BLOCK}, N, blockIdx.x,
+                          dsv41_touchers(gridDim.x));
     __shared__ F4Shared<1> sh;
     dsv41_gemv_tc_impl<1, false, false>(sh, A, W, S, C, M, N, K, out_stride, blockIdx.x, K);
 }
@@ -136,7 +137,8 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_
     unsigned int a_stride,
     unsigned int piece,
     unsigned long long piece_stride) {
-    atlas_pdl_enter();
+    atlas_pdl_enter_touch({W, K, K}, {S, K / F4_BLOCK, K / F4_BLOCK}, N, blockIdx.x,
+                          dsv41_touchers(gridDim.x));
     __shared__ F4Shared<1> sh;
     dsv41_gemv_tc_impl<1, false, false, F4_ROUNDED>(sh, A, W, S, C, M, N, K, out_stride, blockIdx.x,
                                                  a_stride, nullptr, nullptr, piece, piece_stride);
@@ -162,8 +164,10 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_
 
 // Two FP8 projections of the same rows in one launch: C0 [M, N0] = A . W0^T
 // and C1 [M, N1] = A . W1^T, A [M, K] FP8-rounded BF16, M at most 8. A block
-// computes what the same block of `dsv41_fp8_gemv_tc8` computes, from staged
-// weights: this is for long rows. Grid (ceil(N0 / 16) + ceil(N1 / 16)).
+// computes what the same block of `dsv41_fp8_gemv_tc8` computes, the same
+// way: the launch touches its weights ahead of its wait, and on weights the
+// cache holds staging them is the slower form (38 us a launch against 20).
+// Grid (ceil(N0 / 16) + ceil(N1 / 16)).
 extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_two(
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ W0,
@@ -176,15 +180,20 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_
     unsigned int N1,
     unsigned int K,
     unsigned int M) {
-    atlas_pdl_enter();
+    atlas_pdl_enter_touch(
+        blockIdx.x < (N0 + 15u) / 16u ? AtlasTouch{W0, K, K} : AtlasTouch{W1, K, K},
+        blockIdx.x < (N0 + 15u) / 16u ? AtlasTouch{S0, K / F4_BLOCK, K / F4_BLOCK}
+                                      : AtlasTouch{S1, K / F4_BLOCK, K / F4_BLOCK},
+        blockIdx.x < (N0 + 15u) / 16u ? N0 : N1,
+        blockIdx.x < (N0 + 15u) / 16u ? blockIdx.x : blockIdx.x - (N0 + 15u) / 16u,
+        dsv41_touchers(blockIdx.x < (N0 + 15u) / 16u ? (N0 + 15u) / 16u : (N1 + 15u) / 16u));
     __shared__ F4Shared<1> sh;
-    __shared__ F4Staged staged;
     const unsigned int first = (N0 + 15u) / 16u;
     if (blockIdx.x < first) {
-        dsv41_gemv_staged_impl<1, false, false>(sh, staged, A, W0, S0, C0, M, N0, K, N0,
+        dsv41_gemv_tc_impl<1, false, false>(sh, A, W0, S0, C0, M, N0, K, N0,
                                                 blockIdx.x, K);
     } else {
-        dsv41_gemv_staged_impl<1, false, false>(sh, staged, A, W1, S1, C1, M, N1, K, N1,
+        dsv41_gemv_tc_impl<1, false, false>(sh, A, W1, S1, C1, M, N1, K, N1,
                                                 blockIdx.x - first, K);
     }
 }
@@ -201,7 +210,9 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_
     unsigned int N,
     unsigned int K,
     unsigned int M) {
-    atlas_pdl_enter();
+    atlas_pdl_enter_touch({W, K, K}, {S, K / F4_BLOCK, K / F4_BLOCK}, gridDim.y * N,
+                          blockIdx.y * gridDim.x + blockIdx.x,
+                          dsv41_touchers(gridDim.x * gridDim.y));
     __shared__ F4Shared<1> sh;
     __shared__ F4Staged staged;
     const unsigned long long y = blockIdx.y;

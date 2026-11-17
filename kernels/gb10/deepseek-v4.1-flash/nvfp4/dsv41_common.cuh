@@ -6,7 +6,27 @@
 
 #pragma once
 
-#include "../../common/atlas_pdl.cuh"
+#include "../../glm-5.3-flash/nvfp4/atlas_pdl_touch.cuh"
+
+// How many of a launch's blocks read its weights ahead of its wait
+// (`atlas_pdl_enter_touch`), its first: the GPU starts a grid in order, and
+// holds about 160 blocks of 256 threads at once. At one token a projection
+// is on the GPU while the small kernels before it still run (a site's
+// coefficients, a gather, a rounding), 20 to 50 us in which nothing reads
+// memory, and its weights do not depend on them.
+//
+// The touch is not free to its neighbours: a gather beside it polls memory
+// and takes about 10 us longer, and the attention's logits read their keys
+// more slowly. Measured on a decode step under the profiler: 8 blocks 25.5
+// ms (the touch does not keep up and its blocks finish last), 16 blocks
+// 23.8, 32 blocks 24.5; every block touching its own rows cost one gather
+// 28 us.
+#define DSV41_TOUCH 16u
+
+// The blocks of a launch that touch, of the `blocks` it has.
+__device__ __forceinline__ unsigned int dsv41_touchers(unsigned int blocks) {
+    return blocks < DSV41_TOUCH ? blocks : DSV41_TOUCH;
+}
 
 #include <cuda_bf16.h>
 

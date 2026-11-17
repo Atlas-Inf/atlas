@@ -285,7 +285,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_expand_p
 extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_site_sums(
     const __nv_bfloat16* __restrict__ x_parts,
     __nv_bfloat16* streams,
-    const float* __restrict__ hc_fn,
+    const unsigned char* __restrict__ hc_fn_bytes,
     const float* __restrict__ pre_in,
     const float* __restrict__ post,
     const float* __restrict__ comb,
@@ -294,7 +294,10 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_site_sum
     unsigned int H,
     unsigned int hc,
     unsigned int part_rows) {
-    atlas_pdl_enter();
+    atlas_pdl_enter_touch({hc_fn_bytes, 4u * hc * H, 4ull * hc * H}, {hc_fn_bytes, 0u, 0ull},
+                          (2u + hc) * hc, blockIdx.y * gridDim.x + blockIdx.x,
+                          dsv41_touchers(gridDim.x));
+    const float* hc_fn = (const float*)hc_fn_bytes;
     const unsigned int t = blockIdx.y, d = blockIdx.x * DSV41_HC_THREADS + threadIdx.x;
     streams += (size_t)t * hc * H;
     pre_in += (size_t)t * hc;

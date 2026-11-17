@@ -59,20 +59,29 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_expert_in
     unsigned long long stride,
     unsigned int data,
     unsigned int scales) {
-    atlas_pdl_enter();
+    // The shared expert's weights, by the launch's first blocks: the GPU
+    // starts a grid in order and cannot hold all of this one, so the shared
+    // expert's own blocks, its last, start after the wait is over.
+    atlas_pdl_enter_touch({shared_w1, K, K}, {shared_w3, K, K}, rows,
+                          blockIdx.y * gridDim.x + blockIdx.x, dsv41_touchers(gridDim.x));
     __shared__ F4Shared<1> sh;
     __shared__ F4Staged staged;
-    const unsigned int slot = blockIdx.y / 2, which = blockIdx.y & 1u;
-    __nv_bfloat16* out = gate_up + (size_t)blockIdx.y * rows;
+    // The shared expert's rows of the grid are its first: its weights are
+    // in the cache from the touch, until the routed experts' pass through.
+    // They are read as they are used, which is the faster form on weights
+    // the cache holds.
+    const unsigned int y = (blockIdx.y + 2u * routed) % gridDim.y;
+    const unsigned int slot = y / 2, which = y & 1u;
+    __nv_bfloat16* out = gate_up + (size_t)y * rows;
     if (slot < routed) {
         const unsigned char* w =
             dsv41_expert_weights(slab, chosen, slot, stride, data, scales, which);
         dsv41_gemv_staged_impl<1, true, false>(sh, staged, x, w, w + data, out, 1, rows, K, rows,
                                                blockIdx.x, K);
     } else {
-        dsv41_gemv_staged_impl<1, false, false>(
-            sh, staged, x, which ? shared_w3 : shared_w1, which ? shared_s3 : shared_s1, out, 1,
-            rows, K, rows, blockIdx.x, K);
+        dsv41_gemv_tc_impl<1, false, false>(
+            sh, x, which ? shared_w3 : shared_w1, which ? shared_s3 : shared_s1, out, 1, rows, K,
+            rows, blockIdx.x, K);
     }
 }
 
@@ -118,10 +127,14 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_expert_ou
     unsigned int data,
     unsigned int scales,
     unsigned long long piece_stride) {
-    atlas_pdl_enter();
+    atlas_pdl_enter_touch(
+        {shared_w2, rows * DSV41_PARTS, rows * DSV41_PARTS},
+        {shared_s2, rows * DSV41_PARTS / F4_BLOCK, rows * DSV41_PARTS / F4_BLOCK}, N,
+        blockIdx.y * gridDim.x + blockIdx.x, dsv41_touchers(gridDim.x));
     __shared__ F4Shared<1> sh;
     __shared__ F4Staged staged;
-    const unsigned int slot = blockIdx.y, K = rows * DSV41_PARTS;
+    // The shared expert first, as in `dsv41_expert_in`.
+    const unsigned int slot = (blockIdx.y + routed) % gridDim.y, K = rows * DSV41_PARTS;
     const __nv_bfloat16* a = inner + (size_t)slot * rows;
     __nv_bfloat16* c = out + (size_t)slot * N;
     if (slot < routed) {
@@ -129,9 +142,8 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_expert_ou
         dsv41_gemv_staged_impl<1, true, false>(sh, staged, a, w, w + data, c, 1, N, K, N, blockIdx.x,
                                                rows, nullptr, nullptr, rows, piece_stride);
     } else {
-        dsv41_gemv_staged_impl<1, false, false>(sh, staged, a, shared_w2, shared_s2, c, 1, N, K, N,
-                                                blockIdx.x, rows, nullptr, nullptr, rows,
-                                                piece_stride);
+        dsv41_gemv_tc_impl<1, false, false>(sh, a, shared_w2, shared_s2, c, 1, N, K, N, blockIdx.x,
+                                            rows, nullptr, nullptr, rows, piece_stride);
     }
 }
 

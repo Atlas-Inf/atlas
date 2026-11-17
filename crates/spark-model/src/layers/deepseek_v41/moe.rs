@@ -11,6 +11,11 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 use super::weights::{ExpertSlab, Slice};
 
 const THREADS: u32 = 256;
+/// The experts one block of `dsv41_moe_scores` scores. With a block an
+/// expert the GPU cannot hold a token's 384 at once, and the kernels after
+/// it start only as it ends: the experts' then have no time to read their
+/// weights ahead.
+const SCORED_BY_A_BLOCK: u32 = 4;
 /// The widest activation a kernel here stages in shared memory.
 const MAX_K: usize = 5120;
 
@@ -148,7 +153,11 @@ pub fn route_fast(
                 .launch(stream)?;
         }
         false => KernelLaunch::new(gpu, kernels.scores)
-            .grid([experts as u32, tokens as u32, 1])
+            .grid([
+                div_ceil(experts as u32, SCORED_BY_A_BLOCK),
+                tokens as u32,
+                1,
+            ])
             .block([THREADS, 1, 1])
             .arg_ptr(x)
             .arg_ptr(gate)
