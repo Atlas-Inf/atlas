@@ -215,9 +215,16 @@ impl ConversationStore {
     /// id was present.
     pub fn remove_item(&self, conv_id: &str, item_id: &str) -> bool {
         let mut inner = self.inner.lock();
-        let Some(c) = inner.map.get_mut(conv_id) else {
-            return false;
+        let expired = match inner.map.get(conv_id) {
+            Some(c) => c.last_access.elapsed() > self.ttl,
+            None => return false,
         };
+        if expired {
+            inner.map.remove(conv_id);
+            inner.order.retain(|k| k != conv_id);
+            return false;
+        }
+        let c = inner.map.get_mut(conv_id).expect("entry present");
         let before = c.items.len();
         c.items
             .retain(|v| v.get("id").and_then(|v| v.as_str()).unwrap_or("") != item_id);
@@ -326,6 +333,31 @@ mod tests {
         let snap2 = store.get(&id).unwrap();
         assert_eq!(snap2.items.len(), 1);
         assert_eq!(snap2.items[0]["content"], "b");
+    }
+
+    #[test]
+    fn remove_item_evicts_expired_conversation() {
+        let store = ConversationStore::with_config(16, Duration::from_millis(10));
+        let id = store.create(vec![json!({"id": "item_a"})], HashMap::new());
+        std::thread::sleep(Duration::from_millis(30));
+        let removed = store.remove_item(&id, "item_a");
+        let readable = store.get(&id).is_some();
+        assert!(!readable, "expired conversation must stay unreadable");
+        assert!(!removed);
+        assert_eq!(store.len(), 0);
+        assert!(!store.inner.lock().order.contains(&id));
+    }
+
+    #[test]
+    fn remove_item_returns_false_when_missing() {
+        let store = ConversationStore::with_config(16, Duration::from_secs(60));
+        assert!(!store.remove_item("conv_missing", "item_missing"));
+        let id = store.create(vec![json!({"id": "item_a"})], HashMap::new());
+        assert!(!store.remove_item(&id, "item_missing"));
+        assert_eq!(store.get(&id).unwrap().items, vec![json!({"id": "item_a"})]);
+        let empty_id = store.create(Vec::new(), HashMap::new());
+        assert!(!store.remove_item(&empty_id, "item_missing"));
+        assert!(store.get(&empty_id).unwrap().items.is_empty());
     }
 
     #[test]
