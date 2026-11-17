@@ -25,7 +25,9 @@
 // arithmetic.
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
+#include "../../common/mxfp8_act_quant.cuh"
 #include "dsv41_common.cuh"
 
 #define DSV41_DIM 512
@@ -323,7 +325,13 @@ extern "C" __global__ void __launch_bounds__(256) dsv41_attn_batch_tc(
     float scale,
     const unsigned int* __restrict__ positions,
     const float* __restrict__ freqs,
-    unsigned int rope) {
+    unsigned int rope,
+    unsigned char* __restrict__ codes,
+    unsigned long long code_stride,
+    unsigned char* __restrict__ sfs,
+    unsigned long long sf_stride,
+    unsigned int group_heads,
+    unsigned int inner_pad) {
     const unsigned int groups = h / DSV41_GROUP;
     const unsigned int query = blockIdx.y / groups, first = (blockIdx.y % groups) * DSV41_GROUP;
     const unsigned int t = threadIdx.x, warp = t / 32, lane = t % 32;
@@ -497,6 +505,65 @@ extern "C" __global__ void __launch_bounds__(256) dsv41_attn_batch_tc(
     // running maximum.
     if (t < DSV41_GROUP) total[t] = total[t] + expf(sink[first + t] - top[t]);
     __syncthreads();
+    // With `codes`, the output goes out as the projection after it reads
+    // it: the E4M3 codes of the BF16 values below under one scale per 32,
+    // by groups of `group_heads` heads, codes[group][query, group_heads *
+    // 512] and the scales tiled (`dsv41_mx_quant` of out, a group at a
+    // time). A head's 32 values are four tiles of the four lanes that share
+    // its g.
+    if (codes != nullptr) {
+        #pragma unroll
+        for (int which = 0; which < 2; ++which) {
+            const unsigned int head = first + g + 8u * which;
+            const unsigned int group = head / group_heads, in_group = head % group_heads;
+            const float denominator = total[g + 8u * which];
+            unsigned char* row =
+                codes + group * code_stride + ((size_t)query * group_heads + in_group) * DSV41_DIM;
+            #pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                float x[8];
+                float amax = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int tile = half * 4 + i;
+                    const unsigned int d = (warp * 8u + tile) * 8u + 2u * c;
+                    float v0 = dsv41_bf16(acc[tile][which * 2] / denominator);
+                    float v1 = dsv41_bf16(acc[tile][which * 2 + 1] / denominator);
+                    if (d >= turned)
+                        dsv41_rotate_pair(v0, v1, (float)positions[query] * freqs[(d - turned) / 2],
+                                          true, v0, v1);
+                    x[2 * i] = __bfloat162float(__float2bfloat16(v0));
+                    x[2 * i + 1] = __bfloat162float(__float2bfloat16(v1));
+                    amax = fmaxf(amax, fmaxf(fabsf(x[2 * i]), fabsf(x[2 * i + 1])));
+                }
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+                const float scale = dsv41_fp8_scale(amax);
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const unsigned int d = (warp * 8u + half * 4 + i) * 8u + 2u * c;
+                    unsigned int pair = 0u;
+                    #pragma unroll
+                    for (int j = 0; j < 2; ++j) {
+                        const float scaled = fminf(fmaxf(x[2 * i + j] / scale, -448.0f), 448.0f);
+                        pair |= (unsigned int)(unsigned char)__nv_cvt_float_to_fp8(
+                                    dsv41_round_e4m3(scaled), __NV_SATFINITE, __NV_E4M3)
+                                << (8 * j);
+                    }
+                    *(unsigned short*)(row + d) = (unsigned short)pair;
+                }
+                if (c == 0u) {
+                    const unsigned int blocks = group_heads * (DSV41_DIM / 32u);
+                    const unsigned int block = in_group * (DSV41_DIM / 32u) + warp * 2u + half;
+                    unsigned char* sf = sfs + group * sf_stride;
+                    sf[mx_sf_offset(query, block, inner_pad)] =
+                        (unsigned char)(dsv41_exponent(scale) + 127);
+                    if (block + 1u == blocks) mx_sf_zero_pad(sf, query, blocks, inner_pad);
+                }
+            }
+        }
+        return;
+    }
     // The lane's sums: its two heads, by output values 2c and 2c + 1 of each
     // tile, which are a rotary pair where the output is turned.
     #pragma unroll

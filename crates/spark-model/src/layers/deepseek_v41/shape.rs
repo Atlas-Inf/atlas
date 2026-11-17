@@ -215,6 +215,10 @@ pub struct Scratch {
     /// part's partial of a few rows' attention output (`block_out.rs`).
     pub(super) attn_partial: DevicePtr,
     /// Scratch as large as the largest gather, for one that is not in place.
+    /// The tiled scales of a batch's attention output in codes
+    /// (`ops::Coded`): a group of heads [`Scratch::attn_scale_bytes`] after
+    /// the last, for the groups of the parts held.
+    pub(super) attn_scales: DevicePtr,
     pub(super) gather_recv: DevicePtr,
     /// A stream for the gathers a batch's launches can run beside.
     pub(super) beside: Beside,
@@ -254,6 +258,11 @@ pub struct Scratch {
 }
 
 impl Scratch {
+    /// Bytes of one group of heads' tiled scales, for batches of `rows`.
+    pub(super) fn attn_scale_bytes(s: &Shape, rows: usize) -> usize {
+        crate::layers::ops::mx_lt_scale_bytes(rows, s.heads / s.o_groups * HEAD_DIM)
+    }
+
     /// `max_positions` bounds a sequence, and so the compressed positions one
     /// query scores.
     pub fn alloc(gpu: &dyn GpuBackend, s: &Shape, max_positions: usize) -> Result<Self> {
@@ -313,6 +322,8 @@ impl Scratch {
             attn_out: bf16(rows * s.hidden)?,
             moe_out: bf16(rows * s.hidden)?,
             attn_partial: f32s(PARTS * rows.min(PARTIAL_ROWS) * s.hidden)?,
+            attn_scales: gpu
+                .alloc(held.count * (s.o_groups / PARTS) * Self::attn_scale_bytes(s, rows))?,
             beside: Beside::alloc(gpu)?,
             gather_recv: bf16(
                 (rows * ((s.top_k + 1) * s.inter).max(s.o_groups * s.o_rank))

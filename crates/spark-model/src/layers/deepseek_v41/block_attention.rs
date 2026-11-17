@@ -12,10 +12,11 @@ use super::block_index::Chosen;
 use super::cache_recipe::{WINDOW, visible_groups, window_row, window_slot};
 use super::gemm::{GEMM_ROWS, Input, Sent};
 use super::index;
-use super::ops::{self, HEAD_DIM, MAX_KEYS, Turn};
+use super::ops::{self, Coded, HEAD_DIM, MAX_KEYS, Turn};
 use super::owned::{self, Owned};
 use super::parts::{self, PARTS};
 use super::profile;
+use super::shape::Scratch;
 use super::state::{KEPT_ROWS, SeqState};
 
 impl Block {
@@ -299,6 +300,18 @@ impl Block {
                     )?
                 }
             }
+            // A batch's heads leave the attention in the codes wo_a reads,
+            // a group of heads an operand, where the values were.
+            let of_scales = (part - held.first) * groups * Scratch::attn_scale_bytes(s, sc.rows);
+            let coded = gemm
+                .filter(|_| ops::in_one_launch(rows, self.tensor_cores))
+                .map(|_| Coded {
+                    codes: attended,
+                    code_stride: rows * group_in,
+                    scales: sc.attn_scales.offset(of_scales),
+                    scale_stride: Scratch::attn_scale_bytes(s, sc.rows),
+                    group_heads: s.heads / s.o_groups,
+                });
             ops::sparse_attn(
                 gpu,
                 &k.cache,
@@ -315,6 +328,7 @@ impl Block {
                 WINDOW,
                 Some(turn),
                 self.tensor_cores,
+                coded,
                 stream,
             )?;
             profile::end(gpu, stream, "sparse attention", began)?;
@@ -334,14 +348,16 @@ impl Block {
                         let block = g.wo_a[part * groups + group]
                             .as_ref()
                             .context("a held group of wo_a")?;
-                        sc.gemm.project(
-                            gpu,
-                            Input::rows(attended.offset(group * group_in * 2), groups * group_in),
-                            block,
-                            values,
-                            rows,
-                            stream,
-                        )?;
+                        match coded {
+                            Some(coded) => {
+                                block.gemm(coded.operand(group), values, rows, stream)?
+                            }
+                            None => {
+                                let x = attended.offset(group * group_in * 2);
+                                let x = Input::rows(x, groups * group_in);
+                                sc.gemm.project(gpu, x, block, values, rows, stream)?
+                            }
+                        }
                         let at = group * rows * s.o_rank;
                         let scales = to.offset(sent.scales + at / 32);
                         sc.gemm.codes(
@@ -443,50 +459,5 @@ impl Block {
                 ),
             }
         })
-    }
-
-    /// The other ranks' codes of the rows this rank keeps, of the low-rank
-    /// output each left in its part of `scratch.o_low` (`sent`), to where a
-    /// gather of the parts would leave them: an all-to-all a group, its
-    /// codes and their scales. False, with nothing queued, where that does
-    /// not serve; the ranks answer alike.
-    fn codes_home(
-        &self,
-        comm: Option<&dyn CommBackend>,
-        own: Owned,
-        sent: Sent,
-        rows: usize,
-        stream: u64,
-    ) -> Result<bool> {
-        let Some(comm) = comm else {
-            return Ok(false);
-        };
-        let (sc, part) = (&self.shared.scratch, self.shared.held.first);
-        for group in 0..sent.groups {
-            // A group's rows of codes, and of scales, in a part.
-            let plane = |at: usize, row_bytes: usize| {
-                let at = at + group * rows * row_bytes;
-                spark_comm::AllToAllPlane {
-                    src: sc.o_low.offset(part * sent.bytes + at).0,
-                    src_stride: (own.each * row_bytes) as i64,
-                    dst: sc.o_low.offset(at + own.first * row_bytes).0,
-                    dst_stride: sent.bytes as i64,
-                    rows: own.each,
-                    row_bytes,
-                    pitch: row_bytes,
-                }
-            };
-            let planes = [plane(0, sent.piece), plane(sent.scales, sent.piece / 32)];
-            let queued = comm.all_to_all_async(&planes, stream)?;
-            ensure!(
-                queued || group == 0,
-                "layer {}: the all-to-all took one group's codes and not the next's",
-                self.index
-            );
-            if !queued {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 }

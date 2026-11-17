@@ -240,6 +240,7 @@ fn attention_with_the_heads_together_leaves_the_plain_forms_bytes() -> Result<()
             split,
             Some(turn),
             false,
+            None,
             stream,
         )?;
         let want = bytes(gpu, plain, HEADS * HEAD_DIM * 2)?;
@@ -266,6 +267,7 @@ fn attention_with_the_heads_together_leaves_the_plain_forms_bytes() -> Result<()
             split,
             Some(turn),
             true,
+            None,
             stream,
         )?;
         let got = bytes(gpu, fused, HEADS * HEAD_DIM * 2)?;

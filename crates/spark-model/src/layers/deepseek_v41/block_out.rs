@@ -16,7 +16,9 @@ use spark_comm::CommBackend;
 use spark_runtime::gpu::GpuBackend;
 
 use super::block::Block;
+use super::gemm::Sent;
 use super::ops;
+use super::owned::Owned;
 use super::parts::{self, PARTIAL_ROWS, PARTS};
 use super::profile;
 
@@ -98,5 +100,50 @@ impl Block {
             )?;
         }
         Ok(())
+    }
+
+    /// The other ranks' codes of the rows this rank keeps, of the low-rank
+    /// output each left in its part of `scratch.o_low` (`sent`), to where a
+    /// gather of the parts would leave them: an all-to-all a group, its
+    /// codes and their scales. False, with nothing queued, where that does
+    /// not serve; the ranks answer alike.
+    pub(super) fn codes_home(
+        &self,
+        comm: Option<&dyn CommBackend>,
+        own: Owned,
+        sent: Sent,
+        rows: usize,
+        stream: u64,
+    ) -> Result<bool> {
+        let Some(comm) = comm else {
+            return Ok(false);
+        };
+        let (sc, part) = (&self.shared.scratch, self.shared.held.first);
+        for group in 0..sent.groups {
+            // A group's rows of codes, and of scales, in a part.
+            let plane = |at: usize, row_bytes: usize| {
+                let at = at + group * rows * row_bytes;
+                spark_comm::AllToAllPlane {
+                    src: sc.o_low.offset(part * sent.bytes + at).0,
+                    src_stride: (own.each * row_bytes) as i64,
+                    dst: sc.o_low.offset(at + own.first * row_bytes).0,
+                    dst_stride: sent.bytes as i64,
+                    rows: own.each,
+                    row_bytes,
+                    pitch: row_bytes,
+                }
+            };
+            let planes = [plane(0, sent.piece), plane(sent.scales, sent.piece / 32)];
+            let queued = comm.all_to_all_async(&planes, stream)?;
+            ensure!(
+                queued || group == 0,
+                "layer {}: the all-to-all took one group's codes and not the next's",
+                self.index
+            );
+            if !queued {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }

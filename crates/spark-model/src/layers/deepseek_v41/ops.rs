@@ -8,6 +8,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 use super::profile;
+use crate::layers::ops::{MxAct, mx_lt_inner_pad};
 
 /// Values in one key, and in one head's query.
 pub const HEAD_DIM: usize = 512;
@@ -141,6 +142,38 @@ pub fn front(
         .launch(stream)
 }
 
+/// Whether [`sparse_attn`] takes `queries` queries in one launch
+/// (`dsv41_attn_batch_tc`), which is the launch that can leave its output
+/// in codes ([`Coded`]).
+pub fn in_one_launch(queries: usize, batch: bool) -> bool {
+    batch && queries >= SPREAD_BELOW
+}
+
+/// Where a batch's attention leaves its output for the projection after
+/// it, in place of BF16 values: by groups of `group_heads` heads, a
+/// group's E4M3 codes (`[queries, group_heads * 512]`, a group
+/// `code_stride` bytes after the last) and its scales tiled as the GEMM
+/// reads them (a group `scale_stride` bytes after the last). The codes
+/// `dsv41_mx_quant` makes of the values.
+#[derive(Clone, Copy)]
+pub struct Coded {
+    pub codes: DevicePtr,
+    pub code_stride: usize,
+    pub scales: DevicePtr,
+    pub scale_stride: usize,
+    pub group_heads: usize,
+}
+
+impl Coded {
+    /// Group `group`'s output as a GEMM operand.
+    pub fn operand(&self, group: usize) -> MxAct {
+        MxAct {
+            q: self.codes.offset(group * self.code_stride),
+            sf: self.scales.offset(group * self.scale_stride),
+        }
+    }
+}
+
 /// Attention of `queries` queries of `heads` heads (`q`, `[queries, heads,
 /// 512]` BF16) over gathered keys, into `out` of the same shape, in the plain
 /// form: a block a head. `idx` (`[queries, keys]` i32) holds row numbers, -1
@@ -219,8 +252,13 @@ pub fn sparse_attn(
     split: usize,
     turn: Option<Turn>,
     batch: bool,
+    coded: Option<Coded>,
     stream: u64,
 ) -> Result<()> {
+    ensure!(
+        coded.is_none() || in_one_launch(queries, batch),
+        "dsv41_attn: {queries} queries do not leave their output in codes"
+    );
     let turn = turn.unwrap_or(Turn {
         positions: DevicePtr::NULL,
         freqs: DevicePtr::NULL,
@@ -265,6 +303,12 @@ pub fn sparse_attn(
                 .arg_f32((HEAD_DIM as f32).powf(-0.5)),
             &turn,
         )
+        .arg_ptr(coded.map_or(DevicePtr::NULL, |c| c.codes))
+        .arg_u64(coded.map_or(0, |c| c.code_stride) as u64)
+        .arg_ptr(coded.map_or(DevicePtr::NULL, |c| c.scales))
+        .arg_u64(coded.map_or(0, |c| c.scale_stride) as u64)
+        .arg_u32(coded.map_or(1, |c| c.group_heads) as u32)
+        .arg_u32(coded.map_or(0, |c| mx_lt_inner_pad(c.group_heads * HEAD_DIM)) as u32)
         .launch(stream)?;
         return profile::end(gpu, stream, "attention", began);
     }

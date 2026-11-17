@@ -156,6 +156,7 @@ fn run(gpu: &dyn GpuBackend, k: &Kernels, case: &Case, sink: DevicePtr) -> Resul
         case.k,
         None,
         false,
+        None,
         gpu.default_stream(),
     )?;
     let got = download(gpu, out, case.q.len())?;
@@ -361,6 +362,18 @@ fn run_on_tensor_cores(
     m: usize,
     sink: DevicePtr,
 ) -> Result<Vec<u16>> {
+    run_coded(gpu, k, case, m, sink, None)
+}
+
+/// The same, with the output left in `coded` where one is given.
+fn run_coded(
+    gpu: &dyn GpuBackend,
+    k: &Kernels,
+    case: &Case,
+    m: usize,
+    sink: DevicePtr,
+    coded: Option<Coded>,
+) -> Result<Vec<u16>> {
     let values = m * HEADS * HEAD_DIM;
     let q = upload(gpu, &bytes_of(&case.q[..values], u16::to_le_bytes))?;
     let keys = upload(gpu, &bytes_of(&case.keys, u16::to_le_bytes))?;
@@ -370,13 +383,30 @@ fn run_on_tensor_cores(
     let stream = gpu.default_stream();
     sparse_attn(
         gpu, k, q, keys, keys, idx, sink, out, records, m, HEADS, case.k, case.k, None, true,
-        stream,
+        coded, stream,
     )?;
     let got = download(gpu, out, values)?;
     for p in [q, keys, idx, out, records] {
         gpu.free(p)?;
     }
     Ok(got)
+}
+
+/// `m` queries over `columns` of `keys` keys, some of them missing.
+fn sparse_case(rng: &mut Rng, m: usize, keys: usize, columns: usize) -> Case {
+    Case {
+        q: activations(rng, m * HEADS * HEAD_DIM),
+        keys: activations(rng, keys * HEAD_DIM),
+        idx: (0..m * columns)
+            .map(|_| match rng.next() % 9 {
+                0 => -1,
+                _ => (rng.next() % keys as u64) as i32,
+            })
+            .collect(),
+        reference: Vec::new(),
+        m,
+        k: columns,
+    }
 }
 
 #[test]
@@ -390,19 +420,7 @@ fn a_few_queries_spread_over_the_gpu_leave_a_batchs_bytes() -> Result<()> {
     // Key counts that end inside a step of 64 and on one, with keys missing.
     for (keys, columns) in [(700usize, 640usize), (300, 133), (90, 64)] {
         let m = 64;
-        let case = Case {
-            q: activations(&mut rng, m * HEADS * HEAD_DIM),
-            keys: activations(&mut rng, keys * HEAD_DIM),
-            idx: (0..m * columns)
-                .map(|_| match rng.next() % 9 {
-                    0 => -1,
-                    _ => (rng.next() % keys as u64) as i32,
-                })
-                .collect(),
-            reference: Vec::new(),
-            m,
-            k: columns,
-        };
+        let case = sparse_case(&mut rng, m, keys, columns);
         let batch = run_on_tensor_cores(gpu, &k, &case, m, sink_dev)?;
         for few in [1usize, 6, 16] {
             let spread = run_on_tensor_cores(gpu, &k, &case, few, sink_dev)?;
@@ -413,4 +431,67 @@ fn a_few_queries_spread_over_the_gpu_leave_a_batchs_bytes() -> Result<()> {
         }
     }
     gpu.free(sink_dev)
+}
+
+/// A batch's output left in codes is `dsv41_mx_quant` of its output in
+/// values, a group of eight heads an operand: the codes, and the scales in
+/// their tiles.
+#[test]
+#[ignore = "needs a GB10 GPU and the deepseek-v4.1-flash kernel target"]
+fn a_batchs_output_in_codes_is_its_output_rounded() -> Result<()> {
+    use crate::layers::deepseek_v41::gemm::{GemmScratch, Input};
+    use crate::layers::ops::{mx_lt_inner_pad, mx_lt_scale_bytes, mx_lt_sf_offset};
+    const GROUP_HEADS: usize = 8;
+    let gpu = backend()?;
+    let k = Kernels::load(gpu)?;
+    let stream = gpu.default_stream();
+    let mut rng = Rng(0x51de_c0de);
+    let sink: Vec<f32> = (0..HEADS).map(|h| h as f32 / 64.0 - 0.5).collect();
+    let sink_dev = upload(gpu, &bytes_of(&sink, f32::to_le_bytes))?;
+    let (m, keys, columns) = (64usize, 300usize, 133usize);
+    let case = sparse_case(&mut rng, m, keys, columns);
+    let (groups, width) = (HEADS / GROUP_HEADS, GROUP_HEADS * HEAD_DIM);
+    let scale_bytes = mx_lt_scale_bytes(m, width);
+    let coded = Coded {
+        codes: gpu.alloc(groups * m * width)?,
+        code_stride: m * width,
+        scales: gpu.alloc(groups * scale_bytes)?,
+        scale_stride: scale_bytes,
+        group_heads: GROUP_HEADS,
+    };
+    let values = run_on_tensor_cores(gpu, &k, &case, m, sink_dev)?;
+    run_coded(gpu, &k, &case, m, sink_dev, Some(coded))?;
+    let read = |p: DevicePtr, bytes: usize| -> Result<Vec<u8>> {
+        gpu.synchronize(stream)?;
+        let mut out = vec![0u8; bytes];
+        gpu.copy_d2h(p, &mut out)?;
+        Ok(out)
+    };
+    let x = upload(gpu, &bytes_of(&values, u16::to_le_bytes))?;
+    let scratch = GemmScratch::alloc(gpu, m, width)?;
+    let pad = mx_lt_inner_pad(width);
+    for group in 0..groups {
+        let of = Input::rows(x.offset(group * width * 2), HEADS * HEAD_DIM);
+        let want = scratch.quantize(gpu, of, m, width, stream)?;
+        let (want_q, want_sf) = (read(want.q, m * width)?, read(want.sf, scale_bytes)?);
+        let got = coded.operand(group);
+        let (got_q, got_sf) = (read(got.q, m * width)?, read(got.sf, scale_bytes)?);
+        assert!(got_q == want_q, "group {group}: the codes differ");
+        for row in 0..m {
+            for block in 0..width / 32 {
+                let at = mx_lt_sf_offset(row, block, pad);
+                assert!(
+                    got_sf[at] == want_sf[at] && got_sf[at] != 0,
+                    "group {group}, row {row}, block {block}: scale {} for {}",
+                    got_sf[at],
+                    want_sf[at]
+                );
+            }
+        }
+    }
+    println!("{groups} groups of {m} rows: the output in codes is its values rounded");
+    for p in [sink_dev, coded.codes, coded.scales, x] {
+        gpu.free(p)?;
+    }
+    Ok(())
 }
