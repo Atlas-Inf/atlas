@@ -28,6 +28,7 @@ pub struct MoeKernels {
     pub expert_act: KernelHandle,
     pub expert_out: KernelHandle,
     /// The same for a batch of rows, grouped by expert (`moe_grouped.rs`).
+    pub experts_plan: KernelHandle,
     pub experts_in: KernelHandle,
     pub experts_act: KernelHandle,
     pub experts_act_codes: KernelHandle,
@@ -54,6 +55,7 @@ impl MoeKernels {
             expert_in: gpu.kernel("dsv41_expert", "dsv41_expert_in")?,
             expert_act: gpu.kernel("dsv41_expert", "dsv41_expert_act")?,
             expert_out: gpu.kernel("dsv41_expert", "dsv41_expert_out")?,
+            experts_plan: gpu.kernel("dsv41_expert", "dsv41_experts_plan")?,
             experts_in: gpu.kernel("dsv41_expert", "dsv41_experts_in")?,
             experts_act: gpu.kernel("dsv41_expert", "dsv41_experts_act")?,
             experts_act_codes: gpu.kernel("dsv41_expert", "dsv41_experts_act_codes")?,

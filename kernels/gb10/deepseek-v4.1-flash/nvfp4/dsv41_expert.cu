@@ -143,9 +143,56 @@ struct Dsv41Tile {
     unsigned int count;
 };
 
+// The (row, slot) pairs of a few rows in expert order, as the host puts a
+// batch's (`moe_grouped::Plan`), without leaving the device: a step that
+// waits on the host for this, forty times, is a step the ranks fall out of
+// with one another. chosen [rows, top_k] u32 and weights [rows, top_k] FP32
+// as the router leaves them, a pair `row * top_k + slot`. A pair's place is
+// the pairs of lesser experts and the earlier pairs of its own. tiles
+// [pairs]: a tile an expert chosen, in expert order, and none (count 0)
+// after them; row_of and out_row [pairs] i32 and sorted [pairs] FP32 by
+// place. One block, a thread a pair: at most 1,024 of them, and no expert
+// with more than a tile's.
+extern "C" __global__ void dsv41_experts_plan(
+    const unsigned int* __restrict__ chosen,
+    const float* __restrict__ weights,
+    Dsv41Tile* __restrict__ tiles,
+    int* __restrict__ row_of,
+    int* __restrict__ out_row,
+    float* __restrict__ sorted,
+    unsigned int top_k,
+    unsigned int slots) {
+    __shared__ unsigned int expert[1024];
+    __shared__ unsigned char leads[1024];
+    const unsigned int pairs = blockDim.x, p = threadIdx.x;
+    expert[p] = chosen[p];
+    __syncthreads();
+    const unsigned int e = expert[p];
+    unsigned int lesser = 0, same = 0, earlier = 0;
+    for (unsigned int q = 0; q < pairs; ++q) {
+        lesser += expert[q] < e;
+        same += expert[q] == e;
+        earlier += expert[q] == e && q < p;
+    }
+    leads[p] = earlier == 0;
+    __syncthreads();
+    // The experts chosen, and those before this pair's.
+    unsigned int all = 0, tile = 0;
+    for (unsigned int q = 0; q < pairs; ++q) {
+        all += leads[q];
+        tile += leads[q] && expert[q] < e;
+    }
+    const unsigned int at = lesser + earlier;
+    row_of[at] = (int)(p / top_k);
+    out_row[at] = (int)((p / top_k) * slots + p % top_k);
+    sorted[at] = weights[p];
+    if (leads[p]) tiles[tile] = Dsv41Tile{e, lesser, same};
+    if (p >= all) tiles[p] = Dsv41Tile{0u, 0u, 0u};
+}
+
 // gate_up[pair][0] = BF16(w1 . x[row_of[pair]]), [pair][1] the same of w3.
-// x [T, K] FP8-rounded BF16; gate_up [pairs, 2, rows].
-// Grid (ceil(rows / 16), 2 * tiles), block 256.
+// x [T, K] FP8-rounded BF16; gate_up [pairs, 2, rows]. A tile of no pairs is
+// none. Grid (ceil(rows / 16), 2 * tiles), block 256.
 extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_in(
     const __nv_bfloat16* __restrict__ x,
     const unsigned char* __restrict__ slab,
@@ -160,6 +207,7 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_i
     __shared__ F4Shared<4> sh;
     __shared__ F4Staged staged;
     const Dsv41Tile tile = tiles[blockIdx.y / 2];
+    if (tile.count == 0u) return;
     const unsigned int which = blockIdx.y & 1u;
     const unsigned char* w = slab + (unsigned long long)tile.expert * stride +
                              (unsigned long long)which * (data + scales);
@@ -252,6 +300,7 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_o
     __shared__ F4Shared<4> sh;
     __shared__ F4Staged staged;
     const Dsv41Tile tile = tiles[blockIdx.y];
+    if (tile.count == 0u) return;
     const unsigned char* w =
         slab + (unsigned long long)tile.expert * stride + 2ull * (data + scales);
     dsv41_gemv_staged_impl<4, true, false>(

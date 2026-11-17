@@ -11,6 +11,10 @@
 //! activation, and, once the ranks have gathered the activations, the
 //! projection out. A row's bytes are those of [`super::moe::experts_in`]
 //! and [`super::moe::experts_out`] on it alone.
+//!
+//! A few rows, a verify's, are sorted on the device ([`plan_on_device`]):
+//! the host's turn costs a wait for the GPU a layer, and each rank waits its
+//! own while the others wait for it.
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -21,6 +25,17 @@ use super::weights::ExpertSlab;
 
 /// The pairs of one expert a launch takes together (`dsv41_expert.cu`).
 const TILE: usize = 32;
+
+/// The most rows whose pairs the device sorts: no expert of theirs has more
+/// than a tile's.
+pub const DEVICE_ROWS: usize = TILE;
+
+/// The tiles the launches of a batch cover, and its pairs.
+#[derive(Clone, Copy)]
+pub struct Counts {
+    pub tiles: usize,
+    pub pairs: usize,
+}
 
 /// A batch's (row, slot) pairs in expert order, as the kernels read them.
 pub struct Plan {
@@ -74,6 +89,52 @@ impl Plan {
     pub fn pairs(&self) -> usize {
         self.row_of.len()
     }
+
+    pub fn counts(&self) -> Counts {
+        Counts {
+            tiles: self.tile_count(),
+            pairs: self.pairs(),
+        }
+    }
+}
+
+/// [`Plan::new`] of `rows` rows, at most [`DEVICE_ROWS`], on the device and
+/// into `scratch`, from `chosen` and `weights` as the router leaves them
+/// (`[rows, top_k]`). The launches then cover a tile a pair, and those past
+/// the experts chosen are none: the host does not learn how many there are.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_on_device(
+    gpu: &dyn GpuBackend,
+    kernels: &MoeKernels,
+    scratch: &GroupedScratch,
+    chosen: DevicePtr,
+    weights: DevicePtr,
+    rows: usize,
+    top_k: usize,
+    slots: usize,
+    stream: u64,
+) -> Result<Counts> {
+    let pairs = rows * top_k;
+    ensure!(
+        (1..=DEVICE_ROWS).contains(&rows) && pairs <= 1024,
+        "dsv41_experts_plan: {rows} rows of {top_k} experts"
+    );
+    KernelLaunch::new(gpu, kernels.experts_plan)
+        .grid([1, 1, 1])
+        .block([pairs as u32, 1, 1])
+        .arg_ptr(chosen)
+        .arg_ptr(weights)
+        .arg_ptr(scratch.tiles)
+        .arg_ptr(scratch.row_of)
+        .arg_ptr(scratch.out_row)
+        .arg_ptr(scratch.weights)
+        .arg_u32(top_k as u32)
+        .arg_u32(slots as u32)
+        .launch(stream)?;
+    Ok(Counts {
+        tiles: pairs,
+        pairs,
+    })
 }
 
 /// Device buffers of a plan and of the launches' working values, for
@@ -98,8 +159,9 @@ impl GroupedScratch {
     ) -> Result<Self> {
         let pairs = rows * top_k;
         Ok(Self {
-            // An expert's run ends in at most one tile that is not full.
-            tiles: gpu.alloc((experts + pairs / TILE) * 3 * 4)?,
+            // An expert's run ends in at most one tile that is not full; and
+            // a few rows sorted on the device have a tile a pair.
+            tiles: gpu.alloc((experts + pairs / TILE).max(pairs.min(1024)) * 3 * 4)?,
             row_of: gpu.alloc(pairs * 4)?,
             out_row: gpu.alloc(pairs * 4)?,
             weights: gpu.alloc(pairs * 4)?,
@@ -136,7 +198,7 @@ pub fn experts_in(
     gpu: &dyn GpuBackend,
     kernels: &MoeKernels,
     slab: &ExpertSlab,
-    plan: &Plan,
+    plan: Counts,
     scratch: &GroupedScratch,
     x: DevicePtr,
     inner: DevicePtr,
@@ -149,7 +211,7 @@ pub fn experts_in(
         part_rows.is_multiple_of(32) && hidden.is_multiple_of(32),
         "dsv41_experts: {part_rows} rows of {hidden}"
     );
-    let tiles = plan.tile_count() as u32;
+    let tiles = plan.tiles as u32;
     if tiles == 0 {
         return Ok(());
     }
@@ -173,7 +235,7 @@ pub fn experts_in(
         GateUp::paired(scratch.gate_up, part_rows),
         scratch.weights,
         inner,
-        plan.pairs(),
+        plan.pairs,
         part_rows,
         limit,
         stream,
@@ -190,7 +252,7 @@ pub fn experts_out(
     gpu: &dyn GpuBackend,
     kernels: &MoeKernels,
     slab: &ExpertSlab,
-    plan: &Plan,
+    plan: Counts,
     scratch: &GroupedScratch,
     inner: DevicePtr,
     piece_stride: usize,
@@ -203,7 +265,7 @@ pub fn experts_out(
         part_rows.is_multiple_of(64),
         "dsv41_experts_out: {part_rows} hidden rows a part"
     );
-    let tiles = plan.tile_count() as u32;
+    let tiles = plan.tiles as u32;
     if tiles == 0 {
         return Ok(());
     }
@@ -302,3 +364,7 @@ pub fn activate_codes(
         .arg_u64(gate_up.row_stride as u64)
         .launch(stream)
 }
+
+#[cfg(test)]
+#[path = "moe_grouped_test_gpu.rs"]
+mod test_gpu;

@@ -75,8 +75,10 @@ impl Block {
         let began = profile::begin(gpu, stream)?;
         let part_rows = s.inter / PARTS;
         // More than one row: the rows that chose an expert share its weights.
+        // A few rows' pairs are sorted by expert on the device, a batch's on
+        // the host.
         let plan = match rows {
-            1 => None,
+            0..=moe_grouped::DEVICE_ROWS => None,
             _ => {
                 gpu.synchronize(stream)?;
                 let mut chosen = vec![0u8; rows * s.top_k * 4];
@@ -96,6 +98,21 @@ impl Block {
                 sc.grouped.upload(gpu, &plan)?;
                 Some(plan)
             }
+        };
+        let grouped = match (rows, &plan) {
+            (_, Some(plan)) => Some(plan.counts()),
+            (1, None) => None,
+            (_, None) => Some(moe_grouped::plan_on_device(
+                gpu,
+                &k.moe,
+                &sc.grouped,
+                sc.chosen,
+                sc.weights,
+                rows,
+                s.top_k,
+                slots,
+                stream,
+            )?),
         };
         // A large batch's experts go to the block-scaled tensor cores, an
         // expert's pairs in tiles.
@@ -124,15 +141,15 @@ impl Block {
         };
         // A part of the hidden activations as the ranks gather it: values,
         // or from the tensor cores codes and scales.
-        let sent = match (&big, &plan) {
-            (Some(_), Some(plan)) => Some(Sent::new(plan.pairs(), rows, part_rows)),
+        let sent = match (&big, grouped) {
+            (Some(_), Some(grouped)) => Some(Sent::new(grouped.pairs, rows, part_rows)),
             _ => None,
         };
         let part_bytes = sent.map_or(room * 2, |sent| sent.bytes);
         for part in held.range() {
             let of = part_of(part)?;
             let inner = sc.inner_parts.offset(part * part_bytes);
-            let Some(plan) = &plan else {
+            let Some(grouped) = grouped else {
                 moe::experts_in(
                     gpu,
                     &k.moe,
@@ -167,7 +184,7 @@ impl Block {
                     // Every pair's gate values, then every pair's up values.
                     let gate_up = GateUp {
                         base: sc.grouped.gate_up,
-                        up_offset: plan.pairs() * part_rows,
+                        up_offset: grouped.pairs * part_rows,
                         row_stride: part_rows,
                     };
                     let sent = sent.context("a part as the ranks send it")?;
@@ -178,7 +195,7 @@ impl Block {
                         sc.grouped.weights,
                         inner,
                         inner.offset(sent.scales),
-                        plan.pairs(),
+                        grouped.pairs,
                         part_rows,
                         s.swiglu_limit,
                         stream,
@@ -188,7 +205,7 @@ impl Block {
                     gpu,
                     &k.moe,
                     &of.slab,
-                    plan,
+                    grouped,
                     &sc.grouped,
                     sc.quantized,
                     inner,
@@ -240,7 +257,7 @@ impl Block {
                 &k.moe,
                 gate_up,
                 DevicePtr::NULL,
-                inner.offset(sent.map_or(plan.pairs() * part_rows * 2, |sent| sent.shared)),
+                inner.offset(sent.map_or(grouped.pairs * part_rows * 2, |sent| sent.shared)),
                 rows,
                 part_rows,
                 s.swiglu_limit,
@@ -266,7 +283,7 @@ impl Block {
         for part in held.range() {
             let of = part_of(part)?;
             let mut shared_out = DevicePtr::NULL;
-            match &plan {
+            match grouped {
                 None => moe::experts_out(
                     gpu,
                     &k.moe,
@@ -280,7 +297,7 @@ impl Block {
                     part_n,
                     stream,
                 )?,
-                Some(plan) => {
+                Some(grouped) => {
                     match &big {
                         Some((big, runs)) => big.project_out(
                             gpu,
@@ -296,7 +313,7 @@ impl Block {
                             gpu,
                             &k.moe,
                             &of.slab,
-                            plan,
+                            grouped,
                             &sc.grouped,
                             sc.inner_parts,
                             room,
@@ -310,7 +327,7 @@ impl Block {
                     // activations come after the pairs'.
                     let x = sc
                         .inner_parts
-                        .offset(sent.map_or(plan.pairs() * part_rows * 2, |sent| sent.shared));
+                        .offset(sent.map_or(grouped.pairs * part_rows * 2, |sent| sent.shared));
                     match gemm.and_then(|g| g.shared[part].as_ref()) {
                         Some([_, _, w2]) => {
                             let x = Input {
