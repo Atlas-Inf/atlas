@@ -38,7 +38,7 @@
 Atlas is a high-performance, pure Rust & CUDA LLM inference engine purpose-built for prosumer workstations (NVIDIA DGX Spark / GB10 SM121 and AMD Strix Halo). No Python, no PyTorch, no bloated dependency trees—just one compact binary with hand-tuned micro-kernels.
 
 - **Precompiled Kernels**: Kernels ship inside the binary as PTX, so there is no `nvcc` and no Python at runtime; the driver JITs them for your GPU at launch.
-- **Default Flagship Qwen 3.8 27B**: Dense hybrid GDN + Attention running at 26.3 tok/s single-stream with MTP speculative decoding on a single GB10.
+- **Default Flagship Qwen 3.8 27B**: Dense hybrid GDN + Attention running at 23.59 tok/s single-stream with MTP speculative decoding on a single GB10 (26.3 tok/s on the agentic profile, decode-floor gate).
 - **Nemotron 3.5 Lightning + DSpark**: Full bring-up of hybrid Mamba-2 SSM + MoE paired with NVIDIA's DSpark speculative decoding drafter.
 - **Qwen 3.8 Flash-Next Support**: Stream massive ~180B hybrid MoE models inside ~90 GB resident VRAM using direct parallel `pread` NVMe offloading.
 - **Turnkey Sparkrun Integration**: Launch any verified model recipe instantly with `sparkrun run @atlas/<recipe>`.
@@ -67,11 +67,11 @@ Atlas began as a solution to a widely known problem with Python inference engine
 
 One multi-model binary. The right kernel set is selected at startup from the model's `config.json`, so there is no swapping images and no rebuilding. Point Atlas at a HuggingFace ID, or launch a verified recipe with `sparkrun run @atlas/<recipe>`. The recipe SSOT is [sparkrun-recipes](https://github.com/Atlas-Inf/sparkrun-recipes) and the interactive browser lives at [atlasinference.dev/#models](https://atlasinference.dev/#models).
 
-Numbers are decode tok/s unless the row says otherwise. The two Qwen3.8 rows quote the pinned decode-floor gate: the median server decode rate across three runs of one committed code prompt (temperature 0, `max_tokens = 1500`, `reasoning_effort: "none"`). The 27B figure is from one GB10; Flash-Next is FP4-Local on two GB10s (TP=EP=2). The other rows were measured end-to-end through the HTTP API on a short prompt (`max_tokens = 30`, `temperature = 0.1`) with `scripts/sweep_all_models.sh`. Prompt length and timing method differ between the two, so compare rows with care.
+Numbers are decode tok/s unless the row says otherwise. Qwen3.8-27B quotes both measured figures: 23.59 is the default `qwen3.8-27b-nvfp4` recipe's single-stream number (C=1 rung of the 2026-08-17 vLLM comparison; ISL 128 / OSL 1024, temp 0, FP8 KV, thinking off, MTP K=4), and 26.3 is the decode-floor PR gate median (3 runs, one pinned code prompt, `max_tokens = 1500`, `reasoning_effort: "none"`), served by the `qwen3.8-27b-nvfp4-agentic` profile (BF16 KV + head) on one GB10, 2026-11-12. Qwen3.8-Flash-Next quotes the same decode-floor gate at TP=EP=2 on two GB10s (median of 3). The other rows were measured end-to-end through the HTTP API on a short prompt (`max_tokens = 30`, `temperature = 0.1`) with `scripts/sweep_all_models.sh`. Prompt length and timing method differ across these figures, so compare rows with care.
 
 | Model | HuggingFace ID | Params / active | Architecture | Recipe | tok/s |
 |---|---|---|---:|---|---:|
-| **Qwen3.8-27B flagship** | `nvidia/Qwen3.8-27B-NVFP4` | 27B dense | GDN + attention hybrid, MTP | `@atlas/qwen3.8-27b-nvfp4` | 26.3 |
+| **Qwen3.8-27B flagship** | `nvidia/Qwen3.8-27B-NVFP4` | 27B dense | GDN + attention hybrid, MTP | `@atlas/qwen3.8-27b-nvfp4` | 23.59 (default); 26.3 (agentic, gate) |
 | **Qwen3.8-Flash-Next (FP4-Local)** | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | ~180B MoE | GDN + attention + MoE, PLE resident | `@atlas/qwen3.8-flash-next-fp4-local-tp2` | 83.6 (2× GB10, TP=EP=2) |
 | Nemotron-3.5-Lightning + DSpark | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` | 30B / 3B | Mamba-2 + attention + MoE + DSpark drafter | `@atlas/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark` | |
 | **Nemotron-3.5-Super-VL + LiLiCorr** | `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` | 120B / 12B | Mamba-2 + attention + LatentMoE, C-RADIO vision, LiLiCorr drafter (DFlash γ8) | `@atlas/nemotron-3.5-super-vl-120b-a12b-nvfp4-dflash2` | 28 (γ8); also Strix Halo Windows/Linux |
