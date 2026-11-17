@@ -232,6 +232,11 @@ if [ "${MAX_BATCH:-1}" -gt 1 ]; then
   # f160 (Flash-Next, AR, x2): C4 34.0 -> 35.9, C8 38.2 -> 40.0 tok/s; solo text identical 8/8.
   export ATLAS_QWEN4EXP_BATCH_SMALL="${ATLAS_QWEN4EXP_BATCH_SMALL:-1}"
 fi
+# Flash-Next: MTP for at most 3 concurrent sequences (the gfx1151 default cap is 4, shared
+# with the 27B). Framework f335 (main 93db0a3ca, 5 rounds): cap 4 C3 46.5 / C4 47.1 tok/s,
+# cap 3 46.5 / 48.2 (C4 decodes AR, +2.4%), cap 2 C3 39.6. The 27B keeps 4 (f336: cap 3
+# C4 47.4 -> 39.3). Explicit values win.
+case "$MODEL" in *[Ff]lash-[Nn]ext*) export ATLAS_MTP_MAX_SEQS="${ATLAS_MTP_MAX_SEQS:-3}" ;; esac
 exec "$BIN" serve "$MODEL" "${NAME_ARG[@]}" \
   --host "${HOST:-0.0.0.0}" --port "${PORT:-8081}" \
   --max-seq-len "$MAX_SEQ_LEN" \
