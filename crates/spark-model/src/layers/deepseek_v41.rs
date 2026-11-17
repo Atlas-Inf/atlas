@@ -4,12 +4,14 @@
 //! layer, plus compressed keys and index keys that a few source layers
 //! produce and the layers after them read.
 
+mod beside;
 pub mod block;
 mod block_attention;
 mod block_compress;
 mod block_draft;
 mod block_index;
 mod block_moe;
+mod block_moe_big;
 mod block_out;
 pub mod cache_recipe;
 pub mod draft;

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, ensure};
 use spark_runtime::gpu::GpuBackend;
 
-use super::{ExpertGemm, Runs, Sent};
+use super::{ExpertGemm, Runs, Sent, Span};
 use crate::layers::deepseek_v41::block::{BlockKernels, Handoff, Scratch, Shared};
 use crate::layers::deepseek_v41::moe_grouped::{self, GateUp, Plan};
 use crate::layers::deepseek_v41::ops;
@@ -108,8 +108,17 @@ fn the_tensor_cores_leave_what_the_tile_kernels_leave() -> Result<()> {
     let gate_up = gpu.alloc(pairs * 2 * part_rows * 2)?;
     let row_of = sc.grouped.row_of;
     big.round_rows(gpu, quantized, 0, ROWS, s.hidden, stream)?;
+    let all = runs.whole();
     big.project_in(
-        gpu, &slab, &runs, row_of, gate_up, part_rows, s.hidden, stream,
+        gpu,
+        &slab,
+        &runs,
+        all.tiles.clone(),
+        row_of,
+        gate_up,
+        part_rows,
+        s.hidden,
+        stream,
     )?;
     gpu.synchronize(stream)?;
     let planes = download(gpu, gate_up, pairs * 2 * part_rows)?;
@@ -174,7 +183,7 @@ fn the_tensor_cores_leave_what_the_tile_kernels_leave() -> Result<()> {
         None,
         stream,
     )?;
-    big.project_out(gpu, &slab, &runs, coded, sent, part_rows, s.hidden, stream)?;
+    big.project_out(gpu, &slab, &all, coded, sent, part_rows, s.hidden, stream)?;
     gpu.synchronize(stream)?;
     let (tiled, got) = (
         download(gpu, out, ROWS * slots * n)?,
@@ -201,4 +210,45 @@ fn the_tensor_cores_leave_what_the_tile_kernels_leave() -> Result<()> {
         gpu.free(p)?;
     }
     free_store(gpu, &store)
+}
+
+/// Runs of the experts' pairs as tiles: `(expert, pairs)` in order.
+fn runs_of(experts: &[(u32, usize)]) -> Runs {
+    let (mut tiles, mut first) = (Vec::new(), 0usize);
+    for &(expert, pairs) in experts {
+        for at in (0..pairs).step_by(super::TILE) {
+            tiles.extend([
+                expert,
+                (first + at) as u32,
+                (pairs - at).min(super::TILE) as u32,
+            ]);
+        }
+        first += pairs;
+    }
+    Runs {
+        tiles,
+        pairs: first,
+        pair_of: Vec::new(),
+    }
+}
+
+#[test]
+fn a_launchs_tiles_are_cut_where_a_pairs_scales_start_a_word() {
+    // Tiles start at pairs 0, 128, 256, 300, 364 and 492: the first three
+    // on a multiple of eight.
+    let runs = runs_of(&[(3, 300), (7, 64), (9, 200)]);
+    let span = |tiles: std::ops::Range<usize>, pairs: std::ops::Range<usize>| Span { tiles, pairs };
+    assert_eq!(runs.whole(), span(0..6, 0..564));
+    assert_eq!(
+        runs.halves(5),
+        Some([span(0..2, 0..256), span(2..6, 256..564)])
+    );
+    assert_eq!(
+        runs.halves(1),
+        Some([span(0..1, 0..128), span(1..6, 128..564)])
+    );
+    // No tile inside starts on one; and one tile is not cut.
+    assert_eq!(runs_of(&[(0, 100), (1, 100)]).halves(4), None);
+    assert_eq!(runs_of(&[(0, 100)]).halves(4), None);
+    assert_eq!(runs_of(&[]).halves(4), None);
 }

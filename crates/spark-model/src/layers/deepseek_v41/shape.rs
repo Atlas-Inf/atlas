@@ -6,6 +6,7 @@ use anyhow::{Result, ensure};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
+use super::beside::Beside;
 use super::cache_recipe::{WINDOW, rope_freqs};
 use super::gemm::GemmScratch;
 use super::hc::{HcKernels, HcShape};
@@ -215,6 +216,8 @@ pub struct Scratch {
     pub(super) attn_partial: DevicePtr,
     /// Scratch as large as the largest gather, for one that is not in place.
     pub(super) gather_recv: DevicePtr,
+    /// A stream for the gathers a batch's launches can run beside.
+    pub(super) beside: Beside,
     /// `[experts]` FP32: the routing score of every expert.
     pub(super) route_scores: DevicePtr,
     pub(super) chosen: DevicePtr,
@@ -310,6 +313,7 @@ impl Scratch {
             attn_out: bf16(rows * s.hidden)?,
             moe_out: bf16(rows * s.hidden)?,
             attn_partial: f32s(PARTS * rows.min(PARTIAL_ROWS) * s.hidden)?,
+            beside: Beside::alloc(gpu)?,
             gather_recv: bf16(
                 (rows * ((s.top_k + 1) * s.inter).max(s.o_groups * s.o_rank))
                     .max(rows.min(PARTIAL_ROWS) * PARTS * s.hidden * 2),

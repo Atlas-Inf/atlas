@@ -110,6 +110,8 @@ unsafe extern "C" {
     fn cuCtxGetCurrent(pctx: *mut u64) -> i32;
     pub(super) fn cuCtxSetCurrent(ctx: u64) -> i32;
     pub(super) fn cuStreamCreate(phStream: *mut u64, flags: u32) -> i32;
+    pub(super) fn cuStreamCreateWithPriority(phStream: *mut u64, flags: u32, priority: i32) -> i32;
+    pub(super) fn cuCtxGetStreamPriorityRange(least: *mut i32, greatest: *mut i32) -> i32;
     pub(super) fn cuStreamDestroy_v2(hStream: u64) -> i32;
     // Page-locked host memory for efficient async transfers
     pub(super) fn cuMemAllocHost_v2(pp: *mut *mut c_void, bytesize: usize) -> i32;

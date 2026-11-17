@@ -614,6 +614,9 @@ int cuLaunchKernelEx(const AtlasCuLaunchConfig* c, void* f, void** params, void*
 
 // ── streams ───────────────────────────────────────────────────────────
 int cuStreamCreate(void** s, unsigned flags)        { return hipStreamCreateWithFlags((hipStream_t*)s, flags); }
+// One priority here: a stream "ahead" is a stream.
+int cuStreamCreateWithPriority(void** s, unsigned flags, int) { return hipStreamCreateWithFlags((hipStream_t*)s, flags); }
+int cuCtxGetStreamPriorityRange(int* least, int* greatest) { *least = 0; *greatest = 0; return 0; }
 int cuStreamSynchronize(void* s)                    {
     if (atlas_trace_launch()) { fprintf(stderr, "[t=%.0f sync] stream=%p\n", atlas_now_ms(), s); fflush(stderr); }
     int r = hipStreamSynchronize((hipStream_t)s);

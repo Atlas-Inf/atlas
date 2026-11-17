@@ -16,6 +16,8 @@
 //! ([`expert_gemm_rows`]). The products are the row-at-a-time kernels'; the
 //! FP32 sums are in another order.
 
+use std::ops::Range;
+
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
@@ -28,6 +30,22 @@ use super::weights::ExpertSlab;
 /// The fewest rows a batch's routed experts go through these with, unless
 /// `ATLAS_DSV41_EXPERT_GEMM_ROWS` names another (0 for never).
 const EXPERT_GEMM_ROWS: usize = 2048;
+
+/// Eighths of a batch's pairs in the first of the two spans the ranks
+/// gather their hidden activations in (`block_moe_big.rs`), unless
+/// `ATLAS_DSV41_MOE_SPAN` names another; 0 for one span, gathered after
+/// every pair is in. The first span is the larger: its gather has the
+/// second's launches to hide under, and the second's only the first's way
+/// out.
+const FIRST_SPAN: usize = 5;
+
+fn first_span() -> usize {
+    std::env::var("ATLAS_DSV41_MOE_SPAN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&eighths| eighths < 8)
+        .unwrap_or(FIRST_SPAN)
+}
 
 /// A tile's pairs, a block's threads and its shared memory
 /// (`MXG_THREADS`, `MXG_SHARED` in `dsv41_mxg.cu`).
@@ -87,6 +105,51 @@ impl Runs {
     fn tile_count(&self) -> usize {
         self.tiles.len() / 3
     }
+
+    pub fn pairs(&self) -> usize {
+        self.pairs
+    }
+
+    /// Every tile, and every pair.
+    pub fn whole(&self) -> Span {
+        Span {
+            tiles: 0..self.tile_count(),
+            pairs: 0..self.pairs,
+        }
+    }
+
+    /// The tiles in two spans, the first of about `eighths` eighths of the
+    /// pairs: cut at the tile nearest that which starts on a pair that is
+    /// a multiple of [`SPAN_PAIRS`]. None where no tile inside does.
+    pub fn halves(&self, eighths: usize) -> Option<[Span; 2]> {
+        let want = self.pairs * eighths / 8;
+        let (tile, pair) = (1..self.tile_count())
+            .map(|tile| (tile, self.tiles[tile * 3 + 1] as usize))
+            .filter(|&(_, pair)| pair.is_multiple_of(SPAN_PAIRS) && pair < self.pairs)
+            .min_by_key(|&(_, pair)| pair.abs_diff(want))?;
+        Some([
+            Span {
+                tiles: 0..tile,
+                pairs: 0..pair,
+            },
+            Span {
+                tiles: tile..self.tile_count(),
+                pairs: pair..self.pairs,
+            },
+        ])
+    }
+}
+
+/// A span starts on a pair whose scales start on a 16-byte boundary of a
+/// part ([`Sent`]), which the ranks' copies want: a pair's scales are a
+/// multiple of two bytes.
+const SPAN_PAIRS: usize = 8;
+
+/// A run of a launch's tiles, and the pairs in them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub tiles: Range<usize>,
+    pub pairs: Range<usize>,
 }
 
 /// One part of a batch's hidden activations as a rank sends it: the pairs'
@@ -142,6 +205,8 @@ pub struct ExpertGemm {
     pair_out: DevicePtr,
     /// The fewest rows of a batch this takes.
     pub from: usize,
+    /// Eighths of the pairs in the first span ([`Runs::halves`]).
+    pub first_span: usize,
     pairs: usize,
     max_tiles: usize,
 }
@@ -172,6 +237,7 @@ impl ExpertGemm {
             pair_of: gpu.alloc(pairs * 4)?,
             pair_out: gpu.alloc(pairs * part_n * 2)?,
             from: expert_gemm_rows(),
+            first_span: first_span(),
             pairs,
             max_tiles,
         })
@@ -231,8 +297,8 @@ impl ExpertGemm {
         (self.codes, self.sf)
     }
 
-    /// One launch of the tiles through `n` weight rows of `k` values of
-    /// their experts. A pair's codes are row `a_rows[pair]` of `codes`, or
+    /// One launch of `tiles` of the tiles through `n` weight rows of `k`
+    /// values of their experts. A pair's codes are row `a_rows[pair]` of `codes`, or
     /// the pair's own with no `a_rows`, in pieces of `piece[0]` values
     /// `piece[1]` bytes apart, or in one run when that is 0; its outputs are
     /// `out_stride` values after the pair's before.
@@ -241,7 +307,7 @@ impl ExpertGemm {
         &self,
         gpu: &dyn GpuBackend,
         slab: &ExpertSlab,
-        runs: &Runs,
+        tiles: Range<usize>,
         codes: DevicePtr,
         piece: [usize; 2],
         a_rows: DevicePtr,
@@ -251,21 +317,21 @@ impl ExpertGemm {
         out_stride: usize,
         stream: u64,
     ) -> Result<()> {
-        if runs.tile_count() == 0 {
+        if tiles.is_empty() {
             return Ok(());
         }
         let (data, scales) = slab.layout();
         let at = |projection: usize| (projection * (data + scales)) as u32;
         let [p0, p1] = halves.projections;
         KernelLaunch::new(gpu, self.multiply)
-            .grid([(n / halves.row_step) as u32, runs.tile_count() as u32, 1])
+            .grid([(n / halves.row_step) as u32, tiles.len() as u32, 1])
             .block([TILE as u32, 1, 1])
             .shared_mem(SHARED)
             .arg_ptr(codes)
             .arg_ptr(self.sf)
             .arg_ptr(a_rows)
             .arg_ptr(slab.base)
-            .arg_ptr(self.tiles)
+            .arg_ptr(self.tiles.offset(tiles.start * 3 * 4))
             .arg_ptr(halves.out[0])
             .arg_ptr(halves.out[1])
             .arg_u64(slab.stride() as u64)
@@ -282,16 +348,17 @@ impl ExpertGemm {
             .launch(stream)
     }
 
-    /// The way in: `gate_up` gets every pair's `part_rows` gate values and,
-    /// `pairs * part_rows` values on, its up values (BF16), from the
-    /// batch's input in codes ([`Self::round_rows`]); `row_of` is each
-    /// pair's row.
+    /// The way in, of the pairs of `tiles`: `gate_up` gets a pair's
+    /// `part_rows` gate values and, `pairs * part_rows` values on, its up
+    /// values (BF16), from the batch's input in codes
+    /// ([`Self::round_rows`]); `row_of` is each pair's row.
     #[allow(clippy::too_many_arguments)]
     pub fn project_in(
         &self,
         gpu: &dyn GpuBackend,
         slab: &ExpertSlab,
         runs: &Runs,
+        tiles: Range<usize>,
         row_of: DevicePtr,
         gate_up: DevicePtr,
         part_rows: usize,
@@ -309,7 +376,7 @@ impl ExpertGemm {
         self.launch(
             gpu,
             slab,
-            runs,
+            tiles,
             self.codes,
             [0, 0],
             row_of,
@@ -321,15 +388,15 @@ impl ExpertGemm {
         )
     }
 
-    /// The way out: one part of every pair's output, kept here for
-    /// [`Self::sum`]. `inner` is every part of the pairs' hidden activations
-    /// as the ranks sent them ([`Sent`]).
+    /// The way out, of the pairs of `span`: one part of a pair's output,
+    /// kept here for [`Self::sum`]. `inner` is every part of the pairs'
+    /// hidden activations as the ranks sent them ([`Sent`]).
     #[allow(clippy::too_many_arguments)]
     pub fn project_out(
         &self,
         gpu: &dyn GpuBackend,
         slab: &ExpertSlab,
-        runs: &Runs,
+        span: &Span,
         inner: DevicePtr,
         sent: Sent,
         part_rows: usize,
@@ -337,13 +404,17 @@ impl ExpertGemm {
         stream: u64,
     ) -> Result<()> {
         let (inter, part_n) = (part_rows * PARTS, hidden / PARTS);
+        if span.pairs.is_empty() {
+            return Ok(());
+        }
         // A pair's scales in one run; its codes are read where they are.
+        let first = span.pairs.start;
         KernelLaunch::new(gpu, self.scales_rows)
-            .grid([div_ceil((runs.pairs * inter / 32) as u32, 256), 1, 1])
+            .grid([div_ceil((span.pairs.len() * inter / 32) as u32, 256), 1, 1])
             .block([256, 1, 1])
-            .arg_ptr(inner.offset(sent.scales))
-            .arg_ptr(self.sf)
-            .arg_u32(runs.pairs as u32)
+            .arg_ptr(inner.offset(sent.scales + first * part_rows / 32))
+            .arg_ptr(self.sf.offset(first * inter / 32))
+            .arg_u32(span.pairs.len() as u32)
             .arg_u32((part_rows / 32) as u32)
             .arg_u32(PARTS as u32)
             .arg_u64(sent.bytes as u64)
@@ -358,7 +429,7 @@ impl ExpertGemm {
         self.launch(
             gpu,
             slab,
-            runs,
+            span.tiles.clone(),
             inner,
             [part_rows, sent.bytes],
             DevicePtr::NULL,

@@ -210,11 +210,7 @@ fn a_batchs_moe_from_gathered_codes_is_its_moe() -> Result<()> {
         GemmWeights::load(gpu, &SHAPE, &block.weights, Held::ALL, stream)
             .context("the GEMM operands")?,
     );
-    let (s, k, sc) = (
-        &block.shared.shape,
-        &block.shared.kernels,
-        &block.shared.scratch,
-    );
+    let s = &SHAPE;
     // The recorded rows over and over.
     let picks: Vec<usize> = (0..rows).map(|row| row % rec.prefill).collect();
     let inputs = rows_of(
@@ -222,27 +218,42 @@ fn a_batchs_moe_from_gathered_codes_is_its_moe() -> Result<()> {
         s.hidden,
         &picks,
     );
-    gpu.copy_h2d(&inputs, sc.normed).context("the inputs")?;
-    let quant = k.cache.fp8_quant_dequant;
-    ops::fp8_quant_dequant(gpu, quant, sc.normed, sc.quantized, rows * s.hidden, stream)?;
+    {
+        let sc = &block.shared.scratch;
+        gpu.copy_h2d(&inputs, sc.normed).context("the inputs")?;
+        let quant = block.shared.kernels.cache.fp8_quant_dequant;
+        ops::fp8_quant_dequant(gpu, quant, sc.normed, sc.quantized, rows * s.hidden, stream)?;
+    }
     let values = rows * s.hidden;
-    block
-        .moe(gpu, rows, None, None, stream)
-        .context("the MoE of a batch here whole")?;
-    gpu.synchronize(stream)?;
-    let whole = download(gpu, sc.moe_out, values)?;
     let own = Owned::of(rows, Held::ALL);
-    block
-        .moe(gpu, rows, None, Some(own), stream)
-        .context("the MoE of a batch shared out")?;
-    gpu.synchronize(stream)?;
-    let shared_out = download(gpu, sc.moe_out, values)?;
+    let moe = |block: &crate::layers::deepseek_v41::block::Block,
+               own: Option<Owned>|
+     -> Result<Vec<u16>> {
+        block.moe(gpu, rows, None, own, stream)?;
+        gpu.synchronize(stream)?;
+        download(gpu, block.shared.scratch.moe_out, values)
+    };
+    // The pairs in two spans, the first's parts gathered beside the second.
+    let whole = moe(&block, None).context("the MoE of a batch here whole")?;
+    let shared_out = moe(&block, Some(own)).context("the MoE of a batch shared out")?;
     assert!(
         whole.iter().any(|&v| v != 0),
         "the MoE left nothing to compare"
     );
     assert!(whole == shared_out, "the MoE of rows shared out differs");
-    println!("layer {LAYER}: {values} values of a {rows}-row MoE equal, rows shared out or not");
+    // And in one span, gathered after every pair.
+    let scratch = Arc::get_mut(&mut block.shared.scratch).context("the scratch is the block's")?;
+    let big = scratch
+        .expert_gemm
+        .as_mut()
+        .context("the tensor cores' experts")?;
+    assert!(big.first_span > 0, "the pairs were in one span already");
+    big.first_span = 0;
+    let one_span = moe(&block, None).context("the MoE in one span")?;
+    assert!(whole == one_span, "the MoE in two spans differs");
+    println!(
+        "layer {LAYER}: {values} values of a {rows}-row MoE equal: rows shared out or not, in two spans or one"
+    );
     free_store(gpu, &store)?;
     block.weights.free_parts(gpu)?;
     Ok(())

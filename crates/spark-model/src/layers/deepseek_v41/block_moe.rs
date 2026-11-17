@@ -10,7 +10,7 @@ use super::block::Block;
 use super::gemm::{GEMM_ROWS, Input};
 use super::hc::SublayerParts;
 use super::moe::{self, ExpertPart};
-use super::moe_gemm::{ExpertGemm, Runs, Sent};
+use super::moe_gemm::{ExpertGemm, Runs};
 use super::moe_grouped::{self, GateUp, Plan};
 use super::owned::{self, Owned};
 use super::parts::{self, PARTS};
@@ -153,14 +153,12 @@ impl Block {
             )?),
         };
         // The tensor cores take an expert's pairs in tiles.
-        let big = match (&plan, coded) {
-            (Some(plan), Some(big)) => {
-                let runs = Runs::new(plan, rows, s.top_k, slots);
-                big.upload(gpu, &runs)?;
-                Some((big, runs))
-            }
-            _ => None,
-        };
+        if let (Some(plan), Some(big)) = (&plan, coded) {
+            let runs = Runs::new(plan, rows, s.top_k, slots);
+            big.upload(gpu, &runs)?;
+            self.experts_big(gpu, big, &runs, rows, comm, stream)?;
+            return self.moe_home(gpu, rows, comm, own, stream);
+        }
         // The way in: a part of every slot's hidden activation. A token
         // alone has a slot an expert; a batch has its pairs in expert order
         // and then every row's shared expert.
@@ -176,13 +174,8 @@ impl Block {
                 ],
             })
         };
-        // A part of the hidden activations as the ranks gather it: values,
-        // or from the tensor cores codes and scales.
-        let sent = match (&big, grouped) {
-            (Some(_), Some(grouped)) => Some(Sent::new(grouped.pairs, rows, part_rows)),
-            _ => None,
-        };
-        let part_bytes = sent.map_or(room * 2, |sent| sent.bytes);
+        // A part of the hidden activations as the ranks gather it.
+        let part_bytes = room * 2;
         for part in held.range() {
             let of = part_of(part)?;
             let inner = sc.inner_parts.offset(part * part_bytes);
@@ -204,53 +197,20 @@ impl Block {
                 )?;
                 continue;
             };
-            match &big {
-                Some((big, runs)) => {
-                    big.project_in(
-                        gpu,
-                        &of.slab,
-                        runs,
-                        sc.grouped.row_of,
-                        sc.grouped.gate_up,
-                        part_rows,
-                        s.hidden,
-                        stream,
-                    )?;
-                    // Every pair's gate values, then every pair's up values.
-                    let gate_up = GateUp {
-                        base: sc.grouped.gate_up,
-                        up_offset: grouped.pairs * part_rows,
-                        row_stride: part_rows,
-                    };
-                    let sent = sent.context("a part as the ranks send it")?;
-                    moe_grouped::activate_codes(
-                        gpu,
-                        &k.moe,
-                        gate_up,
-                        sc.grouped.weights,
-                        inner,
-                        inner.offset(sent.scales),
-                        grouped.pairs,
-                        part_rows,
-                        s.swiglu_limit,
-                        stream,
-                    )?;
-                }
-                None => moe_grouped::experts_in(
-                    gpu,
-                    &k.moe,
-                    &of.slab,
-                    grouped,
-                    &sc.grouped,
-                    sc.quantized,
-                    inner,
-                    part_rows,
-                    s.hidden,
-                    s.swiglu_limit,
-                    fused.then_some(([of.shared[0], of.shared[1]], rows)),
-                    stream,
-                )?,
-            }
+            moe_grouped::experts_in(
+                gpu,
+                &k.moe,
+                &of.slab,
+                grouped,
+                &sc.grouped,
+                sc.quantized,
+                inner,
+                part_rows,
+                s.hidden,
+                s.swiglu_limit,
+                fused.then_some(([of.shared[0], of.shared[1]], rows)),
+                stream,
+            )?;
             if fused {
                 continue;
             }
@@ -258,15 +218,8 @@ impl Block {
             let gate_up = match gemm.and_then(|g| g.shared[part].as_ref()) {
                 // Every row's gate values, then every row's up values.
                 Some([w1, w3, _]) => {
-                    let act = match coded.map(ExpertGemm::input) {
-                        Some((codes, scales)) => {
-                            sc.gemm.coded(gpu, codes, scales, rows, s.hidden, stream)?
-                        }
-                        None => {
-                            let x = Input::rows(sc.quantized, s.hidden);
-                            sc.gemm.quantize(gpu, x, rows, s.hidden, stream)?
-                        }
-                    };
+                    let x = Input::rows(sc.quantized, s.hidden);
+                    let act = sc.gemm.quantize(gpu, x, rows, s.hidden, stream)?;
                     let up = sc.shared_gate_up.offset(rows * part_rows * 2);
                     w1.gemm(act, sc.shared_gate_up, rows, stream)?;
                     w3.gemm(act, up, rows, stream)?;
@@ -303,7 +256,7 @@ impl Block {
                 &k.moe,
                 gate_up,
                 DevicePtr::NULL,
-                inner.offset(sent.map_or(grouped.pairs * part_rows * 2, |sent| sent.shared)),
+                inner.offset(grouped.pairs * part_rows * 2),
                 rows,
                 part_rows,
                 s.swiglu_limit,
@@ -344,39 +297,25 @@ impl Block {
                     stream,
                 )?,
                 Some(grouped) => {
-                    match &big {
-                        Some((big, runs)) => big.project_out(
-                            gpu,
-                            &of.slab,
-                            runs,
-                            sc.inner_parts,
-                            sent.context("the parts as the ranks sent them")?,
-                            part_rows,
-                            s.hidden,
-                            stream,
-                        )?,
-                        None => moe_grouped::experts_out(
-                            gpu,
-                            &k.moe,
-                            &of.slab,
-                            grouped,
-                            &sc.grouped,
-                            sc.inner_parts,
-                            room,
-                            sc.slot_out,
-                            part_rows,
-                            part_n,
-                            fused.then_some((of.shared[2], rows)),
-                            stream,
-                        )?,
-                    }
+                    moe_grouped::experts_out(
+                        gpu,
+                        &k.moe,
+                        &of.slab,
+                        grouped,
+                        &sc.grouped,
+                        sc.inner_parts,
+                        room,
+                        sc.slot_out,
+                        part_rows,
+                        part_n,
+                        fused.then_some((of.shared[2], rows)),
+                        stream,
+                    )?;
                     // The shared expert's, where it did not ride those
                     // launches: its rows of the hidden activations come
                     // after the pairs'.
                     if !fused {
-                        let x = sc
-                            .inner_parts
-                            .offset(sent.map_or(grouped.pairs * part_rows * 2, |sent| sent.shared));
+                        let x = sc.inner_parts.offset(grouped.pairs * part_rows * 2);
                         match gemm.and_then(|g| g.shared[part].as_ref()) {
                             Some([_, _, w2]) => {
                                 let x = Input {
@@ -408,24 +347,35 @@ impl Block {
                 }
             }
             let y = sc.moe_out.offset(part * rows * part_n * 2);
-            match &big {
-                Some((big, _)) => big.sum(gpu, shared_out, y, rows, s.top_k, part_n, stream)?,
-                None => parts::slots_sum(
-                    gpu,
-                    k.parts.slots_sum,
-                    sc.slot_out,
-                    shared_out,
-                    y,
-                    rows,
-                    slots,
-                    part_n,
-                    stream,
-                )?,
-            }
+            parts::slots_sum(
+                gpu,
+                k.parts.slots_sum,
+                sc.slot_out,
+                shared_out,
+                y,
+                rows,
+                slots,
+                part_n,
+                stream,
+            )?;
         }
         profile::end(gpu, stream, "experts out", began)?;
+        self.moe_home(gpu, rows, comm, own, stream)
+    }
+
+    /// The MoE's output, a part on each rank, to where it is read: every
+    /// rank, or with `own` the rank that keeps a row.
+    fn moe_home(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: usize,
+        comm: Option<&dyn CommBackend>,
+        own: Option<Owned>,
+        stream: u64,
+    ) -> Result<()> {
+        let (s, sc, held) = (&self.shared.shape, &self.shared.scratch, self.shared.held);
         profile::stage(gpu, stream, "gather", || {
-            let (recv, bytes) = (sc.gather_recv, part_n * 2);
+            let (recv, bytes) = (sc.gather_recv, s.hidden / PARTS * 2);
             match own {
                 // Only the rank that keeps a row reads its output.
                 Some(own) => {
