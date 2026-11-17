@@ -113,6 +113,7 @@ else:
 EOF
 kill -INT "$APID" 2>/dev/null; for _ in $(seq 1 120); do kill -0 "$APID" 2>/dev/null || break; sleep 2; done; kill -9 "$APID" 2>/dev/null || true
 cp "$OUT/atlas-server.log" "$OUT/serve-prof.log" 2>/dev/null || true
+grep -aE "MoE transpose|KV cache: [0-9.]+ GB total" "$OUT/atlas-server.log" | sed "s/\x1b\[[0-9;]*m//g" | head -3
 # ATLAS_TRACE_D2D=1 (debug branches only): sampled copy call sites.
 if grep -aq "TRACE_D2D" "$OUT/atlas-server.log"; then
   log "TRACE_D2D samples: $(grep -ac TRACE_D2D "$OUT/atlas-server.log")"
