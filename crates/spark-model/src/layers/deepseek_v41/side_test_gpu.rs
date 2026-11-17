@@ -13,6 +13,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::*;
 use crate::layers::deepseek_v41::cache_recipe::bf16_to_f32;
+use crate::layers::deepseek_v41::parts::PARTS;
 use crate::layers::deepseek_v41::test_support::{
     Recording, backend, bf16s, checkpoint, closeness, download, le_bytes, picks, rows_of, upload,
 };
@@ -134,10 +135,21 @@ fn engram_replays_the_reference() -> Result<()> {
         gpu,
         &rows_of(&rec.prefill("L1.engram_in")?.1, 4 * HIDDEN, &picks),
     )?;
-    let kv = upload(
-        gpu,
-        &rows_of(&rec.prefill("L1.op.engram.wkv.out")?.1, 5 * HIDDEN, &picks),
-    )?;
+    // The projection as the ranks gather it: four parts, a part every
+    // token's quarter of the values.
+    let rows = rows_of(&rec.prefill("L1.op.engram.wkv.out")?.1, 5 * HIDDEN, &picks);
+    let (part, width) = (5 * HIDDEN / PARTS * 2, 5 * HIDDEN * 2);
+    let in_parts: Vec<u8> = (0..PARTS)
+        .flat_map(|at| {
+            let rows = &rows;
+            (0..picks.len()).flat_map(move |row| {
+                rows[row * width + at * part..row * width + (at + 1) * part]
+                    .iter()
+                    .copied()
+            })
+        })
+        .collect();
+    let kv = upload(gpu, &in_parts)?;
     engram_gate(
         gpu,
         k.engram_gate,
