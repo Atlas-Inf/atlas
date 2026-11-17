@@ -19,6 +19,7 @@ use spark_runtime::weights::{WeightDtype, WeightStore};
 use super::hc::HcSite;
 use super::parts::{Held, PARTS, PartKernels};
 use super::shape::Shape;
+use super::weights_columns::{fp8_columns, free_columns};
 use super::weights_experts::{expert_slab, release_experts};
 use crate::weight_map::{Mxfp8Weight, fp8_block_scales_to_rows};
 
@@ -108,8 +109,11 @@ pub struct AttentionWeights {
     pub wkv: Fp8Proj,
     /// The same: a part is a quarter of the groups.
     pub wo_a: Fp8Proj,
-    /// The same: a part is a quarter of its rows.
+    /// The same: a part is a quarter of its rows, which a batch's GEMMs read.
     pub wo_b: Fp8Proj,
+    /// wo_b again for a few rows, by its columns: a part is every row's
+    /// values of the low-rank output that part computes.
+    pub wo_b_columns: Parted,
     /// `[heads]` FP32.
     pub sink: DevicePtr,
 }
@@ -267,9 +271,10 @@ fn hc_site(store: &WeightStore, layer: &str, site: &str) -> Result<HcSite> {
 }
 
 impl BlockWeights {
-    /// Free the parts this made for itself: the routed experts. The rest
-    /// belongs to the store it was loaded from.
+    /// Free the parts this made for itself: the routed experts and wo_b's
+    /// columns. The rest belongs to the store it was loaded from.
     pub fn free_parts(&self, gpu: &dyn GpuBackend) -> Result<()> {
+        free_columns(gpu, &self.attn.wo_b_columns)?;
         for slab in self.moe.experts.iter().flatten() {
             gpu.free(slab.base)?;
         }
@@ -334,6 +339,10 @@ impl BlockWeights {
             wq_b: fp8_held(store, gpu, &format!("{layer}.attn.wq_b"), held)?,
             wkv: fp8(store, gpu, &format!("{layer}.attn.wkv"))?,
             wo_a: fp8_held(store, gpu, &format!("{layer}.attn.wo_a"), held)?,
+            wo_b_columns: {
+                let name = format!("{layer}.attn.wo_b");
+                fp8_columns(store, gpu, kernels, &name, held, stream)?
+            },
             wo_b: fp8_held(store, gpu, &format!("{layer}.attn.wo_b"), held)?,
             sink: tensor(store, &format!("{layer}.attn.attn_sink"), WeightDtype::FP32)?,
         };

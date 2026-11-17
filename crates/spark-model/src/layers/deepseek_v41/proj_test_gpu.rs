@@ -241,9 +241,9 @@ fn queries_and_window_keys_replay_the_reference() -> Result<()> {
 fn the_output_projection_replays_the_reference() -> Result<()> {
     let rec = Recording::open()?;
     let gpu = backend()?;
-    let (k, groups_q, stream) = (
+    let (k, by_groups, stream) = (
         Kernels::load(gpu)?,
-        PartKernels::load(gpu)?.fp8_groups_q,
+        PartKernels::load(gpu)?.fp8_groups,
         gpu.default_stream(),
     );
     const GROUPS: usize = 8;
@@ -264,8 +264,8 @@ fn the_output_projection_replays_the_reference() -> Result<()> {
         let o = upload(gpu, &rows_of(&attended, 64 * HEAD_DIM, &picks))?;
         let low = gpu.alloc(picks.len() * GROUPS * RANK * 2)?;
 
-        // Undo the query's rotation, then each group of 8 heads through its
-        // own [1024, 4096] block of wo_a, which rounds them to FP8.
+        // Undo the query's rotation, round the heads to FP8, then each
+        // group of 8 heads through its own [1024, 4096] block of wo_a.
         rotate(
             gpu,
             k.rotate,
@@ -283,10 +283,19 @@ fn the_output_projection_replays_the_reference() -> Result<()> {
             data: wo_a.data,
             scales: wo_a.scales,
         };
+        let values = picks.len() * GROUPS * group_in;
+        crate::layers::deepseek_v41::ops::fp8_quant_dequant(
+            gpu,
+            k.fp8_quant_dequant,
+            o,
+            o,
+            values,
+            stream,
+        )?;
         for row in 0..picks.len() {
             project_groups(
                 gpu,
-                groups_q,
+                by_groups,
                 o.offset(row * GROUPS * group_in * 2),
                 w,
                 low.offset(row * GROUPS * RANK * 2),

@@ -14,7 +14,7 @@ use super::moe::MoeKernels;
 use super::moe_gemm::{ExpertGemm, expert_gemm_rows};
 use super::moe_grouped::GroupedScratch;
 use super::ops::{HEAD_DIM, Kernels, MAX_KEYS, attn_records};
-use super::parts::{Held, PARTS, PartKernels};
+use super::parts::{Held, PARTIAL_ROWS, PARTS, PartKernels};
 use super::side::SideKernels;
 
 /// The dimensions and constants of a block.
@@ -210,6 +210,9 @@ pub struct Scratch {
     /// attention's output and of the MoE's.
     pub(super) attn_out: DevicePtr,
     pub(super) moe_out: DevicePtr,
+    /// `[PARTS, rows, hidden]` FP32 for [`PARTIAL_ROWS`] rows at most: each
+    /// part's partial of a few rows' attention output (`block_out.rs`).
+    pub(super) attn_partial: DevicePtr,
     /// Scratch as large as the largest gather, for one that is not in place.
     pub(super) gather_recv: DevicePtr,
     /// `[experts]` FP32: the routing score of every expert.
@@ -306,7 +309,11 @@ impl Scratch {
             slot_out: bf16(rows * (s.top_k + 1) * s.hidden / PARTS)?,
             attn_out: bf16(rows * s.hidden)?,
             moe_out: bf16(rows * s.hidden)?,
-            gather_recv: bf16(rows * ((s.top_k + 1) * s.inter).max(s.o_groups * s.o_rank))?,
+            attn_partial: f32s(PARTS * rows.min(PARTIAL_ROWS) * s.hidden)?,
+            gather_recv: bf16(
+                (rows * ((s.top_k + 1) * s.inter).max(s.o_groups * s.o_rank))
+                    .max(rows.min(PARTIAL_ROWS) * PARTS * s.hidden * 2),
+            )?,
             route_scores: f32s(rows * (s.experts))?,
             chosen: f32s(rows * (s.top_k))?,
             weights: f32s(rows * (s.top_k))?,

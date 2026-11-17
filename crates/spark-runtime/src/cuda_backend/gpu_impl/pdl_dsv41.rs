@@ -35,7 +35,6 @@ pub(super) const DSV41_PDL_KERNELS: &[&str] = &[
     "dsv41_fp4_gemv_tc8_f32",
     "dsv41_fp4_quant_dequant",
     "dsv41_fp8_gemv_groups",
-    "dsv41_fp8_gemv_groups_q",
     "dsv41_fp8_gemv_pieces",
     "dsv41_fp8_gemv_pieces_q",
     "dsv41_fp8_gemv_tc8",

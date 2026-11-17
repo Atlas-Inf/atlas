@@ -10,6 +10,7 @@ mod block_compress;
 mod block_draft;
 mod block_index;
 mod block_moe;
+mod block_out;
 pub mod cache_recipe;
 pub mod draft;
 pub mod draft_head;
@@ -34,6 +35,7 @@ pub mod side;
 mod state;
 pub mod tail;
 pub mod weights;
+mod weights_columns;
 mod weights_experts;
 
 #[cfg(test)]

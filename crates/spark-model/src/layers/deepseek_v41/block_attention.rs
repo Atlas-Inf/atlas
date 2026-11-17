@@ -15,7 +15,6 @@ use super::ops::{self, HEAD_DIM, MAX_KEYS, Turn};
 use super::parts::{self, PARTS};
 use super::profile;
 use super::state::{KEPT_ROWS, SeqState};
-use super::weights::row_part;
 
 impl Block {
     /// The device word holding `position`, for a rotation to read.
@@ -365,9 +364,13 @@ impl Block {
             }
             profile::end(gpu, stream, "output projections", began)?;
         }
-        // wo_b reads every group, so the ranks gather their low-rank
-        // outputs, and a part computes a quarter of wo_b's rows from them
-        // all, rounding its input to FP8.
+        // A few rows: each part straight on through its columns of wo_b.
+        let Some(g) = gemm else {
+            return self.output_few(gpu, rows, comm, stream);
+        };
+        // A batch's wo_b reads every group, so the ranks gather their
+        // low-rank outputs, the codes the GEMMs left, and a part computes a
+        // quarter of wo_b's rows from them all.
         let (width, part_n) = (groups * s.o_rank, s.hidden / PARTS);
         ensure!(
             w.wo_b.n == s.hidden && w.wo_b.k == PARTS * width,
@@ -375,49 +378,20 @@ impl Block {
             w.wo_b.n,
             w.wo_b.k
         );
-        // A part of the low-rank output: values, or from the GEMMs codes.
-        let sent = gemm.map(|_| Sent::new(rows, groups, s.o_rank));
-        let part_bytes = sent.map_or(rows * width * 2, |sent| sent.bytes);
+        let sent = Sent::new(rows, groups, s.o_rank);
         profile::stage(gpu, stream, "gather", || {
             let recv = sc.gather_recv;
             parts::gather(
-                gpu, comm, held, sc.o_low, recv, part_bytes, part_bytes, stream,
+                gpu, comm, held, sc.o_low, recv, sent.bytes, sent.bytes, stream,
             )
         })?;
         let began = profile::begin(gpu, stream)?;
-        if gemm.is_none() {
-            // Rounded to FP8 once, where they lie: a block of the projection
-            // that rounds its own input does it again for every 16 rows of
-            // wo_b, which cost a decode step more than its weights did.
-            let (quant, values) = (k.cache.fp8_quant_dequant, PARTS * rows * width);
-            ops::fp8_quant_dequant(gpu, quant, sc.o_low, sc.o_low, values, stream)?;
-        }
         for part in held.range() {
             let out = sc.attn_out.offset(part * rows * part_n * 2);
-            match gemm {
-                // Every rank's codes, a row's together.
-                Some(g) => {
-                    let sent = sent.context("the low-rank output in codes")?;
-                    let act = sc.gemm.gathered(gpu, sc.o_low, sent, rows, stream)?;
-                    let block = g.wo_b[part].as_ref().context("a held part of wo_b")?;
-                    block.gemm(act, out, rows, stream)?
-                }
-                // A part's rows are a piece, a row its groups.
-                None => parts::project_pieces(
-                    gpu,
-                    k.parts.fp8_pieces,
-                    sc.o_low,
-                    row_part(&w.wo_b, part),
-                    out,
-                    part_n,
-                    rows,
-                    part_n,
-                    w.wo_b.k,
-                    width,
-                    rows * width,
-                    stream,
-                )?,
-            }
+            // Every rank's codes, a row's together.
+            let act = sc.gemm.gathered(gpu, sc.o_low, sent, rows, stream)?;
+            let block = g.wo_b[part].as_ref().context("a held part of wo_b")?;
+            block.gemm(act, out, rows, stream)?;
         }
         profile::end(gpu, stream, "output projections", began)?;
         profile::stage(gpu, stream, "gather", || {

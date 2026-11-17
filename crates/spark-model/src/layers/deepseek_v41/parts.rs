@@ -10,7 +10,9 @@
 //! left. The Engram's projection is cut by input columns, a part reading
 //! the table rows of a quarter of the hash columns: its sum is an FP32
 //! partial, and the four are added in part order before the one rounding
-//! (`dsv41_parts.cu`).
+//! (`dsv41_parts.cu`). So is wo_b for a few rows (`block_out.rs`): a part
+//! reads the low-rank output it has just computed, and the gather between
+//! the two output projections, a fifth of a decode step's, is not needed.
 //!
 //! A rank holds `PARTS / world` consecutive parts. One Spark computes all
 //! four, four Sparks one each and gather. The kernels, their operands and
@@ -33,6 +35,9 @@ pub const TILE: usize = 8;
 /// The widest row a kernel that stages its weights has room for
 /// (`F4_MAX_BLOCKS` scale blocks in `dsv41_tc.cuh`).
 pub const STAGED_K: usize = 8192;
+/// Rows of FP32 partials the ranks gather at once: a batch of more takes
+/// turns, which bounds the scratch a row of them needs.
+pub const PARTIAL_ROWS: usize = 64;
 
 /// The parts one rank computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,9 +86,8 @@ pub struct PartKernels {
     pub fp8_q: KernelHandle,
     pub fp8_f32_q: KernelHandle,
     /// Two FP8 projections of one vector in a launch, and a block-diagonal
-    /// one that rounds its input.
+    /// one.
     pub fp8_two: KernelHandle,
-    pub fp8_groups_q: KernelHandle,
     pub fp8_groups: KernelHandle,
     /// An FP8 projection of an input in pieces, and the same rounding it.
     pub fp8_pieces: KernelHandle,
@@ -105,7 +109,6 @@ impl PartKernels {
             fp8_q: tc("dsv41_fp8_gemv_tc8_q")?,
             fp8_f32_q: tc("dsv41_fp8_gemv_tc8_f32_q")?,
             fp8_two: tc("dsv41_fp8_gemv_two")?,
-            fp8_groups_q: tc("dsv41_fp8_gemv_groups_q")?,
             fp8_groups: tc("dsv41_fp8_gemv_groups")?,
             fp8_pieces: tc("dsv41_fp8_gemv_pieces")?,
             fp8_pieces_q: tc("dsv41_fp8_gemv_pieces_q")?,
@@ -218,9 +221,9 @@ pub fn project_two(
 }
 
 /// A block-diagonal FP8 projection, a launch a tile of rows: group `g` of
-/// `groups` is `out[row][g]` (`[n]` BF16) = `w[g]` (`[n, k]`) times the FP8
-/// rounding of `x[row][g]` (`[k]` BF16, as it was computed). `w` holds the
-/// groups one after another, `x` and `out` a row's groups one after another.
+/// `groups` is `out[row][g]` (`[n]` BF16) = `w[g]` (`[n, k]`) times
+/// `x[row][g]` (`[k]` BF16, FP8-rounded already). `w` holds the groups one
+/// after another, `x` and `out` a row's groups one after another.
 #[allow(clippy::too_many_arguments)]
 pub fn project_groups(
     gpu: &dyn GpuBackend,
@@ -234,13 +237,10 @@ pub fn project_groups(
     k: usize,
     stream: u64,
 ) -> Result<()> {
-    ensure!(
-        k.is_multiple_of(32) && k <= STAGED_K,
-        "dsv41_fp8_gemv_groups_q: k {k}"
-    );
+    ensure!(k.is_multiple_of(32), "dsv41_fp8_gemv_groups: k {k}");
     for first in (0..rows).step_by(TILE) {
         KernelLaunch::new(gpu, kernel)
-            .grid([div_ceil(n as u32, 16), groups as u32, 1])
+            .grid([div_ceil(n as u32, 32), groups as u32, 1])
             .block([256, 1, 1])
             .arg_ptr(x.offset(first * groups * k * 2))
             .arg_ptr(w.data)
@@ -254,9 +254,10 @@ pub fn project_groups(
     Ok(())
 }
 
-/// `out` (`[slots, n]` BF16) = the four parts of `parts` added in part order
-/// and rounded. A part is `[slots, n]` FP32 and the next starts `stride`
-/// values on.
+/// Rows `first..first + rows` of `out` = the sum of their four `parts`,
+/// added in part order and rounded. A part is `[rows, n]` FP32 and the next
+/// starts `stride` values on; `out` is BF16 in the four parts a projection
+/// cut by rows leaves, each `[out_rows, n / PARTS]`.
 #[allow(clippy::too_many_arguments)]
 pub fn round(
     gpu: &dyn GpuBackend,
@@ -264,18 +265,22 @@ pub fn round(
     parts: DevicePtr,
     out: DevicePtr,
     stride: usize,
-    slots: usize,
+    rows: usize,
     n: usize,
+    first: usize,
+    out_rows: usize,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil((slots * n) as u32, 256), 1, 1])
+        .grid([div_ceil((rows * n) as u32, 256), 1, 1])
         .block([256, 1, 1])
         .arg_ptr(parts)
         .arg_ptr(out)
-        .arg_u32(slots as u32)
+        .arg_u32(rows as u32)
         .arg_u32(n as u32)
         .arg_u32(stride as u32)
+        .arg_u32(first as u32)
+        .arg_u32(out_rows as u32)
         .launch(stream)
 }
 

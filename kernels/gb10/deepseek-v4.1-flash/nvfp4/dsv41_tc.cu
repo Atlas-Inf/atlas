@@ -86,7 +86,8 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_
     unsigned int N,
     unsigned int K,
     unsigned int out_stride) {
-    atlas_pdl_enter();
+    atlas_pdl_enter_touch({W, K, K}, {S, K / F4_BLOCK, K / F4_BLOCK}, N, blockIdx.x,
+                          dsv41_touchers(gridDim.x));
     __shared__ F4Shared<1> sh;
     dsv41_gemv_tc_impl<1, false, true>(sh, A, W, S, C, M, N, K, out_stride, blockIdx.x, K);
 }
@@ -198,10 +199,20 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_
     }
 }
 
-// `dsv41_fp8_gemv_groups_q` of an input that is FP8-rounded already
-// (`dsv41_fp8_quant_dequant`): a block that rounds its own input does it
-// again for every 16 rows of the weights, which at one token costs more
-// than the launch that rounds it once.
+// A block-diagonal FP8 projection in one launch: group y of the grid is
+// C[m][y] [N] = W[y] [N, K] . A[m][y] [K] for each of M rows (at most 8),
+// with W and S the groups' one after another and A and C a row's groups one
+// after another. A is FP8-rounded already (`dsv41_fp8_quant_dequant`): a
+// block that rounds its own input does it again for every 16 rows of the
+// weights, which at one token costs more than the launch that rounds it
+// once.
+//
+// A block computes what two blocks of `dsv41_fp8_gemv_tc8` compute for its
+// group, one after the other, reading its weights as it uses them: they are
+// touched ahead of the wait. Half the blocks of a seventh of the shared
+// memory that staging takes are few enough for the GPU to hold the grid at
+// once, so the projection after this one starts, and touches, beside it.
+// Grid (ceil(N / 32), groups).
 extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_groups(
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ W,
@@ -214,32 +225,12 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_
                           blockIdx.y * gridDim.x + blockIdx.x,
                           dsv41_touchers(gridDim.x * gridDim.y));
     __shared__ F4Shared<1> sh;
-    __shared__ F4Staged staged;
     const unsigned long long y = blockIdx.y;
-    dsv41_gemv_staged_impl<1, false, false>(
-        sh, staged, A + y * K, W + y * N * K, S + y * N * (K / F4_BLOCK), C + y * N, M, N, K,
-        gridDim.y * N, blockIdx.x, gridDim.y * K);
-}
-
-// A block-diagonal FP8 projection in one launch: group y of the grid is
-// C[m][y] [N] = W[y] [N, K] . fp8(A[m][y] [K]) for each of M rows (at most
-// 8), with W and S the groups' one after another and A and C a row's groups
-// one after another. A block computes what the same block of
-// `dsv41_fp8_gemv_tc8_q` computes for its group, from staged weights: this
-// is for long rows. Grid (ceil(N / 16), groups).
-extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_groups_q(
-    const __nv_bfloat16* __restrict__ A,
-    const unsigned char* __restrict__ W,
-    const unsigned char* __restrict__ S,
-    __nv_bfloat16* __restrict__ C,
-    unsigned int N,
-    unsigned int K,
-    unsigned int M) {
-    atlas_pdl_enter();
-    __shared__ F4Shared<1> sh;
-    __shared__ F4Staged staged;
-    const unsigned long long y = blockIdx.y;
-    dsv41_gemv_staged_impl<1, false, false, F4_QUANT>(
-        sh, staged, A + y * K, W + y * N * K, S + y * N * (K / F4_BLOCK), C + y * N, M, N, K,
-        gridDim.y * N, blockIdx.x, gridDim.y * K);
+    for (unsigned int cta = 2u * blockIdx.x; cta < 2u * blockIdx.x + 2u; ++cta) {
+        dsv41_gemv_tc_impl<1, false, false>(
+            sh, A + y * K, W + y * N * K, S + y * N * (K / F4_BLOCK), C + y * N, M, N, K,
+            gridDim.y * N, cta, gridDim.y * K);
+        // The first warp adds up the block's sums before the next overwrite them.
+        __syncthreads();
+    }
 }
