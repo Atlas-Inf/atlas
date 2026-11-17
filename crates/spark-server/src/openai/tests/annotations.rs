@@ -30,6 +30,23 @@ fn bare_url_extracted() {
 }
 
 #[test]
+fn unicode_citation_character_indices() {
+    for input in [
+        "café — see https://example.com",
+        "😀 café — see [文档](https://example.com/文)",
+    ] {
+        for got in [extract_url_annotations(input), merged_annotations(input)] {
+            let got = got.unwrap();
+            let (s, e, url, _) = url_of(&got[0]);
+            let byte_start = input.find(url).unwrap();
+            assert_eq!(s, input[..byte_start].chars().count());
+            assert_eq!(e, input[..byte_start + url.len()].chars().count());
+            assert_eq!(input.chars().skip(s).take(e - s).collect::<String>(), url);
+        }
+    }
+}
+
+#[test]
 fn trailing_sentence_punct_stripped() {
     let got = extract_url_annotations("go to https://example.com.").unwrap();
     let (_, _, u, _) = url_of(&got[0]);
