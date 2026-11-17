@@ -309,10 +309,17 @@ extern "C" __global__ void __launch_bounds__(DSV41_FEW_THREADS) dsv41_attn_outpu
 // q [m, h, 512] BF16, sink [h] FP32, out [m, h, 512] BF16; h a multiple of
 // 16. Grid (1, m * h / 16), block 256.
 //
-// It is bound by the keys it reads from memory, not by how many blocks are
-// on the GPU: at 8,192 queries, two blocks a multiprocessor take 9.9 ms a
-// layer and four (64 registers) 11.4.
-extern "C" __global__ void __launch_bounds__(256) dsv41_attn_batch_tc(
+// What bounds it is the warps at work. A block's shared memory was 39 KB,
+// two blocks a multiprocessor: the heads of q, a step's logits and weights,
+// and 16 KB for a warp's 64 values of the 16 keys it is adding. Those 64
+// are now staged a quarter at a time, in the memory the step's logits no
+// longer need, which leaves 22.7 KB a block and four blocks a
+// multiprocessor (64 registers, a few spilled). At 16,384 queries a layer
+// took 16.7 ms with two blocks and takes about 13 with four. (Four blocks'
+// registers with two blocks' shared memory, tried first, were slower: 11.4
+// ms against 9.9 at 8,192 queries. A step's 64 keys staged whole, one block
+// a multiprocessor, took twice as long.)
+extern "C" __global__ void __launch_bounds__(256, 4) dsv41_attn_batch_tc(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ keys_a,
     const __nv_bfloat16* __restrict__ keys_b,
@@ -347,7 +354,9 @@ extern "C" __global__ void __launch_bounds__(256) dsv41_attn_batch_tc(
     __shared__ float total[DSV41_GROUP];
     // A warp's 64 output values of the 16 keys it is adding: fetched 16
     // bytes at a time and read from here.
-    __shared__ __align__(16) unsigned short staged[8][16][64];
+    // A quarter of a warp's 64 values of 16 keys, in the logits' memory:
+    // the logits are done with when the keys are staged.
+    unsigned short (*staged)[16][16] = (unsigned short (*)[16][16])logit;
 
     // The block's heads of q, turned to the query's position.
     const uint4* qv = (const uint4*)(q + ((size_t)query * h + first) * DSV41_DIM);
@@ -453,6 +462,8 @@ extern "C" __global__ void __launch_bounds__(256) dsv41_attn_batch_tc(
             for (unsigned int i = 0; i < DSV41_KEYS_PER_STEP; ++i) sum += logit[t][i];
             total[t] = total[t] * shrink[t] + sum;
         }
+        // The staged keys take the logits' memory from here.
+        __syncthreads();
         // The step's keys into the output, 16 at a time.
         {
             const float s0 = shrink[g], s1 = shrink[g + 8u];
@@ -472,30 +483,38 @@ extern "C" __global__ void __launch_bounds__(256) dsv41_attn_batch_tc(
                 };
                 const unsigned int a[4] = {pair(g, slot[0], slot[1]), pair(g + 8u, slot[0], slot[1]),
                                            pair(g, slot[2], slot[3]), pair(g + 8u, slot[2], slot[3])};
-                // Two lanes a key: 32 of the warp's 64 values of it each.
-                {
-                    const unsigned int of = lane >> 1, half = (lane & 1u) * 32u;
-                    const __nv_bfloat16* row = dsv41_tc_key(
-                        keys_a, keys_b, ids, step * DSV41_KEYS_PER_STEP + chunk * 16u + of, k,
-                        split);
-                    const uint4* from = (const uint4*)((row ? row : any) + warp * 64u + half);
-                    uint4* to = (uint4*)&staged[warp][of][half];
-                    #pragma unroll
-                    for (int i = 0; i < 4; ++i) to[i] = from[i];
-                }
-                __syncwarp();
-                const unsigned short* key[4] = {
-                    staged[warp][2u * c], staged[warp][2u * c + 1u], staged[warp][2u * c + 8u],
-                    staged[warp][2u * c + 9u]};
+                // The warp's 64 values of each key in four quarters of 16, a
+                // quarter staged and added at a time: two lanes a key, eight
+                // values each. (All 64 at once was 12 KB more of shared
+                // memory a block, and two blocks filled a multiprocessor.)
+                // A tile's sum is its own either way.
+                const __nv_bfloat16* row = dsv41_tc_key(
+                    keys_a, keys_b, ids, step * DSV41_KEYS_PER_STEP + chunk * 16u + (lane >> 1), k,
+                    split);
                 #pragma unroll
-                for (int tile = 0; tile < 8; ++tile) {
-                    const unsigned int d = tile * 8u + g;
-                    const unsigned int b0 = (unsigned int)key[0][d] | ((unsigned int)key[1][d] << 16);
-                    const unsigned int b1 = (unsigned int)key[2][d] | ((unsigned int)key[3][d] << 16);
-                    dsv41_tc_mma(acc[tile], a, b0, b1);
+                for (unsigned int quarter = 0; quarter < 4u; ++quarter) {
+                    {
+                        const unsigned int of = lane >> 1, part = (lane & 1u) * 8u;
+                        const uint4* from =
+                            (const uint4*)((row ? row : any) + warp * 64u + quarter * 16u + part);
+                        *(uint4*)&staged[warp][of][part] = from[0];
+                    }
+                    __syncwarp();
+                    const unsigned short* key[4] = {
+                        staged[warp][2u * c], staged[warp][2u * c + 1u],
+                        staged[warp][2u * c + 8u], staged[warp][2u * c + 9u]};
+                    #pragma unroll
+                    for (unsigned int i = 0; i < 2u; ++i) {
+                        const unsigned int d = i * 8u + g;
+                        const unsigned int b0 =
+                            (unsigned int)key[0][d] | ((unsigned int)key[1][d] << 16);
+                        const unsigned int b1 =
+                            (unsigned int)key[2][d] | ((unsigned int)key[3][d] << 16);
+                        dsv41_tc_mma(acc[quarter * 2u + i], a, b0, b1);
+                    }
+                    // The next quarter, or the next 16 keys, replace these.
+                    __syncwarp();
                 }
-                // The next 16 keys replace these.
-                __syncwarp();
             }
         }
         // The next step's logits and weights replace these.
