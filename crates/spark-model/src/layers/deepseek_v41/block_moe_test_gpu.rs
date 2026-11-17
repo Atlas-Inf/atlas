@@ -15,11 +15,14 @@ use anyhow::{Context, Result};
 use spark_runtime::gpu::GpuBackend;
 
 use crate::layers::deepseek_v41::block::{BlockKernels, Handoff, Scratch, Shared};
+use crate::layers::deepseek_v41::gemm::GemmWeights;
 use crate::layers::deepseek_v41::moe;
+use crate::layers::deepseek_v41::moe_gemm::expert_gemm_rows;
 use crate::layers::deepseek_v41::ops;
+use crate::layers::deepseek_v41::owned::Owned;
 use crate::layers::deepseek_v41::parts::{self, Held, PARTS};
 use crate::layers::deepseek_v41::test_support::{
-    Recording, SHAPE, backend, block, free_store, picks, rows_of,
+    Recording, SHAPE, backend, block, download, free_store, picks, rows_of,
 };
 use crate::layers::deepseek_v41::weights::row_part;
 
@@ -178,6 +181,68 @@ fn the_moe_leaves_the_bytes_of_one_launch_at_a_time() -> Result<()> {
     for p in [gate, up, inner, slot_out, one] {
         gpu.free(p)?;
     }
+    free_store(gpu, &store)?;
+    block.weights.free_parts(gpu)?;
+    Ok(())
+}
+
+/// A batch the ranks share out reads its input as the codes they gathered,
+/// and a batch every rank has whole as the codes it rounds itself: the same
+/// codes, so the same MoE.
+#[test]
+#[ignore = "needs a GB10 GPU, the deepseek-v4.1-flash target, ATLAS_DSV41_REC (--ops) and ATLAS_DSV41_CKPT"]
+fn a_batchs_moe_from_gathered_codes_is_its_moe() -> Result<()> {
+    let rec = Recording::open()?;
+    let gpu = backend()?;
+    let stream = gpu.default_stream();
+    // Enough rows for the tensor cores' experts, and not a multiple of the
+    // parts.
+    let rows = expert_gemm_rows() + 3;
+    let shared = Shared {
+        shape: SHAPE,
+        held: Held::ALL,
+        kernels: BlockKernels::load(gpu)?,
+        scratch: Arc::new(Scratch::alloc_rows(gpu, &SHAPE, 16, rows + 1, Held::ALL)?),
+        handoff: Arc::new(Mutex::new(Handoff::default())),
+    };
+    let (mut block, store) = block(gpu, LAYER, true, shared)?;
+    block.gemm = Some(
+        GemmWeights::load(gpu, &SHAPE, &block.weights, Held::ALL, stream)
+            .context("the GEMM operands")?,
+    );
+    let (s, k, sc) = (
+        &block.shared.shape,
+        &block.shared.kernels,
+        &block.shared.scratch,
+    );
+    // The recorded rows over and over.
+    let picks: Vec<usize> = (0..rows).map(|row| row % rec.prefill).collect();
+    let inputs = rows_of(
+        &rec.prefill(&format!("L{LAYER}.op.ffn.in"))?.1,
+        s.hidden,
+        &picks,
+    );
+    gpu.copy_h2d(&inputs, sc.normed).context("the inputs")?;
+    let quant = k.cache.fp8_quant_dequant;
+    ops::fp8_quant_dequant(gpu, quant, sc.normed, sc.quantized, rows * s.hidden, stream)?;
+    let values = rows * s.hidden;
+    block
+        .moe(gpu, rows, None, None, stream)
+        .context("the MoE of a batch here whole")?;
+    gpu.synchronize(stream)?;
+    let whole = download(gpu, sc.moe_out, values)?;
+    let own = Owned::of(rows, Held::ALL);
+    block
+        .moe(gpu, rows, None, Some(own), stream)
+        .context("the MoE of a batch shared out")?;
+    gpu.synchronize(stream)?;
+    let shared_out = download(gpu, sc.moe_out, values)?;
+    assert!(
+        whole.iter().any(|&v| v != 0),
+        "the MoE left nothing to compare"
+    );
+    assert!(whole == shared_out, "the MoE of rows shared out differs");
+    println!("layer {LAYER}: {values} values of a {rows}-row MoE equal, rows shared out or not");
     free_store(gpu, &store)?;
     block.weights.free_parts(gpu)?;
     Ok(())

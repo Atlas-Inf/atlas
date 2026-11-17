@@ -107,8 +107,9 @@ fn the_tensor_cores_leave_what_the_tile_kernels_leave() -> Result<()> {
     let tiled = download(gpu, sc.grouped.gate_up, pairs * 2 * part_rows)?;
     let gate_up = gpu.alloc(pairs * 2 * part_rows * 2)?;
     let row_of = sc.grouped.row_of;
+    big.round_rows(gpu, quantized, 0, ROWS, s.hidden, stream)?;
     big.project_in(
-        gpu, &slab, &runs, quantized, ROWS, row_of, gate_up, part_rows, s.hidden, stream,
+        gpu, &slab, &runs, row_of, gate_up, part_rows, s.hidden, stream,
     )?;
     gpu.synchronize(stream)?;
     let planes = download(gpu, gate_up, pairs * 2 * part_rows)?;

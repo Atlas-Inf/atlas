@@ -92,6 +92,7 @@ impl Sent {
 pub struct GemmScratch {
     quant: KernelHandle,
     gathered: KernelHandle,
+    tile_scales: KernelHandle,
     q: DevicePtr,
     sf: DevicePtr,
     rows: usize,
@@ -104,6 +105,7 @@ impl GemmScratch {
         Ok(Self {
             quant: gpu.kernel("dsv41_mx", "dsv41_mx_quant")?,
             gathered: gpu.kernel("dsv41_mx", "dsv41_mx_gathered")?,
+            tile_scales: gpu.kernel("dsv41_mx", "dsv41_mx_tile_scales")?,
             q: gpu.alloc(rows * k)?,
             sf: gpu.alloc(mx_lt_scale_bytes(rows, k))?,
             rows,
@@ -212,6 +214,40 @@ impl GemmScratch {
             .launch(stream)?;
         Ok(MxAct {
             q: self.q,
+            sf: self.sf,
+        })
+    }
+
+    /// Rows already in codes (`[rows, k]` E4M3) with their scales as they
+    /// come (`[rows, k / 32]`) as a GEMM operand: the codes where they are,
+    /// and the scales tiled. It holds until the next call, and while the
+    /// codes do.
+    pub fn coded(
+        &self,
+        gpu: &dyn GpuBackend,
+        codes: DevicePtr,
+        scales: DevicePtr,
+        rows: usize,
+        k: usize,
+        stream: u64,
+    ) -> Result<MxAct> {
+        ensure!(
+            rows <= self.rows && k <= self.k && k.is_multiple_of(32),
+            "dsv41_mx_tile_scales: {rows} rows of {k}, room for {} of {}",
+            self.rows,
+            self.k
+        );
+        KernelLaunch::new(gpu, self.tile_scales)
+            .grid([div_ceil((rows * k / 32) as u32, 256), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(scales)
+            .arg_ptr(self.sf)
+            .arg_u32(rows as u32)
+            .arg_u32((k / 32) as u32)
+            .arg_u32(mx_lt_inner_pad(k) as u32)
+            .launch(stream)?;
+        Ok(MxAct {
+            q: codes,
             sf: self.sf,
         })
     }
@@ -327,3 +363,7 @@ impl GemmWeights {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+#[path = "gemm_test_gpu.rs"]
+mod test_gpu;

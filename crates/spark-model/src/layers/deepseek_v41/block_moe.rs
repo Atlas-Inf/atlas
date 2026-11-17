@@ -10,7 +10,7 @@ use super::block::Block;
 use super::gemm::{GEMM_ROWS, Input};
 use super::hc::SublayerParts;
 use super::moe::{self, ExpertPart};
-use super::moe_gemm::{Runs, Sent};
+use super::moe_gemm::{ExpertGemm, Runs, Sent};
 use super::moe_grouped::{self, GateUp, Plan};
 use super::owned::{self, Owned};
 use super::parts::{self, PARTS};
@@ -80,6 +80,16 @@ impl Block {
                 stream,
             )
         })?;
+        // A large batch's experts go to the block-scaled tensor cores, which
+        // read the input in codes: the rows here rounded once, for the routed
+        // experts and the shared one.
+        let coded = sc.expert_gemm.as_ref().filter(|big| {
+            self.gemm.is_some() && rows >= big.from && rows > moe_grouped::DEVICE_ROWS
+        });
+        if let Some(big) = coded {
+            let x = sc.quantized.offset(at * s.hidden * 2);
+            big.round_rows(gpu, x, at, kept, s.hidden, stream)?;
+        }
         if let Some(own) = own {
             let rows_of = |base: DevicePtr, row_bytes: usize| {
                 let recv = sc.gather_recv;
@@ -87,7 +97,14 @@ impl Block {
             };
             rows_of(sc.chosen, s.top_k * 4)?;
             rows_of(sc.weights, s.top_k * 4)?;
-            rows_of(sc.quantized, s.hidden * 2)?;
+            match coded.map(ExpertGemm::input) {
+                // Half the bytes of the values.
+                Some((codes, scales)) => {
+                    rows_of(codes, s.hidden)?;
+                    rows_of(scales, s.hidden / 32)?;
+                }
+                None => rows_of(sc.quantized, s.hidden * 2)?,
+            }
         }
         // One slot per chosen expert, then the shared expert's.
         let slots = s.top_k + 1;
@@ -135,10 +152,9 @@ impl Block {
                 stream,
             )?),
         };
-        // A large batch's experts go to the block-scaled tensor cores, an
-        // expert's pairs in tiles.
-        let big = match (&plan, &sc.expert_gemm) {
-            (Some(plan), Some(big)) if self.gemm.is_some() && rows >= big.from => {
+        // The tensor cores take an expert's pairs in tiles.
+        let big = match (&plan, coded) {
+            (Some(plan), Some(big)) => {
                 let runs = Runs::new(plan, rows, s.top_k, slots);
                 big.upload(gpu, &runs)?;
                 Some((big, runs))
@@ -194,8 +210,6 @@ impl Block {
                         gpu,
                         &of.slab,
                         runs,
-                        sc.quantized,
-                        rows,
                         sc.grouped.row_of,
                         sc.grouped.gate_up,
                         part_rows,
@@ -244,8 +258,15 @@ impl Block {
             let gate_up = match gemm.and_then(|g| g.shared[part].as_ref()) {
                 // Every row's gate values, then every row's up values.
                 Some([w1, w3, _]) => {
-                    let x = Input::rows(sc.quantized, s.hidden);
-                    let act = sc.gemm.quantize(gpu, x, rows, s.hidden, stream)?;
+                    let act = match coded.map(ExpertGemm::input) {
+                        Some((codes, scales)) => {
+                            sc.gemm.coded(gpu, codes, scales, rows, s.hidden, stream)?
+                        }
+                        None => {
+                            let x = Input::rows(sc.quantized, s.hidden);
+                            sc.gemm.quantize(gpu, x, rows, s.hidden, stream)?
+                        }
+                    };
                     let up = sc.shared_gate_up.offset(rows * part_rows * 2);
                     w1.gemm(act, sc.shared_gate_up, rows, stream)?;
                     w3.gemm(act, up, rows, stream)?;

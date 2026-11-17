@@ -165,7 +165,8 @@ impl ExpertGemm {
             scales_rows: gpu.kernel("dsv41_mx", "dsv41_mx_scales_rows")?,
             multiply: gpu.kernel("dsv41_mxg", "dsv41_mxg")?,
             pairs_sum: gpu.kernel("dsv41_mx", "dsv41_pairs_sum")?,
-            codes: gpu.alloc(rows * s.hidden)?,
+            // Rows gathered a part each fill whole parts.
+            codes: gpu.alloc(rows.next_multiple_of(PARTS) * s.hidden)?,
             sf: gpu.alloc(pairs * s.inter / 32)?,
             tiles: gpu.alloc(max_tiles * 3 * 4)?,
             pair_of: gpu.alloc(pairs * 4)?,
@@ -192,21 +193,28 @@ impl ExpertGemm {
         gpu.copy_h2d(&pairs, self.pair_of)
     }
 
-    /// `rows` rows of `k` values of `x` as codes and scales, rounded to FP8.
-    fn quantize(
+    /// Rows `first..first + rows` of the batch's input as codes and scales,
+    /// rounded to FP8: `x` is those rows' `k` values each (BF16). Every
+    /// row's are in place before [`Self::project_in`]: rounded here, or a
+    /// rank's own rows here and the others' gathered ([`Self::input`]).
+    pub fn round_rows(
         &self,
         gpu: &dyn GpuBackend,
         x: DevicePtr,
+        first: usize,
         rows: usize,
         k: usize,
         stream: u64,
     ) -> Result<()> {
+        if rows == 0 {
+            return Ok(());
+        }
         KernelLaunch::new(gpu, self.quant)
             .grid([div_ceil((rows * k / 32) as u32, 256), 1, 1])
             .block([256, 1, 1])
             .arg_ptr(x)
-            .arg_ptr(self.codes)
-            .arg_ptr(self.sf)
+            .arg_ptr(self.codes.offset(first * k))
+            .arg_ptr(self.sf.offset(first * k / 32))
             .arg_u32(rows as u32)
             .arg_u32(k as u32)
             .arg_u32(k as u32)
@@ -214,6 +222,13 @@ impl ExpertGemm {
             .arg_u64(0)
             .arg_u32(0)
             .launch(stream)
+    }
+
+    /// The batch's input as [`Self::round_rows`] leaves it: codes, `hidden`
+    /// bytes a row, and scales, `hidden / 32`. Half the bytes of its values,
+    /// and what the ranks gather of each other's rows.
+    pub fn input(&self) -> (DevicePtr, DevicePtr) {
+        (self.codes, self.sf)
     }
 
     /// One launch of the tiles through `n` weight rows of `k` values of
@@ -268,24 +283,21 @@ impl ExpertGemm {
     }
 
     /// The way in: `gate_up` gets every pair's `part_rows` gate values and,
-    /// `pairs * part_rows` values on, its up values (BF16). `x` is the
-    /// batch's input (`[rows, hidden]` BF16), of `rows` rows, and `row_of`
-    /// each pair's row.
+    /// `pairs * part_rows` values on, its up values (BF16), from the
+    /// batch's input in codes ([`Self::round_rows`]); `row_of` is each
+    /// pair's row.
     #[allow(clippy::too_many_arguments)]
     pub fn project_in(
         &self,
         gpu: &dyn GpuBackend,
         slab: &ExpertSlab,
         runs: &Runs,
-        x: DevicePtr,
-        rows: usize,
         row_of: DevicePtr,
         gate_up: DevicePtr,
         part_rows: usize,
         hidden: usize,
         stream: u64,
     ) -> Result<()> {
-        self.quantize(gpu, x, rows, hidden, stream)?;
         // A block's two halves are the same 64 rows of the gate and of the
         // up projection, which read the same codes.
         let halves = Halves {

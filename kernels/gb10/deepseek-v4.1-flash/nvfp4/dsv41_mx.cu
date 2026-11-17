@@ -117,6 +117,22 @@ extern "C" __global__ void dsv41_mx_gathered(
     if (b + 1u == blocks) mx_sf_zero_pad(sf, m, blocks, inner_pad);
 }
 
+// Scales as they come ([M, blocks], `dsv41_mx_quant` with no `inner_pad`)
+// tiled as the GEMM reads them: the codes beside them are an operand where
+// they are. One thread a scale.
+extern "C" __global__ void dsv41_mx_tile_scales(
+    const unsigned char* __restrict__ scales,
+    unsigned char* __restrict__ sf,
+    unsigned int M,
+    unsigned int blocks,
+    unsigned int inner_pad) {
+    const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (size_t)M * blocks) return;
+    const unsigned int m = (unsigned int)(t / blocks), b = (unsigned int)(t % blocks);
+    sf[mx_sf_offset(m, b, inner_pad)] = scales[t];
+    if (b + 1u == blocks) mx_sf_zero_pad(sf, m, blocks, inner_pad);
+}
+
 // Scales the ranks gathered, a part each, as one run a row: out[m, part *
 // blocks + b] = sf[part * piece_stride + m * blocks + b], where a part's
 // `blocks` scales of a row are `piece_stride` bytes after the part's before.
