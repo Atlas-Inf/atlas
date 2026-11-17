@@ -36,6 +36,7 @@ pub struct Conversation {
     pub metadata: HashMap<String, String>,
     /// Items in wire-format JSON. Each has a top-level `"id"` field.
     pub items: Vec<serde_json::Value>,
+    next_item_seq: usize,
     /// For LRU — bumped on every read + write.
     last_access: Instant,
 }
@@ -99,6 +100,7 @@ impl ConversationStore {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let next_item_seq = initial_items.len();
         let items = initial_items
             .into_iter()
             .enumerate()
@@ -109,6 +111,7 @@ impl ConversationStore {
             created_at: now_unix,
             metadata,
             items,
+            next_item_seq,
             last_access: Instant::now(),
         };
         let mut inner = self.inner.lock();
@@ -200,12 +203,13 @@ impl ConversationStore {
             return Err(AddItemsError::NotFound);
         }
         let c = inner.map.get_mut(id).expect("entry present");
-        let start = c.items.len();
+        let start = c.next_item_seq;
         let stamped: Vec<serde_json::Value> = new_items
             .into_iter()
             .enumerate()
             .map(|(i, v)| stamp_id(v, id, start + i))
             .collect();
+        c.next_item_seq += stamped.len();
         c.items.extend(stamped.iter().cloned());
         c.last_access = Instant::now();
         Ok(stamped)
@@ -358,6 +362,28 @@ mod tests {
         let empty_id = store.create(Vec::new(), HashMap::new());
         assert!(!store.remove_item(&empty_id, "item_missing"));
         assert!(store.get(&empty_id).unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn add_items_after_removal_keeps_ids_unique() {
+        let store = ConversationStore::with_config(16, Duration::from_secs(60));
+        let id = store.create(
+            vec![
+                json!({"type": "message", "content": "A"}),
+                json!({"type": "message", "content": "B"}),
+            ],
+            HashMap::new(),
+        );
+        let snap = store.get(&id).unwrap();
+        let a_id = snap.items[0]["id"].as_str().unwrap();
+        let b_id = snap.items[1]["id"].as_str().unwrap();
+        assert!(store.remove_item(&id, a_id));
+        let added = store
+            .add_items(&id, vec![json!({"type": "message", "content": "C"})])
+            .unwrap();
+        assert_ne!(added[0]["id"], b_id);
+        assert!(store.remove_item(&id, b_id));
+        assert_eq!(store.get(&id).unwrap().items, added);
     }
 
     #[test]
