@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// DeepSeek-V4.1-Flash attention over gathered keys, for a batch of queries,
-// on tensor cores: the first and third launches of the shared form of
-// `dsv41_attn.cu`, with `dsv41_attn_schedule` between them as there.
+// DeepSeek-V4.1-Flash attention over gathered keys on tensor cores: the
+// first and third launches of the shared form of `dsv41_attn.cu`, with
+// `dsv41_attn_schedule` between them as there, for a few queries; and the
+// three in one launch for a batch (`dsv41_attn_batch_tc`).
 //
 // The schedule is that file's: keys 64 at a time in the order of the index
 // row, a running maximum that rescales what has been summed, weights rounded
@@ -15,9 +16,8 @@
 // reference's own differ between batch shapes, and a prefill runs this
 // where a decode step runs that.
 //
-// A block is one query and 16 heads. Grid (1, m * h / 16), block 256.
-//
-// A few queries leave most of the GPU idle that way, so theirs are spread:
+// A batch's block is one query and 16 heads. A few queries leave most of
+// the GPU idle that way, so theirs are spread:
 // the logits over the blocks of a grid row, each taking every
 // `gridDim.x`-th run of keys, and the output over sixteen blocks of 32
 // values (`dsv41_attn_output_tc_few`). No sum is cut, so the bytes are the
@@ -57,11 +57,6 @@ static __device__ __forceinline__ void dsv41_tc_mma(
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
-static __device__ __forceinline__ unsigned int dsv41_tc_pair(float lo, float hi) {
-    return (unsigned int)__bfloat16_as_ushort(__float2bfloat16(lo)) |
-           ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(hi)) << 16);
 }
 
 // records [m, h, DSV41_RECORD] FP32: a logit a key. With rope > 0, q is
@@ -167,101 +162,14 @@ extern "C" __global__ void __launch_bounds__(256) dsv41_attn_logits_tc(
     }
 }
 
-// out [m, h, 512] BF16 from the records the schedule left and the keys, its
-// last `rope` values turned back, as `dsv41_attn_output` leaves it.
-//
-// Heads by output values is the MMA's 16 by 8, and its 16 k-slots are 16
-// keys: a lane packs the weights of two heads for four keys, and, for each
-// of the 64 output values its warp holds, those four keys' values. The sums
-// are rescaled before each step of 64 keys.
-extern "C" __global__ void __launch_bounds__(256) dsv41_attn_output_tc(
-    const __nv_bfloat16* __restrict__ keys_a,
-    const __nv_bfloat16* __restrict__ keys_b,
-    const int* __restrict__ idx,
-    const float* __restrict__ records,
-    __nv_bfloat16* __restrict__ out,
-    unsigned int h,
-    unsigned int k,
-    unsigned int split,
-    const unsigned int* __restrict__ positions,
-    const float* __restrict__ freqs,
-    unsigned int rope) {
-    const unsigned int groups = h / DSV41_GROUP;
-    const unsigned int query = blockIdx.y / groups, first = (blockIdx.y % groups) * DSV41_GROUP;
-    const unsigned int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const unsigned int g = lane >> 2, c = lane & 3u;
-    const unsigned int steps = dsv41_tc_steps(k);
-    const int* ids = idx + (size_t)query * k;
-    // The lane's two heads.
-    const float* record[2] = {records + ((size_t)query * h + first + g) * DSV41_RECORD,
-                              records + ((size_t)query * h + first + g + 8u) * DSV41_RECORD};
-    // A key a query does not have weighs nothing; its place is taken by the
-    // query's first key, which every query has.
-    const __nv_bfloat16* first_key = dsv41_tc_key(keys_a, keys_b, ids, 0, k, split);
-    const __nv_bfloat16* any = first_key ? first_key : keys_a;
-    // Eight tiles of eight output values: 64 * warp on.
-    float acc[8][4];
-    #pragma unroll
-    for (int tile = 0; tile < 8; ++tile) acc[tile][0] = acc[tile][1] = acc[tile][2] = acc[tile][3] = 0.0f;
-    for (unsigned int chunk = 0; chunk < steps * (DSV41_KEYS_PER_STEP / 16); ++chunk) {
-        if (chunk % (DSV41_KEYS_PER_STEP / 16) == 0) {
-            const unsigned int step = chunk / (DSV41_KEYS_PER_STEP / 16);
-            const float s0 = record[0][DSV41_RECORD_SHRINK + step];
-            const float s1 = record[1][DSV41_RECORD_SHRINK + step];
-            #pragma unroll
-            for (int tile = 0; tile < 8; ++tile) {
-                acc[tile][0] *= s0;
-                acc[tile][1] *= s0;
-                acc[tile][2] *= s1;
-                acc[tile][3] *= s1;
-            }
-        }
-        // The lane's k-slots: keys 2c, 2c + 1, 2c + 8 and 2c + 9 of the 16.
-        const unsigned int j0 = chunk * 16u + 2u * c;
-        const unsigned int slot[4] = {j0, j0 + 1u, j0 + 8u, j0 + 9u};
-        const unsigned int a[4] = {dsv41_tc_pair(record[0][slot[0]], record[0][slot[1]]),
-                                   dsv41_tc_pair(record[1][slot[0]], record[1][slot[1]]),
-                                   dsv41_tc_pair(record[0][slot[2]], record[0][slot[3]]),
-                                   dsv41_tc_pair(record[1][slot[2]], record[1][slot[3]])};
-        const unsigned short* key[4];
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const __nv_bfloat16* row = dsv41_tc_key(keys_a, keys_b, ids, slot[i], k, split);
-            key[i] = (const unsigned short*)(row ? row : any);
-        }
-        #pragma unroll
-        for (int tile = 0; tile < 8; ++tile) {
-            const unsigned int d = (warp * 8u + tile) * 8u + g;
-            const unsigned int b0 = (unsigned int)key[0][d] | ((unsigned int)key[1][d] << 16);
-            const unsigned int b1 = (unsigned int)key[2][d] | ((unsigned int)key[3][d] << 16);
-            dsv41_tc_mma(acc[tile], a, b0, b1);
-        }
-    }
-    // The lane's sums: its two heads, by output values 2c and 2c + 1 of each
-    // tile, which are a rotary pair where the output is turned.
-    const unsigned int turned = DSV41_DIM - rope;
-    #pragma unroll
-    for (int which = 0; which < 2; ++which) {
-        const float denominator = record[which][DSV41_RECORD_DENOMINATOR];
-        __nv_bfloat16* o = out + ((size_t)query * h + first + g + 8u * which) * DSV41_DIM;
-        #pragma unroll
-        for (int tile = 0; tile < 8; ++tile) {
-            const unsigned int d = (warp * 8u + tile) * 8u + 2u * c;
-            float v0 = dsv41_bf16(acc[tile][which * 2] / denominator);
-            float v1 = dsv41_bf16(acc[tile][which * 2 + 1] / denominator);
-            if (d >= turned)
-                dsv41_rotate_pair(v0, v1, (float)positions[query] * freqs[(d - turned) / 2], true,
-                                  v0, v1);
-            o[d] = __float2bfloat16(v0);
-            o[d + 1] = __float2bfloat16(v1);
-        }
-    }
-}
-
-// `dsv41_attn_output_tc` for a few queries, with its bytes. That kernel
-// fetches a key's values and a head's weights as it reaches them, one load
-// behind another, which a batch hides behind its other blocks and a query
-// alone waits out: forty times over. Here a (query, 16 heads) is sixteen
+// The output for a few queries, from the records the schedule left:
+// out [m, h, 512] BF16, its last `rope` values turned back, as
+// `dsv41_attn_output` leaves it. Heads by output values is the MMA's 16 by
+// 8, and its 16 k-slots are 16 keys: a lane packs the weights of two heads
+// for four keys and those four keys' values; the sums are rescaled before
+// each step of 64 keys. A lane that fetches a key's values and a head's
+// weights as it reaches them waits out one load behind another, forty times
+// over. Here a (query, 16 heads) is sixteen
 // blocks of 32 output values, and a block first stages what it will read:
 // its 32 values of every key and its heads' weights as the BF16 the multiply
 // takes, every load at once. Its four warps then take a tile of eight
@@ -374,5 +282,237 @@ extern "C" __global__ void __launch_bounds__(DSV41_FEW_THREADS) dsv41_attn_outpu
     }
     // The next unit's keys and weights replace what the warps have read.
     __syncthreads();
+    }
+}
+
+// A batch's attention in one launch and one pass over a query's keys: the
+// logits, the schedule and the output of `dsv41_attn_logits_tc`,
+// `dsv41_attn_schedule` and `dsv41_attn_output_tc_few`, with their bytes.
+//
+// The schedule is a running one: a step of 64 keys needs the largest logit
+// of the steps before it and nothing of the steps after. So a block takes a
+// (query, 16 heads) a step at a time: the step's logits, its weights from
+// them, and the step's keys into the output while they are still in the
+// cache. As three launches a layer wrote a logit a (query, head, key) to
+// memory, read and rewrote them for the weights and read them again for the
+// output, 344 MB a rank at 8,192 rows each time, and read every key twice
+// from memory: 12.3 ms of a layer's 75, and 9.9 so.
+//
+// Every sum is the one the three launches made, in their order: a logit's
+// products by the same MMA steps (a warp takes eight heads of 16 keys where
+// `dsv41_attn_logits_tc`'s took sixteen: a head's sums do not meet
+// another's), a step's weights added in key order, the output's keys 16 at
+// a time with the sum rescaled before each step.
+//
+// q [m, h, 512] BF16, sink [h] FP32, out [m, h, 512] BF16; h a multiple of
+// 16. Grid (1, m * h / 16), block 256.
+//
+// It is bound by the keys it reads from memory, not by how many blocks are
+// on the GPU: at 8,192 queries, two blocks a multiprocessor take 9.9 ms a
+// layer and four (64 registers) 11.4.
+extern "C" __global__ void __launch_bounds__(256) dsv41_attn_batch_tc(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ keys_a,
+    const __nv_bfloat16* __restrict__ keys_b,
+    const int* __restrict__ idx,
+    const float* __restrict__ sink,
+    __nv_bfloat16* __restrict__ out,
+    unsigned int h,
+    unsigned int k,
+    unsigned int split,
+    float scale,
+    const unsigned int* __restrict__ positions,
+    const float* __restrict__ freqs,
+    unsigned int rope) {
+    const unsigned int groups = h / DSV41_GROUP;
+    const unsigned int query = blockIdx.y / groups, first = (blockIdx.y % groups) * DSV41_GROUP;
+    const unsigned int t = threadIdx.x, warp = t / 32, lane = t % 32;
+    const unsigned int g = lane >> 2, c = lane & 3u;
+    __shared__ uint4 qs[DSV41_GROUP * DSV41_DIM / 8];
+    // A step's logits, then its weights unrounded; the weights as BF16.
+    __shared__ float logit[DSV41_GROUP][DSV41_KEYS_PER_STEP];
+    __shared__ unsigned short weight[DSV41_GROUP][DSV41_KEYS_PER_STEP];
+    // A head's running maximum, what the step rescales its sums by, and its
+    // denominator so far.
+    __shared__ float top[DSV41_GROUP];
+    __shared__ float shrink[DSV41_GROUP];
+    __shared__ float total[DSV41_GROUP];
+    // A warp's 64 output values of the 16 keys it is adding: fetched 16
+    // bytes at a time and read from here.
+    __shared__ __align__(16) unsigned short staged[8][16][64];
+
+    // The block's heads of q, turned to the query's position.
+    const uint4* qv = (const uint4*)(q + ((size_t)query * h + first) * DSV41_DIM);
+    for (unsigned int i = t; i < DSV41_GROUP * DSV41_DIM / 8; i += 256) qs[i] = qv[i];
+    if (t < DSV41_GROUP) {
+        top[t] = -1e30f;
+        total[t] = 0.0f;
+    }
+    __syncthreads();
+    __nv_bfloat16* qb = (__nv_bfloat16*)qs;
+    const unsigned int pairs = rope / 2, turned = DSV41_DIM - rope;
+    for (unsigned int i = t; i < DSV41_GROUP * pairs; i += 256) {
+        __nv_bfloat16* pair = qb + (size_t)(i / pairs) * DSV41_DIM + turned + 2 * (i % pairs);
+        float re, im;
+        dsv41_rotate_pair(__bfloat162float(pair[0]), __bfloat162float(pair[1]),
+                          (float)positions[query] * freqs[i % pairs], false, re, im);
+        pair[0] = __float2bfloat16(re);
+        pair[1] = __float2bfloat16(im);
+    }
+    __syncthreads();
+
+    const int* ids = idx + (size_t)query * k;
+    const unsigned int steps = dsv41_tc_steps(k);
+    // A key a query does not have weighs nothing; its place is taken by the
+    // query's first key, which every query has.
+    const __nv_bfloat16* first_key = dsv41_tc_key(keys_a, keys_b, ids, 0, k, split);
+    const __nv_bfloat16* any = first_key ? first_key : keys_a;
+    const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+    // The output: eight tiles of eight values, 64 * warp on, of the lane's
+    // two heads.
+    float acc[8][4];
+    #pragma unroll
+    for (int tile = 0; tile < 8; ++tile) acc[tile][0] = acc[tile][1] = acc[tile][2] = acc[tile][3] = 0.0f;
+
+    for (unsigned int step = 0; step < steps; ++step) {
+        // The step's logits: a pair of warps 16 keys, a warp eight heads.
+        {
+            const unsigned int base = (warp / 2u) * 16u, set = warp & 1u;
+            const unsigned int j[2] = {base + g, base + g + 8u};
+            const unsigned int at_key = step * DSV41_KEYS_PER_STEP;
+            const __nv_bfloat16* key[2] = {
+                dsv41_tc_key(keys_a, keys_b, ids, at_key + j[0], k, split),
+                dsv41_tc_key(keys_a, keys_b, ids, at_key + j[1], k, split)};
+            float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            #pragma unroll 2
+            for (unsigned int chunk = 0; chunk < DSV41_DIM / 64; ++chunk) {
+                const unsigned int at = chunk * 64u + 16u * c;
+                uint4 w[2][2];
+                #pragma unroll
+                for (int which = 0; which < 2; ++which) {
+                    w[which][0] = zero;
+                    w[which][1] = zero;
+                    if (key[which]) {
+                        const uint4* kp = (const uint4*)(key[which] + at);
+                        w[which][0] = kp[0];
+                        w[which][1] = kp[1];
+                    }
+                }
+                const unsigned int w0[8] = {w[0][0].x, w[0][0].y, w[0][0].z, w[0][0].w,
+                                            w[0][1].x, w[0][1].y, w[0][1].z, w[0][1].w};
+                const unsigned int w1[8] = {w[1][0].x, w[1][0].y, w[1][0].z, w[1][0].w,
+                                            w[1][1].x, w[1][1].y, w[1][1].z, w[1][1].w};
+                const uint4* col = qs + (size_t)(set * 8 + g) * (DSV41_DIM / 8) + at / 8;
+                const uint4 lo = col[0], hi = col[1];
+                const unsigned int xw[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+                #pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    const unsigned int a[4] = {w0[2 * s], w1[2 * s], w0[2 * s + 1], w1[2 * s + 1]};
+                    dsv41_tc_mma(sum, a, xw[2 * s], xw[2 * s + 1]);
+                }
+            }
+            // The lane's sums: its two keys, by heads 2c and 2c + 1 of the set.
+            #pragma unroll
+            for (int which = 0; which < 2; ++which) {
+                #pragma unroll
+                for (int p = 0; p < 2; ++p)
+                    logit[set * 8 + 2u * c + p][j[which]] =
+                        key[which] ? sum[which * 2 + p] * scale : -INFINITY;
+            }
+        }
+        __syncthreads();
+        // A thread a head: the step's largest logit, the running maximum up
+        // to and including it, and what it rescales the sums so far by.
+        if (t < DSV41_GROUP) {
+            float peak = -INFINITY;
+            for (unsigned int i = 0; i < DSV41_KEYS_PER_STEP; ++i) peak = fmaxf(peak, logit[t][i]);
+            const float before = top[t], now = fmaxf(before, peak);
+            shrink[t] = expf(before - now);
+            top[t] = now;
+        }
+        __syncthreads();
+        for (unsigned int i = t; i < DSV41_GROUP * DSV41_KEYS_PER_STEP; i += 256) {
+            const unsigned int head = i / DSV41_KEYS_PER_STEP, key = i % DSV41_KEYS_PER_STEP;
+            const float e = expf(logit[head][key] - top[head]);
+            logit[head][key] = e;
+            weight[head][key] = __bfloat16_as_ushort(__float2bfloat16(e));
+        }
+        __syncthreads();
+        // A thread a head: the step's weights added in key order, unrounded,
+        // onto the denominator so far.
+        if (t < DSV41_GROUP) {
+            float sum = 0.0f;
+            for (unsigned int i = 0; i < DSV41_KEYS_PER_STEP; ++i) sum += logit[t][i];
+            total[t] = total[t] * shrink[t] + sum;
+        }
+        // The step's keys into the output, 16 at a time.
+        {
+            const float s0 = shrink[g], s1 = shrink[g + 8u];
+            #pragma unroll
+            for (int tile = 0; tile < 8; ++tile) {
+                acc[tile][0] *= s0;
+                acc[tile][1] *= s0;
+                acc[tile][2] *= s1;
+                acc[tile][3] *= s1;
+            }
+            for (unsigned int chunk = 0; chunk < DSV41_KEYS_PER_STEP / 16; ++chunk) {
+                // The lane's k-slots: keys 2c, 2c + 1, 2c + 8 and 2c + 9 of the 16.
+                const unsigned int j0 = chunk * 16u + 2u * c;
+                const unsigned int slot[4] = {j0, j0 + 1u, j0 + 8u, j0 + 9u};
+                auto pair = [&](unsigned int head, unsigned int lo, unsigned int hi) {
+                    return (unsigned int)weight[head][lo] | ((unsigned int)weight[head][hi] << 16);
+                };
+                const unsigned int a[4] = {pair(g, slot[0], slot[1]), pair(g + 8u, slot[0], slot[1]),
+                                           pair(g, slot[2], slot[3]), pair(g + 8u, slot[2], slot[3])};
+                // Two lanes a key: 32 of the warp's 64 values of it each.
+                {
+                    const unsigned int of = lane >> 1, half = (lane & 1u) * 32u;
+                    const __nv_bfloat16* row = dsv41_tc_key(
+                        keys_a, keys_b, ids, step * DSV41_KEYS_PER_STEP + chunk * 16u + of, k,
+                        split);
+                    const uint4* from = (const uint4*)((row ? row : any) + warp * 64u + half);
+                    uint4* to = (uint4*)&staged[warp][of][half];
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) to[i] = from[i];
+                }
+                __syncwarp();
+                const unsigned short* key[4] = {
+                    staged[warp][2u * c], staged[warp][2u * c + 1u], staged[warp][2u * c + 8u],
+                    staged[warp][2u * c + 9u]};
+                #pragma unroll
+                for (int tile = 0; tile < 8; ++tile) {
+                    const unsigned int d = tile * 8u + g;
+                    const unsigned int b0 = (unsigned int)key[0][d] | ((unsigned int)key[1][d] << 16);
+                    const unsigned int b1 = (unsigned int)key[2][d] | ((unsigned int)key[3][d] << 16);
+                    dsv41_tc_mma(acc[tile], a, b0, b1);
+                }
+                // The next 16 keys replace these.
+                __syncwarp();
+            }
+        }
+        // The next step's logits and weights replace these.
+        __syncthreads();
+    }
+    // A head's denominator: its weights, and the sink's under the last
+    // running maximum.
+    if (t < DSV41_GROUP) total[t] = total[t] + expf(sink[first + t] - top[t]);
+    __syncthreads();
+    // The lane's sums: its two heads, by output values 2c and 2c + 1 of each
+    // tile, which are a rotary pair where the output is turned.
+    #pragma unroll
+    for (int which = 0; which < 2; ++which) {
+        const float denominator = total[g + 8u * which];
+        __nv_bfloat16* o = out + ((size_t)query * h + first + g + 8u * which) * DSV41_DIM;
+        #pragma unroll
+        for (int tile = 0; tile < 8; ++tile) {
+            const unsigned int d = (warp * 8u + tile) * 8u + 2u * c;
+            float v0 = dsv41_bf16(acc[tile][which * 2] / denominator);
+            float v1 = dsv41_bf16(acc[tile][which * 2 + 1] / denominator);
+            if (d >= turned)
+                dsv41_rotate_pair(v0, v1, (float)positions[query] * freqs[(d - turned) / 2], true,
+                                  v0, v1);
+            o[d] = __float2bfloat16(v0);
+            o[d + 1] = __float2bfloat16(v1);
+        }
     }
 }

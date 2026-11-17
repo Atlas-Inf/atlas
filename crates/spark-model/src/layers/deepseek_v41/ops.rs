@@ -52,12 +52,12 @@ pub struct Kernels {
     attn_logits: KernelHandle,
     attn_schedule: KernelHandle,
     attn_output: KernelHandle,
-    /// The first and third of those on tensor cores, for a batch
-    /// (`dsv41_attn_tc.cu`).
+    /// The first of those on tensor cores (`dsv41_attn_tc.cu`).
     attn_logits_tc: KernelHandle,
-    attn_output_tc: KernelHandle,
     /// The third on tensor cores for a few queries, with the batch's bytes.
     attn_output_few: KernelHandle,
+    /// A batch's logits, schedule and output in one launch.
+    attn_batch: KernelHandle,
     pub rotate: KernelHandle,
     pub fp8_quant_dequant: KernelHandle,
     /// A batch's window out of the ring, and a verify's refused rows back.
@@ -75,8 +75,8 @@ impl Kernels {
             attn_schedule: gpu.kernel("dsv41_attn", "dsv41_attn_schedule")?,
             attn_output: gpu.kernel("dsv41_attn", "dsv41_attn_output")?,
             attn_logits_tc: gpu.kernel("dsv41_attn_tc", "dsv41_attn_logits_tc")?,
-            attn_output_tc: gpu.kernel("dsv41_attn_tc", "dsv41_attn_output_tc")?,
             attn_output_few: gpu.kernel("dsv41_attn_tc", "dsv41_attn_output_tc_few")?,
+            attn_batch: gpu.kernel("dsv41_attn_tc", "dsv41_attn_batch_tc")?,
             rotate: gpu.kernel("dsv41_cache", "dsv41_rotate")?,
             fp8_quant_dequant: gpu.kernel("dsv41_cache", "dsv41_fp8_quant_dequant")?,
             window_unroll: gpu.kernel("dsv41_cache", "dsv41_window_unroll")?,
@@ -198,9 +198,10 @@ pub fn attn_records(queries: usize, heads: usize) -> usize {
 ///
 /// `batch` takes the first and third launches on tensor cores: the same
 /// products with their FP32 sums in another order. A batch runs a block a
-/// query; a few queries are spread over more blocks, with the batch's bytes
+/// query, the three launches' work in one that never leaves the GPU's
+/// cache; a few queries are spread over more blocks, with the batch's bytes
 /// (`dsv41_attn_tc.cu`), so a query's do not depend on how many share its
-/// launch.
+/// launch. `records` is the few queries' and the row-at-a-time order's.
 #[allow(clippy::too_many_arguments)]
 pub fn sparse_attn(
     gpu: &dyn GpuBackend,
@@ -244,21 +245,42 @@ pub fn sparse_attn(
     // A block a (query, heads) fills the GPU with a batch; a few queries
     // are spread over more blocks.
     let few = batch && queries < SPREAD_BELOW;
-    let (logits, across) = match (batch, few) {
-        (true, true) => (kernels.attn_logits_tc, steps.div_ceil(2)),
-        (true, false) => (kernels.attn_logits_tc, 1),
-        (false, _) => (kernels.attn_logits, steps * (64 / ATTN_GROUP) as u32),
+    if batch && !few {
+        // A batch in one launch and one pass over its keys, with the three
+        // launches' bytes (`dsv41_attn_batch_tc`).
+        let began = profile::begin(gpu, stream)?;
+        turned(
+            KernelLaunch::new(gpu, kernels.attn_batch)
+                .grid([1, groups, 1])
+                .block(block)
+                .arg_ptr(q)
+                .arg_ptr(keys_a)
+                .arg_ptr(keys_b)
+                .arg_ptr(idx)
+                .arg_ptr(sink)
+                .arg_ptr(out)
+                .arg_u32(heads as u32)
+                .arg_u32(keys as u32)
+                .arg_u32(split as u32)
+                .arg_f32((HEAD_DIM as f32).powf(-0.5)),
+            &turn,
+        )
+        .launch(stream)?;
+        return profile::end(gpu, stream, "attention", began);
+    }
+    // What is left is a few queries on tensor cores, or the row-at-a-time
+    // order.
+    let (logits, across) = match few {
+        true => (kernels.attn_logits_tc, steps.div_ceil(2)),
+        false => (kernels.attn_logits, steps * (64 / ATTN_GROUP) as u32),
     };
-    let output = match (batch, few) {
+    let output = match few {
         // A few queries a block, one after another: see the kernel.
-        (true, true) => KernelLaunch::new(gpu, kernels.attn_output_few)
+        true => KernelLaunch::new(gpu, kernels.attn_output_few)
             .grid([FEW_ACROSS, groups.div_ceil(FEW_IN_TURN), 1])
             .block([FEW_THREADS, 1, 1])
             .shared_mem(FEW_SHARED),
-        (true, false) => KernelLaunch::new(gpu, kernels.attn_output_tc)
-            .grid([1, groups, 1])
-            .block(block),
-        (false, _) => KernelLaunch::new(gpu, kernels.attn_output)
+        false => KernelLaunch::new(gpu, kernels.attn_output)
             .grid([(HEAD_DIM / ATTN_GROUP) as u32, groups, 1])
             .block(block),
     };
