@@ -97,6 +97,9 @@ impl Block {
             };
             rows_of(sc.chosen, s.top_k * 4)?;
             rows_of(sc.weights, s.top_k * 4)?;
+            // The host plans a batch from its routing, and reads that from
+            // here, while the stream brings the input.
+            sc.beside.made(gpu, stream)?;
             match coded.map(ExpertGemm::input) {
                 // Half the bytes of the values.
                 Some((codes, scales)) => {
@@ -116,7 +119,10 @@ impl Block {
         let plan = match rows {
             0..=moe_grouped::DEVICE_ROWS => None,
             _ => {
-                gpu.synchronize(stream)?;
+                match own {
+                    Some(_) => sc.beside.read(gpu)?,
+                    None => gpu.synchronize(stream)?,
+                }
                 let mut chosen = vec![0u8; rows * s.top_k * 4];
                 let mut weights = vec![0u8; rows * s.top_k * 4];
                 gpu.copy_d2h(sc.chosen, &mut chosen)?;

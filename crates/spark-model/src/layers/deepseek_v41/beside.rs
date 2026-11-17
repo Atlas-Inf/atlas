@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! A second stream for the collectives a batch's own work can run beside,
-//! and the events that order the two.
+//! and the events that order the two; and an event for the host to read
+//! what a stream has made while the stream goes on.
 //!
 //! A gather waits on the wire, and the stream it is on waits with it. Where
 //! a batch has work that does not read what is being gathered, the gather
@@ -24,6 +25,9 @@ pub struct Beside {
     ready: [u64; SENDS],
     /// Recorded on this stream when a send's gathers are done.
     done: [u64; SENDS],
+    /// Recorded on the batch's stream where the host reads what it has made
+    /// so far ([`Beside::made`]).
+    made: u64,
 }
 
 impl Beside {
@@ -42,6 +46,7 @@ impl Beside {
             stream: gpu.create_stream_ahead()?,
             ready: events()?,
             done: events()?,
+            made: gpu.create_event()?,
         })
     }
 
@@ -63,6 +68,20 @@ impl Beside {
         gpu.stream_wait_event(self.stream, self.ready[at])?;
         gathers(self.stream)?;
         gpu.record_event(self.done[at], self.stream)
+    }
+
+    /// The host is to read what `stream` has queued so far
+    /// ([`Self::read`]), and not wait for what it queues next: nothing
+    /// queued after this may write what the host reads or what it then
+    /// writes.
+    pub fn made(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+        gpu.record_event(self.made, stream)
+    }
+
+    /// Wait, on the host, for what the stream had queued at the last
+    /// [`Self::made`].
+    pub fn read(&self, gpu: &dyn GpuBackend) -> Result<()> {
+        gpu.event_synchronize(self.made)
     }
 
     /// What `stream` queues next reads what send `at` brought.
