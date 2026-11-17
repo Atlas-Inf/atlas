@@ -287,6 +287,22 @@ extern "C" __global__ void __launch_bounds__(DSV41_FEW_THREADS) dsv41_attn_outpu
     }
 }
 
+// Four 8-by-8 matrices of 16-bit values from shared memory as a tensor-core
+// operand: lane `l` names row `l % 8` of matrix `l / 8`, 16 bytes, and gets
+// of each matrix its row `l / 4`'s values `2 (l % 4)` and the one after
+// (the first operand's rows), or turned, its rows `2 (l % 4)` and the one
+// after at value `l / 4` (the second's columns).
+static __device__ __forceinline__ void dsv41_attn_rows(unsigned int (&r)[4], const void* row) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"((unsigned int)__cvta_generic_to_shared(row)));
+}
+static __device__ __forceinline__ void dsv41_attn_columns(unsigned int (&r)[4], const void* row) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"((unsigned int)__cvta_generic_to_shared(row)));
+}
+
 // A batch's attention in one launch and one pass over a query's keys: the
 // logits, the schedule and the output of `dsv41_attn_logits_tc`,
 // `dsv41_attn_schedule` and `dsv41_attn_output_tc_few`, with their bytes.
@@ -309,17 +325,23 @@ extern "C" __global__ void __launch_bounds__(DSV41_FEW_THREADS) dsv41_attn_outpu
 // q [m, h, 512] BF16, sink [h] FP32, out [m, h, 512] BF16; h a multiple of
 // 16. Grid (1, m * h / 16), block 256.
 //
-// What bounds it is the warps at work. A block's shared memory was 39 KB,
-// two blocks a multiprocessor: the heads of q, a step's logits and weights,
-// and 16 KB for a warp's 64 values of the 16 keys it is adding. Those 64
-// are now staged a quarter at a time, in the memory the step's logits no
-// longer need, which leaves 22.7 KB a block and four blocks a
-// multiprocessor (64 registers, a few spilled). At 16,384 queries a layer
-// took 16.7 ms with two blocks and takes about 13 with four. (Four blocks'
-// registers with two blocks' shared memory, tried first, were slower: 11.4
-// ms against 9.9 at 8,192 queries. A step's 64 keys staged whole, one block
-// a multiprocessor, took twice as long.)
-extern "C" __global__ void __launch_bounds__(256, 4) dsv41_attn_batch_tc(
+// What bounds it is the keys' bytes arriving, and after that the registers.
+// The multiplies are free (every one made twice costs nothing) and so is
+// the schedule; half the launch is the output's reads of the keys. A
+// block's shared memory was 39 KB, two blocks a multiprocessor: the heads
+// of q, a step's logits and weights, and 16 KB for a warp's 64 values of
+// the 16 keys it is adding. Those 64 are staged a quarter at a time, in the
+// memory the step's logits no longer need, which leaves 22.7 KB a block.
+// That is room for four blocks, but four leave a thread 64 registers, and
+// what does not fit is kept in memory and read back in the loops: three
+// blocks, 85 registers, are quicker. 16 heads of 16,384 queries over 640
+// keys take 17.1 ms with three blocks, 21.2 with four and 17.8 with two
+// (which need no memory for registers at all), and a 32,000-token prefill
+// 4.35 s where four took 4.50. (A step's 64 keys staged whole, one block a
+// multiprocessor, took twice as long. A warp taking a key once for all
+// sixteen heads in the logits, half their reads, was slower. Reading the
+// four quarters' pieces ahead of the first changed nothing.)
+extern "C" __global__ void __launch_bounds__(256, 3) dsv41_attn_batch_tc(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ keys_a,
     const __nv_bfloat16* __restrict__ keys_b,
@@ -345,8 +367,8 @@ extern "C" __global__ void __launch_bounds__(256, 4) dsv41_attn_batch_tc(
     const unsigned int g = lane >> 2, c = lane & 3u;
     __shared__ uint4 qs[DSV41_GROUP * DSV41_DIM / 8];
     // A step's logits, then its weights unrounded; the weights as BF16.
-    __shared__ float logit[DSV41_GROUP][DSV41_KEYS_PER_STEP];
-    __shared__ unsigned short weight[DSV41_GROUP][DSV41_KEYS_PER_STEP];
+    __shared__ __align__(16) float logit[DSV41_GROUP][DSV41_KEYS_PER_STEP];
+    __shared__ __align__(16) unsigned short weight[DSV41_GROUP][DSV41_KEYS_PER_STEP];
     // A head's running maximum, what the step rescales its sums by, and its
     // denominator so far.
     __shared__ float top[DSV41_GROUP];
@@ -475,14 +497,13 @@ extern "C" __global__ void __launch_bounds__(256, 4) dsv41_attn_batch_tc(
                 acc[tile][3] *= s1;
             }
             for (unsigned int chunk = 0; chunk < DSV41_KEYS_PER_STEP / 16; ++chunk) {
-                // The lane's k-slots: keys 2c, 2c + 1, 2c + 8 and 2c + 9 of the 16.
-                const unsigned int j0 = chunk * 16u + 2u * c;
-                const unsigned int slot[4] = {j0, j0 + 1u, j0 + 8u, j0 + 9u};
-                auto pair = [&](unsigned int head, unsigned int lo, unsigned int hi) {
-                    return (unsigned int)weight[head][lo] | ((unsigned int)weight[head][hi] << 16);
-                };
-                const unsigned int a[4] = {pair(g, slot[0], slot[1]), pair(g + 8u, slot[0], slot[1]),
-                                           pair(g, slot[2], slot[3]), pair(g + 8u, slot[2], slot[3])};
+                // The lane's k-slots: keys 2c, 2c + 1, 2c + 8 and 2c + 9 of the
+                // 16, of heads g and g + 8: the weights' four matrices are
+                // heads 0-7 and 8-15 of keys 0-7, then of keys 8-15.
+                const unsigned int matrix = lane >> 3, line = lane & 7u;
+                unsigned int a[4];
+                dsv41_attn_rows(
+                    a, &weight[(matrix & 1u) * 8u + line][chunk * 16u + (matrix >> 1) * 8u]);
                 // The warp's 64 values of each key in four quarters of 16, a
                 // quarter staged and added at a time: two lanes a key, eight
                 // values each. (All 64 at once was 12 KB more of shared
@@ -500,18 +521,14 @@ extern "C" __global__ void __launch_bounds__(256, 4) dsv41_attn_batch_tc(
                         *(uint4*)&staged[warp][of][part] = from[0];
                     }
                     __syncwarp();
-                    const unsigned short* key[4] = {
-                        staged[warp][2u * c], staged[warp][2u * c + 1u],
-                        staged[warp][2u * c + 8u], staged[warp][2u * c + 9u]};
-                    #pragma unroll
-                    for (unsigned int i = 0; i < 2u; ++i) {
-                        const unsigned int d = i * 8u + g;
-                        const unsigned int b0 =
-                            (unsigned int)key[0][d] | ((unsigned int)key[1][d] << 16);
-                        const unsigned int b1 =
-                            (unsigned int)key[2][d] | ((unsigned int)key[3][d] << 16);
-                        dsv41_tc_mma(acc[quarter * 2u + i], a, b0, b1);
-                    }
+                    // The staged keys' four matrices: keys 0-7 and 8-15 of
+                    // values 0-7, then of values 8-15; a lane's are its
+                    // keys' at value g of each.
+                    unsigned int b[4];
+                    dsv41_attn_columns(
+                        b, &staged[warp][(matrix & 1u) * 8u + line][(matrix >> 1) * 8u]);
+                    dsv41_tc_mma(acc[quarter * 2u], a, b[0], b[1]);
+                    dsv41_tc_mma(acc[quarter * 2u + 1u], a, b[2], b[3]);
                     // The next quarter, or the next 16 keys, replace these.
                     __syncwarp();
                 }
