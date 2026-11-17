@@ -6,7 +6,7 @@ use anyhow::{Result, ensure};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
-use super::cache_recipe::WINDOW;
+use super::cache_recipe::{WINDOW, rope_freqs};
 use super::gemm::GemmScratch;
 use super::hc::{HcKernels, HcShape};
 use super::index::{INDEX_DIM, IndexKernels};
@@ -330,4 +330,27 @@ impl Scratch {
             score_rows,
         })
     }
+}
+
+/// A rotary ladder on the device: `[rope / 2]` FP32 radians per position,
+/// YaRN-scaled from `original` positions when that is not 0.
+pub fn ladder(
+    gpu: &dyn GpuBackend,
+    config: &ModelConfig,
+    rope: usize,
+    original: usize,
+    theta: f64,
+) -> Result<DevicePtr> {
+    let freqs = rope_freqs(
+        rope,
+        original,
+        theta as f32,
+        config.yarn_factor,
+        config.yarn_beta_fast,
+        config.yarn_beta_slow,
+    );
+    let bytes: Vec<u8> = freqs.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let p = gpu.alloc(bytes.len())?;
+    gpu.copy_h2d(&bytes, p)?;
+    Ok(p)
 }

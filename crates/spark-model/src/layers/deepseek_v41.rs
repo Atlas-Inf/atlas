@@ -7,9 +7,15 @@
 pub mod block;
 mod block_attention;
 mod block_compress;
+mod block_draft;
 mod block_index;
 mod block_moe;
 pub mod cache_recipe;
+pub mod draft;
+pub mod draft_head;
+pub mod draft_ops;
+mod draft_propose;
+pub mod draft_seq;
 pub mod engram;
 pub mod engram_table;
 pub mod gemm;

@@ -32,13 +32,14 @@ impl ModelWeightLoader for DeepSeekV41WeightLoader {
         crate::layers::deepseek_v41::layer::load_layers(store, config, gpu)
     }
 
-    /// The vision tower and the draft stages are not served yet, and a
-    /// debug cut of the model (`ATLAS_DSV41_DEBUG_LAYERS`) reads only its
-    /// first layers.
+    /// The vision tower is not served yet, the draft stages only where
+    /// asked for (`ATLAS_DSV41_DRAFT`), and a debug cut of the model
+    /// (`ATLAS_DSV41_DEBUG_LAYERS`) reads only its first layers.
     fn dead_namespaces(&self, config: &ModelConfig) -> Vec<String> {
-        let mut dead: Vec<String> = ["vision.", "aligner.", "image_", "mtp."]
-            .map(String::from)
-            .to_vec();
+        let mut dead: Vec<String> = ["vision.", "aligner.", "image_"].map(String::from).to_vec();
+        if !crate::layers::deepseek_v41::draft_seq::requested() {
+            dead.push("mtp.".to_string());
+        }
         dead.extend((config.num_hidden_layers..128).map(|layer| format!("layers.{layer}.")));
         dead
     }

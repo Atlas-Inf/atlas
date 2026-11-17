@@ -3,10 +3,13 @@
 //! One sequence's DeepSeek-V4.1 attention cache on one layer, and what
 //! source layers hand to the layers after them within a pass.
 
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::cache_recipe::WINDOW;
+use super::draft_seq::{DraftSeq, tap};
 use super::index::INDEX_DIM;
 use super::ops::HEAD_DIM;
 use super::shape::MAX_RATIO;
@@ -79,6 +82,9 @@ pub struct SeqState {
     /// On an Engram layer: the compressed id of the token at every position
     /// so far, which the n-grams ending at the next ones are hashed from.
     pub history: Vec<u32>,
+    /// On the first layer the draft head reads: the sequence's side of the
+    /// head, which that layer and the ones after it fill.
+    pub(super) draft: Option<Arc<Mutex<DraftSeq>>>,
 }
 
 impl SeqState {
@@ -110,6 +116,7 @@ impl SeqState {
             kept_window: gpu.alloc(KEPT_ROWS * HEAD_DIM * 2)?,
             kept: None,
             history: Vec::new(),
+            draft: None,
         })
     }
 
@@ -165,6 +172,10 @@ impl SeqState {
     pub fn free(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
         gpu.free(self.window)?;
         gpu.free(self.kept_window)?;
+        if let Some(draft) = self.draft.take() {
+            tap().forget(&draft);
+            draft.lock().expect("draft sequence").free(gpu)?;
+        }
         if let Some(c) = self.compressed.take() {
             let kept = [c.kept_kv, c.kept_score];
             for p in [c.keys, c.index_keys, c.kv_state, c.score_state]

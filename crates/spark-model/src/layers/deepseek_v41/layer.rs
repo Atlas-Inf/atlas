@@ -19,7 +19,7 @@ use spark_runtime::kv_cache::PagedKvCache;
 use spark_runtime::weights::WeightStore;
 
 use super::block::{Block, BlockKernels, Candidates, Handoff, Scratch, SeqState, Shape, Shared};
-use super::cache_recipe::rope_freqs;
+use super::draft_seq;
 use super::engram::{Engram, EngramWeights, held_columns};
 use super::engram_table::{EngramHash, EngramTable, Prefetcher};
 use super::gemm::{GemmWeights, gemms};
@@ -28,7 +28,7 @@ use super::index::INDEX_DIM;
 use super::ops::HEAD_DIM;
 use super::parts::Held;
 use super::profile;
-use super::shape::batch_rows;
+use super::shape::{batch_rows, ladder};
 use super::state::KEPT_ROWS;
 use super::tail;
 use super::weights::BlockWeights;
@@ -66,6 +66,7 @@ pub struct Layer {
     last: bool,
     /// The rows of a chunk's end a prefill may run alone (`tail.rs`).
     tail: Option<usize>,
+    target: Option<Target>,
 }
 
 impl Layer {
@@ -123,6 +124,9 @@ impl Layer {
         }
         if let Some(lookup) = &self.lookup {
             self.look_up(lookup, row, rows, streams, state, position, ctx, stream)?;
+        }
+        if let Some(target) = &self.target {
+            target.take(gpu, &shared.shape, streams, rows, state, position, stream)?;
         }
         let comm = ctx.comm.filter(|_| ctx.config.ep_world_size > 1);
         self.block
@@ -262,11 +266,11 @@ impl TransformerLayer for Layer {
     }
 
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
-        Ok(Box::new(SeqState::alloc(
-            gpu,
-            self.compresses,
-            FIRST_POSITIONS,
-        )?))
+        let mut state = SeqState::alloc(gpu, self.compresses, FIRST_POSITIONS)?;
+        if let Some(target) = &self.target {
+            state.draft = target.sequence(gpu, self.block.shared.shape.hidden)?;
+        }
+        Ok(Box::new(state))
     }
 
     fn free_state(&self, gpu: &dyn GpuBackend, state: &mut dyn LayerState) -> Result<()> {
@@ -324,30 +328,28 @@ pub fn load_layers(
         )?),
         handoff: Arc::new(std::sync::Mutex::new(Handoff::default())),
     };
-    let ladder = |original: usize, theta: f64| -> Result<DevicePtr> {
-        let freqs = rope_freqs(
-            shape.rope,
-            original,
-            theta as f32,
-            config.yarn_factor,
-            config.yarn_beta_fast,
-            config.yarn_beta_slow,
-        );
-        let bytes: Vec<u8> = freqs.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let p = gpu.alloc(bytes.len())?;
-        gpu.copy_h2d(&bytes, p)?;
-        Ok(p)
-    };
     ensure!(
         config.window_rope_theta > 0.0 && config.rope_theta > 0.0,
         "deepseek_v41: no rotary bases"
     );
     // A layer that attends over its window only is not YaRN-scaled.
-    let window = ladder(0, config.window_rope_theta)?;
+    let window = ladder(gpu, config, shape.rope, 0, config.window_rope_theta)?;
     let compressed = ladder(
+        gpu,
+        config,
+        shape.rope,
         config.yarn_original_max_position_embeddings,
         config.rope_theta,
     )?;
+    // The layers the draft head reads, when it is served.
+    let targets: &[usize] = match draft_seq::requested() {
+        true => &config.dspark_target_layer_ids,
+        false => &[],
+    };
+    let mean = match targets {
+        [] => None,
+        _ => Some(gpu.kernel("dsv41_draft", "dsv41_stream_mean")?),
+    };
     let geometry = config.deepseek_v41_engram(config.engram_pad_id)?;
     tracing::info!(
         "DeepSeek-V4.1: {layers} layers, parts {:?} of every wide projection, key sources {:?}, index sources {:?}, Engram at {:?}",
@@ -466,10 +468,24 @@ pub fn load_layers(
             first: layer == 0,
             last: layer + 1 == layers,
             tail: tail::rows_of_layer(layer, layers, &per_row),
+            target: targets
+                .iter()
+                .position(|&l| l == layer)
+                .zip(mean)
+                .map(|(index, mean)| Target {
+                    index,
+                    of: targets.len(),
+                    stages: config.num_mtp_modules,
+                    mean,
+                }),
         }));
     }
     Ok(out)
 }
+
+#[path = "layer_draft.rs"]
+mod draft;
+use draft::Target;
 
 #[path = "layer_lookup.rs"]
 mod lookup;

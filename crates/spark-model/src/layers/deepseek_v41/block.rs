@@ -118,7 +118,7 @@ impl Block {
     /// `before` into the stream, then the input of the next, collapsed with
     /// `pre_in`, in `scratch.normed` and `scratch.quantized`.
     #[allow(clippy::too_many_arguments)]
-    fn site(
+    pub(super) fn site(
         &self,
         gpu: &dyn GpuBackend,
         weights: &HcSite,
@@ -237,7 +237,7 @@ impl Block {
     /// FFN, collapsed with the attention site's pre, and its output into the
     /// stream. `pre` is left holding the FFN site's. `comm` reaches the
     /// other ranks when the routed experts are split over them.
-    fn finish(
+    pub(super) fn finish(
         &self,
         gpu: &dyn GpuBackend,
         rows: usize,

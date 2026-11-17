@@ -372,11 +372,15 @@ pub fn build_model(
             None
         };
 
+    // DeepSeek-V4.1's draft head (`ATLAS_DSV41_DRAFT`) is sliced as the
+    // model is, a part on every rank.
+    let dsv41_drafts =
+        config.model_type == "deepseek_v41" && crate::layers::deepseek_v41::draft_seq::requested();
     glm::ensure_expert_tp_drafter(
         &config,
         use_speculative,
         dflash_args.is_none(),
-        native_glm_mtp,
+        native_glm_mtp || dsv41_drafts,
     )?;
     // Qwen3.8-Flash-Next ships an MTP block that is architecturally a full
     // layer (gated attention + QSA indexer + mHC + 512-expert MoE), not the
@@ -519,6 +523,20 @@ pub fn build_model(
     // same BF16 head via dense_gemv (drafts are re-verified by the target, so the
     // draft head only affects acceptance). DenseWeight is Copy.
     let v4_mtp_lm_head = lm_head;
+    // DeepSeek-V4.1's draft head: every rank holds its part, the first
+    // proposes and the others serve it. Built here, while the store is at
+    // hand, and installed once the model exists.
+    let dsv41_draft = if dsv41_drafts {
+        Some(crate::layers::deepseek_v41::draft::Draft::load(
+            &store,
+            &config,
+            gpu.as_ref(),
+            embed.weight,
+            lm_head.weight,
+        )?)
+    } else {
+        None
+    };
     // ── Step 3b: Post-load MoE prefill transpose (MiniMax EP=2 TTFT fix) ──
     //
     // MiniMax M2.7-NVFP4 EP=2 has ~46 GB free at layer-0 load time but
@@ -1369,6 +1387,15 @@ pub fn build_model(
                 "Failed to build DeepSeek-V4 MTP proposer: {e:#}. Speculative decoding disabled."
             ),
         }
+    }
+
+    if let Some(draft) = dsv41_draft {
+        let draft = std::sync::Arc::new(draft);
+        match model.config_ref().ep_rank {
+            0 => model.set_dflash_proposer(draft),
+            _ => model.set_draft_assist(draft),
+        }
+        tracing::info!("DeepSeek-V4.1 draft head: ENABLED, a part on every rank");
     }
 
     // ── Step 6c: Qwen3.8-Flash-Next MTP proposer (optional) ──

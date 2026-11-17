@@ -19,7 +19,7 @@ use super::weights::row_part;
 
 impl Block {
     /// The device word holding `position`, for a rotation to read.
-    fn at(&self, position: usize) -> Result<DevicePtr> {
+    pub(super) fn at(&self, position: usize) -> Result<DevicePtr> {
         let sc = &self.shared.scratch;
         ensure!(
             position < sc.max_groups,
@@ -97,7 +97,6 @@ impl Block {
             &self.shared.scratch,
             &self.weights.attn,
         );
-        let held = self.shared.held;
         let began = profile::begin(gpu, stream)?;
         // The low-rank query and the window key, both from the input's FP8
         // form; then the query normed, and the key normed, turned to the
@@ -205,12 +204,39 @@ impl Block {
             }
         };
         profile::end(gpu, stream, "compress and choose", began)?;
+        self.attend_keys(gpu, rows, window, compressed, keys, turn, comm, stream)
+    }
+
+    /// The rest of the attention, from the keys: each of the `rows` queries
+    /// in `scratch.q_low_normed` reads the `keys` keys its row of
+    /// `scratch.idx` names, the window's of `window` and then those of
+    /// `others`, and the heads' output goes through the output projections
+    /// into the parts of [`Block::attention_parts`].
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attend_keys(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: usize,
+        window: DevicePtr,
+        others: DevicePtr,
+        keys: usize,
+        turn: Turn,
+        comm: Option<&dyn CommBackend>,
+        stream: u64,
+    ) -> Result<()> {
+        let (s, k, sc, w) = (
+            &self.shared.shape,
+            &self.shared.kernels,
+            &self.shared.scratch,
+            &self.weights.attn,
+        );
+        let held = self.shared.held;
+        let gemm = self.gemm.as_ref().filter(|_| rows >= GEMM_ROWS);
         ensure!(
             keys <= MAX_KEYS,
             "layer {}: {keys} keys for one query",
             self.index
         );
-
         let (heads, groups) = (s.heads / PARTS, s.o_groups / PARTS);
         let group_in = s.heads / s.o_groups * HEAD_DIM;
         ensure!(
@@ -268,7 +294,7 @@ impl Block {
                 &k.cache,
                 q,
                 window,
-                compressed,
+                others,
                 sc.idx,
                 w.sink.offset(part * heads * 4),
                 attended,
