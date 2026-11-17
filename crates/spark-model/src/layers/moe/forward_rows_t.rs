@@ -98,7 +98,26 @@ impl MoeLayer {
         // landing adjacent so the union kernel sees `rows * top_k` ids.
         let gate_logits = ctx.buffers.gate_logits();
         let router_n = self.router_logits_n;
-        for r in 0..rows {
+        // NVFP4 gate with the batch tiers resolved: every row's logits in one
+        // launch (`router_input` is the identity here: no router pre-norm).
+        // Strix kbench (512 x 2560): batch2/4/8 rows memcmp-equal to per-row
+        // w4a16_gemv_sw and w4a16_gemv, 8.7 / 17.3 / 34.6 -> 4.6 / 6.6 / 9.7 us.
+        let router_once = match self.gate_nvfp4 {
+            Some(ref nvfp4) if self.w4a16_batchm.has_base() => {
+                self.wide_rows.w4a16_rows(
+                    ctx.gpu,
+                    &self.w4a16_batchm,
+                    input,
+                    nvfp4,
+                    gate_logits,
+                    (rows as u32, router_n, h),
+                    stream,
+                )?;
+                true
+            }
+            _ => false,
+        };
+        for r in (0..rows).filter(|_| !router_once) {
             let in_r = input.offset(r * h as usize * bf16);
             let router_in = self.router_input(in_r, 1, h, ctx, stream)?;
             if let Some(ref nvfp4) = self.gate_nvfp4 {
