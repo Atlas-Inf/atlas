@@ -113,6 +113,13 @@ else:
 EOF
 kill -INT "$APID" 2>/dev/null; for _ in $(seq 1 120); do kill -0 "$APID" 2>/dev/null || break; sleep 2; done; kill -9 "$APID" 2>/dev/null || true
 cp "$OUT/atlas-server.log" "$OUT/serve-prof.log" 2>/dev/null || true
+# ATLAS_TRACE_D2D=1 (debug branches only): sampled copy call sites.
+if grep -aq "TRACE_D2D" "$OUT/atlas-server.log"; then
+  log "TRACE_D2D samples: $(grep -ac TRACE_D2D "$OUT/atlas-server.log")"
+  grep -a "TRACE_D2D" "$OUT/atlas-server.log" | awk '{print $2, $4}' | sort | uniq -c | sort -rn | head -10
+  grep -a -A40 "TRACE_D2D d2d #8192 " "$OUT/atlas-server.log" | grep -aE "spark_model|TRACE_D2D" | head -14
+  grep -a -A40 "TRACE_D2D h2d #8192 " "$OUT/atlas-server.log" | grep -aE "spark_model|TRACE_D2D" | head -14
+fi
 # ATLAS_QWEN4EXP_BATCH_FAST_CHECK=1: the batched rows vs single-sequence decode, byte for byte.
 if grep -aq "BATCH_FAST_CHECK" "$OUT/atlas-server.log"; then
   log "BATCH_FAST_CHECK lines: $(grep -ac BATCH_FAST_CHECK "$OUT/atlas-server.log"), mismatching: $(grep -a BATCH_FAST_CHECK "$OUT/atlas-server.log" | grep -aciE 'mismatch|differ|FAIL')"
