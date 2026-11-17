@@ -12,8 +12,8 @@
 #define CHECK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { printf("HIP %s at %s:%d\n", hipGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
 
 int main() {
-    struct S { unsigned N, K; const char* nm; } shapes[] = {{16384, 2560, "qkvz"}, {2560, 4096, "out K4096"}, {2560, 6144, "out K6144"}, {2560, 8192, "out K8192"}};
-    for (auto& sh : shapes) for (unsigned M : {5u, 8u}) {
+    struct S { unsigned N, K; const char* nm; } shapes[] = {{5120, 6144, "27B 5120x6144"}, {16384, 5120, "27B 16384x5120"}, {12288, 5120, "27B 12288x5120"}, {1024, 5120, "27B 1024x5120"}, {5120, 4096, "27B 5120x4096"}};
+    for (auto& sh : shapes) for (unsigned M : {8u}) {
         const unsigned N = sh.N, K = sh.K; const int NB = 6;
         const size_t nsc = (size_t)((N + 127) / 128) * ((K + 127) / 128);
         std::vector<unsigned char> hb((size_t)N * K); std::vector<float> hs(nsc); std::vector<__nv_bfloat16> ha((size_t)M * K); srand(N + K + M);
