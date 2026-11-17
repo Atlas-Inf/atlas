@@ -86,6 +86,7 @@ extern "C" __global__ void __launch_bounds__(256) dsv41_attn_logits_tc(
     const unsigned int* __restrict__ positions,
     const float* __restrict__ freqs,
     unsigned int rope) {
+    atlas_pdl_enter();
     const unsigned int groups = h / DSV41_GROUP;
     const unsigned int query = blockIdx.y / groups, first = (blockIdx.y % groups) * DSV41_GROUP;
     const unsigned int t = threadIdx.x;
@@ -285,6 +286,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_FEW_THREADS) dsv41_attn_outpu
     const unsigned int* __restrict__ positions,
     const float* __restrict__ freqs,
     unsigned int rope) {
+    atlas_pdl_enter();
     extern __shared__ __align__(16) unsigned char dsv41_few_shared[];
     // [slots, 32] key values, then [16, slots] weights.
     unsigned short* skeys = (unsigned short*)dsv41_few_shared;

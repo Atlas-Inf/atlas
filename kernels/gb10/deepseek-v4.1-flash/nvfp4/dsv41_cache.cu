@@ -23,6 +23,7 @@ extern "C" __global__ void dsv41_rotate(
     unsigned int dim,
     unsigned int rope,
     unsigned int inverse) {
+    atlas_pdl_enter();
     const unsigned int pairs = rope / 2;
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)rows * vectors * pairs) return;
@@ -41,6 +42,7 @@ extern "C" __global__ void dsv41_rotate(
 // One thread per block.
 extern "C" __global__ void dsv41_fp8_quant_dequant(
     const __nv_bfloat16* src, __nv_bfloat16* dst, unsigned int blocks) {
+    atlas_pdl_enter();
     const size_t b = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= blocks) return;
     const __nv_bfloat16* p = src + b * 32;
@@ -54,6 +56,7 @@ extern "C" __global__ void dsv41_fp8_quant_dequant(
 // an E4M3 scale (compressed keys).
 extern "C" __global__ void dsv41_fp4_quant_dequant(
     __nv_bfloat16* __restrict__ x, unsigned int groups, unsigned int e4m3_scale) {
+    atlas_pdl_enter();
     const size_t g = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= groups) return;
     const int width = e4m3_scale ? 16 : 32;

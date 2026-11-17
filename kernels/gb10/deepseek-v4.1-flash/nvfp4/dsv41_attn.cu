@@ -174,6 +174,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_THREADS) dsv41_sparse_attn(
     unsigned int k,
     unsigned int split,
     float scale) {
+    atlas_pdl_enter();
     const unsigned int query = blockIdx.x, head = blockIdx.y, t = threadIdx.x;
     const unsigned int steps = dsv41_steps(k);
     __shared__ float qs[DSV41_DIM];
@@ -216,6 +217,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_GROUP_THREADS) dsv41_attn_log
     const unsigned int* __restrict__ positions,
     const float* __restrict__ freqs,
     unsigned int rope) {
+    atlas_pdl_enter();
     const unsigned int groups = h / DSV41_GROUP;
     const unsigned int query = blockIdx.y / groups, first = (blockIdx.y % groups) * DSV41_GROUP;
     const unsigned int t = threadIdx.x, in_group = t % DSV41_GROUP;
@@ -248,6 +250,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_THREADS) dsv41_attn_schedule(
     const float* __restrict__ sink,
     unsigned int h,
     unsigned int k) {
+    atlas_pdl_enter();
     const unsigned int query = blockIdx.x, head = blockIdx.y, t = threadIdx.x;
     const unsigned int steps = dsv41_steps(k);
     float* record = records + ((size_t)query * h + head) * DSV41_RECORD;
@@ -280,6 +283,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_GROUP_THREADS) dsv41_attn_out
     const unsigned int* __restrict__ positions,
     const float* __restrict__ freqs,
     unsigned int rope) {
+    atlas_pdl_enter();
     const unsigned int groups = h / DSV41_GROUP;
     const unsigned int query = blockIdx.y / groups, first = (blockIdx.y % groups) * DSV41_GROUP;
     const unsigned int t = threadIdx.x, head = first + t % DSV41_GROUP;

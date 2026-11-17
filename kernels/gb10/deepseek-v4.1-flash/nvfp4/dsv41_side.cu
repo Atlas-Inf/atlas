@@ -28,6 +28,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_DOT_THREADS) dsv41_gemv_f32(
     const __nv_bfloat16* __restrict__ w,
     float* __restrict__ out,
     unsigned int k) {
+    atlas_pdl_enter();
     const float sum =
         dsv41_dot_wide(x + (size_t)blockIdx.y * k, w + (size_t)blockIdx.x * k, k);
     if (threadIdx.x == 0) out[(size_t)blockIdx.y * gridDim.x + blockIdx.x] = sum;
@@ -42,6 +43,7 @@ extern "C" __global__ void dsv41_compress_pool(
     __nv_bfloat16* __restrict__ pooled,
     unsigned int ratio,
     unsigned int dim) {
+    atlas_pdl_enter();
     const unsigned int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= dim) return;
     kv += (size_t)blockIdx.y * ratio * dim;
@@ -68,6 +70,7 @@ extern "C" __global__ void dsv41_engram_rows(
     const unsigned int* __restrict__ scale_slots,
     __nv_bfloat16* __restrict__ out,
     unsigned int columns) {
+    atlas_pdl_enter();
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= columns * 256) return;
     const unsigned int c = i / 256, d = i % 256;
@@ -98,6 +101,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_SIDE_THREADS) dsv41_engram_ga
     unsigned int H,
     unsigned int hc,
     float eps) {
+    atlas_pdl_enter();
     const unsigned int t = blockIdx.x, j = blockIdx.y, tid = threadIdx.x;
     __nv_bfloat16* h = stream + ((size_t)t * hc + j) * H;
     // Value e of this token's projection.

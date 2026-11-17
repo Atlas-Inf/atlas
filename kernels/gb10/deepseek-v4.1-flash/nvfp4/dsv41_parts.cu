@@ -26,6 +26,7 @@ extern "C" __global__ void dsv41_parts_round(
     unsigned int slots,
     unsigned int n,
     unsigned int stride) {
+    atlas_pdl_enter();
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= slots * n) return;
     out[i] = __float2bfloat16(dsv41_parts_sum(parts, stride, i));
@@ -42,6 +43,7 @@ extern "C" __global__ void dsv41_slots_sum(
     unsigned int n,
     unsigned int rows,
     const __nv_bfloat16* __restrict__ shared) {
+    atlas_pdl_enter();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)rows * n) return;
     const size_t row = i / n, d = i % n;
@@ -62,6 +64,7 @@ extern "C" __global__ void dsv41_slice_columns(
     unsigned int src_stride,
     unsigned int first,
     unsigned int width) {
+    atlas_pdl_enter();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)rows * width) return;
     const size_t row = i / width, col = i % width;

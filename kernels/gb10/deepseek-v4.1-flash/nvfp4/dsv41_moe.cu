@@ -46,6 +46,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_MOE_THREADS) dsv41_moe_route(
     unsigned int experts,
     unsigned int top_k,
     float route_scale) {
+    atlas_pdl_enter();
     const unsigned int t = blockIdx.x, tid = threadIdx.x;
     __shared__ float xs[DSV41_MAX_K];
     __shared__ float score[DSV41_MAX_EXPERTS];
@@ -95,6 +96,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_MOE_THREADS) dsv41_moe_scores
     float* __restrict__ score,
     unsigned int H,
     unsigned int experts) {
+    atlas_pdl_enter();
     const unsigned int e = blockIdx.x, t = blockIdx.y;
     const float logit = dsv41_dot_wide(x + (size_t)t * H, gate + (size_t)e * H, H);
     if (threadIdx.x != 0) return;
@@ -104,6 +106,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_MOE_THREADS) dsv41_moe_scores
 // score[i] = sqrt(softplus(score[i])), in place: a batch's scores from the
 // logits a GEMM left (x . gate^T in FP32), as `dsv41_moe_scores` leaves them.
 extern "C" __global__ void dsv41_moe_soften(float* __restrict__ score, unsigned int count) {
+    atlas_pdl_enter();
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const float logit = score[i];
@@ -124,6 +127,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_MAX_EXPERTS) dsv41_moe_pick(
     unsigned int top_k,
     float route_scale,
     unsigned int by_expert) {
+    atlas_pdl_enter();
     const unsigned int t = blockIdx.x, tid = threadIdx.x;
     __shared__ float value[DSV41_MAX_EXPERTS];
     __shared__ unsigned int pick[DSV41_MAX_TOPK];
@@ -163,6 +167,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_MOE_THREADS) dsv41_fp4_gemv(
     __nv_bfloat16* __restrict__ out,
     unsigned int n,
     unsigned int k) {
+    atlas_pdl_enter();
     __shared__ float xs[DSV41_MAX_K];
     for (unsigned int d = threadIdx.x; d < k; d += DSV41_MOE_THREADS) xs[d] = __bfloat162float(x[d]);
     __syncthreads();
@@ -191,6 +196,7 @@ extern "C" __global__ void dsv41_swiglu(
     unsigned int n,
     float weight,
     float limit) {
+    atlas_pdl_enter();
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     h[i] = __float2bfloat16(
@@ -200,12 +206,14 @@ extern "C" __global__ void dsv41_swiglu(
 // acc += x, FP32 += BF16; and the rounding back.
 extern "C" __global__ void dsv41_accumulate(
     float* __restrict__ acc, const __nv_bfloat16* __restrict__ x, unsigned int n) {
+    atlas_pdl_enter();
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) acc[i] += __bfloat162float(x[i]);
 }
 
 extern "C" __global__ void dsv41_round_bf16(
     const float* __restrict__ acc, __nv_bfloat16* __restrict__ out, unsigned int n) {
+    atlas_pdl_enter();
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __float2bfloat16(acc[i]);
 }

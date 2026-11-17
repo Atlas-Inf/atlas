@@ -193,6 +193,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_CHOOSE_THREADS) dsv41_index_c
     unsigned int block,
     unsigned int position,
     unsigned int ratio) {
+    atlas_pdl_enter();
     __shared__ unsigned int hist[256];
     __shared__ unsigned int cut[2];
     __shared__ unsigned int equal[DSV41_CHOOSE_THREADS];
@@ -275,6 +276,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_CHOOSE_THREADS) dsv41_index_c
     const unsigned char* __restrict__ flags,
     unsigned int flag_cols,
     unsigned int block) {
+    atlas_pdl_enter();
     __shared__ unsigned int hist[256];
     __shared__ unsigned int cut[2];
     __shared__ unsigned int above[DSV41_CHOOSE_THREADS], equal[DSV41_CHOOSE_THREADS];
@@ -356,6 +358,7 @@ extern "C" __global__ void dsv41_attn_index(
     unsigned int position,
     unsigned int rows,
     unsigned int ring) {
+    atlas_pdl_enter();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)rows * keys) return;
     const unsigned int r = (unsigned int)(i / keys), j = (unsigned int)(i % keys);

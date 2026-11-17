@@ -22,6 +22,8 @@
 
 #include <cuda_bf16.h>
 
+#include "../../common/atlas_pdl.cuh"
+
 #define DSV41_INDEX_THREADS 256
 #define DSV41_INDEX_MAX_Q 4096
 #define DSV41_INDEX_MAX_HEADS 64
@@ -46,6 +48,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_INDEX_THREADS) dsv41_index_sc
     float weight_scale,
     unsigned int position,
     unsigned int ratio) {
+    atlas_pdl_enter();
     __shared__ float qs[DSV41_INDEX_MAX_Q];
     __shared__ float ws[DSV41_INDEX_MAX_HEADS];
     q += (size_t)blockIdx.y * heads * width;

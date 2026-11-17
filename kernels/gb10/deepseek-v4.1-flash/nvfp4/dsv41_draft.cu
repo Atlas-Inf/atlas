@@ -23,6 +23,7 @@ extern "C" __global__ void dsv41_stream_mean(
     unsigned int hc,
     unsigned int out_stride,
     unsigned int tokens) {
+    atlas_pdl_enter();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)tokens * H) return;
     const size_t t = i / H, d = i % H;
@@ -41,6 +42,7 @@ extern "C" __global__ void dsv41_parts_rows(
     unsigned int rows,
     unsigned int part_n,
     unsigned int P) {
+    atlas_pdl_enter();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t n = (size_t)P * part_n;
     if (i >= rows * n) return;
@@ -59,6 +61,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_TOP_THREADS) dsv41_draft_top(
     unsigned int n,
     unsigned int first,
     unsigned int keep) {
+    atlas_pdl_enter();
     __shared__ float values[DSV41_TOP_THREADS];
     __shared__ unsigned int columns[DSV41_TOP_THREADS];
     const float* row = logits + (size_t)blockIdx.x * n;

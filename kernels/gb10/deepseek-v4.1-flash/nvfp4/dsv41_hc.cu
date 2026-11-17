@@ -162,6 +162,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_mix_sums
     float* __restrict__ partials,
     unsigned int H,
     unsigned int hc) {
+    atlas_pdl_enter();
     const unsigned int t = blockIdx.y, d = blockIdx.x * DSV41_HC_THREADS + threadIdx.x;
     const __nv_bfloat16* x = streams + (size_t)t * hc * H;
     float v[DSV41_HC_MAX];
@@ -185,6 +186,7 @@ extern "C" __global__ void __launch_bounds__(32) dsv41_hc_mix_finish(
     unsigned int sinkhorn_iters,
     float norm_eps,
     float hc_eps) {
+    atlas_pdl_enter();
     const unsigned int t = blockIdx.x, blocks = H / DSV41_HC_THREADS;
     __shared__ float mix[DSV41_MIX_SUMS];
     __shared__ volatile float comb[DSV41_HC_MAX * DSV41_HC_MAX];
@@ -202,6 +204,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_collapse
     __nv_bfloat16* __restrict__ y,
     unsigned int H,
     unsigned int hc) {
+    atlas_pdl_enter();
     const unsigned int t = blockIdx.y, d = blockIdx.x * DSV41_HC_THREADS + threadIdx.x;
     if (d >= H) return;
     const __nv_bfloat16* x = streams + (size_t)t * hc * H;
@@ -221,6 +224,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_expand(
     __nv_bfloat16* out,
     unsigned int H,
     unsigned int hc) {
+    atlas_pdl_enter();
     const unsigned int t = blockIdx.y, d = blockIdx.x * DSV41_HC_THREADS + threadIdx.x;
     if (d >= H) return;
     const __nv_bfloat16* res = residual + (size_t)t * hc * H;
@@ -255,6 +259,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_expand_p
     unsigned int H,
     unsigned int hc,
     unsigned int part_rows) {
+    atlas_pdl_enter();
     const unsigned int t = blockIdx.y, d = blockIdx.x * DSV41_HC_THREADS + threadIdx.x;
     if (d >= H) return;
     const float xd = dsv41_hc_gathered(x_parts, t, d, H, part_rows);
@@ -289,6 +294,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_site_sum
     unsigned int H,
     unsigned int hc,
     unsigned int part_rows) {
+    atlas_pdl_enter();
     const unsigned int t = blockIdx.y, d = blockIdx.x * DSV41_HC_THREADS + threadIdx.x;
     streams += (size_t)t * hc * H;
     pre_in += (size_t)t * hc;
@@ -347,6 +353,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_FINISH_THREADS) dsv41_hc_site
     unsigned int sinkhorn_iters,
     float norm_eps,
     float hc_eps) {
+    atlas_pdl_enter();
     const unsigned int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
     const unsigned int t = blockIdx.y, blocks = H / DSV41_HC_THREADS;
     __shared__ float mix[DSV41_MIX_SUMS];
@@ -570,6 +577,7 @@ extern "C" __global__ void dsv41_hc_start(
     unsigned int rows,
     unsigned int hidden,
     unsigned int copies) {
+    atlas_pdl_enter();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int per = hidden / 8u;
     if (i >= (size_t)rows * per) return;

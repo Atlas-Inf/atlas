@@ -73,6 +73,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_FRONT_THREADS) dsv41_attn_fro
     unsigned int q_rank,
     unsigned int rope,
     float eps) {
+    atlas_pdl_enter();
     const unsigned int tid = threadIdx.x, t = blockIdx.x;
     q_low += (size_t)t * q_rank;
     q_normed += (size_t)t * q_rank;

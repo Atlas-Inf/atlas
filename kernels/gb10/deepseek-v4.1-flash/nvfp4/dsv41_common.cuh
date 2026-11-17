@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "../../common/atlas_pdl.cuh"
+
 #include <cuda_bf16.h>
 
 #define DSV41_PARTS 4

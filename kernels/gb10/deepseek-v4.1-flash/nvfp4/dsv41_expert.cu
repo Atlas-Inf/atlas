@@ -59,6 +59,7 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_expert_in
     unsigned long long stride,
     unsigned int data,
     unsigned int scales) {
+    atlas_pdl_enter();
     __shared__ F4Shared<1> sh;
     __shared__ F4Staged staged;
     const unsigned int slot = blockIdx.y / 2, which = blockIdx.y & 1u;
@@ -86,6 +87,7 @@ extern "C" __global__ void dsv41_expert_act(
     unsigned int slots,
     unsigned int rows,
     float limit) {
+    atlas_pdl_enter();
     const unsigned int b = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int per_slot = rows / 32;
     if (b >= slots * per_slot) return;
@@ -116,6 +118,7 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_expert_ou
     unsigned int data,
     unsigned int scales,
     unsigned long long piece_stride) {
+    atlas_pdl_enter();
     __shared__ F4Shared<1> sh;
     __shared__ F4Staged staged;
     const unsigned int slot = blockIdx.y, K = rows * DSV41_PARTS;
@@ -162,6 +165,7 @@ extern "C" __global__ void dsv41_experts_plan(
     float* __restrict__ sorted,
     unsigned int top_k,
     unsigned int slots) {
+    atlas_pdl_enter();
     __shared__ unsigned int expert[1024];
     __shared__ unsigned char leads[1024];
     const unsigned int pairs = blockDim.x, p = threadIdx.x;
@@ -204,6 +208,7 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_i
     unsigned long long stride,
     unsigned int data,
     unsigned int scales) {
+    atlas_pdl_enter();
     __shared__ F4Shared<4> sh;
     __shared__ F4Staged staged;
     const Dsv41Tile tile = tiles[blockIdx.y / 2];
@@ -230,6 +235,7 @@ extern "C" __global__ void dsv41_experts_act(
     float limit,
     unsigned long long up_offset,
     unsigned long long row_stride) {
+    atlas_pdl_enter();
     const size_t b = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int per_row = rows / 32;
     if (b >= (size_t)count * per_row) return;
@@ -297,6 +303,7 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_o
     unsigned int data,
     unsigned int scales,
     unsigned long long piece_stride) {
+    atlas_pdl_enter();
     __shared__ F4Shared<4> sh;
     __shared__ F4Staged staged;
     const Dsv41Tile tile = tiles[blockIdx.y];

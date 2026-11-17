@@ -16,9 +16,8 @@
 // part's sum is a partial, and the parts are added in a fixed order before
 // the one rounding, whichever Spark computed them.
 //
-//   dsv41_{fp4,fp8}_gemv_tc{8,16,32}[_f32]: C[M, N] = A[M, K] .
-//     dequant(W)[N, K]^T for up
-//     to 8/16/32 rows. The layout is `mxfp8_gemv_tc`'s (glm-5.3-flash
+//   dsv41_{fp4,fp8}_gemv_tc8[_f32]: C[M, N] = A[M, K] . dequant(W)[N, K]^T
+//     for up to 8 rows. The layout is `mxfp8_gemv_tc`'s (glm-5.3-flash
 //     mxfp8_gemv.cu): CTA = 16 weight rows; 8 warps split K in 64-wide
 //     chunks; lane (g = lane/4, c = lane%4) loads 16 consecutive K values of
 //     rows g and g+8 (8 packed bytes each) and of each activation tile row
@@ -33,62 +32,133 @@
 
 #include "dsv41_tc.cuh"
 
-#define DSV41_TC(NAME, NT, FP4, F32OUT, CTYPE)                                              \
-    extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) NAME(                 \
-        const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,           \
-        const unsigned char* __restrict__ S, CTYPE* __restrict__ C, unsigned int M,         \
-        unsigned int N, unsigned int K, unsigned int out_stride) {                          \
-        __shared__ F4Shared<NT> sh;                                                         \
-        dsv41_gemv_tc_impl<NT, FP4, F32OUT>(sh, A, W, S, C, M, N, K, out_stride,            \
-                                            blockIdx.x, K);                                 \
-    }
+// An entry a weight format and an output: FP4 or FP8 weights, the sum
+// rounded to BF16 or left in FP32.
+extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp4_gemv_tc8(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int out_stride) {
+    atlas_pdl_enter();
+    __shared__ F4Shared<1> sh;
+    dsv41_gemv_tc_impl<1, true, false>(sh, A, W, S, C, M, N, K, out_stride, blockIdx.x, K);
+}
 
-DSV41_TC(dsv41_fp4_gemv_tc8, 1, true, false, __nv_bfloat16)
-DSV41_TC(dsv41_fp4_gemv_tc16, 2, true, false, __nv_bfloat16)
-DSV41_TC(dsv41_fp4_gemv_tc32, 4, true, false, __nv_bfloat16)
-DSV41_TC(dsv41_fp4_gemv_tc8_f32, 1, true, true, float)
-DSV41_TC(dsv41_fp4_gemv_tc16_f32, 2, true, true, float)
-DSV41_TC(dsv41_fp4_gemv_tc32_f32, 4, true, true, float)
-DSV41_TC(dsv41_fp8_gemv_tc8, 1, false, false, __nv_bfloat16)
-DSV41_TC(dsv41_fp8_gemv_tc16, 2, false, false, __nv_bfloat16)
-DSV41_TC(dsv41_fp8_gemv_tc32, 4, false, false, __nv_bfloat16)
-DSV41_TC(dsv41_fp8_gemv_tc8_f32, 1, false, true, float)
-DSV41_TC(dsv41_fp8_gemv_tc16_f32, 2, false, true, float)
-DSV41_TC(dsv41_fp8_gemv_tc32_f32, 4, false, true, float)
+extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp4_gemv_tc8_f32(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S,
+    float* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int out_stride) {
+    atlas_pdl_enter();
+    __shared__ F4Shared<1> sh;
+    dsv41_gemv_tc_impl<1, true, true>(sh, A, W, S, C, M, N, K, out_stride, blockIdx.x, K);
+}
+
+extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_tc8(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int out_stride) {
+    atlas_pdl_enter();
+    __shared__ F4Shared<1> sh;
+    dsv41_gemv_tc_impl<1, false, false>(sh, A, W, S, C, M, N, K, out_stride, blockIdx.x, K);
+}
+
+extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_tc8_f32(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S,
+    float* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int out_stride) {
+    atlas_pdl_enter();
+    __shared__ F4Shared<1> sh;
+    dsv41_gemv_tc_impl<1, false, true>(sh, A, W, S, C, M, N, K, out_stride, blockIdx.x, K);
+}
 
 // The same with the input rounded to FP8 on the way in (`F4_QUANT` in
 // `dsv41_tc.cuh`): `A` is BF16 as it was computed, and the bytes are those
 // of `dsv41_fp8_quant_dequant` and then the entry above.
-#define DSV41_TC_Q(NAME, F32OUT, CTYPE)                                                    \
-    extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) NAME(                 \
-        const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,           \
-        const unsigned char* __restrict__ S, CTYPE* __restrict__ C, unsigned int M,         \
-        unsigned int N, unsigned int K, unsigned int out_stride) {                          \
-        __shared__ F4Shared<1> sh;                                                          \
-        dsv41_gemv_tc_impl<1, false, F32OUT, F4_QUANT>(sh, A, W, S, C, M, N, K, out_stride, \
-                                                       blockIdx.x, K);                      \
-    }
+extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_tc8_q(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int out_stride) {
+    atlas_pdl_enter();
+    __shared__ F4Shared<1> sh;
+    dsv41_gemv_tc_impl<1, false, false, F4_QUANT>(sh, A, W, S, C, M, N, K, out_stride, blockIdx.x, K);
+}
 
-DSV41_TC_Q(dsv41_fp8_gemv_tc8_q, false, __nv_bfloat16)
-DSV41_TC_Q(dsv41_fp8_gemv_tc8_f32_q, true, float)
+extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_tc8_f32_q(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S,
+    float* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int out_stride) {
+    atlas_pdl_enter();
+    __shared__ F4Shared<1> sh;
+    dsv41_gemv_tc_impl<1, false, true, F4_QUANT>(sh, A, W, S, C, M, N, K, out_stride, blockIdx.x, K);
+}
 
 // An FP8 projection of an input the ranks gathered, which is in pieces
 // (`f4_at` in `dsv41_tc.cuh`): row m of piece p is at A[p * piece_stride +
 // m * a_stride]. `_q` rounds the input to FP8 on the way in. C [M, N] BF16.
-#define DSV41_TC_P(NAME, IN)                                                                \
-    extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) NAME(                 \
-        const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,           \
-        const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C, unsigned int M, \
-        unsigned int N, unsigned int K, unsigned int out_stride, unsigned int a_stride,     \
-        unsigned int piece, unsigned long long piece_stride) {                              \
-        __shared__ F4Shared<1> sh;                                                          \
-        dsv41_gemv_tc_impl<1, false, false, IN>(sh, A, W, S, C, M, N, K, out_stride,        \
-                                                blockIdx.x, a_stride, nullptr, nullptr,     \
-                                                piece, piece_stride);                       \
-    }
+extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_pieces(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int out_stride,
+    unsigned int a_stride,
+    unsigned int piece,
+    unsigned long long piece_stride) {
+    atlas_pdl_enter();
+    __shared__ F4Shared<1> sh;
+    dsv41_gemv_tc_impl<1, false, false, F4_ROUNDED>(sh, A, W, S, C, M, N, K, out_stride, blockIdx.x,
+                                                 a_stride, nullptr, nullptr, piece, piece_stride);
+}
 
-DSV41_TC_P(dsv41_fp8_gemv_pieces, F4_ROUNDED)
-DSV41_TC_P(dsv41_fp8_gemv_pieces_q, F4_QUANT)
+extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_pieces_q(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int out_stride,
+    unsigned int a_stride,
+    unsigned int piece,
+    unsigned long long piece_stride) {
+    atlas_pdl_enter();
+    __shared__ F4Shared<1> sh;
+    dsv41_gemv_tc_impl<1, false, false, F4_QUANT>(sh, A, W, S, C, M, N, K, out_stride, blockIdx.x,
+                                               a_stride, nullptr, nullptr, piece, piece_stride);
+}
 
 // Two FP8 projections of the same rows in one launch: C0 [M, N0] = A . W0^T
 // and C1 [M, N1] = A . W1^T, A [M, K] FP8-rounded BF16, M at most 8. A block
@@ -106,6 +176,7 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_
     unsigned int N1,
     unsigned int K,
     unsigned int M) {
+    atlas_pdl_enter();
     __shared__ F4Shared<1> sh;
     __shared__ F4Staged staged;
     const unsigned int first = (N0 + 15u) / 16u;
@@ -130,6 +201,7 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_
     unsigned int N,
     unsigned int K,
     unsigned int M) {
+    atlas_pdl_enter();
     __shared__ F4Shared<1> sh;
     __shared__ F4Staged staged;
     const unsigned long long y = blockIdx.y;
@@ -152,6 +224,7 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_
     unsigned int N,
     unsigned int K,
     unsigned int M) {
+    atlas_pdl_enter();
     __shared__ F4Shared<1> sh;
     __shared__ F4Staged staged;
     const unsigned long long y = blockIdx.y;
