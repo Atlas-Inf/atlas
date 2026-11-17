@@ -28,6 +28,17 @@ __device__ __forceinline__ unsigned int dsv41_touchers(unsigned int blocks) {
     return blocks < DSV41_TOUCH ? blocks : DSV41_TOUCH;
 }
 
+// How many of a projection's `rows` rows of `row_bytes` bytes a launch
+// touches: what the 24 MB cache still holds when the launch reads it, beside
+// whatever its neighbours touch. A weight that does not fit is read twice if
+// it is touched whole: the draft head's 165 MB took 1.6 ms a pass so, and
+// takes 0.7 read once.
+#define DSV41_TOUCH_BYTES (12u << 20)
+__device__ __forceinline__ unsigned int dsv41_touched(unsigned int rows, unsigned int row_bytes) {
+    const unsigned int most = DSV41_TOUCH_BYTES / (row_bytes ? row_bytes : 1u);
+    return rows < most ? rows : most;
+}
+
 #include <cuda_bf16.h>
 
 #define DSV41_PARTS 4

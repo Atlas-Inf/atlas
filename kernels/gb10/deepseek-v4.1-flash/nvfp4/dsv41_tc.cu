@@ -71,8 +71,8 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_
     unsigned int N,
     unsigned int K,
     unsigned int out_stride) {
-    atlas_pdl_enter_touch({W, K, K}, {S, K / F4_BLOCK, K / F4_BLOCK}, N, blockIdx.x,
-                          dsv41_touchers(gridDim.x));
+    atlas_pdl_enter_touch({W, K, K}, {S, K / F4_BLOCK, K / F4_BLOCK}, dsv41_touched(N, K),
+                          blockIdx.x, dsv41_touchers(gridDim.x));
     __shared__ F4Shared<1> sh;
     dsv41_gemv_tc_impl<1, false, false>(sh, A, W, S, C, M, N, K, out_stride, blockIdx.x, K);
 }
@@ -86,8 +86,8 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_
     unsigned int N,
     unsigned int K,
     unsigned int out_stride) {
-    atlas_pdl_enter_touch({W, K, K}, {S, K / F4_BLOCK, K / F4_BLOCK}, N, blockIdx.x,
-                          dsv41_touchers(gridDim.x));
+    atlas_pdl_enter_touch({W, K, K}, {S, K / F4_BLOCK, K / F4_BLOCK}, dsv41_touched(N, K),
+                          blockIdx.x, dsv41_touchers(gridDim.x));
     __shared__ F4Shared<1> sh;
     dsv41_gemv_tc_impl<1, false, true>(sh, A, W, S, C, M, N, K, out_stride, blockIdx.x, K);
 }
@@ -138,8 +138,8 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_
     unsigned int a_stride,
     unsigned int piece,
     unsigned long long piece_stride) {
-    atlas_pdl_enter_touch({W, K, K}, {S, K / F4_BLOCK, K / F4_BLOCK}, N, blockIdx.x,
-                          dsv41_touchers(gridDim.x));
+    atlas_pdl_enter_touch({W, K, K}, {S, K / F4_BLOCK, K / F4_BLOCK}, dsv41_touched(N, K),
+                          blockIdx.x, dsv41_touchers(gridDim.x));
     __shared__ F4Shared<1> sh;
     dsv41_gemv_tc_impl<1, false, false, F4_ROUNDED>(sh, A, W, S, C, M, N, K, out_stride, blockIdx.x,
                                                  a_stride, nullptr, nullptr, piece, piece_stride);
@@ -221,8 +221,8 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_
     unsigned int N,
     unsigned int K,
     unsigned int M) {
-    atlas_pdl_enter_touch({W, K, K}, {S, K / F4_BLOCK, K / F4_BLOCK}, gridDim.y * N,
-                          blockIdx.y * gridDim.x + blockIdx.x,
+    atlas_pdl_enter_touch({W, K, K}, {S, K / F4_BLOCK, K / F4_BLOCK},
+                          dsv41_touched(gridDim.y * N, K), blockIdx.y * gridDim.x + blockIdx.x,
                           dsv41_touchers(gridDim.x * gridDim.y));
     __shared__ F4Shared<1> sh;
     const unsigned long long y = blockIdx.y;
