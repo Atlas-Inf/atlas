@@ -222,7 +222,11 @@ impl TransformerModel {
         self.final_norm_rows(hidden, normed, k as u32, stream)?;
 
         // ── LM head for K tokens → logits[K, vocab] ──
-        self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
+        // In a share a rank where the ranks hold the head so (`head_shares`):
+        // serial decode's bytes, and a quarter of the head to read.
+        if !self.head_rows_in_shares(normed, k, stream)? {
+            self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
+        }
 
         // ── Argmax per token ──
         let vocab = self.config.vocab_size;

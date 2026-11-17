@@ -57,6 +57,7 @@ impl TransformerModel {
                 if rows > 1
                     && self.dense_gemv_batchm_kernel.0 != 0
                     && (self.levers.exact_verify
+                        || self.config.model_type == "deepseek_v41"
                         || self.config.model_type == "qwen4_exp"
                             && (batchm_requested() || self.levers.qwen4exp_batch_fast))
                     && !self.levers.batch_bisect(ops::BISECT_HEAD) =>
