@@ -130,24 +130,34 @@ __device__ __forceinline__ void dsv41_hc_coefficients(
     }
     __syncwarp();
     // Columns once, then `sinkhorn_iters - 1` rounds of rows and columns,
-    // each dividing by (sum + eps). A lane owns a row in the row pass and a
-    // column in the column pass.
+    // each dividing by (sum + eps). A lane owns one entry: it adds its row's
+    // (or its column's) entries in their order and divides its own. A
+    // division is some 80 ns here, and with a lane a row (four of them one
+    // after another in each of forty passes) they were most of this
+    // launch's 20 us, which a decode step makes eighty times.
+    const unsigned int mine_row = lane / hc, mine_col = lane % hc;
+    const bool mine = lane < hc * hc;
     for (unsigned int round = 0; round < sinkhorn_iters; ++round) {
         if (round > 0) {
-            if (lane < hc) {
+            float next = 0.0f;
+            if (mine) {
                 float sum = 0.0f;
-                for (unsigned int k = 0; k < hc; ++k) sum += comb[lane * hc + k];
-                for (unsigned int k = 0; k < hc; ++k)
-                    comb[lane * hc + k] = comb[lane * hc + k] / (sum + hc_eps);
+                for (unsigned int k = 0; k < hc; ++k) sum += comb[mine_row * hc + k];
+                next = comb[lane] / (sum + hc_eps);
             }
+            // Every lane has read the pass's entries before one is replaced.
+            __syncwarp();
+            if (mine) comb[lane] = next;
             __syncwarp();
         }
-        if (lane < hc) {
+        float next = 0.0f;
+        if (mine) {
             float sum = 0.0f;
-            for (unsigned int j = 0; j < hc; ++j) sum += comb[j * hc + lane];
-            for (unsigned int j = 0; j < hc; ++j)
-                comb[j * hc + lane] = comb[j * hc + lane] / (sum + hc_eps);
+            for (unsigned int j = 0; j < hc; ++j) sum += comb[j * hc + mine_col];
+            next = comb[lane] / (sum + hc_eps);
         }
+        __syncwarp();
+        if (mine) comb[lane] = next;
         __syncwarp();
     }
     if (lane < hc * hc) comb_out[lane] = comb[lane];

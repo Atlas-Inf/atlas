@@ -97,17 +97,16 @@ extern "C" __global__ void dsv41_expert_act(
     unsigned int rows,
     float limit) {
     atlas_pdl_enter();
-    const unsigned int b = blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned int per_slot = rows / 32;
-    if (b >= slots * per_slot) return;
-    const unsigned int slot = b / per_slot, at = (b % per_slot) * 32;
+    // A thread a value, a warp a block of 32: rows % 32 == 0, and a block's
+    // threads are whole warps.
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= slots * rows) return;
+    const unsigned int slot = i / rows, at = i % rows;
     const float weight = slot < routed ? weights[slot] : 1.0f;
     const __nv_bfloat16* gate = gate_up + (size_t)(2 * slot) * rows + at;
-    const __nv_bfloat16* up = gate + rows;
-    float v[32];
-    for (int i = 0; i < 32; ++i)
-        v[i] = dsv41_swiglu_one(__bfloat162float(gate[i]), __bfloat162float(up[i]), weight, limit);
-    dsv41_fp8_block(v, inner + (size_t)slot * rows + at);
+    const float v =
+        dsv41_swiglu_one(__bfloat162float(gate[0]), __bfloat162float(gate[rows]), weight, limit);
+    inner[(size_t)slot * rows + at] = dsv41_fp8_block_lane(v);
 }
 
 // out[slot] = BF16(w2 . inner[slot]) for the part's N rows of w2: [slots, N].
@@ -280,18 +279,16 @@ extern "C" __global__ void dsv41_experts_act(
     unsigned long long up_offset,
     unsigned long long row_stride) {
     atlas_pdl_enter();
-    const size_t b = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned int per_row = rows / 32;
-    if (b >= (size_t)count * per_row) return;
-    const size_t r = b / per_row;
-    const unsigned int at = (unsigned int)(b % per_row) * 32;
+    // A thread a value, a warp a block of 32 (`dsv41_expert_act`).
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)count * rows) return;
+    const size_t r = i / rows;
+    const unsigned int at = (unsigned int)(i % rows);
     const float weight = weights ? weights[r] : 1.0f;
     const __nv_bfloat16* gate = gate_up + r * row_stride + at;
-    const __nv_bfloat16* up = gate + up_offset;
-    float v[32];
-    for (int i = 0; i < 32; ++i)
-        v[i] = dsv41_swiglu_one(__bfloat162float(gate[i]), __bfloat162float(up[i]), weight, limit);
-    dsv41_fp8_block(v, inner + r * rows + at);
+    const float v = dsv41_swiglu_one(__bfloat162float(gate[0]), __bfloat162float(gate[up_offset]),
+                                     weight, limit);
+    inner[r * rows + at] = dsv41_fp8_block_lane(v);
 }
 
 // The same activations as the ranks send them and the tensor cores read

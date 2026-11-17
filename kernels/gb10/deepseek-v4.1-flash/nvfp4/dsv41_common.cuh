@@ -92,6 +92,17 @@ __device__ __forceinline__ void dsv41_fp8_block(const float* v, __nv_bfloat16* d
     for (int i = 0; i < 32; ++i) dst[i] = __float2bfloat16(dsv41_fp8_value(v[i], scale));
 }
 
+// The same of one value a lane: the warp's 32 values `v` are a block, and
+// every lane gets its own value as `dsv41_fp8_block` writes it. A thread a
+// block took the block's 32 roundings one after another.
+__device__ __forceinline__ __nv_bfloat16 dsv41_fp8_block_lane(float v) {
+    float amax = fabsf(v);
+    #pragma unroll
+    for (unsigned int o = 16; o > 0; o >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    return __float2bfloat16(dsv41_fp8_value(v, dsv41_fp8_scale(amax)));
+}
+
 // Two BF16 values in a word.
 __device__ __forceinline__ void dsv41_unpack2(unsigned int packed, float& v0, float& v1) {
     v0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed & 0xFFFFu)));

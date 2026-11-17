@@ -382,7 +382,7 @@ pub fn experts_in(
             .arg_u32(hidden as u32),
     )
     .launch(stream)?;
-    elementwise(gpu, kernels.expert_act, slots as usize * rows / 32)
+    elementwise(gpu, kernels.expert_act, slots as usize * rows)
         .arg_ptr(gate_up)
         .arg_ptr(weights)
         .arg_ptr(inner)

@@ -356,7 +356,7 @@ pub fn activate(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernels.experts_act)
-        .grid([div_ceil((count * part_rows / 32) as u32, 256), 1, 1])
+        .grid([div_ceil((count * part_rows) as u32, 256), 1, 1])
         .block([256, 1, 1])
         .arg_ptr(gate_up.base)
         .arg_ptr(weights)
