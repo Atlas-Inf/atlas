@@ -66,6 +66,12 @@ pub struct Layer {
     last: bool,
     /// The rows of a chunk's end a prefill may run alone (`tail.rs`).
     tail: Option<usize>,
+    /// Whether a rank runs a large batch's mixing for its own rows alone
+    /// ([`Owned`]): a layer of every row, with a layer after it that
+    /// [`Self::replicates`]. And whether this is that layer, the first that
+    /// runs a prompt's last rows alone.
+    owns: bool,
+    replicates: bool,
     target: Option<Target>,
 }
 
@@ -129,8 +135,10 @@ impl Layer {
             target.take(gpu, &shared.shape, streams, rows, state, position, stream)?;
         }
         let comm = ctx.comm.filter(|_| ctx.config.ep_world_size > 1);
-        self.block
-            .forward_rows(gpu, row, rows, streams, pre, state, position, comm, stream)?;
+        let own = self.owned(rows, ctx).filter(|_| self.owns);
+        self.block.forward_rows(
+            gpu, row, rows, streams, pre, state, position, comm, own, stream,
+        )?;
         if self.last {
             // Before the head, the stream collapses with the last mix.
             hc::collapse(
@@ -146,28 +154,6 @@ impl Layer {
             (0..rows).for_each(|_| profile::token_done());
             profile::pass_ends(gpu, stream)?;
         }
-        Ok(())
-    }
-}
-
-impl Layer {
-    /// At a chunk's first layer: whether the pass reads every row of the
-    /// last layer, which the rank that serves the request knows and the
-    /// others are told, for the layers after this one to go by.
-    fn agree_on_rows(&self, ctx: &ForwardContext, stream: u64) -> Result<()> {
-        let shared = &self.block.shared;
-        let mut whole = tail::whole_here();
-        if let Some(comm) = ctx.comm.filter(|_| ctx.config.ep_world_size > 1) {
-            let word = shared.scratch.word;
-            let mut bytes = [0u8; 16];
-            bytes[0] = u8::from(whole);
-            ctx.gpu.synchronize(stream)?;
-            ctx.gpu.copy_h2d(&bytes, word)?;
-            comm.broadcast(word.0, bytes.len(), 0)?;
-            ctx.gpu.copy_d2h(word, &mut bytes)?;
-            whole = bytes[0] != 0;
-        }
-        shared.handoff.lock().expect("handoff").whole = whole;
         Ok(())
     }
 }
@@ -258,6 +244,9 @@ impl TransformerLayer for Layer {
         }
         let whole = self.block.shared.handoff.lock().expect("handoff").whole;
         let from = tail::first_row(self.tail, num_tokens, whole);
+        if self.replicates && from < num_tokens {
+            self.replicate(hidden, num_tokens, from, ctx, stream)?;
+        }
         for first in (from..num_tokens).step_by(batch) {
             let rows = (num_tokens - first).min(batch);
             let at = hidden.offset(first * width);
@@ -469,6 +458,11 @@ pub fn load_layers(
             first: layer == 0,
             last: layer + 1 == layers,
             tail: tail::rows_of_layer(layer, layers, &per_row),
+            owns: tail::rows_of_layer(layer, layers, &per_row).is_none()
+                && tail::rows_of_layer(layers - 1, layers, &per_row).is_some(),
+            replicates: tail::rows_of_layer(layer, layers, &per_row).is_some()
+                && layer > 0
+                && tail::rows_of_layer(layer - 1, layers, &per_row).is_none(),
             target: targets
                 .iter()
                 .position(|&l| l == layer)
@@ -487,6 +481,9 @@ pub fn load_layers(
 #[path = "layer_draft.rs"]
 mod draft;
 use draft::Target;
+
+#[path = "layer_rows.rs"]
+mod rows;
 
 #[path = "layer_lookup.rs"]
 mod lookup;

@@ -12,6 +12,7 @@ use super::hc::SublayerParts;
 use super::moe::{self, ExpertPart};
 use super::moe_gemm::{Runs, Sent};
 use super::moe_grouped::{self, GateUp, Plan};
+use super::owned::{self, Owned};
 use super::parts::{self, PARTS};
 use super::profile;
 use super::weights::row_part;
@@ -40,6 +41,7 @@ impl Block {
         gpu: &dyn GpuBackend,
         rows: usize,
         comm: Option<&dyn CommBackend>,
+        own: Option<Owned>,
         stream: u64,
     ) -> Result<()> {
         let (s, k, sc, w) = (
@@ -50,26 +52,43 @@ impl Block {
         );
         let held = self.shared.held;
         // The chosen in expert order: the reference adds their outputs so.
+        // Of the rows whose input is here: every row's, or the rows this
+        // rank keeps. The ranks then gather each other's routing, and the
+        // input in FP8, which every rank's part of the experts reads.
+        let (at, kept) = own.map_or((0, rows), |own| (own.first, own.count));
+        let routed = at * s.top_k * 4;
         profile::stage(gpu, stream, "route", || {
+            if kept == 0 {
+                return Ok(());
+            }
             moe::route_fast(
                 gpu,
                 &k.moe,
-                sc.normed,
+                sc.normed.offset(at * s.hidden * 2),
                 w.gate,
                 w.bias,
                 sc.route_scores,
-                sc.chosen,
-                sc.weights,
-                rows,
+                sc.chosen.offset(routed),
+                sc.weights.offset(routed),
+                kept,
                 s.hidden,
                 s.experts,
                 s.top_k,
                 s.route_scale,
                 true,
-                self.gemm.is_some() && rows >= GEMM_ROWS,
+                self.gemm.is_some() && kept >= GEMM_ROWS,
                 stream,
             )
         })?;
+        if let Some(own) = own {
+            let rows_of = |base: DevicePtr, row_bytes: usize| {
+                let recv = sc.gather_recv;
+                owned::gather_rows(gpu, comm, held, own, base, recv, row_bytes, stream)
+            };
+            rows_of(sc.chosen, s.top_k * 4)?;
+            rows_of(sc.weights, s.top_k * 4)?;
+            rows_of(sc.quantized, s.hidden * 2)?;
+        }
         // One slot per chosen expert, then the shared expert's.
         let slots = s.top_k + 1;
         let began = profile::begin(gpu, stream)?;
@@ -385,16 +404,23 @@ impl Block {
         }
         profile::end(gpu, stream, "experts out", began)?;
         profile::stage(gpu, stream, "gather", || {
-            parts::gather(
-                gpu,
-                comm,
-                held,
-                sc.moe_out,
-                sc.gather_recv,
-                rows * part_n * 2,
-                rows * part_n * 2,
-                stream,
-            )
+            let (recv, bytes) = (sc.gather_recv, part_n * 2);
+            match own {
+                // Only the rank that keeps a row reads its output.
+                Some(own) => {
+                    owned::to_owners(gpu, comm, held, own, sc.moe_out, recv, rows, bytes, stream)
+                }
+                None => parts::gather(
+                    gpu,
+                    comm,
+                    held,
+                    sc.moe_out,
+                    recv,
+                    rows * bytes,
+                    rows * bytes,
+                    stream,
+                ),
+            }
         })
     }
 }

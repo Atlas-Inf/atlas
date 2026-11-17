@@ -78,7 +78,7 @@ fn the_moe_leaves_the_bytes_of_one_launch_at_a_time() -> Result<()> {
             s.hidden,
             stream,
         )?;
-        block.moe(gpu, 1, None, stream)?;
+        block.moe(gpu, 1, None, None, stream)?;
         let fused = read(sc.moe_out, PARTS * n * 2)?;
         let chosen: Vec<usize> = read(sc.chosen, s.top_k * 4)?
             .chunks_exact(4)

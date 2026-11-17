@@ -13,6 +13,7 @@ use super::cache_recipe::{WINDOW, visible_groups, window_row, window_slot};
 use super::gemm::{GEMM_ROWS, Input, Sent};
 use super::index;
 use super::ops::{self, HEAD_DIM, MAX_KEYS, Turn};
+use super::owned::{self, Owned};
 use super::parts::{self, PARTS};
 use super::profile;
 use super::state::{KEPT_ROWS, SeqState};
@@ -70,6 +71,7 @@ impl Block {
         state: &mut SeqState,
         position: usize,
         comm: Option<&dyn CommBackend>,
+        own: Option<Owned>,
         stream: u64,
     ) -> Result<()> {
         let (s, k, sc, w) = (
@@ -85,10 +87,30 @@ impl Block {
         let gemm = self.gemm.as_ref().filter(|_| rows >= GEMM_ROWS);
         match gemm {
             Some(g) => {
-                let x = Input::rows(sc.quantized, s.hidden);
-                let act = sc.gemm.quantize(gpu, x, rows, s.hidden, stream)?;
-                g.wq_a.gemm(act, sc.q_low, rows, stream)?;
-                g.wkv.gemm(act, sc.key, rows, stream)?;
+                // Of the rows whose input is here: every row's, or the rows
+                // this rank keeps, which the ranks then gather.
+                let (at, kept) = own.map_or((0, rows), |own| (own.first, own.count));
+                if kept > 0 {
+                    let x = Input::rows(sc.quantized.offset(at * s.hidden * 2), s.hidden);
+                    let act = sc.gemm.quantize(gpu, x, kept, s.hidden, stream)?;
+                    g.wq_a
+                        .gemm(act, sc.q_low.offset(at * s.q_rank * 2), kept, stream)?;
+                    g.wkv
+                        .gemm(act, sc.key.offset(at * HEAD_DIM * 2), kept, stream)?;
+                }
+                if let Some(own) = own {
+                    let held = self.shared.held;
+                    let rows_of = |base: DevicePtr, row_bytes: usize| {
+                        let recv = sc.gather_recv;
+                        owned::gather_rows(gpu, comm, held, own, base, recv, row_bytes, stream)
+                    };
+                    rows_of(sc.q_low, s.q_rank * 2)?;
+                    rows_of(sc.key, HEAD_DIM * 2)?;
+                    // A key source and an indexer read every row's input.
+                    if self.weights.compressor.is_some() || self.weights.indexer.is_some() {
+                        rows_of(sc.normed, s.hidden * 2)?;
+                    }
+                }
             }
             None => parts::project_two(
                 gpu,
@@ -185,7 +207,7 @@ impl Block {
             }
         };
         profile::end(gpu, stream, "compress and choose", began)?;
-        self.attend_keys(gpu, rows, window, compressed, keys, turn, comm, stream)
+        self.attend_keys(gpu, rows, window, compressed, keys, turn, comm, own, stream)
     }
 
     /// The rest of the attention, from the keys: each of the `rows` queries
@@ -203,6 +225,7 @@ impl Block {
         keys: usize,
         turn: Turn,
         comm: Option<&dyn CommBackend>,
+        own: Option<Owned>,
         stream: u64,
     ) -> Result<()> {
         let (s, k, sc, w) = (
@@ -370,16 +393,23 @@ impl Block {
         }
         profile::end(gpu, stream, "output projections", began)?;
         profile::stage(gpu, stream, "gather", || {
-            parts::gather(
-                gpu,
-                comm,
-                held,
-                sc.attn_out,
-                sc.gather_recv,
-                rows * part_n * 2,
-                rows * part_n * 2,
-                stream,
-            )
+            let (recv, bytes) = (sc.gather_recv, part_n * 2);
+            match own {
+                // Only the rank that keeps a row reads its output.
+                Some(own) => {
+                    owned::to_owners(gpu, comm, held, own, sc.attn_out, recv, rows, bytes, stream)
+                }
+                None => parts::gather(
+                    gpu,
+                    comm,
+                    held,
+                    sc.attn_out,
+                    recv,
+                    rows * bytes,
+                    rows * bytes,
+                    stream,
+                ),
+            }
         })
     }
 }

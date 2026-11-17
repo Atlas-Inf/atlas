@@ -93,7 +93,9 @@ fn blocks_replay_the_reference_token_by_token() -> Result<()> {
                 );
                 hand_choice(&block, &role, &theirs, visible_groups(position, ratio));
             }
-            block.attend(gpu, 0, 1, streams, pre, &mut state, position, None, stream)?;
+            block.attend(
+                gpu, 0, 1, streams, pre, &mut state, position, None, None, stream,
+            )?;
             attended.extend(download(gpu, block.attention_out(gpu, stream)?, hidden)?);
             // A key is FP4: one rounding step in it is a large step, and
             // every later token reads it. So once a group's keys have been
@@ -128,7 +130,7 @@ fn blocks_replay_the_reference_token_by_token() -> Result<()> {
                 gpu,
                 &attention[position * hidden * 2..(position + 1) * hidden * 2],
             )?;
-            block.finish(gpu, 1, streams, pre, None, stream)?;
+            block.finish(gpu, 1, streams, pre, None, None, stream)?;
             got.extend(download(gpu, streams, copies * hidden)?);
             let mut out = vec![0u8; copies * 4];
             gpu.copy_d2h(pre, &mut out)?;

@@ -28,6 +28,7 @@ pub mod moe;
 pub mod moe_gemm;
 pub mod moe_grouped;
 pub mod ops;
+mod owned;
 pub mod parts;
 mod profile;
 mod seen;

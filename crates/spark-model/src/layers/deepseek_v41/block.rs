@@ -16,7 +16,8 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::gemm::{GEMM_ROWS, GemmWeights};
 use super::hc::{self, HcSite, SiteOut, SublayerParts};
-use super::parts::Held;
+use super::owned::Owned;
+use super::parts::{Held, PARTS};
 use super::profile;
 pub use super::shape::{BlockKernels, Scratch, Shape};
 pub use super::state::{CompressedKeys, Handoff, SeqState};
@@ -116,7 +117,9 @@ impl Block {
 
     /// One Hyper-Connection site of `rows` tokens (`hc::site`): the sublayer
     /// `before` into the stream, then the input of the next, collapsed with
-    /// `pre_in`, in `scratch.normed` and `scratch.quantized`.
+    /// `pre_in`, in `scratch.normed` and `scratch.quantized`. With `own`,
+    /// of the rows this rank keeps the stream of, and no others: every
+    /// buffer is a row a token, so those rows are where they would be.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn site(
         &self,
@@ -128,6 +131,7 @@ impl Block {
         pre_in: DevicePtr,
         pre_out: DevicePtr,
         norm_weight: DevicePtr,
+        own: Option<Owned>,
         stream: u64,
     ) -> Result<()> {
         let (s, k, sc) = (
@@ -135,10 +139,27 @@ impl Block {
             &self.shared.kernels,
             &self.shared.scratch,
         );
+        let (at, rows) = own.map_or((0, rows), |own| (own.first, own.count));
+        if rows == 0 {
+            return Ok(());
+        }
+        let (row, mix) = (at * s.hidden * 2, at * s.hc.copies * 4);
+        let (streams, pre_in, pre_out) = (
+            streams.offset(row * s.hc.copies),
+            pre_in.offset(mix),
+            pre_out.offset(mix),
+        );
+        let (post, comb) = (sc.post.offset(mix), sc.comb.offset(mix * s.hc.copies));
+        // A part of the sublayer before is a run of rows: a later row is
+        // the same number of values on in each.
+        let before = before.map(|b| SublayerParts {
+            parts: b.parts.offset(row / PARTS),
+            rows: b.rows,
+        });
         let out = SiteOut {
-            collapsed: sc.x,
-            normed: sc.normed,
-            quantized: sc.quantized,
+            collapsed: sc.x.offset(row),
+            normed: sc.normed.offset(row),
+            quantized: sc.quantized.offset(row),
             partials: sc.hc_partials,
         };
         // A batch's mix is a GEMM against the site's weights in three BF16
@@ -159,8 +180,8 @@ impl Block {
                 streams,
                 pre_in,
                 pre_out,
-                sc.post,
-                sc.comb,
+                post,
+                comb,
                 norm_weight,
                 out,
                 sc.hc_sums,
@@ -176,8 +197,8 @@ impl Block {
                 streams,
                 pre_in,
                 pre_out,
-                sc.post,
-                sc.comb,
+                post,
+                comb,
                 norm_weight,
                 out,
                 rows,
@@ -210,6 +231,7 @@ impl Block {
         state: &mut SeqState,
         position: usize,
         comm: Option<&dyn CommBackend>,
+        own: Option<Owned>,
         stream: u64,
     ) -> Result<()> {
         let (sc, w) = (&self.shared.scratch, &self.weights);
@@ -228,9 +250,10 @@ impl Block {
             pre,
             sc.site_pre,
             w.attn.norm,
+            own,
             stream,
         )?;
-        self.attention(gpu, row, rows, state, position, comm, stream)
+        self.attention(gpu, row, rows, state, position, comm, own, stream)
     }
 
     /// The rest of the block: the attention's output into the stream, the
@@ -244,6 +267,7 @@ impl Block {
         streams: DevicePtr,
         pre: DevicePtr,
         comm: Option<&dyn CommBackend>,
+        own: Option<Owned>,
         stream: u64,
     ) -> Result<()> {
         let (s, k, sc, w) = (
@@ -261,19 +285,30 @@ impl Block {
             sc.site_pre,
             pre,
             w.moe.norm,
+            own,
             stream,
         )?;
-        self.moe(gpu, rows, comm, stream)?;
+        self.moe(gpu, rows, comm, own, stream)?;
+        // The MoE's output into the stream: of the rows kept here.
+        let (at, kept) = own.map_or((0, rows), |own| (own.first, own.count));
+        if kept == 0 {
+            return Ok(());
+        }
+        let (row, mix) = (at * s.hidden * 2, at * s.hc.copies * 4);
+        let parts = self.moe_parts(rows);
         profile::stage(gpu, stream, "expand", || {
             hc::expand_parts(
                 gpu,
                 k.hc.expand_parts,
                 &s.hc,
-                self.moe_parts(rows),
-                streams,
-                sc.post,
-                sc.comb,
-                rows,
+                SublayerParts {
+                    parts: parts.parts.offset(row / PARTS),
+                    rows: parts.rows,
+                },
+                streams.offset(row * s.hc.copies),
+                sc.post.offset(mix),
+                sc.comb.offset(mix * s.hc.copies),
+                kept,
                 stream,
             )
         })
@@ -284,6 +319,8 @@ impl Block {
     /// `[rows, copies, hidden]` BF16 stream, updated in place. `pre` is
     /// `[rows, copies]` FP32: the coefficients this block's attention is
     /// collapsed with on entry, the ones the next block's is on return.
+    /// With `own`, the stream and `pre` are this rank's for its rows of the
+    /// batch alone ([`Owned`]), on entry and on return.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_rows(
         &self,
@@ -295,10 +332,13 @@ impl Block {
         state: &mut SeqState,
         position: usize,
         comm: Option<&dyn CommBackend>,
+        own: Option<Owned>,
         stream: u64,
     ) -> Result<()> {
-        self.attend(gpu, row, rows, streams, pre, state, position, comm, stream)?;
-        self.finish(gpu, rows, streams, pre, comm, stream)
+        self.attend(
+            gpu, row, rows, streams, pre, state, position, comm, own, stream,
+        )?;
+        self.finish(gpu, rows, streams, pre, comm, own, stream)
     }
 }
 

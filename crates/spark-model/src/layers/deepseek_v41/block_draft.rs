@@ -115,6 +115,7 @@ impl Block {
             pre,
             sc.site_pre,
             w.attn.norm,
+            None,
             stream,
         )?;
         parts::project_two(
@@ -156,7 +157,7 @@ impl Block {
             .flat_map(|_| row.iter().flat_map(|i| i.to_le_bytes()))
             .collect();
         gpu.copy_h2d_async(&bytes, sc.idx, stream)?;
-        self.attend_keys(gpu, rows, window, own, row.len(), turn, comm, stream)?;
-        self.finish(gpu, rows, streams, pre, comm, stream)
+        self.attend_keys(gpu, rows, window, own, row.len(), turn, comm, None, stream)?;
+        self.finish(gpu, rows, streams, pre, comm, None, stream)
     }
 }
