@@ -84,3 +84,18 @@ fn token_refund_restores_budget() {
     lim.refund_tokens("k", 500);
     assert!(lim.admit("k", 500).allowed);
 }
+
+#[test]
+fn identity_map_stops_growing_at_cap_when_every_key_is_active() {
+    let lim = RateLimiter::with_config(cfg(60, 0));
+    for i in 0..MAX_KEYS {
+        assert!(lim.admit(&format!("xff:{i}"), 0).allowed);
+    }
+    assert_eq!(lim.inner.lock().len(), MAX_KEYS);
+
+    for i in 0..10 {
+        let d = lim.admit(&format!("xff:new-{i}"), 0);
+        assert!(d.allowed, "a new identity past the cap fails open");
+    }
+    assert_eq!(lim.inner.lock().len(), MAX_KEYS);
+}

@@ -285,15 +285,23 @@ impl RateLimiter {
                 state.requests.last_refill.elapsed() < IDLE_EVICT
                     || state.tokens.last_refill.elapsed() < IDLE_EVICT
             });
-            // If the cap is still hit (every key is genuinely active),
-            // fail-open for the new key — better to admit than to OOM.
-            // Real production with this many distinct identities should
-            // have an upstream gateway shaping traffic.
         }
-        let state = map.entry(key.to_string()).or_insert_with(|| KeyState {
+        let new_key_state = || KeyState {
             requests: Bucket::new(self.cfg.burst_rpm),
             tokens: Bucket::new(self.cfg.burst_tpm),
-        });
+        };
+        // If the cap is still hit (every key is genuinely active), judge the
+        // new key against a fresh, untracked bucket: it is admitted as any
+        // new identity would be, but the map stays bounded. Real production
+        // with this many distinct identities should have an upstream gateway
+        // shaping traffic.
+        let mut untracked;
+        let state = if map.len() >= MAX_KEYS && !map.contains_key(key) {
+            untracked = new_key_state();
+            &mut untracked
+        } else {
+            map.entry(key.to_string()).or_insert_with(new_key_state)
+        };
 
         // Request bucket.
         let req_allowed = if rpm > 0 {
