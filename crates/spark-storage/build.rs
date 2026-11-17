@@ -28,6 +28,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ATLAS_SKIP_BUILD");
     println!("cargo:rerun-if-env-changed=SKIP_ATLAS_BUILD");
     println!("cargo:rerun-if-env-changed=ATLAS_TARGET_HW");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
     // FIRST, before any early return: `rustc-check-cfg` does not cross crates,
     // so this crate must declare the cfg name or every `#[cfg(atlas_rdma_verbs)]`
     // below trips `unexpected_cfgs` (a hard error under `warnings = "deny"`).
