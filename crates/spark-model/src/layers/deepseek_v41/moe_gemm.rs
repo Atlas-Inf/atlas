@@ -96,8 +96,8 @@ impl Runs {
 }
 
 /// One part of a batch's hidden activations as a rank sends it: the pairs'
-/// codes, their scales, and then the shared expert's rows as BF16 values
-/// (its projection out is a GEMM of its own, which rounds them itself).
+/// codes, their scales, and then the shared expert's rows the same way,
+/// codes and then scales ([`Self::shared_rows`]).
 #[derive(Clone, Copy)]
 pub struct Sent {
     /// Bytes of a part, and from one part to the next.
@@ -113,9 +113,20 @@ impl Sent {
         let scales = pairs * part_rows;
         let shared = scales + (pairs * part_rows / 32).next_multiple_of(16);
         Self {
-            bytes: (shared + rows * part_rows * 2).next_multiple_of(16),
+            bytes: (shared + rows * part_rows + rows * part_rows / 32).next_multiple_of(16),
             scales,
             shared,
+        }
+    }
+
+    /// The shared expert's `rows` rows of a part, from [`Self::shared`] on,
+    /// as the GEMM that projects them out reads what the ranks gathered.
+    pub fn shared_rows(&self, rows: usize, part_rows: usize) -> super::gemm::Sent {
+        super::gemm::Sent {
+            groups: 1,
+            piece: part_rows,
+            bytes: self.bytes,
+            scales: rows * part_rows,
         }
     }
 }

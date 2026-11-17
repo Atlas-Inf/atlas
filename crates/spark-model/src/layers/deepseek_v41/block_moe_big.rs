@@ -21,7 +21,6 @@ use spark_comm::CommBackend;
 use spark_runtime::gpu::GpuBackend;
 
 use super::block::Block;
-use super::gemm::Input;
 use super::moe_gemm::{Act, ExpertGemm, Runs, Sent, Span};
 use super::moe_grouped::{self, GateUp};
 use super::parts::{self, PARTS};
@@ -125,17 +124,19 @@ impl Block {
                     up_offset: rows * part_rows,
                     row_stride: part_rows,
                 };
+                // In codes, as the pairs' are: half the bytes to gather, and
+                // what the projection out reads.
                 let to = inner(part).offset(sent.shared);
-                let limit = s.swiglu_limit;
-                moe_grouped::activate(
+                moe_grouped::activate_codes(
                     gpu,
                     &k.moe,
                     gate_up,
                     spark_runtime::gpu::DevicePtr::NULL,
                     to,
+                    to.offset(sent.shared_rows(rows, part_rows).scales),
                     rows,
                     part_rows,
-                    limit,
+                    s.swiglu_limit,
                     stream,
                 )?;
             }
@@ -170,13 +171,12 @@ impl Block {
             }
             // Its rows of the hidden activations come after the pairs'.
             let [_, _, w2] = shared(part)?;
-            let x = Input {
-                x: sc.inner_parts.offset(sent.shared),
-                stride: part_rows,
-                piece: part_rows,
-                piece_stride: sent.bytes / 2,
-            };
-            sc.gemm.project(gpu, x, w2, sc.shared_out, rows, stream)?;
+            let (theirs, sent) = (
+                sc.inner_parts.offset(sent.shared),
+                sent.shared_rows(rows, part_rows),
+            );
+            let act = sc.gemm.gathered(gpu, theirs, sent, rows, stream)?;
+            w2.gemm(act, sc.shared_out, rows, stream)?;
             let y = sc.moe_out.offset(part * rows * part_n * 2);
             big.sum(gpu, sc.shared_out, y, rows, s.top_k, part_n, stream)?;
         }
