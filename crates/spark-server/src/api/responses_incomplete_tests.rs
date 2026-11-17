@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! A response cut off at the output-token budget must surface as
+//! `status: "incomplete"` with `incomplete_details.reason:
+//! "max_output_tokens"` on both `/v1/responses` encoders, not as a
+//! completed answer.
+
+use std::sync::Arc;
+
+use axum::response::{IntoResponse, Sse};
+use serde_json::Value;
+
+use super::responses_stream_finalize::{FinalizeCtx, finalize_responses_stream};
+use super::responses_translate::translate_chat_response_to_responses;
+use crate::api::chat::ChatOutcome;
+use crate::api::test_app_state;
+use crate::ir;
+
+fn tokenizer() -> crate::tokenizer::ChatTokenizer {
+    let dir = tempfile::tempdir().unwrap();
+    let vocab = [("[UNK]".to_string(), 0)].into_iter().collect();
+    let model = tokenizers::models::wordlevel::WordLevel::builder()
+        .vocab(vocab)
+        .unk_token("[UNK]".into())
+        .build()
+        .unwrap();
+    tokenizers::Tokenizer::new(model)
+        .save(dir.path().join("tokenizer.json"), false)
+        .unwrap();
+    crate::tokenizer::ChatTokenizer::from_model_dir(
+        dir.path(),
+        0,
+        true,
+        "glm5_next",
+        "",
+        None,
+        false,
+        false,
+    )
+    .unwrap()
+}
+
+fn chat_response(finish_reason: ir::FinishReason) -> ir::ChatResponse {
+    ir::ChatResponse {
+        id: "test".into(),
+        model: "fixture".into(),
+        created: 0,
+        choices: vec![ir::Choice {
+            index: 0,
+            content: Some("The answer is".into()),
+            reasoning: None,
+            tool_calls: vec![],
+            refusal: None,
+            finish_reason,
+            matched_stop: None,
+            logprobs: None,
+            guard_stop: None,
+        }],
+        usage: ir::Usage {
+            prompt_tokens: 3,
+            completion_tokens: 4,
+            ..Default::default()
+        },
+    }
+}
+
+async fn blocking_body(finish_reason: ir::FinishReason) -> Value {
+    let outcome = ChatOutcome::Blocking(Box::new(chat_response(finish_reason)));
+    let resp = translate_chat_response_to_responses(outcome, None, None, vec![], false, None).await;
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Runs the stream finalizer and returns the terminal SSE frame as
+/// `(event name, data)`.
+async fn stream_terminal(finish_reason: &str) -> (String, Value) {
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let state = Arc::new(test_app_state::app_state(tokenizer()));
+    let ctx = FinalizeCtx {
+        seq: 0,
+        completed_items: vec![],
+        final_usage: None,
+        finish_reason: finish_reason.into(),
+        refusal_text: None,
+        message_item_id: "msg_test".into(),
+        output_index: 0,
+        resp_id: "resp_test".into(),
+        created_at: 0,
+        model: "fixture".into(),
+        metadata_for_done: None,
+        store_flag: false,
+        input_messages: vec![],
+        conversation_id: None,
+        conv_new_user_items: vec![],
+    };
+    finalize_responses_stream(&tx, state, ctx).await;
+    drop(tx);
+    let sse = Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx)).into_response();
+    let bytes = axum::body::to_bytes(sse.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let frame = text.trim_end().rsplit("\n\n").next().unwrap();
+    let field = |name: &str| {
+        frame
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap()
+            .to_string()
+    };
+    (
+        field("event: "),
+        serde_json::from_str(&field("data: ")).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn blocking_response_cut_at_token_limit_is_incomplete() {
+    let body = blocking_body(ir::FinishReason::Length).await;
+    assert_eq!(body["status"], "incomplete");
+    assert_eq!(body["incomplete_details"]["reason"], "max_output_tokens");
+}
+
+#[tokio::test]
+async fn blocking_response_that_stops_is_completed() {
+    let body = blocking_body(ir::FinishReason::Stop).await;
+    assert_eq!(body["status"], "completed");
+    assert!(body.get("incomplete_details").is_none());
+}
+
+#[tokio::test]
+async fn stream_cut_at_token_limit_ends_with_response_incomplete() {
+    let (event, data) = stream_terminal("length").await;
+    assert_eq!(event, "response.incomplete");
+    assert_eq!(data["type"], "response.incomplete");
+    assert_eq!(data["response"]["status"], "incomplete");
+    assert_eq!(
+        data["response"]["incomplete_details"]["reason"],
+        "max_output_tokens"
+    );
+}
+
+#[tokio::test]
+async fn stream_that_stops_ends_with_response_completed() {
+    let (event, data) = stream_terminal("stop").await;
+    assert_eq!(event, "response.completed");
+    assert_eq!(data["response"]["status"], "completed");
+    assert!(data["response"].get("incomplete_details").is_none());
+}

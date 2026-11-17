@@ -158,13 +158,17 @@ pub(super) async fn translate_chat_response_to_responses(
         }),
         total_tokens: chat.usage.prompt_tokens + chat.usage.completion_tokens,
     };
+    let (status, incomplete_details) = chat.choices.first().map_or(("completed", None), |c| {
+        crate::openai::responses_terminal_status(&c.finish_reason)
+    });
     let resp_id = format!("resp_{}", chat.id);
     let resp = crate::openai::ResponsesResponse {
         id: resp_id.clone(),
         object: "response",
         created_at: chat.created,
         model: chat.model.clone(),
-        status: "completed",
+        status,
+        incomplete_details,
         error: None,
         output,
         reasoning: None,

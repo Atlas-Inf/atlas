@@ -114,6 +114,10 @@ pub struct ResponsesResponse {
     pub created_at: u64,
     pub model: String,
     pub status: &'static str,
+    /// Why the response stopped short; set exactly when `status` is
+    /// `"incomplete"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_details: Option<ResponsesIncompleteDetails>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<serde_json::Value>,
     pub output: Vec<ResponsesOutputItem>,
@@ -122,6 +126,32 @@ pub struct ResponsesResponse {
     pub usage: ResponsesUsage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResponsesIncompleteDetails {
+    pub reason: &'static str,
+}
+
+/// THE mapping from a finish reason to the Responses `status` and
+/// `incomplete_details`, shared by the blocking and streaming encoders.
+pub fn responses_terminal_status(
+    finish_reason: &crate::ir::FinishReason,
+) -> (&'static str, Option<ResponsesIncompleteDetails>) {
+    use crate::ir::FinishReason;
+    match finish_reason {
+        FinishReason::Length => (
+            "incomplete",
+            Some(ResponsesIncompleteDetails {
+                reason: "max_output_tokens",
+            }),
+        ),
+        FinishReason::Error => ("failed", None),
+        FinishReason::Stop
+        | FinishReason::ToolCalls
+        | FinishReason::ContentFilter
+        | FinishReason::Other(_) => ("completed", None),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -196,6 +226,9 @@ pub struct ResponsesUsage {
 //   response.function_call.arguments.delta → per tool-arg fragment
 //   response.output_item.done       → at the end of each output item
 //   response.completed              → terminal envelope with usage
+//   response.incomplete             → terminal envelope instead of
+//                                     `completed` when the output was
+//                                     cut short (`max_output_tokens`)
 //   response.failed                 → emitted on generation error
 //
 // `sequence_number` increments by 1 per emitted event (OpenAI behavior).
@@ -324,12 +357,36 @@ pub enum ResponsesStreamEvent {
         sequence_number: u64,
         response: ResponsesResponse,
     },
+    #[serde(rename = "response.incomplete")]
+    Incomplete {
+        sequence_number: u64,
+        response: ResponsesResponse,
+    },
     #[serde(rename = "response.failed")]
     Failed {
         sequence_number: u64,
         response: ResponsesStreamEnvelope,
         error: serde_json::Value,
     },
+}
+
+impl ResponsesStreamEvent {
+    /// The terminal event carrying the final `response`:
+    /// `response.incomplete` when it stopped short, else
+    /// `response.completed`.
+    pub fn terminal(sequence_number: u64, response: ResponsesResponse) -> Self {
+        if response.incomplete_details.is_some() {
+            Self::Incomplete {
+                sequence_number,
+                response,
+            }
+        } else {
+            Self::Completed {
+                sequence_number,
+                response,
+            }
+        }
+    }
 }
 
 /// Envelope shape used by the `created`, `in_progress`, and `failed`
@@ -378,6 +435,7 @@ pub fn responses_event_name(ev: &ResponsesStreamEvent) -> &'static str {
             "response.reasoning_summary_part.done"
         }
         ResponsesStreamEvent::Completed { .. } => "response.completed",
+        ResponsesStreamEvent::Incomplete { .. } => "response.incomplete",
         ResponsesStreamEvent::Failed { .. } => "response.failed",
     }
 }
