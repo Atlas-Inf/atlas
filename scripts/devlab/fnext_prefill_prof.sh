@@ -26,13 +26,14 @@ if [ -n "${DRAFT_REPO:-}" ]; then
     || { log "DRAFT DOWNLOAD FAILED"; exit 1; }
   export DFLASH=1 DRAFT_MODEL="$DM"
 fi
-IFS=, read -r -a EXTRA_A <<< "${EXTRA:-}"   # comma-separated (workflow args split on spaces)
+IFS=, read -r -a EXTRA_A <<< "${EXTRA:-}"
+PCFLAG=--enable-prefix-caching; [ "${PC:-1}" = 0 ] && PCFLAG=   # PC=0: serve without prefix caching   # comma-separated (workflow args split on spaces)
 
 # spark under the profiler: serve-amd.sh execs $ATLAS_BIN, so point it at a wrapper.
 W="$OUT/spark-prof"; mkdir -p "$OUT/prof"
 if [ "${NOPROF:-0}" = 1 ]; then W="$PWD/target/release/spark"; else printf '#!/usr/bin/env bash\nexec rocprofv3 --kernel-trace --output-format csv -d %q -o run -- %q "$@"\n' "$OUT/prof" "$PWD/target/release/spark" > "$W"; chmod +x "$W"; fi
 ( exec env RUST_LOG=info ATLAS_BIN="$W" PORT="$PORT" HOST=127.0.0.1 MODEL_NAME=m GPU_UTIL=${GPU_UTIL:-0.76} MAX_SEQ_LEN=${MAX_SEQ_LEN:-32768} \
-    ATLAS_KV_EXTERNAL_RESERVE_GB=0 MAX_BATCH=${MAX_BATCH:-1} ./serve-amd.sh "$REPO" --disable-thinking --request-timeout 0 --enable-prefix-caching "${EXTRA_A[@]}" ) > "$OUT/atlas-server.log" 2>&1 &
+    ATLAS_KV_EXTERNAL_RESERVE_GB=0 MAX_BATCH=${MAX_BATCH:-1} ./serve-amd.sh "$REPO" --disable-thinking --request-timeout 0 ${PCFLAG} "${EXTRA_A[@]}" ) > "$OUT/atlas-server.log" 2>&1 &
 APID=$!; ENGINE_ALIVE() { kill -0 "$APID" 2>/dev/null; }
 wait_ready "$PORT" 720 || { log "SERVE FAILED: $(grep -aE 'ERROR|allocfail|panick' "$OUT/atlas-server.log" | tail -3)"; kill -9 "$APID" 2>/dev/null; exit 1; }
 log "serving under rocprofv3"
