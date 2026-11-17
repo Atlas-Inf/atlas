@@ -543,7 +543,7 @@ impl BufferSizes {
             && config.qk_rope_head_dim == 0
             && config.o_lora_rank == 0;
 
-        Self {
+        let sizes = Self {
             hidden_states: m * h * residual_elem,
             residual: m * h * residual_elem,
             norm_output: m * max_dim * bf16,
@@ -761,7 +761,8 @@ impl BufferSizes {
             lora_seq_slot,
             q2_dequant_scratch,
             q2_act_q8,
-        }
+        };
+        sizes.for_model(config)
     }
 
     /// Rows of an `m`-row arena's `ssm_conv_out_f32` at the FP32 q|k|v|z
