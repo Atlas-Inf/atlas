@@ -52,6 +52,13 @@ struct Inner {
     order: VecDeque<String>,
 }
 
+impl Inner {
+    fn touch_lru(&mut self, id: &str) {
+        self.order.retain(|k| k != id);
+        self.order.push_back(id.to_string());
+    }
+}
+
 /// Maximum items per conversation insert (mirrors OpenAI's spec).
 pub const MAX_ITEMS_PER_INSERT: usize = 20;
 
@@ -140,8 +147,7 @@ impl ConversationStore {
             inner.order.retain(|k| k != id);
             return None;
         }
-        inner.order.retain(|k| k != id);
-        inner.order.push_back(id.to_string());
+        inner.touch_lru(id);
         let c = inner.map.get_mut(id).expect("entry present");
         c.last_access = Instant::now();
         Some(ConversationSnapshot {
@@ -169,6 +175,7 @@ impl ConversationStore {
             inner.order.retain(|k| k != id);
             return None;
         }
+        inner.touch_lru(id);
         let c = inner.map.get_mut(id).expect("entry present");
         c.last_access = Instant::now();
         for (k, v) in patch {
@@ -202,6 +209,7 @@ impl ConversationStore {
             inner.order.retain(|k| k != id);
             return Err(AddItemsError::NotFound);
         }
+        inner.touch_lru(id);
         let c = inner.map.get_mut(id).expect("entry present");
         let start = c.next_item_seq;
         let stamped: Vec<serde_json::Value> = new_items
@@ -228,6 +236,7 @@ impl ConversationStore {
         let removed = c.items.len() < before;
         if removed {
             c.last_access = Instant::now();
+            inner.touch_lru(conv_id);
         }
         removed
     }
@@ -289,6 +298,45 @@ fn stamp_id(mut v: serde_json::Value, conv_id: &str, idx: usize) -> serde_json::
 mod tests {
     use super::*;
     use serde_json::json;
+
+    macro_rules! write_refreshes_lru {
+        ($name:ident, $mutate:expr) => {
+            #[test]
+            fn $name() {
+                let store = ConversationStore::with_config(2, Duration::from_secs(60));
+                let a = store.create(vec![json!({"id": "initial"})], HashMap::new());
+                let b = store.create(Vec::new(), HashMap::new());
+                $mutate(&store, &a);
+                let c = store.create(Vec::new(), HashMap::new());
+                assert!(store.get(&a).is_some(), "written conversation was evicted");
+                assert!(store.get(&b).is_none(), "least recently used entry survived");
+                assert!(store.get(&c).is_some());
+            }
+        };
+    }
+
+    write_refreshes_lru!(
+        update_metadata_refreshes_lru,
+        |store: &ConversationStore, id: &str| {
+            store
+                .update_metadata(id, HashMap::from([("key".into(), "value".into())]))
+                .unwrap();
+        }
+    );
+    write_refreshes_lru!(
+        add_items_refreshes_lru,
+        |store: &ConversationStore, id: &str| {
+            store
+                .add_items(id, vec![json!({"type": "message"})])
+                .unwrap();
+        }
+    );
+    write_refreshes_lru!(
+        remove_item_refreshes_lru,
+        |store: &ConversationStore, id: &str| {
+            assert!(store.remove_item(id, "initial"));
+        }
+    );
 
     #[test]
     fn create_and_retrieve() {
