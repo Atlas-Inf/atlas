@@ -6,20 +6,22 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
-use super::draft_head::{KEEP, Kept};
 use super::parts::PARTS;
+
+/// Tokens a block of a Markov round takes (`DSV41_MARKOV_THREADS`).
+const MARKOV_THREADS: usize = 256;
 
 #[derive(Clone, Copy)]
 pub struct DraftKernels {
     parts_rows: KernelHandle,
-    top: KernelHandle,
+    markov: KernelHandle,
 }
 
 impl DraftKernels {
     pub fn load(gpu: &dyn GpuBackend) -> Result<Self> {
         Ok(Self {
             parts_rows: gpu.kernel("dsv41_draft", "dsv41_parts_rows")?,
-            top: gpu.kernel("dsv41_draft", "dsv41_draft_top")?,
+            markov: gpu.kernel("dsv41_draft", "dsv41_markov_round")?,
         })
     }
 }
@@ -46,46 +48,97 @@ pub fn rows_of_parts(
         .launch(stream)
 }
 
-/// `best` (`[rows, KEEP]` of a value and a token, 8 bytes each) = the
-/// largest of each row of `logits` (`[rows, n]` FP32), largest first, whose
-/// column `c` is token `first + c`.
+/// The Markov head and the vocabulary it is over: `embed` (`[vocab, rank]`
+/// BF16) whole, and `head` the same shape, of which a part reads its rows.
+#[derive(Clone, Copy)]
+pub struct Markov {
+    pub embed: DevicePtr,
+    pub head: DevicePtr,
+    pub vocab: usize,
+    pub rank: usize,
+}
+
+impl Markov {
+    /// Tokens a part of the vocabulary holds, and the candidates it leaves
+    /// of a row: a block's best each.
+    pub fn share(&self) -> usize {
+        self.vocab / PARTS
+    }
+
+    pub fn candidates(&self) -> usize {
+        self.share().div_ceil(MARKOV_THREADS)
+    }
+
+    /// Bytes of one part's candidates of a row.
+    pub fn bytes(&self) -> usize {
+        self.candidates() * 8
+    }
+}
+
+/// Part `part`'s round of one row of a draft block (`dsv41_markov_round`):
+/// the row's `logits` (`[share]` FP32, this part's) with the Markov head's
+/// gain after the token before, and the part's best of them into `mine`
+/// ([`Markov::bytes`]). The token before is `token` on the first row, and
+/// otherwise the best of `before`, every part's candidates of the row
+/// before, which also goes to `chosen` (a u32) as that row's draft.
 #[allow(clippy::too_many_arguments)]
-pub fn largest(
+pub fn markov_round(
     gpu: &dyn GpuBackend,
     kernels: &DraftKernels,
+    markov: &Markov,
+    part: usize,
     logits: DevicePtr,
-    best: DevicePtr,
-    rows: usize,
-    n: usize,
-    first: usize,
+    before: DevicePtr,
+    mine: DevicePtr,
+    chosen: DevicePtr,
+    token: u32,
     stream: u64,
 ) -> Result<()> {
-    KernelLaunch::new(gpu, kernels.top)
-        .grid([rows as u32, 1, 1])
-        .block([1024, 1, 1])
+    let (share, rank) = (markov.share(), markov.rank);
+    KernelLaunch::new(gpu, kernels.markov)
+        .grid([markov.candidates() as u32, 1, 1])
+        .block([MARKOV_THREADS as u32, 1, 1])
         .arg_ptr(logits)
-        .arg_ptr(best)
-        .arg_u32(n as u32)
-        .arg_u32(first as u32)
-        .arg_u32(KEEP as u32)
+        .arg_ptr(markov.head.offset(part * share * rank * 2))
+        .arg_ptr(markov.embed)
+        .arg_ptr(before)
+        .arg_ptr(mine)
+        .arg_ptr(chosen)
+        .arg_u32(share as u32)
+        .arg_u32(rank as u32)
+        .arg_u32((part * share) as u32)
+        .arg_u32((PARTS * markov.candidates()) as u32)
+        .arg_u32(token)
+        .arg_u32(markov.vocab as u32)
         .launch(stream)
 }
 
-/// What [`largest`] left of `rows` rows for every part of the head
-/// (`[4, rows, KEEP]`, as bytes), a row's from every part together.
-pub fn kept(best: &[u8], rows: usize) -> Vec<Vec<Kept>> {
-    let word = |at: usize| u32::from_le_bytes([0, 1, 2, 3].map(|byte| best[at * 4 + byte]));
-    (0..rows)
-        .map(|row| {
-            (0..PARTS)
-                .flat_map(|part| (0..KEEP).map(move |i| ((part * rows + row) * KEEP + i) * 2))
-                .map(|at| Kept {
-                    logit: f32::from_bits(word(at)),
-                    token: word(at + 1),
-                })
-                .collect()
-        })
-        .collect()
+/// The last row's draft into `chosen`, from every part's candidates of it:
+/// the launch that ends a chain of [`markov_round`]s.
+pub fn markov_close(
+    gpu: &dyn GpuBackend,
+    kernels: &DraftKernels,
+    markov: &Markov,
+    before: DevicePtr,
+    chosen: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernels.markov)
+        .grid([1, 1, 1])
+        .block([MARKOV_THREADS as u32, 1, 1])
+        .arg_ptr(DevicePtr::NULL)
+        .arg_ptr(DevicePtr::NULL)
+        .arg_ptr(DevicePtr::NULL)
+        .arg_ptr(before)
+        .arg_ptr(DevicePtr::NULL)
+        .arg_ptr(chosen)
+        .arg_u32(0)
+        .arg_u32(0)
+        .arg_u32(0)
+        .arg_u32((PARTS * markov.candidates()) as u32)
+        .arg_u32(0)
+        .arg_u32(markov.vocab as u32)
+        .launch(stream)
 }
 
 #[cfg(test)]

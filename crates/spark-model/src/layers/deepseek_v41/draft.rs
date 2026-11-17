@@ -27,8 +27,8 @@ use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use super::block::{Block, BlockKernels, Candidates, Handoff, Scratch, Shape, Shared};
 use super::cache_recipe::WINDOW;
-use super::draft_head::{HostHead, KEEP, Kept};
-use super::draft_ops::{self, DraftKernels};
+use super::draft_head::HostHead;
+use super::draft_ops::{self, DraftKernels, Markov};
 use super::draft_seq::{DraftSeq, Plan, slot_runs};
 use super::hc;
 use super::ops::{self, HEAD_DIM};
@@ -57,16 +57,18 @@ struct Buffers {
     keys_normed: DevicePtr,
     recv: DevicePtr,
     /// The block: its rows' embeddings, stream and mix, what the stages
-    /// leave of them, the norm of that, one part's logits (`[rows, vocab /
-    /// 4]` FP32) and every part's largest (`[4, rows, KEEP]` of a value and
-    /// a token).
+    /// leave of them, the norm of that, the logits of the parts held (`[rows,
+    /// vocab / 4]` FP32 each), every part's candidates of every row
+    /// (`[rows, 4]` of [`Markov::bytes`]) and the rows' drafts (`[rows]`
+    /// u32).
     embeds: DevicePtr,
     streams: DevicePtr,
     pre: DevicePtr,
     x: DevicePtr,
     normed: DevicePtr,
     logits: DevicePtr,
-    best: DevicePtr,
+    found: DevicePtr,
+    drafts: DevicePtr,
 }
 
 pub struct Draft {
@@ -84,7 +86,7 @@ pub struct Draft {
     /// the head is a third of what a pass reads.
     embed: DevicePtr,
     head: Mxfp8Weight,
-    vocab: usize,
+    markov: Markov,
     noise: u32,
     /// Rows of a block.
     pub(super) rows: usize,
@@ -189,6 +191,29 @@ impl Draft {
             main_proj.k
         );
         let last = format!("mtp.{}", stages - 1);
+        // The Markov head, whole on every rank: a rank reads its part of
+        // the vocabulary's rows of `head`, and any token's of `embed`.
+        let markov = {
+            let rank = config.dspark_markov_rank;
+            let table = |name: &str| -> Result<DevicePtr> {
+                let name = format!("{last}.markov_head.{name}.weight");
+                ensure!(
+                    store.get(&name)?.num_elements() == vocab * rank,
+                    "{name}: not [{vocab}, {rank}]"
+                );
+                tensor(store, &name, WeightDtype::BF16)
+            };
+            ensure!(
+                (1..=256).contains(&rank),
+                "deepseek_v41: a Markov head of rank {rank}"
+            );
+            Markov {
+                embed: table("embed")?,
+                head: table("head")?,
+                vocab,
+                rank,
+            }
+        };
         let bf16 = |values: usize| gpu.alloc(values * 2);
         let copies = shape.hc.copies;
         let buffers = Buffers {
@@ -205,12 +230,22 @@ impl Draft {
             pre: gpu.alloc(rows * copies * 4)?,
             x: bf16(rows * hidden)?,
             normed: bf16(rows * hidden)?,
-            logits: gpu.alloc(rows * vocab / PARTS * 4)?,
-            best: gpu.alloc(PARTS * rows * KEEP * 8)?,
+            logits: gpu.alloc(held.count * rows * vocab / PARTS * 4)?,
+            found: gpu.alloc(rows * PARTS * markov.bytes())?,
+            drafts: gpu.alloc(rows * 4)?,
         };
-        // The Markov and confidence heads are the host's, where requests
-        // are served; the other ranks have no use for them.
-        let host = HostHead::load(store, gpu, &last, hidden, vocab, config.dspark_markov_rank)?;
+        // The confidence head is the host's, where requests are served.
+        let host = match config.ep_rank {
+            0 => Some(HostHead::load(
+                store,
+                gpu,
+                &last,
+                hidden,
+                vocab,
+                markov.rank,
+            )?),
+            _ => None,
+        };
         Ok(Self {
             shape,
             held,
@@ -232,18 +267,18 @@ impl Draft {
                 gpu.synchronize(stream)?;
                 fp8
             },
-            vocab,
+            markov,
             noise: config.dspark_noise_token_id,
             rows,
             targets,
             buffers,
-            host: (config.ep_rank == 0).then_some(host),
+            host,
         })
     }
 
     /// Whether `token` is one of the model's.
     pub(super) fn holds(&self, token: u32) -> bool {
-        (token as usize) < self.vocab
+        (token as usize) < self.markov.vocab
     }
 
     fn norm(
@@ -385,8 +420,9 @@ impl Draft {
 
     /// This rank's part of a pass for a sequence of `len` tokens whose next
     /// is `token`: the keys the stages lack, the block through the stages,
-    /// and the largest logits of this rank's parts of the head, which the
-    /// ranks gather.
+    /// and the Markov chain over this rank's parts of the head, a row's
+    /// candidates gathered before the next row.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn pass(
         &self,
         gpu: &dyn GpuBackend,
@@ -433,9 +469,14 @@ impl Draft {
             stream,
         )?;
         self.norm(gpu, b.x, self.norm, b.normed, rows, stream)?;
-        // The head a part at a time: its logits, and the largest of them.
-        let part_n = self.vocab / PARTS;
-        let bytes = rows * KEEP * 8;
+        // The head: the logits of the parts held, then the Markov chain a
+        // row at a time, each part's best of a row gathered before the next
+        // row reads which token the ranks chose.
+        let (m, part_n, bytes) = (&self.markov, self.markov.share(), self.markov.bytes());
+        let logits = |part: usize| {
+            b.logits
+                .offset((part - self.held.first) * rows * part_n * 4)
+        };
         for part in self.held.range() {
             let at = (part - self.held.first) * part_n * hidden;
             let (weights, scales) = (self.head.data.offset(at), self.head.scales.offset(at / 32));
@@ -445,7 +486,7 @@ impl Draft {
                 b.normed,
                 weights,
                 scales,
-                b.logits,
+                logits(part),
                 4,
                 part_n,
                 rows,
@@ -453,30 +494,55 @@ impl Draft {
                 hidden,
                 stream,
             )?;
-            let (best, first) = (b.best.offset(part * bytes), part * part_n);
-            draft_ops::largest(gpu, &self.own, b.logits, best, rows, part_n, first, stream)?;
         }
-        parts::gather(gpu, comm, self.held, b.best, b.recv, bytes, bytes, stream)
+        let found = |row: usize| b.found.offset(row * PARTS * bytes);
+        let none = DevicePtr::NULL;
+        for row in 0..rows {
+            let (before, chosen) = match row {
+                0 => (none, none),
+                _ => (found(row - 1), b.drafts.offset((row - 1) * 4)),
+            };
+            for part in self.held.range() {
+                let (of_row, mine) = (
+                    logits(part).offset(row * part_n * 4),
+                    found(row).offset(part * bytes),
+                );
+                draft_ops::markov_round(
+                    gpu, &self.own, m, part, of_row, before, mine, chosen, token, stream,
+                )?;
+            }
+            parts::gather(
+                gpu,
+                comm,
+                self.held,
+                found(row),
+                b.recv,
+                bytes,
+                bytes,
+                stream,
+            )?;
+        }
+        let last = b.drafts.offset((rows - 1) * 4);
+        draft_ops::markov_close(gpu, &self.own, m, found(rows - 1), last, stream)
     }
 
-    /// What a pass left for the host: each row's largest logits from every
-    /// part of the head, and the rows the head read before their norm
-    /// (`[rows, hidden]` BF16).
-    pub(super) fn read(
-        &self,
-        gpu: &dyn GpuBackend,
-        stream: u64,
-    ) -> Result<(Vec<Vec<Kept>>, Vec<u16>)> {
+    /// What a pass left for the host: the rows' drafts, and the rows the
+    /// head read before their norm (`[rows, hidden]` BF16).
+    pub(super) fn read(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<(Vec<u32>, Vec<u16>)> {
         let (b, rows) = (&self.buffers, self.rows);
         gpu.synchronize(stream)?;
-        let mut best = vec![0u8; PARTS * rows * KEEP * 8];
-        gpu.copy_d2h(b.best, &mut best)?;
+        let mut drafts = vec![0u8; rows * 4];
+        gpu.copy_d2h(b.drafts, &mut drafts)?;
         let mut x = vec![0u8; rows * self.shape.hidden * 2];
         gpu.copy_d2h(b.x, &mut x)?;
+        let drafts = drafts
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
         let x = x
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
-        Ok((draft_ops::kept(&best, rows), x))
+        Ok((drafts, x))
     }
 }

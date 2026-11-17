@@ -16,39 +16,106 @@ use crate::layers::deepseek_v41::test_support::{
     Rng, activations, backend, download, le_bytes, upload,
 };
 
+/// BF16 bits of a value BF16 holds exactly.
+fn exact(v: f32) -> u16 {
+    (v.to_bits() >> 16) as u16
+}
+
 #[test]
 #[ignore = "needs a GB10 GPU and the deepseek-v4.1-flash target"]
-fn the_largest_logits_of_a_row_are_the_hosts() -> Result<()> {
+fn the_markov_chain_over_the_parts_is_the_hosts_over_the_vocabulary() -> Result<()> {
     let gpu = backend()?;
     let (stream, k) = (gpu.default_stream(), DraftKernels::load(gpu)?);
-    let (rows, n, first) = (5usize, 32_320usize, 96_960usize);
-    let mut rng = Rng(0x0d5a_7e57);
-    // Few distinct values, so that equals are common and the tie rule shows.
-    let logits: Vec<f32> = (0..rows * n)
-        .map(|_| (rng.next() % 4096) as f32 / 64.0 - 20.0)
-        .collect();
-    let on_device = upload(gpu, &le_bytes(&logits, f32::to_le_bytes))?;
-    let best = gpu.alloc(rows * KEEP * 8)?;
-    largest(gpu, &k, on_device, best, rows, n, first, stream)?;
-    gpu.synchronize(stream)?;
-    let mut bytes = vec![0u8; rows * KEEP * 8];
-    gpu.copy_d2h(best, &mut bytes)?;
+    // A share that does not fill its last block, and values whose products
+    // and sums are exact, so that the order of a sum cannot matter.
+    let (rows, share, rank, token) = (5usize, 300usize, 16usize, 7u32);
+    let vocab = PARTS * share;
+    let mut rng = Rng(0x3a2c_0de5);
+    let mut eighths = |n: usize, span: u64| -> Vec<f32> {
+        (0..n)
+            .map(|_| (rng.next() % span) as f32 / 8.0 - span as f32 / 16.0)
+            .collect()
+    };
+    let (embed, head) = (eighths(vocab * rank, 33), eighths(vocab * rank, 33));
+    // Few distinct logits, so that tokens tie and the tie rule shows.
+    let logits = eighths(rows * vocab, 9);
+    let bf16 = |v: &[f32]| -> Vec<u16> { v.iter().map(|&x| exact(x)).collect() };
+    let markov = Markov {
+        embed: upload(gpu, &le_bytes(&bf16(&embed), u16::to_le_bytes))?,
+        head: upload(gpu, &le_bytes(&bf16(&head), u16::to_le_bytes))?,
+        vocab,
+        rank,
+    };
+    // A part's logits of a row, as a rank holds them: [rows, share].
+    let part_logits: Vec<DevicePtr> = (0..PARTS)
+        .map(|part| {
+            let mine: Vec<f32> = (0..rows)
+                .flat_map(|row| {
+                    let from = row * vocab + part * share;
+                    logits[from..from + share].to_vec()
+                })
+                .collect();
+            upload(gpu, &le_bytes(&mine, f32::to_le_bytes))
+        })
+        .collect::<Result<_>>()?;
+    let bytes = markov.bytes();
+    let found = gpu.alloc(rows * PARTS * bytes)?;
+    let drafts = gpu.alloc(rows * 4)?;
+    let none = DevicePtr::NULL;
     for row in 0..rows {
-        let mut order: Vec<usize> = (0..n).collect();
-        let of = |c: usize| logits[row * n + c];
-        order.sort_by(|&a, &b| of(b).total_cmp(&of(a)).then(a.cmp(&b)));
-        for (i, &column) in order[..KEEP].iter().enumerate() {
-            let at = (row * KEEP + i) * 8;
-            let word = |at: usize| u32::from_le_bytes([0, 1, 2, 3].map(|b| bytes[at + b]));
-            assert_eq!(
-                (f32::from_bits(word(at)), word(at + 4) as usize),
-                (of(column), first + column),
-                "row {row}, place {i}"
-            );
+        let (before, chosen) = match row {
+            0 => (none, none),
+            _ => (
+                found.offset((row - 1) * PARTS * bytes),
+                drafts.offset((row - 1) * 4),
+            ),
+        };
+        for (part, of_part) in part_logits.iter().enumerate() {
+            let mine = found.offset((row * PARTS + part) * bytes);
+            let of_row = of_part.offset(row * share * 4);
+            markov_round(
+                gpu, &k, &markov, part, of_row, before, mine, chosen, token, stream,
+            )?;
         }
     }
-    gpu.free(on_device)?;
-    gpu.free(best)
+    let last = found.offset((rows - 1) * PARTS * bytes);
+    markov_close(
+        gpu,
+        &k,
+        &markov,
+        last,
+        drafts.offset((rows - 1) * 4),
+        stream,
+    )?;
+    gpu.synchronize(stream)?;
+    let mut got = vec![0u8; rows * 4];
+    gpu.copy_d2h(drafts, &mut got)?;
+    let got: Vec<u32> = got
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    // The host's chain: a row's largest logit plus gain, the lower token
+    // among equals.
+    let mut want = Vec::new();
+    let mut before = token as usize;
+    for row in 0..rows {
+        let from = &embed[before * rank..(before + 1) * rank];
+        let value = |v: usize| -> f32 {
+            let gain: f32 = (0..rank).map(|i| from[i] * head[v * rank + i]).sum();
+            logits[row * vocab + v] + gain
+        };
+        let best = (0..vocab).fold(0, |best, v| if value(v) > value(best) { v } else { best });
+        want.push(best as u32);
+        before = best;
+    }
+    assert_eq!(got, want);
+    for p in [markov.embed, markov.head, found, drafts]
+        .into_iter()
+        .chain(part_logits)
+    {
+        gpu.free(p)?;
+    }
+    Ok(())
 }
 
 #[test]

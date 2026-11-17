@@ -19,8 +19,10 @@ use crate::speculative::{DraftProposer, ProposerState};
 
 /// The chance, of a draft and all before it standing, below which a pass
 /// stops offering drafts, unless `ATLAS_DSV41_DRAFT_FLOOR` says: a verified
-/// row costs a part of a decode step, and a refused one buys nothing.
-const FLOOR: f32 = 0.3;
+/// row costs a part of a decode step, and a refused one buys nothing. About
+/// a row's cost over a token's: at 0.2 prose, code and JSON were each as
+/// fast as at any floor from 0.12 to 0.45.
+const FLOOR: f32 = 0.2;
 
 fn floor() -> f32 {
     static SAID: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -95,18 +97,17 @@ impl DraftProposer for Draft {
             .host
             .as_ref()
             .context("deepseek_v41: a draft pass started on a rank that serves no requests")?;
-        let (kept, x) = self.read(gpu, stream)?;
-        let mut chain = host.chain(last_token, &kept, &x);
+        let (drafts, x) = self.read(gpu, stream)?;
+        // A row that found no token ends the drafts.
+        let mut drafts: Vec<u32> = drafts.into_iter().take_while(|&t| self.holds(t)).collect();
+        let confidence = host.confidence(last_token, &drafts, &x);
         let most = num_drafts.min(self.rows);
-        chain
-            .tokens
-            .truncate(worth(&chain.confidence, floor(), most));
+        drafts.truncate(worth(&confidence, floor(), most));
         tracing::debug!(
-            "DSpark: {} of {most} drafts offered after {position} tokens, confidence {:?}",
-            chain.tokens.len(),
-            chain.confidence
+            "DSpark: {} of {most} drafts offered after {position} tokens, confidence {confidence:?}",
+            drafts.len()
         );
-        Ok(chain.tokens)
+        Ok(drafts)
     }
 
     /// Nothing of a pass outlasts it, so there is nothing to take back.
