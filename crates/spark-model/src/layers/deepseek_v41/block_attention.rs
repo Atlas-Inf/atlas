@@ -378,6 +378,25 @@ impl Block {
             w.wo_b.k
         );
         let sent = Sent::new(rows, groups, s.o_rank);
+        // With the rows shared out and wo_b whole here, a rank takes the rows
+        // it keeps through every part of wo_b: it needs the other ranks'
+        // codes of those rows alone, a quarter of the gather's traffic, and
+        // its output goes nowhere.
+        let whole = g.wo_b.iter().all(Option::is_some);
+        if let Some(own) = own.filter(|own| whole && held.count == 1 && own.each * PARTS == rows)
+            && self.codes_home(comm, own, sent, rows, stream)?
+        {
+            let began = profile::begin(gpu, stream)?;
+            let mine = own.first..own.first + own.count;
+            let act = sc
+                .gemm
+                .gathered_rows(gpu, sc.o_low, sent, rows, mine, stream)?;
+            for (part, block) in g.wo_b.iter().flatten().enumerate() {
+                let out = sc.attn_out.offset((part * rows + own.first) * part_n * 2);
+                block.gemm(act, out, own.count, stream)?;
+            }
+            return profile::end(gpu, stream, "output projections", began);
+        }
         profile::stage(gpu, stream, "gather", || {
             let recv = sc.gather_recv;
             parts::gather(
@@ -412,5 +431,50 @@ impl Block {
                 ),
             }
         })
+    }
+
+    /// The other ranks' codes of the rows this rank keeps, of the low-rank
+    /// output each left in its part of `scratch.o_low` (`sent`), to where a
+    /// gather of the parts would leave them: an all-to-all a group, its
+    /// codes and their scales. False, with nothing queued, where that does
+    /// not serve; the ranks answer alike.
+    fn codes_home(
+        &self,
+        comm: Option<&dyn CommBackend>,
+        own: Owned,
+        sent: Sent,
+        rows: usize,
+        stream: u64,
+    ) -> Result<bool> {
+        let Some(comm) = comm else {
+            return Ok(false);
+        };
+        let (sc, part) = (&self.shared.scratch, self.shared.held.first);
+        for group in 0..sent.groups {
+            // A group's rows of codes, and of scales, in a part.
+            let plane = |at: usize, row_bytes: usize| {
+                let at = at + group * rows * row_bytes;
+                spark_comm::AllToAllPlane {
+                    src: sc.o_low.offset(part * sent.bytes + at).0,
+                    src_stride: (own.each * row_bytes) as i64,
+                    dst: sc.o_low.offset(at + own.first * row_bytes).0,
+                    dst_stride: sent.bytes as i64,
+                    rows: own.each,
+                    row_bytes,
+                    pitch: row_bytes,
+                }
+            };
+            let planes = [plane(0, sent.piece), plane(sent.scales, sent.piece / 32)];
+            let queued = comm.all_to_all_async(&planes, stream)?;
+            ensure!(
+                queued || group == 0,
+                "layer {}: the all-to-all took one group's codes and not the next's",
+                self.index
+            );
+            if !queued {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }

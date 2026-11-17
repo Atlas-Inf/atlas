@@ -388,6 +388,10 @@ pub fn load_layers(
             Some(source) if index_source && source < layer => Candidates::Reader,
             _ => Candidates::None,
         };
+        // A layer that runs every row of a prompt shares a batch's rows
+        // out between the ranks, and there a rank's GEMMs read wo_b whole.
+        let owns = tail::rows_of_layer(layer, layers, &per_row).is_none()
+            && tail::rows_of_layer(layers - 1, layers, &per_row).is_some();
         let weights = BlockWeights::load(
             store,
             gpu,
@@ -397,6 +401,7 @@ pub fn load_layers(
             compresses,
             index_source,
             held,
+            owns && gemms(),
             true,
             stream,
         )
@@ -458,8 +463,7 @@ pub fn load_layers(
             first: layer == 0,
             last: layer + 1 == layers,
             tail: tail::rows_of_layer(layer, layers, &per_row),
-            owns: tail::rows_of_layer(layer, layers, &per_row).is_none()
-                && tail::rows_of_layer(layers - 1, layers, &per_row).is_some(),
+            owns,
             replicates: tail::rows_of_layer(layer, layers, &per_row).is_some()
                 && layer > 0
                 && tail::rows_of_layer(layer - 1, layers, &per_row).is_none(),

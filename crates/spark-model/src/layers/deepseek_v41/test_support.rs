@@ -121,6 +121,7 @@ pub(crate) fn block(
             role.compresses(),
             role.index_source,
             shared.held,
+            false,
             experts,
             gpu.default_stream(),
         )?,

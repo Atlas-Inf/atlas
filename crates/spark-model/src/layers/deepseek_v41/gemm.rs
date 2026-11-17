@@ -13,6 +13,8 @@
 //! FP32; its order is another, so a row's bytes differ from that path's the
 //! way the reference's own differ from one batch shape to the next.
 
+use std::ops::Range;
+
 use anyhow::{Context, Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
@@ -191,16 +193,34 @@ impl GemmScratch {
         rows: usize,
         stream: u64,
     ) -> Result<MxAct> {
+        self.gathered_rows(gpu, parts, sent, rows, 0..rows, stream)
+    }
+
+    /// [`Self::gathered`] of the rows `of` alone, the operand's row 0 the
+    /// first of them: of a batch's `rows`, the ones whose codes are here.
+    pub fn gathered_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        parts: DevicePtr,
+        sent: Sent,
+        rows: usize,
+        of: Range<usize>,
+        stream: u64,
+    ) -> Result<MxAct> {
         let k = PARTS * sent.groups * sent.piece;
         ensure!(
-            rows <= self.rows && k <= self.k && sent.piece.is_multiple_of(32),
-            "dsv41_mx_gathered: {rows} rows of {k} in pieces of {}, room for {} of {}",
+            of.end <= rows
+                && !of.is_empty()
+                && of.len() <= self.rows
+                && k <= self.k
+                && sent.piece.is_multiple_of(32),
+            "dsv41_mx_gathered: rows {of:?} of {rows}, of {k} in pieces of {}, room for {} of {}",
             sent.piece,
             self.rows,
             self.k
         );
         KernelLaunch::new(gpu, self.gathered)
-            .grid([div_ceil((rows * k / 32) as u32, 256), 1, 1])
+            .grid([div_ceil((of.len() * k / 32) as u32, 256), 1, 1])
             .block([256, 1, 1])
             .arg_ptr(parts)
             .arg_ptr(self.q)
@@ -211,6 +231,8 @@ impl GemmScratch {
             .arg_u32(sent.groups as u32)
             .arg_u64(sent.bytes as u64)
             .arg_u32(mx_lt_inner_pad(k) as u32)
+            .arg_u32(of.start as u32)
+            .arg_u32(of.len() as u32)
             .launch(stream)?;
         Ok(MxAct {
             q: self.q,
@@ -278,6 +300,8 @@ pub struct GemmWeights {
     pub wq_b: [Option<MxW8a8>; PARTS],
     /// One group's block of wo_a each.
     pub wo_a: Vec<Option<MxW8a8>>,
+    /// A part's rows of wo_b: the parts held, or every part where the
+    /// rank keeps wo_b whole (`AttentionWeights::wo_b_whole`).
     pub wo_b: [Option<MxW8a8>; PARTS],
     /// A part's rows of the shared expert's w1, w3 and w2.
     pub shared: [Option<[MxW8a8; 3]>; PARTS],
@@ -353,12 +377,19 @@ impl GemmWeights {
                 let rows = a.wo_a.rows_from(group * s.o_rank);
                 out.wo_a[group] = Some(operand(gpu, rows, s.o_rank, a.wo_a.k, stream)?);
             }
-            out.wo_b[at] = Some(part(&a.wo_b, at)?);
+            if !a.wo_b_whole {
+                out.wo_b[at] = Some(part(&a.wo_b, at)?);
+            }
             out.shared[at] = Some([
                 part(&w.moe.shared_w1, at)?,
                 part(&w.moe.shared_w3, at)?,
                 part(&w.moe.shared_w2, at)?,
             ]);
+        }
+        if a.wo_b_whole {
+            for at in 0..PARTS {
+                out.wo_b[at] = Some(part(&a.wo_b, at)?);
+            }
         }
         Ok(out)
     }

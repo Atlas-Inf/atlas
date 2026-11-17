@@ -90,7 +90,8 @@ extern "C" __global__ void dsv41_mx_quant(
 //
 // A part is `region` bytes after the last: its `groups` pieces' codes, each
 // [M, piece], then their scales, each [M, piece / 32]. K = parts * groups *
-// piece. One thread a block of 32 codes.
+// piece. The operand is the `count` rows from row `first`, its row 0 the
+// first of them. One thread a block of 32 codes.
 extern "C" __global__ void dsv41_mx_gathered(
     const unsigned char* __restrict__ parts,
     unsigned char* __restrict__ q,
@@ -100,21 +101,25 @@ extern "C" __global__ void dsv41_mx_gathered(
     unsigned int piece,
     unsigned int groups,
     unsigned long long region,
-    unsigned int inner_pad) {
+    unsigned int inner_pad,
+    unsigned int first,
+    unsigned int count) {
     const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int blocks = K / 32u;
-    if (t >= (size_t)M * blocks) return;
-    const unsigned int m = (unsigned int)(t / blocks), b = (unsigned int)(t % blocks);
+    if (t >= (size_t)count * blocks) return;
+    // Row `to` of the operand is row `m` of the parts.
+    const unsigned int to_row = (unsigned int)(t / blocks), b = (unsigned int)(t % blocks);
+    const unsigned int m = first + to_row;
     const unsigned int kb = b * 32u, of = kb / piece, in = kb % piece;
     const unsigned char* part = parts + (size_t)(of / groups) * region;
     const size_t group = of % groups;
     const uint4* from = (const uint4*)(part + (group * M + m) * piece + in);
-    uint4* to = (uint4*)(q + (size_t)m * K + kb);
+    uint4* to = (uint4*)(q + (size_t)to_row * K + kb);
     to[0] = from[0];
     to[1] = from[1];
     const unsigned char* scales = part + (size_t)groups * M * piece;
-    sf[mx_sf_offset(m, b, inner_pad)] = scales[(group * M + m) * (piece / 32u) + in / 32u];
-    if (b + 1u == blocks) mx_sf_zero_pad(sf, m, blocks, inner_pad);
+    sf[mx_sf_offset(to_row, b, inner_pad)] = scales[(group * M + m) * (piece / 32u) + in / 32u];
+    if (b + 1u == blocks) mx_sf_zero_pad(sf, to_row, blocks, inner_pad);
 }
 
 // Scales as they come ([M, blocks], `dsv41_mx_quant` with no `inner_pad`)

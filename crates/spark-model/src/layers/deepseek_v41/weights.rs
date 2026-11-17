@@ -110,7 +110,12 @@ pub struct AttentionWeights {
     /// The same: a part is a quarter of the groups.
     pub wo_a: Fp8Proj,
     /// The same: a part is a quarter of its rows, which a batch's GEMMs read.
+    /// With [`Self::wo_b_whole`] every part's rows are here.
     pub wo_b: Fp8Proj,
+    /// wo_b is whole on a rank that holds a part: on the layers that share a
+    /// prefill batch's rows out, where a rank projects the rows it keeps
+    /// through every part (`Block::attend_keys`), 32 MB a layer more.
+    pub wo_b_whole: bool,
     /// wo_b again for a few rows, by its columns: a part is every row's
     /// values of the low-rank output that part computes.
     pub wo_b_columns: Parted,
@@ -283,9 +288,11 @@ impl BlockWeights {
 
     /// Layer `index` from `store`. `compress_ratio` is the layer's ratio when
     /// it produces compressed keys itself, 0 otherwise; `index_source` says
-    /// it runs an indexer. `held` are the parts this rank computes, and
-    /// `experts` says whether to load the routed experts at all (a test of
-    /// the attention alone leaves them out).
+    /// it runs an indexer. `held` are the parts this rank computes,
+    /// `wo_b_whole` keeps every part of wo_b's rows
+    /// ([`AttentionWeights::wo_b_whole`]), and `experts` says whether to load
+    /// the routed experts at all (a test of the attention alone leaves them
+    /// out).
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         store: &WeightStore,
@@ -296,6 +303,7 @@ impl BlockWeights {
         compress_ratio: usize,
         index_source: bool,
         held: Held,
+        wo_b_whole: bool,
         experts: bool,
         stream: u64,
     ) -> Result<Self> {
@@ -309,6 +317,7 @@ impl BlockWeights {
             compress_ratio,
             index_source,
             held,
+            wo_b_whole,
             experts,
             stream,
         )
@@ -327,6 +336,7 @@ impl BlockWeights {
         compress_ratio: usize,
         index_source: bool,
         held: Held,
+        wo_b_whole: bool,
         experts: bool,
         stream: u64,
     ) -> Result<Self> {
@@ -343,7 +353,11 @@ impl BlockWeights {
                 let name = format!("{layer}.attn.wo_b");
                 fp8_columns(store, gpu, kernels, &name, held, stream)?
             },
-            wo_b: fp8_held(store, gpu, &format!("{layer}.attn.wo_b"), held)?,
+            wo_b: match wo_b_whole {
+                true => fp8(store, gpu, &format!("{layer}.attn.wo_b"))?,
+                false => fp8_held(store, gpu, &format!("{layer}.attn.wo_b"), held)?,
+            },
+            wo_b_whole: wo_b_whole || held.count == PARTS,
             sink: tensor(store, &format!("{layer}.attn.attn_sink"), WeightDtype::FP32)?,
         };
         let compressor = match compress_ratio {
