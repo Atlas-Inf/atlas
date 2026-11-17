@@ -57,10 +57,12 @@ __device__ __forceinline__ void dsv41_squares_block(unsigned int threads, float*
 }
 
 // q_low [T, q_rank] and key [T, 512] BF16, as projected. q_normed [T, q_rank]
-// = the norm of q_low under q_weight. slot [T, 512] = fp8(turn(norm of key
-// under key_weight, position[T])), the turn over the last `rope` values by
-// freqs [rope / 2] radians a position. q_rank is even and at most 2,048.
-// Grid (T).
+// = fp8(the norm of q_low under q_weight): every projection that reads the
+// query reads it in FP8, and a launch of its own to round it was 7 us of a
+// decode step in every layer. slot [T, 512] = fp8(turn(norm of key under
+// key_weight, position[T])), the turn over the last `rope` values by freqs
+// [rope / 2] radians a position. q_rank is a multiple of 64, so that whole
+// warps hold its pairs, and at most 2,048. Grid (T).
 extern "C" __global__ void __launch_bounds__(DSV41_FRONT_THREADS) dsv41_attn_front(
     const __nv_bfloat16* __restrict__ q_low,
     const __nv_bfloat16* __restrict__ q_weight,
@@ -98,7 +100,16 @@ extern "C" __global__ void __launch_bounds__(DSV41_FRONT_THREADS) dsv41_attn_fro
         float x0, x1, w0, w1;
         dsv41_unpack2(x32[i], x0, x1);
         dsv41_unpack2(w32[i], w0, w1);
-        out32[i] = dsv41_pack2(x0 * q_rms * w0, x1 * q_rms * w1);
+        // Normed and rounded to BF16, then to FP8: a scale block's 32
+        // values are the pairs of 16 neighbouring lanes.
+        float v0, v1;
+        dsv41_unpack2(dsv41_pack2(x0 * q_rms * w0, x1 * q_rms * w1), v0, v1);
+        float amax = fmaxf(fabsf(v0), fabsf(v1));
+        #pragma unroll
+        for (unsigned int o = 8; o > 0; o >>= 1)
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        const float scale = dsv41_fp8_scale(amax);
+        out32[i] = dsv41_pack2(dsv41_fp8_value(v0, scale), dsv41_fp8_value(v1, scale));
     }
     const float key_rms = rsqrtf(key_squares[0] / (float)DSV41_KEY + eps);
     if (tid < DSV41_KEY / 2) {

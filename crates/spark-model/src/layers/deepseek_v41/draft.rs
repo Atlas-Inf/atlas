@@ -28,17 +28,20 @@ use super::draft_seq::{DraftSeq, Plan, slot_runs};
 use super::hc;
 use super::ops;
 use super::parts::{self, Held, PARTS};
+use super::seen::Seen;
 use super::weights::{Fp8Proj, row_part};
 use crate::layers::ops::rms_norm;
 use crate::weight_map::{DenseWeight, Mxfp8Weight};
 
 /// Rows a stage's scratch has room for: a block is five.
 const BLOCK_ROOM: usize = 8;
+/// Bytes of the word the ranks agree on a pass with.
+const WORD: usize = 16;
 
 /// The buffers of a pass.
 struct Buffers {
     /// What the rank that serves the request tells the others of a pass.
-    word: DevicePtr,
+    word: Seen,
     /// For the positions a pass makes keys for, up to a window of them: the
     /// target layers' means in FP8 (`[128, targets * hidden]` BF16), the
     /// projection of them in parts and in rows, its norm, and a stage's keys
@@ -63,6 +66,17 @@ struct Buffers {
     logits: DevicePtr,
     found: DevicePtr,
     drafts: DevicePtr,
+    /// `x`, room to a multiple of 64 bytes and `drafts`, as the host reads
+    /// them after a pass ([`Buffers::read_layout`]).
+    read: Seen,
+}
+
+impl Buffers {
+    /// Bytes of `x`, of the room it is given and of `drafts`.
+    fn read_layout(rows: usize, hidden: usize) -> (usize, usize, usize) {
+        let x = rows * hidden * 2;
+        (x, x.next_multiple_of(64), rows * 4)
+    }
 }
 
 pub struct Draft {
@@ -133,8 +147,8 @@ impl Draft {
         let Some(comm) = comm.filter(|_| self.held.count < PARTS) else {
             return Ok(said.flatten());
         };
-        let word = self.buffers.word;
-        let mut bytes = [0u8; 16];
+        let word = self.buffers.word.at;
+        let mut bytes = [0u8; WORD];
         gpu.synchronize(stream)?;
         if let Some(said) = said {
             let (go, token, len) = match said {
@@ -147,7 +161,7 @@ impl Draft {
             gpu.copy_h2d(&bytes, word)?;
         }
         comm.broadcast(word.0, bytes.len(), 0)?;
-        gpu.copy_d2h(word, &mut bytes)?;
+        let bytes = self.buffers.word.read(gpu, stream)?;
         let value = |at: usize| u32::from_le_bytes([0, 1, 2, 3].map(|b| bytes[at * 4 + b]));
         Ok((value(0) != 0).then(|| (value(1), value(2) as usize)))
     }
@@ -344,17 +358,13 @@ impl Draft {
     /// What a pass left for the host: the rows' drafts, and the rows the
     /// head read before their norm (`[rows, hidden]` BF16).
     pub(super) fn read(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<(Vec<u32>, Vec<u16>)> {
-        let (b, rows) = (&self.buffers, self.rows);
-        gpu.synchronize(stream)?;
-        let mut drafts = vec![0u8; rows * 4];
-        gpu.copy_d2h(b.drafts, &mut drafts)?;
-        let mut x = vec![0u8; rows * self.shape.hidden * 2];
-        gpu.copy_d2h(b.x, &mut x)?;
-        let drafts = drafts
+        let (x, room, _) = Buffers::read_layout(self.rows, self.shape.hidden);
+        let read = self.buffers.read.read(gpu, stream)?;
+        let drafts = read[room..]
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        let x = x
+        let x = read[..x]
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();

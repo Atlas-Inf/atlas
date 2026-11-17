@@ -30,6 +30,7 @@ pub mod moe_grouped;
 pub mod ops;
 pub mod parts;
 mod profile;
+mod seen;
 mod shape;
 pub mod side;
 mod state;

@@ -38,7 +38,7 @@ fn ladder(gpu: &dyn GpuBackend) -> Result<DevicePtr> {
 
 #[test]
 #[ignore = "needs a GB10 GPU and the deepseek-v4.1-flash target"]
-fn the_front_in_one_launch_leaves_the_bytes_of_five() -> Result<()> {
+fn the_front_in_one_launch_leaves_the_bytes_of_six() -> Result<()> {
     let gpu = backend()?;
     let stream = gpu.default_stream();
     let k = Kernels::load(gpu)?;
@@ -83,6 +83,7 @@ fn the_front_in_one_launch_leaves_the_bytes_of_five() -> Result<()> {
             eps,
             stream,
         )?;
+        fp8_quant_dequant(gpu, k.fp8_quant_dequant, plain_q, plain_q, q_rank, stream)?;
         rms_norm(
             gpu,
             norm,
@@ -133,7 +134,7 @@ fn the_front_in_one_launch_leaves_the_bytes_of_five() -> Result<()> {
         )?;
         assert!(
             bytes(gpu, plain_q, q_rank * 2)? == bytes(gpu, fused_q, q_rank * 2)?,
-            "trial {trial}: the normed query differs"
+            "trial {trial}: the normed query in FP8 differs"
         );
         assert!(
             bytes(gpu, plain_slot, HEAD_DIM * 2)? == bytes(gpu, fused_slot, HEAD_DIM * 2)?,
@@ -144,7 +145,7 @@ fn the_front_in_one_launch_leaves_the_bytes_of_five() -> Result<()> {
         }
     }
     println!(
-        "the attention's front in one launch leaves the bytes of five, at positions {POSITIONS:?}"
+        "the attention's front in one launch leaves the bytes of six, at positions {POSITIONS:?}"
     );
     Ok(())
 }

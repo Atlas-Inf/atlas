@@ -15,9 +15,10 @@ use super::super::draft_head::HostHead;
 use super::super::draft_ops::{DraftKernels, Markov};
 use super::super::ops::HEAD_DIM;
 use super::super::parts::{Held, PARTS};
+use super::super::seen::Seen;
 use super::super::shape::ladder;
 use super::super::weights::{BlockWeights, fp8_held, tensor};
-use super::{BLOCK_ROOM, Buffers, Draft};
+use super::{BLOCK_ROOM, Buffers, Draft, WORD};
 use crate::layers::ops::mxfp8_quantize;
 use crate::weight_map::Mxfp8Weight;
 
@@ -141,8 +142,10 @@ impl Draft {
         };
         let bf16 = |values: usize| gpu.alloc(values * 2);
         let copies = shape.hc.copies;
+        let (_, room, drafts) = Buffers::read_layout(rows, hidden);
+        let read = Seen::alloc(gpu, room + drafts)?;
         let buffers = Buffers {
-            word: gpu.alloc(64)?,
+            word: Seen::alloc(gpu, WORD)?,
             means: bf16(WINDOW * targets * hidden)?,
             projected: bf16(WINDOW * hidden)?,
             main: bf16(WINDOW * hidden)?,
@@ -153,11 +156,12 @@ impl Draft {
             embeds: bf16(rows * hidden)?,
             streams: bf16(rows * copies * hidden)?,
             pre: gpu.alloc(rows * copies * 4)?,
-            x: bf16(rows * hidden)?,
+            x: read.at,
             normed: bf16(rows * hidden)?,
             logits: gpu.alloc(held.count * rows * vocab / PARTS * 4)?,
             found: gpu.alloc(rows * PARTS * markov.bytes())?,
-            drafts: gpu.alloc(rows * 4)?,
+            drafts: read.at.offset(room),
+            read,
         };
         // The confidence head is the host's, where requests are served.
         let host = match config.ep_rank {

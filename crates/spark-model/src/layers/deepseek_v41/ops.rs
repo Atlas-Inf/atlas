@@ -49,6 +49,9 @@ pub struct Kernels {
     attn_output_few: KernelHandle,
     pub rotate: KernelHandle,
     pub fp8_quant_dequant: KernelHandle,
+    /// A batch's window out of the ring, and a verify's refused rows back.
+    pub window_unroll: KernelHandle,
+    pub window_restore: KernelHandle,
     pub fp4_quant_dequant: KernelHandle,
 }
 
@@ -65,6 +68,8 @@ impl Kernels {
             attn_output_few: gpu.kernel("dsv41_attn_tc", "dsv41_attn_output_tc_few")?,
             rotate: gpu.kernel("dsv41_cache", "dsv41_rotate")?,
             fp8_quant_dequant: gpu.kernel("dsv41_cache", "dsv41_fp8_quant_dequant")?,
+            window_unroll: gpu.kernel("dsv41_cache", "dsv41_window_unroll")?,
+            window_restore: gpu.kernel("dsv41_cache", "dsv41_window_restore")?,
             fp4_quant_dequant: gpu.kernel("dsv41_cache", "dsv41_fp4_quant_dequant")?,
         })
     }
@@ -81,7 +86,8 @@ pub struct Turn {
 
 /// What each of `rows` tokens' attention does between its first two
 /// projections and its heads, in one launch (`dsv41_front.cu`): `q_normed`
-/// (`[rows, q_rank]` BF16) = the norm of `q_low` under `q_weight`, and `slot`
+/// (`[rows, q_rank]` BF16) = the FP8 form of the norm of `q_low` under
+/// `q_weight`, which is what the heads' projection reads, and `slot`
 /// (`[rows, 512]` BF16) = the FP8 form of the norm of `key` under
 /// `key_weight` turned to the token's position (`turn.positions`, a row a
 /// token). The bytes of [`rotate`], [`fp8_quant_dequant`] and the RMS norm
@@ -103,7 +109,7 @@ pub fn front(
     stream: u64,
 ) -> Result<()> {
     ensure!(
-        q_rank.is_multiple_of(2) && q_rank <= 2048 && turn.rope <= HEAD_DIM,
+        q_rank.is_multiple_of(64) && q_rank <= 2048 && turn.rope <= HEAD_DIM,
         "dsv41_attn_front: q_rank {q_rank}, rope {}",
         turn.rope
     );
@@ -336,8 +342,9 @@ pub fn fp8_quant_dequant(
         "dsv41_fp8_quant_dequant: {values} values"
     );
     let blocks = (values / 32) as u32;
+    // A thread two values.
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(blocks, THREADS), 1, 1])
+        .grid([div_ceil(blocks * 16, THREADS), 1, 1])
         .block([THREADS, 1, 1])
         .arg_ptr(src)
         .arg_ptr(dst)

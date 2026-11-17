@@ -5,6 +5,7 @@
 use anyhow::{Context, Result, ensure};
 use spark_comm::CommBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::kernel_args::KernelLaunch;
 
 use super::block::Block;
 use super::block_index::Chosen;
@@ -30,10 +31,10 @@ impl Block {
     }
 
     /// The window's keys for a batch of more than one row from `position`,
-    /// in `scratch.chunk_keys`: the ring unrolled into position order, with
-    /// room after it for the batch's own, which `front` writes there and this
-    /// copies on into the ring. A row then reads its 128 by position, and no
-    /// row's key displaces one an earlier row of the batch still reads.
+    /// in `scratch.chunk_keys`: the ring unrolled into position order, ahead
+    /// of the batch's own, which `front` has written there and which go on
+    /// into the ring (`dsv41_window_unroll`). A small batch may be a verify
+    /// whose rows are taken back, and leaves the keys its rows displace.
     fn unroll_window(
         &self,
         gpu: &dyn GpuBackend,
@@ -42,37 +43,18 @@ impl Block {
         rows: usize,
         stream: u64,
     ) -> Result<()> {
-        let sc = &self.shared.scratch;
-        let key = HEAD_DIM * 2;
-        // Entry i of the unrolled keys is position `position - 128 + i`.
-        let turn = window_slot(position);
-        let copy = |from: usize, to: usize, count: usize, back: bool| -> Result<()> {
-            if count == 0 {
-                return Ok(());
-            }
-            let (ring, run) = (
-                state.window.offset(from * key),
-                sc.chunk_keys.offset(to * key),
-            );
-            match back {
-                false => gpu.copy_d2d_async(ring, run, count * key, stream),
-                true => gpu.copy_d2d_async(run, ring, count * key, stream),
-            }
-        };
-        copy(turn, 0, WINDOW - turn, false)?;
-        copy(0, WINDOW - turn, turn, false)?;
-        // A small batch may be a verify whose rows are taken back: the keys
-        // its rows displace are the first of the unrolled ones.
-        if rows <= KEPT_ROWS {
-            gpu.copy_d2d_async(sc.chunk_keys, state.kept_window, rows * key, stream)?;
-        }
-        // The batch's keys, once `front` has written them, into the ring:
-        // its last 128, when it is longer than the window.
-        let kept = rows.min(WINDOW);
-        let (from, turn) = (WINDOW + rows - kept, window_slot(position + rows - kept));
-        let first = kept.min(WINDOW - turn);
-        copy(turn, from, first, true)?;
-        copy(0, from + first, kept - first, true)
+        let (k, sc) = (&self.shared.kernels.cache, &self.shared.scratch);
+        let keep = if rows <= KEPT_ROWS { rows } else { 0 };
+        KernelLaunch::new(gpu, k.window_unroll)
+            .grid([(WINDOW * HEAD_DIM / 8).div_ceil(256) as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(state.window)
+            .arg_ptr(sc.chunk_keys)
+            .arg_ptr(state.kept_window)
+            .arg_u32(position as u32)
+            .arg_u32(rows as u32)
+            .arg_u32(keep as u32)
+            .launch(stream)
     }
 
     /// Attention of the `rows` inputs in `scratch.normed`, and in FP8 in
@@ -248,13 +230,6 @@ impl Block {
             w.wq_b.n,
             w.wq_b.k
         );
-        if gemm.is_none() {
-            // The query rounded to FP8 once, where it lies, for the heads'
-            // projection: one that rounds its own input does it again in
-            // every block (512 of them a part).
-            let (quant, values) = (k.cache.fp8_quant_dequant, rows * s.q_rank);
-            ops::fp8_quant_dequant(gpu, quant, sc.q_low_normed, sc.q_low_normed, values, stream)?;
-        }
         for part in held.range() {
             let began = profile::begin(gpu, stream)?;
             // This part's heads: projected from the query's FP8 form, and

@@ -6,7 +6,8 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 use super::cache_recipe::WINDOW;
 use super::draft_seq::{DraftSeq, tap};
@@ -130,6 +131,7 @@ impl SeqState {
     pub fn roll_back(
         &mut self,
         gpu: &dyn GpuBackend,
+        restore: KernelHandle,
         ratio: usize,
         accepted: usize,
         rows: usize,
@@ -147,21 +149,30 @@ impl SeqState {
             kept == rows,
             "deepseek_v41: a verify of {rows} rows after a batch of {kept}"
         );
-        gpu.synchronize(stream)?;
-        let key = HEAD_DIM * 2;
-        for row in accepted..rows {
-            let slot = (first + row) % WINDOW;
-            let from = self.kept_window.offset(row * key);
-            gpu.copy_d2d(from, self.window.offset(slot * key), key)?;
-        }
+        // In stream order, behind the batch and ahead of the next: a wait
+        // for the stream and a copy a row, in every layer, was 1.6 ms of a
+        // verify step with nothing on the GPU.
+        KernelLaunch::new(gpu, restore)
+            .grid([
+                div_ceil(((rows - accepted) * HEAD_DIM / 8) as u32, 256),
+                1,
+                1,
+            ])
+            .block([256, 1, 1])
+            .arg_ptr(self.kept_window)
+            .arg_ptr(self.window)
+            .arg_u32(first as u32)
+            .arg_u32(accepted as u32)
+            .arg_u32(rows as u32)
+            .launch(stream)?;
         let end = first + accepted;
         if let Some(c) = self.compressed.as_ref().filter(|_| ratio > 1) {
             // The pools start at the group that was open before the batch.
             let (start, open) = (first - first % ratio, end % ratio);
             let (at, bytes) = ((end - open - start) * HEAD_DIM * 4, open * HEAD_DIM * 4);
             if bytes > 0 {
-                gpu.copy_d2d(c.kept_kv.offset(at), c.kv_state, bytes)?;
-                gpu.copy_d2d(c.kept_score.offset(at), c.score_state, bytes)?;
+                gpu.copy_d2d_async(c.kept_kv.offset(at), c.kv_state, bytes, stream)?;
+                gpu.copy_d2d_async(c.kept_score.offset(at), c.score_state, bytes, stream)?;
             }
         }
         self.history.truncate(end);

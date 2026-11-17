@@ -69,5 +69,7 @@ pub(super) const DSV41_PDL_KERNELS: &[&str] = &[
     "dsv41_sparse_attn",
     "dsv41_stream_mean",
     "dsv41_swiglu",
+    "dsv41_window_restore",
+    "dsv41_window_unroll",
     "mla_cache_assemble_batched",
 ];
