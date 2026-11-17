@@ -51,6 +51,13 @@ struct Inner {
     order: VecDeque<String>,
 }
 
+impl Inner {
+    fn touch_lru(&mut self, id: &str) {
+        self.order.retain(|k| k != id);
+        self.order.push_back(id.to_string());
+    }
+}
+
 /// Maximum items per conversation insert (mirrors OpenAI's spec).
 pub const MAX_ITEMS_PER_INSERT: usize = 20;
 
@@ -137,8 +144,7 @@ impl ConversationStore {
             inner.order.retain(|k| k != id);
             return None;
         }
-        inner.order.retain(|k| k != id);
-        inner.order.push_back(id.to_string());
+        inner.touch_lru(id);
         let c = inner.map.get_mut(id).expect("entry present");
         c.last_access = Instant::now();
         Some(ConversationSnapshot {
@@ -166,6 +172,7 @@ impl ConversationStore {
             inner.order.retain(|k| k != id);
             return None;
         }
+        inner.touch_lru(id);
         let c = inner.map.get_mut(id).expect("entry present");
         c.last_access = Instant::now();
         for (k, v) in patch {
@@ -199,6 +206,7 @@ impl ConversationStore {
             inner.order.retain(|k| k != id);
             return Err(AddItemsError::NotFound);
         }
+        inner.touch_lru(id);
         let c = inner.map.get_mut(id).expect("entry present");
         let start = c.items.len();
         let stamped: Vec<serde_json::Value> = new_items
@@ -224,6 +232,7 @@ impl ConversationStore {
         let removed = c.items.len() < before;
         if removed {
             c.last_access = Instant::now();
+            inner.touch_lru(conv_id);
         }
         removed
     }
