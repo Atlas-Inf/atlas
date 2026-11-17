@@ -275,16 +275,10 @@ pub(super) fn hc_pre_split(
     }
 
     let k_stage = gpu.kernel("hyper_connection", "hc_pre_stage")?;
-    // Two shapes of the same math. `hc_pre_down` stages the whole 40 KB
-    // `normed` row and makes one pass -- right for decode (T=1), where a single
-    // pass costs no barriers. `hc_pre_down_tiled` tiles tokens and chunks
-    // hc_dim -- right for prefill widths, where the single-pass version is
-    // L2-bandwidth-bound re-reading the 6.55 MB `down_w` once per token.
-    //
-    // Measured (nsys, 87-token prefill chunked 64+23):
-    //   prefill hc_pre_down  89.2 ms -> 33.0 ms   (prefill window 491.5 -> 438.3)
-    //   decode  hc_pre_down  28.8 ms -> 65.0 ms   (679 calls; 2.3x WORSE)
-    // so neither kernel wins everywhere and the dispatch is on T.
+    // Two shapes of the same math: `hc_pre_down` stages the 40 KB `normed` row and makes one
+    // pass (decode); `hc_pre_down_tiled` tiles tokens and chunks hc_dim (prefill, where the
+    // single pass is L2-bound re-reading the 6.55 MB `down_w` per token).
+    // nsys, 87-token prefill: tiled 89.2 -> 33.0 ms; decode 28.8 -> 65.0 ms (2.3x worse). Dispatch on T.
     let k_down = gpu.kernel("hyper_connection", "hc_pre_down")?;
     let k_down_tiled = gpu.kernel("hyper_connection", "hc_pre_down_tiled")?;
     let k_fin = gpu.kernel("hyper_connection", "hc_pre_finish")?;
@@ -413,13 +407,17 @@ pub(super) fn hc_pre_split(
         let hc_smem = hc_dim as usize * 4;
         anyhow::ensure!(
             hc_smem <= HC_SMEM_MAX,
-            "hc_pre_down: normed row is {} B of shared, over the {} B block \
-             limit (hc_dim={}).",
+            "hc_pre_down: normed row is {} B of shared, over the {} B limit (hc_dim={}).",
             hc_smem,
             HC_SMEM_MAX,
             hc_dim,
         );
-        let dsplit = (48 / num_tokens.max(1)).clamp(1, 10);
+        // T >= 4: fewer row splits (each block re-stages the T-token nx); kbench 43868021041 T=4..8 1.2-1.4x, same bytes.
+        let dsplit = if num_tokens >= 4 {
+            (32 / num_tokens).max(4)
+        } else {
+            (48 / num_tokens.max(1)).clamp(1, 10)
+        };
         KernelLaunch::new(gpu, k_down)
             .grid([num_tokens, dsplit, 1])
             .block([1024, 1, 1])
