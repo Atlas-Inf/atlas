@@ -45,6 +45,8 @@
 //! pattern we recognize". The shape clients receive is identical to
 //! what a real web-search backend would produce.
 
+use std::ops::Range;
+
 use crate::citation_structured::{
     footnote_citations, numeric_ref_citations, sources_block_citations,
 };
@@ -75,11 +77,15 @@ pub fn merged_citations(content: &str) -> Option<Vec<Citation>> {
 
 /// Find structured citations in `content` and return one entry per
 /// reference site. Returns an empty vec when nothing matched.
+///
+/// Patterns inside code spans are skipped, as in
+/// [`extract_url_citations`].
 pub fn extract(content: &str) -> Vec<Citation> {
+    let code = CodeSpans::find(content);
     let mut out = Vec::new();
-    out.extend(footnote_citations(content));
-    out.extend(numeric_ref_citations(content));
-    out.extend(sources_block_citations(content));
+    out.extend(footnote_citations(content, &code));
+    out.extend(numeric_ref_citations(content, &code));
+    out.extend(sources_block_citations(content, &code));
     // Sort by start position so consumers see document order.
     out.sort_by_key(|c| c.start_index);
     out
@@ -241,69 +247,71 @@ fn balanced_paren_close(s: &str) -> Option<usize> {
     None
 }
 
+/// Byte ranges of fenced code blocks (```) and inline code spans (`) in
+/// some content, sorted and non-overlapping. An unterminated fence or span
+/// runs to the end of the content. Shared by the bare-URL scan (through
+/// [`mask_code_spans`]) and the structured extractors, so both agree on
+/// what is illustrative code rather than a citation.
+pub(crate) struct CodeSpans(Vec<Range<usize>>);
+
+impl CodeSpans {
+    pub(crate) fn find(content: &str) -> Self {
+        let bytes = content.as_bytes();
+        let mut spans = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let delimiter = if bytes[i..].starts_with(b"```") {
+                "```"
+            } else if bytes[i] == b'`' {
+                "`"
+            } else {
+                // Step one whole UTF-8 codepoint.
+                i += match bytes[i] {
+                    0x00..=0x7f => 1,
+                    0xc0..=0xdf => 2,
+                    0xe0..=0xef => 3,
+                    0xf0..=0xf7 => 4,
+                    _ => 1,
+                };
+                continue;
+            };
+            let after = i + delimiter.len();
+            let end = match content[after..].find(delimiter) {
+                Some(r) => after + r + delimiter.len(),
+                None => bytes.len(),
+            };
+            spans.push(i..end);
+            i = end;
+        }
+        Self(spans)
+    }
+
+    /// Whether byte offset `pos` falls inside a code span.
+    pub(crate) fn contains(&self, pos: usize) -> bool {
+        let idx = self.0.partition_point(|r| r.end <= pos);
+        self.0.get(idx).is_some_and(|r| r.start <= pos)
+    }
+}
+
 /// Return a copy of `content` where the insides of fenced code blocks
 /// (```) and inline code spans (`) are replaced with ASCII spaces while
 /// preserving byte offsets and UTF-8 validity. Used so the URL scan can
 /// skip over code regions without rebuilding indices.
 ///
-/// We walk char-by-char to keep multi-byte characters intact: each non-
-/// newline char inside a code region becomes N ASCII spaces where N is
-/// the char's UTF-8 byte length. Newlines are kept so line-based parsers
-/// still see the structure.
+/// Each non-newline char inside a code region becomes N ASCII spaces
+/// where N is the char's UTF-8 byte length. Newlines are kept so
+/// line-based parsers still see the structure.
 fn mask_code_spans(content: &str) -> String {
-    let bytes = content.as_bytes();
-    let mut out: Vec<u8> = bytes.to_vec();
-
-    // Blank bytes [start, end) by char: non-newline chars → ASCII spaces
-    // of the same byte length, newlines preserved. Char boundaries taken
-    // from the original content (which is guaranteed UTF-8).
-    fn blank(out: &mut [u8], content: &str, start: usize, end: usize) {
-        let region = &content[start..end];
-        let mut cursor = start;
-        for ch in region.chars() {
+    let mut out: Vec<u8> = content.as_bytes().to_vec();
+    for span in CodeSpans::find(content).0 {
+        let mut cursor = span.start;
+        for ch in content[span].chars() {
             let len = ch.len_utf8();
             if ch != '\n' {
-                for b in out.iter_mut().skip(cursor).take(len) {
-                    *b = b' ';
-                }
+                out[cursor..cursor + len].fill(b' ');
             }
             cursor += len;
         }
-    }
-
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i..].starts_with(b"```") {
-            let after = i + 3;
-            let rest = &content[after..];
-            let end = match rest.find("```") {
-                Some(r) => after + r + 3,
-                None => bytes.len(),
-            };
-            blank(&mut out, content, i, end);
-            i = end;
-            continue;
-        }
-        if bytes[i] == b'`' {
-            let after = i + 1;
-            let rest = &content[after..];
-            let end = match rest.find('`') {
-                Some(r) => after + r + 1,
-                None => bytes.len(),
-            };
-            blank(&mut out, content, i, end);
-            i = end;
-            continue;
-        }
-        // Step one whole UTF-8 codepoint.
-        let step = match bytes[i] {
-            0x00..=0x7f => 1,
-            0xc0..=0xdf => 2,
-            0xe0..=0xef => 3,
-            0xf0..=0xf7 => 4,
-            _ => 1,
-        };
-        i += step;
     }
     String::from_utf8(out).expect("mask preserves UTF-8")
 }
@@ -395,6 +403,33 @@ mod tests {
     fn query_and_fragment_kept() {
         let got = extract_url_citations("see https://example.com/p?q=1&r=2#frag here");
         assert_eq!(got[0].url, "https://example.com/p?q=1&r=2#frag");
+    }
+
+    #[test]
+    fn footnote_inside_fenced_code_skipped() {
+        let input = "```markdown\nSee [^1].\n[^1]: https://example.com Example\n```";
+        assert!(merged_citations(input).is_none());
+    }
+
+    #[test]
+    fn numeric_ref_inside_fenced_code_skipped() {
+        let input = "```\nSee [1].\n[1] https://example.com\n```";
+        assert!(merged_citations(input).is_none());
+    }
+
+    #[test]
+    fn sources_block_inside_fenced_code_skipped() {
+        let input = "```\nSources:\n- https://example.com\n```";
+        assert!(merged_citations(input).is_none());
+    }
+
+    #[test]
+    fn structured_refs_inside_inline_code_skipped() {
+        let input = "Write `text[^1]` for a footnote, like this[^1].\n\n[^1]: https://example.com The `md` guide";
+        let got = extract(input);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].start_index, input.find("this[^1]").unwrap() + 4);
+        assert_eq!(got[0].title, "The `md` guide");
     }
 
     #[test]

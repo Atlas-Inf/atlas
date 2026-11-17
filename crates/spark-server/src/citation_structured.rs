@@ -5,12 +5,22 @@
 //! [`crate::citation`] module docs for the recognized shapes; these are
 //! the pattern parsers behind [`crate::citation::extract`].
 
-use crate::citation::Citation;
+use crate::citation::{Citation, CodeSpans};
+
+/// `(byte offset, line)` for each `\n`-separated line of `content`. A
+/// trailing `\r` stays on the line; callers trim it as whitespace.
+fn lines_with_offsets(content: &str) -> impl Iterator<Item = (usize, &str)> {
+    content.split('\n').scan(0, |next, line| {
+        let start = *next;
+        *next += line.len() + 1;
+        Some((start, line))
+    })
+}
 
 /// Parse markdown footnote references: every `[^label]` in text paired
-/// with a `[^label]: url [title]` definition.
-pub(crate) fn footnote_citations(content: &str) -> Vec<Citation> {
-    let defs = collect_footnote_defs(content);
+/// with a `[^label]: url [title]` definition, ignoring both inside `code`.
+pub(crate) fn footnote_citations(content: &str, code: &CodeSpans) -> Vec<Citation> {
+    let defs = collect_footnote_defs(content, code);
     if defs.is_empty() {
         return Vec::new();
     }
@@ -20,6 +30,10 @@ pub(crate) fn footnote_citations(content: &str) -> Vec<Citation> {
     while i < bytes.len() {
         if let Some(rel) = content[i..].find("[^") {
             let start = i + rel;
+            if code.contains(start) {
+                i = start + 2;
+                continue;
+            }
             // Skip footnote definitions (`[^x]:` at line start).
             let after_br = &content[start..];
             if let Some(close_rel) = after_br.find(']') {
@@ -53,10 +67,14 @@ pub(crate) fn footnote_citations(content: &str) -> Vec<Citation> {
 /// matching `[^label]: url [title]`.
 fn collect_footnote_defs(
     content: &str,
+    code: &CodeSpans,
 ) -> std::collections::HashMap<String, (String, Option<String>)> {
     let mut map = std::collections::HashMap::new();
-    for line in content.lines() {
+    for (offset, line) in lines_with_offsets(content) {
         let trimmed = line.trim_start();
+        if code.contains(offset + line.len() - trimmed.len()) {
+            continue;
+        }
         let Some(rest) = trimmed.strip_prefix("[^") else {
             continue;
         };
@@ -83,9 +101,10 @@ fn collect_footnote_defs(
     map
 }
 
-/// Parse `[N]` refs paired with a `[N] url` definition line.
-pub(crate) fn numeric_ref_citations(content: &str) -> Vec<Citation> {
-    let defs = collect_numeric_defs(content);
+/// Parse `[N]` refs paired with a `[N] url` definition line, ignoring
+/// both inside `code`.
+pub(crate) fn numeric_ref_citations(content: &str, code: &CodeSpans) -> Vec<Citation> {
+    let defs = collect_numeric_defs(content, code);
     if defs.is_empty() {
         return Vec::new();
     }
@@ -96,6 +115,10 @@ pub(crate) fn numeric_ref_citations(content: &str) -> Vec<Citation> {
             break;
         };
         let start = i + rel;
+        if code.contains(start) {
+            i = start + 1;
+            continue;
+        }
         let after = &content[start + 1..];
         let Some(close_rel) = after.find(']') else {
             break;
@@ -128,10 +151,14 @@ pub(crate) fn numeric_ref_citations(content: &str) -> Vec<Citation> {
 
 fn collect_numeric_defs(
     content: &str,
+    code: &CodeSpans,
 ) -> std::collections::HashMap<String, (String, Option<String>)> {
     let mut map = std::collections::HashMap::new();
-    for line in content.lines() {
+    for (offset, line) in lines_with_offsets(content) {
         let trimmed = line.trim_start();
+        if code.contains(offset + line.len() - trimmed.len()) {
+            continue;
+        }
         let Some(rest) = trimmed.strip_prefix('[') else {
             continue;
         };
@@ -163,8 +190,8 @@ fn collect_numeric_defs(
 
 /// Find `Sources:` or `References:` heading and emit a citation for
 /// each bullet line containing an http(s) URL until a blank line or a
-/// non-bullet line breaks the section.
-pub(crate) fn sources_block_citations(content: &str) -> Vec<Citation> {
+/// non-bullet line breaks the section. Headings inside `code` are ignored.
+pub(crate) fn sources_block_citations(content: &str, code: &CodeSpans) -> Vec<Citation> {
     let lower = content.to_ascii_lowercase();
     let markers = ["sources:", "references:", "citations:"];
     let mut out = Vec::new();
@@ -175,7 +202,7 @@ pub(crate) fn sources_block_citations(content: &str) -> Vec<Citation> {
             // Must be at a line start (previous char is \n or BOF).
             let at_line_start =
                 heading_start == 0 || content.as_bytes().get(heading_start - 1) == Some(&b'\n');
-            if !at_line_start {
+            if !at_line_start || code.contains(heading_start) {
                 search_from = heading_start + marker.len();
                 continue;
             }
