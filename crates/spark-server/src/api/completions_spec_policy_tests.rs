@@ -9,7 +9,7 @@ use crate::api::inference_types::{InferenceRequest, InferenceResponse};
 use crate::main_modules::model_host::CurrentModel;
 use serde_json::json;
 
-fn tokenizer() -> crate::tokenizer::ChatTokenizer {
+pub(super) fn tokenizer() -> crate::tokenizer::ChatTokenizer {
     let dir = tempfile::tempdir().unwrap();
     let vocab = [
         "[UNK]", "answer", "<think>", "secret", "</think>", "STOP", "prompt",

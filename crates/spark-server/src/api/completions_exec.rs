@@ -254,3 +254,7 @@ mod token_ids_tests;
 #[cfg(test)]
 #[path = "completions_spec_policy_tests.rs"]
 mod spec_policy_tests;
+
+#[cfg(test)]
+#[path = "completions_stream_error_tests.rs"]
+mod stream_error_tests;
