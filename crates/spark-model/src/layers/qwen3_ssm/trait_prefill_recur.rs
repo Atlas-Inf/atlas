@@ -50,6 +50,12 @@ impl Qwen3SsmLayer {
         // paths (and a future C=32 FLA variant) are Blackwell-only. NVIDIA
         // (cfg unset) takes the full FLA/WY ladder below unchanged.
         if cfg!(atlas_scale) {
+            // A capture on the 64-token grid rides the FLA spine (`fla_midchunk`).
+            let ptrs = [h_state, q_ptr, k_ptr, v_ptr, gates_buf, gdn_out_buf];
+            let dims = [nk, nv, kd, vd, conv_dim];
+            if self.fla_midchunk_capture(ctx, midcap_idx, ptrs, k, dims, gb_stride, stream)? {
+                return Ok(());
+            }
             // MID-CHUNK tail capture: split the split4 recurrence at cap_local
             // (and, when present, cap_local - bs), D2D each captured h_state
             // into its reserved slot, then finish the trailing tokens with

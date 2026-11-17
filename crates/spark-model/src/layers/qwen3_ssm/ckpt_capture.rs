@@ -20,9 +20,7 @@ impl Qwen3SsmLayer {
             && vd == 128
             && ctx.buffers.gdn_fla_scratch().0 != 0
             && self.gdn_prefill_fla_recompute_wu_k.0 != 0
-            // gfx1151 builds only the fused spine (`_vfused`, which has the `_cap` twin).
-            && (self.gdn_prefill_fla_chunk_delta_h_k.0 != 0
-                || (cfg!(atlas_scale) && self.gdn_prefill_fla_chunk_delta_h_fused_k.0 != 0))
+            && self.gdn_prefill_fla_chunk_delta_h_k.0 != 0
             && self.gdn_prefill_fla_chunk_fwd_o_k.0 != 0
     }
 
