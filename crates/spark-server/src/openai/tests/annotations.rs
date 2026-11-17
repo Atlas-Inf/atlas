@@ -47,6 +47,25 @@ fn unicode_citation_character_indices() {
 }
 
 #[test]
+fn crlf_sources_citation_character_indices() {
+    let input = "Sources:\r\n- https://example.com/(文)\r\n- https://other.com/文\r\n";
+    let citations = crate::citation::extract(input);
+    assert_eq!(citations.len(), 2);
+    for citation in citations {
+        assert_eq!(
+            &input[citation.start_index..citation.end_index],
+            citation.url
+        );
+    }
+    for annotations in [extract_url_annotations(input), merged_annotations(input)] {
+        for annotation in annotations.unwrap() {
+            let (s, e, url, _) = url_of(&annotation);
+            assert_eq!(input.chars().skip(s).take(e - s).collect::<String>(), url);
+        }
+    }
+}
+
+#[test]
 fn trailing_sentence_punct_stripped() {
     let got = extract_url_annotations("go to https://example.com.").unwrap();
     let (_, _, u, _) = url_of(&got[0]);

@@ -186,12 +186,13 @@ pub(crate) fn sources_block_citations(content: &str) -> Vec<Citation> {
             // newline so the first real line is the first bullet.
             let mut cursor = after;
             let mut seen_content = false;
-            for line in rest.lines() {
+            for line_with_ending in rest.split_inclusive('\n') {
                 let line_start = cursor;
-                cursor += line.len();
-                if content.as_bytes().get(cursor) == Some(&b'\n') {
-                    cursor += 1;
-                }
+                cursor += line_with_ending.len();
+                let line = line_with_ending
+                    .strip_suffix("\r\n")
+                    .or_else(|| line_with_ending.strip_suffix('\n'))
+                    .unwrap_or(line_with_ending);
                 let trimmed = line.trim_start();
                 if trimmed.is_empty() {
                     if seen_content {
