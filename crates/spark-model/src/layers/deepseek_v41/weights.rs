@@ -13,13 +13,13 @@
 //! leaves them on disk and the parts are read from there.
 
 use anyhow::{Context, Result, ensure};
-use spark_runtime::fast_weights::{SliceAxis, with_deferred_slice};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use super::hc::HcSite;
-use super::parts::{self, Held, PARTS, PartKernels};
+use super::parts::{Held, PARTS, PartKernels};
 use super::shape::Shape;
+use super::weights_experts::{expert_slab, release_experts};
 use crate::weight_map::{Mxfp8Weight, fp8_block_scales_to_rows};
 
 /// An FP8 projection `[n, k]`.
@@ -58,8 +58,8 @@ pub type Parted = [Option<Slice>; PARTS];
 pub struct ExpertSlab {
     pub base: DevicePtr,
     /// Bytes of one projection's part, and of its scales.
-    data: usize,
-    scales: usize,
+    pub(super) data: usize,
+    pub(super) scales: usize,
 }
 
 impl ExpertSlab {
@@ -73,7 +73,7 @@ impl ExpertSlab {
         (self.data, self.scales)
     }
 
-    fn slice(&self, expert: usize, projection: usize) -> Slice {
+    pub(super) fn slice(&self, expert: usize, projection: usize) -> Slice {
         let at = expert * self.stride() + projection * (self.data + self.scales);
         Slice {
             data: self.base.offset(at),
@@ -102,12 +102,13 @@ pub struct AttentionWeights {
     pub q_norm: DevicePtr,
     pub kv_norm: DevicePtr,
     pub wq_a: Fp8Proj,
-    /// Whole on every rank; a part is a quarter of the heads' rows.
+    /// A part is a quarter of the heads' rows, and a rank has the rows of
+    /// the parts it holds ([`fp8_held`]).
     pub wq_b: Fp8Proj,
     pub wkv: Fp8Proj,
-    /// Whole on every rank; a part is a quarter of the groups.
+    /// The same: a part is a quarter of the groups.
     pub wo_a: Fp8Proj,
-    /// Whole on every rank; a part is a quarter of its rows.
+    /// The same: a part is a quarter of its rows.
     pub wo_b: Fp8Proj,
     /// `[heads]` FP32.
     pub sink: DevicePtr,
@@ -148,8 +149,8 @@ pub struct MoeWeights {
     pub bias: DevicePtr,
     /// Every routed expert, a part at a time.
     pub experts: [Option<ExpertSlab>; PARTS],
-    /// The shared expert, whole on every rank: a part is a quarter of each
-    /// projection's rows.
+    /// The shared expert: a part is a quarter of each projection's rows,
+    /// and a rank has the rows of the parts it holds.
     pub shared_w1: Fp8Proj,
     pub shared_w3: Fp8Proj,
     pub shared_w2: Fp8Proj,
@@ -203,116 +204,51 @@ pub(super) fn fp8(store: &WeightStore, gpu: &dyn GpuBackend, prefix: &str) -> Re
     })
 }
 
+/// [`fp8`] of a projection whose rows this rank computes a part of: the rows
+/// of the parts it holds are kept, and the store's copy of the whole let go,
+/// which on one of four ranks is three quarters of it. The projection is
+/// still addressed as a whole (`rows_from`, [`row_part`]); the rows of the
+/// other parts are not there to read.
+pub(super) fn fp8_held(
+    store: &WeightStore,
+    gpu: &dyn GpuBackend,
+    prefix: &str,
+    held: Held,
+) -> Result<Fp8Proj> {
+    let whole = fp8(store, gpu, prefix)?;
+    if held.count == PARTS {
+        return Ok(whole);
+    }
+    let (n, k) = (whole.n, whole.k);
+    ensure!(
+        n.is_multiple_of(PARTS),
+        "{prefix}: {n} rows do not split in {PARTS} parts"
+    );
+    let (first, rows) = (held.first * n / PARTS, held.count * n / PARTS);
+    let keep = |from: DevicePtr, width: usize| -> Result<DevicePtr> {
+        let (kept, before) = (gpu.alloc(rows * width)?, (first * width) as u64);
+        gpu.copy_d2d(from.offset(first * width), kept, rows * width)?;
+        ensure!(kept.0 >= before, "{prefix}: a part below its own start");
+        Ok(DevicePtr(kept.0 - before))
+    };
+    let (data, scales) = (keep(whole.w.data, k)?, keep(whole.w.scales, k / 32)?);
+    store.reclaim(gpu, &format!("{prefix}.weight"))?;
+    gpu.free(whole.w.scales)?;
+    Ok(Fp8Proj {
+        w: Mxfp8Weight {
+            data,
+            scales,
+            tiled: false,
+        },
+        n,
+        k,
+    })
+}
+
 /// Part `part` of the rows of a whole FP8 projection: a quarter of its
 /// output.
 pub fn row_part(whole: &Fp8Proj, part: usize) -> Slice {
     whole.rows_from(part * whole.n / PARTS)
-}
-
-/// Part `part` of one routed-expert tensor `name` (`[rows, row_bytes]`
-/// bytes) into `dst`: a quarter of its rows or of its columns. The tensor is
-/// read from disk where the loader left it there, and from the device
-/// otherwise.
-#[allow(clippy::too_many_arguments)]
-fn expert_part(
-    store: &WeightStore,
-    gpu: &dyn GpuBackend,
-    kernels: &PartKernels,
-    name: &str,
-    rows: usize,
-    row_bytes: usize,
-    axis: SliceAxis,
-    part: usize,
-    dst: DevicePtr,
-    stream: u64,
-) -> Result<()> {
-    if !store.contains(name) {
-        return with_deferred_slice(store, name, rows, row_bytes, axis, part, PARTS, |bytes| {
-            gpu.copy_h2d(bytes, dst)
-        });
-    }
-    let whole = store.get(name)?;
-    ensure!(
-        whole.shape == [rows, row_bytes] && whole.dtype.byte_size() == 1,
-        "{name}: {:?} {:?}, expected [{rows}, {row_bytes}] bytes",
-        whole.dtype,
-        whole.shape
-    );
-    match axis {
-        SliceAxis::Rows => {
-            let bytes = rows / PARTS * row_bytes;
-            gpu.synchronize(stream)?;
-            gpu.copy_d2d(whole.ptr.offset(part * bytes), dst, bytes)
-        }
-        SliceAxis::Cols => {
-            let width = row_bytes / PARTS;
-            parts::slice_columns(
-                gpu,
-                kernels.slice,
-                whole.ptr,
-                dst,
-                rows,
-                row_bytes,
-                part * width,
-                width,
-                stream,
-            )
-        }
-    }
-}
-
-/// Part `part` of every routed expert of layer `layer`.
-fn expert_slab(
-    store: &WeightStore,
-    gpu: &dyn GpuBackend,
-    kernels: &PartKernels,
-    shape: &Shape,
-    layer: usize,
-    part: usize,
-    stream: u64,
-) -> Result<ExpertSlab> {
-    let (inter, hidden) = (shape.inter, shape.hidden);
-    ensure!(
-        inter.is_multiple_of(PARTS * 32) && hidden.is_multiple_of(32),
-        "deepseek_v41: experts [{inter}, {hidden}] do not split in {PARTS} parts"
-    );
-    // A part of w1 or w3 is inter / 4 rows of hidden values; a part of w2 is
-    // hidden / 4 rows of inter values. Both are the same number of bytes.
-    let slab = ExpertSlab {
-        base: gpu.alloc(shape.experts * 3 * (inter / PARTS) * (hidden / 2 + hidden / 32))?,
-        data: inter / PARTS * hidden / 2,
-        scales: inter / PARTS * hidden / 32,
-    };
-    for expert in 0..shape.experts {
-        let prefix = format!("layers.{layer}.ffn.experts.{expert}");
-        for (projection, name, rows, columns, axis) in [
-            (0, "w1", inter, hidden, SliceAxis::Rows),
-            (1, "w3", inter, hidden, SliceAxis::Rows),
-            (2, "w2", hidden, inter, SliceAxis::Rows),
-        ] {
-            let slice = slab.slice(expert, projection);
-            for (tensor, row_bytes, dst) in [
-                ("weight", columns / 2, slice.data),
-                ("scale", columns / 32, slice.scales),
-            ] {
-                expert_part(
-                    store,
-                    gpu,
-                    kernels,
-                    &format!("{prefix}.{name}.{tensor}"),
-                    rows,
-                    row_bytes,
-                    axis,
-                    part,
-                    dst,
-                    stream,
-                )
-                .with_context(|| format!("{prefix}.{name}.{tensor}"))?;
-            }
-        }
-    }
-    gpu.synchronize(stream)?;
-    Ok(slab)
 }
 
 fn hc_site(store: &WeightStore, layer: &str, site: &str) -> Result<HcSite> {
@@ -359,16 +295,46 @@ impl BlockWeights {
         stream: u64,
     ) -> Result<Self> {
         let layer = format!("layers.{index}");
+        Self::load_named(
+            store,
+            gpu,
+            kernels,
+            shape,
+            &layer,
+            compress_ratio,
+            index_source,
+            held,
+            experts,
+            stream,
+        )
+    }
+
+    /// [`Self::load`] of the block whose tensors are named `layer.*`: a
+    /// decoder layer, or a draft stage (`mtp.N`), which is a block with
+    /// fewer experts and no compressed keys.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_named(
+        store: &WeightStore,
+        gpu: &dyn GpuBackend,
+        kernels: &PartKernels,
+        shape: &Shape,
+        layer: &str,
+        compress_ratio: usize,
+        index_source: bool,
+        held: Held,
+        experts: bool,
+        stream: u64,
+    ) -> Result<Self> {
         let bf16 = |name: &str| tensor(store, &format!("{layer}.{name}"), WeightDtype::BF16);
         let attn = AttentionWeights {
             norm: bf16("attn_norm.weight")?,
             q_norm: bf16("attn.q_norm.weight")?,
             kv_norm: bf16("attn.kv_norm.weight")?,
             wq_a: fp8(store, gpu, &format!("{layer}.attn.wq_a"))?,
-            wq_b: fp8(store, gpu, &format!("{layer}.attn.wq_b"))?,
+            wq_b: fp8_held(store, gpu, &format!("{layer}.attn.wq_b"), held)?,
             wkv: fp8(store, gpu, &format!("{layer}.attn.wkv"))?,
-            wo_a: fp8(store, gpu, &format!("{layer}.attn.wo_a"))?,
-            wo_b: fp8(store, gpu, &format!("{layer}.attn.wo_b"))?,
+            wo_a: fp8_held(store, gpu, &format!("{layer}.attn.wo_a"), held)?,
+            wo_b: fp8_held(store, gpu, &format!("{layer}.attn.wo_b"), held)?,
             sink: tensor(store, &format!("{layer}.attn.attn_sink"), WeightDtype::FP32)?,
         };
         let compressor = match compress_ratio {
@@ -405,18 +371,24 @@ impl BlockWeights {
                 let mut slabs = [None; PARTS];
                 for part in held.range().filter(|_| experts) {
                     slabs[part] = Some(expert_slab(
-                        store, gpu, kernels, shape, index, part, stream,
+                        store, gpu, kernels, shape, layer, part, stream,
                     )?);
+                }
+                // The slabs hold this rank's part of every expert, and
+                // nothing else reads them: a store that had them whole on
+                // the device (a rank alone, or a draft stage's) lets them go.
+                if experts {
+                    release_experts(store, gpu, layer, shape.experts)?;
                 }
                 slabs
             },
-            shared_w1: fp8(store, gpu, &format!("{layer}.ffn.shared_experts.w1"))?,
-            shared_w3: fp8(store, gpu, &format!("{layer}.ffn.shared_experts.w3"))?,
-            shared_w2: fp8(store, gpu, &format!("{layer}.ffn.shared_experts.w2"))?,
+            shared_w1: fp8_held(store, gpu, &format!("{layer}.ffn.shared_experts.w1"), held)?,
+            shared_w3: fp8_held(store, gpu, &format!("{layer}.ffn.shared_experts.w3"), held)?,
+            shared_w2: fp8_held(store, gpu, &format!("{layer}.ffn.shared_experts.w2"), held)?,
         };
         Ok(Self {
-            hc_attn: hc_site(store, &layer, "attn")?,
-            hc_ffn: hc_site(store, &layer, "ffn")?,
+            hc_attn: hc_site(store, layer, "attn")?,
+            hc_ffn: hc_site(store, layer, "ffn")?,
             attn,
             compressor,
             indexer,

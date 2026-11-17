@@ -28,6 +28,7 @@ pub mod side;
 mod state;
 pub mod tail;
 pub mod weights;
+mod weights_experts;
 
 #[cfg(test)]
 mod test_support;
