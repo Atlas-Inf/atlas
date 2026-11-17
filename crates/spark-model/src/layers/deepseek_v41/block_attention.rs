@@ -98,18 +98,14 @@ impl Block {
                     g.wkv
                         .gemm(act, sc.key.offset(at * HEAD_DIM * 2), kept, stream)?;
                 }
-                if let Some(own) = own {
-                    let held = self.shared.held;
-                    let rows_of = |base: DevicePtr, row_bytes: usize| {
-                        let recv = sc.gather_recv;
-                        owned::gather_rows(gpu, comm, held, own, base, recv, row_bytes, stream)
-                    };
-                    rows_of(sc.q_low, s.q_rank * 2)?;
-                    rows_of(sc.key, HEAD_DIM * 2)?;
-                    // A key source and an indexer read every row's input.
-                    if self.weights.compressor.is_some() || self.weights.indexer.is_some() {
-                        rows_of(sc.normed, s.hidden * 2)?;
-                    }
+                // The query and the key are gathered as the launch below
+                // leaves them. A key source and an indexer read every row's
+                // input.
+                let reads_input =
+                    self.weights.compressor.is_some() || self.weights.indexer.is_some();
+                if let Some(own) = own.filter(|_| reads_input) {
+                    let (held, recv, bytes) = (self.shared.held, sc.gather_recv, s.hidden * 2);
+                    owned::gather_rows(gpu, comm, held, own, sc.normed, recv, bytes, stream)?;
                 }
             }
             None => parts::project_two(
@@ -138,21 +134,37 @@ impl Block {
             ),
             _ => (sc.chunk_keys, sc.chunk_keys.offset(WINDOW * HEAD_DIM * 2)),
         };
-        ops::front(
-            gpu,
-            k.cache.front,
-            sc.q_low,
-            w.q_norm,
-            sc.q_low_normed,
-            sc.key,
-            w.kv_norm,
-            slot,
-            turn,
-            s.q_rank,
-            rows,
-            s.norm_eps,
-            stream,
-        )?;
+        // Of the rows whose query and key are here: every row's, or the rows
+        // this rank keeps, whose normed query and rounded key the ranks then
+        // gather.
+        let (at, kept) = own.map_or((0, rows), |own| (own.first, own.count));
+        if kept > 0 {
+            let turn = Turn {
+                positions: self.at(position + at)?,
+                ..turn
+            };
+            ops::front(
+                gpu,
+                k.cache.front,
+                sc.q_low.offset(at * s.q_rank * 2),
+                w.q_norm,
+                sc.q_low_normed.offset(at * s.q_rank * 2),
+                sc.key.offset(at * HEAD_DIM * 2),
+                w.kv_norm,
+                slot.offset(at * HEAD_DIM * 2),
+                turn,
+                s.q_rank,
+                kept,
+                s.norm_eps,
+                stream,
+            )?;
+        }
+        if let Some(own) = own {
+            let (held, recv) = (self.shared.held, sc.gather_recv);
+            for (base, row_bytes) in [(sc.q_low_normed, s.q_rank * 2), (slot, HEAD_DIM * 2)] {
+                owned::gather_rows(gpu, comm, held, own, base, recv, row_bytes, stream)?;
+            }
+        }
         if rows > 1 {
             self.unroll_window(gpu, state, position, rows, stream)?;
         }
