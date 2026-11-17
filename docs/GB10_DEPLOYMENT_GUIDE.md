@@ -63,11 +63,21 @@ serves correctly on the same image (runtime gate:
 catalogue — a feel, not a benchmark. "Ctx" is a **practical** single-Spark ceiling
 at conc=1; it trades against batch size and KV dtype (see §4).
 
+¹ Qwen3.8-27B has two measured figures, taken under different conditions, so
+neither replaces the other. **23.59** is the single-stream figure the default
+`qwen3.8-27b-nvfp4` recipe quotes, from the C=1 rung of the 2026-08-17 vLLM
+comparison in `qwen3.8-27b-nvfp4-concurrency` (ISL 128 / OSL 1024, temp 0,
+FP8 KV, thinking off, MTP K=4). **26.3** is the median server decode rate from the
+decode-floor PR gate (3 runs, one pinned code prompt, `max_tokens = 1500`,
+`reasoning_effort: "none"`), served by the `qwen3.8-27b-nvfp4-agentic` profile
+(BF16 KV + head) at `f3f700ac`, single GB10, 2026-11-12. The README quotes the
+gate figure.
+
 ### Single-node (fits one GB10)
 
 | Model | HuggingFace id | Params (total/active) | Weight quant | Architecture | ~tok/s | Practical ctx | Notes |
 |-------|----------------|----------------------|--------------|--------------|--------|---------------|-------|
-| **Qwen3.8-27B** ⭐ | `nvidia/Qwen3.8-27B-NVFP4` | 27B dense | NVFP4 (mixed) | hybrid GDN + attn + dense FFN | ~23.59 | 32K recipe window | **Default flagship.** MTP K=4, FP8 KV; agentic profile uses BF16 KV + head. Quality above ~24K is uncharacterized in the agentic recipe |
+| **Qwen3.8-27B** ⭐ | `nvidia/Qwen3.8-27B-NVFP4` | 27B dense | NVFP4 (mixed) | hybrid GDN + attn + dense FFN | ~23.59 (default) / 26.3 (agentic, gate)¹ | 32K recipe window | **Default flagship.** MTP K=4, FP8 KV; agentic profile uses BF16 KV + head. Quality above ~24K is uncharacterized in the agentic recipe |
 | **Qwen3.6-35B-A3B** | `Qwen/Qwen3.6-35B-A3B-FP8` | 35B / 3B | FP8 | hybrid SSM (GDN) + attn + MoE | ~157 (nvfp4) | **64K** | MTP K=2, DFlash drafter `z-lab/…-DFlash`, live tool-call streaming |
 | **Qwen3.6-27B** | `Qwen/Qwen3.6-27B-FP8` | 27B dense | FP8 | hybrid attn + GDN + dense FFN | ~15 | 24K | Dense reasoning; MTP off; DFlash `z-lab/Qwen3.6-27B-DFlash` |
 | **Qwen3.6-27B** (NVFP4) | `nvidia/Qwen3.6-27B-NVFP4` | 27B dense | NVFP4 (mixed) | hybrid attn + GDN + dense FFN | ~14 | 24K | Dense; MTP off; ModelOpt mixed FP8-attn/NVFP4-MLP, requants at load. Avoid `unsloth/Qwen3.6-27B-NVFP4` on current HF main (2026-07-10 re-upload broke the layout, see #327; old pin `890bdef7` still works) |
