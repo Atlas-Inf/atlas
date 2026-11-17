@@ -58,6 +58,11 @@ pub struct Block {
     /// [`GEMM_ROWS`](super::gemm::GEMM_ROWS) rows or more; without them
     /// every batch goes eight rows a launch.
     pub gemm: Option<GemmWeights>,
+    /// The attention on tensor cores at every row count (`ops::sparse_attn`'s
+    /// `batch`): a decode step, a verify's rows and a prefill's batch are then
+    /// one arithmetic, which a verify needs of the first two. Without it a
+    /// block attends a row at a time in the reference's order.
+    pub tensor_cores: bool,
     pub shared: Shared,
 }
 

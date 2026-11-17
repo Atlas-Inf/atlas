@@ -125,6 +125,7 @@ pub(crate) fn block(
             gpu.default_stream(),
         )?,
         gemm: None,
+        tensor_cores: false,
         shared,
     };
     Ok((block, store))

@@ -18,6 +18,14 @@ pub const MAX_KEYS: usize = 640;
 const THREADS: u32 = 256;
 /// `dsv41_sparse_attn` runs a head on one block this wide: a thread a key.
 const ATTN_THREADS: u32 = 640;
+/// The queries from which the tensor-core form runs a block a (query,
+/// heads); fewer are spread over more blocks (`dsv41_attn_tc.cu`), with the
+/// same bytes: the output over `FEW_ACROSS` blocks of `FEW_THREADS` threads
+/// and `FEW_SHARED` bytes of shared memory each.
+const SPREAD_BELOW: usize = 64;
+const FEW_ACROSS: u32 = 16;
+const FEW_THREADS: u32 = 128;
+const FEW_SHARED: u32 = ((MAX_KEYS * HEAD_DIM / 16 + ATTN_GROUP * MAX_KEYS) * 2) as u32;
 /// Heads a block of the shared form takes together, and the FP32 values it
 /// keeps of a (query, head) between its launches (`dsv41_attn.cu`).
 const ATTN_GROUP: usize = 16;
@@ -37,6 +45,8 @@ pub struct Kernels {
     /// (`dsv41_attn_tc.cu`).
     attn_logits_tc: KernelHandle,
     attn_output_tc: KernelHandle,
+    /// The third on tensor cores for a few queries, with the batch's bytes.
+    attn_output_few: KernelHandle,
     pub rotate: KernelHandle,
     pub fp8_quant_dequant: KernelHandle,
     pub fp4_quant_dequant: KernelHandle,
@@ -52,6 +62,7 @@ impl Kernels {
             attn_output: gpu.kernel("dsv41_attn", "dsv41_attn_output")?,
             attn_logits_tc: gpu.kernel("dsv41_attn_tc", "dsv41_attn_logits_tc")?,
             attn_output_tc: gpu.kernel("dsv41_attn_tc", "dsv41_attn_output_tc")?,
+            attn_output_few: gpu.kernel("dsv41_attn_tc", "dsv41_attn_output_tc_few")?,
             rotate: gpu.kernel("dsv41_cache", "dsv41_rotate")?,
             fp8_quant_dequant: gpu.kernel("dsv41_cache", "dsv41_fp8_quant_dequant")?,
             fp4_quant_dequant: gpu.kernel("dsv41_cache", "dsv41_fp4_quant_dequant")?,
@@ -169,8 +180,10 @@ pub fn attn_records(queries: usize, heads: usize) -> usize {
 /// after.
 ///
 /// `batch` takes the first and third launches on tensor cores: the same
-/// products with their FP32 sums in another order, a block a query, for a
-/// prefill's thousands of queries.
+/// products with their FP32 sums in another order. A batch runs a block a
+/// query; a few queries are spread over more blocks, with the batch's bytes
+/// (`dsv41_attn_tc.cu`), so a query's do not depend on how many share its
+/// launch.
 #[allow(clippy::too_many_arguments)]
 pub fn sparse_attn(
     gpu: &dyn GpuBackend,
@@ -211,21 +224,30 @@ pub fn sparse_attn(
             .arg_u32(turn.rope as u32)
             .launch(stream)
     };
-    let (logits, output, across) = match batch {
-        true => (kernels.attn_logits_tc, kernels.attn_output_tc, [1, 1]),
-        false => (
-            kernels.attn_logits,
-            kernels.attn_output,
-            [
-                steps * (64 / ATTN_GROUP) as u32,
-                (HEAD_DIM / ATTN_GROUP) as u32,
-            ],
-        ),
+    // A block a (query, heads) fills the GPU with a batch; a few queries
+    // are spread over more blocks.
+    let few = batch && queries < SPREAD_BELOW;
+    let (logits, across) = match (batch, few) {
+        (true, true) => (kernels.attn_logits_tc, steps.div_ceil(2)),
+        (true, false) => (kernels.attn_logits_tc, 1),
+        (false, _) => (kernels.attn_logits, steps * (64 / ATTN_GROUP) as u32),
+    };
+    let output = match (batch, few) {
+        (true, true) => KernelLaunch::new(gpu, kernels.attn_output_few)
+            .grid([FEW_ACROSS, groups, 1])
+            .block([FEW_THREADS, 1, 1])
+            .shared_mem(FEW_SHARED),
+        (true, false) => KernelLaunch::new(gpu, kernels.attn_output_tc)
+            .grid([1, groups, 1])
+            .block(block),
+        (false, _) => KernelLaunch::new(gpu, kernels.attn_output)
+            .grid([(HEAD_DIM / ATTN_GROUP) as u32, groups, 1])
+            .block(block),
     };
     let began = profile::begin(gpu, stream)?;
     turned(
         KernelLaunch::new(gpu, logits)
-            .grid([across[0], groups, 1])
+            .grid([across, groups, 1])
             .block(block)
             .arg_ptr(q)
             .arg_ptr(keys_a)
@@ -250,9 +272,7 @@ pub fn sparse_attn(
     profile::end(gpu, stream, "attention: schedule", began)?;
     let began = profile::begin(gpu, stream)?;
     turned(
-        KernelLaunch::new(gpu, output)
-            .grid([across[1], groups, 1])
-            .block(block)
+        output
             .arg_ptr(keys_a)
             .arg_ptr(keys_b)
             .arg_ptr(idx)

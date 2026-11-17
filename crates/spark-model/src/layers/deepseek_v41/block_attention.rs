@@ -278,7 +278,7 @@ impl Block {
                 keys,
                 WINDOW,
                 Some(turn),
-                gemm.is_some(),
+                self.tensor_cores,
                 stream,
             )?;
             profile::end(gpu, stream, "sparse attention", began)?;

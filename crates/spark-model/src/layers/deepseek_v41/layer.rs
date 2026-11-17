@@ -422,6 +422,7 @@ pub fn load_layers(
             candidates,
             freqs: if ratio == 0 { window } else { compressed },
             weights,
+            tensor_cores: gemm.is_some(),
             gemm,
             shared: shared.clone(),
         };

@@ -351,3 +351,66 @@ fn attention_replays_the_reference_recording() -> Result<()> {
     }
     Ok(())
 }
+
+/// The tensor-core form of `m` queries of `case`'s first, as a batch runs
+/// them or, below 64 of them, spread over a grid row.
+fn run_on_tensor_cores(
+    gpu: &dyn GpuBackend,
+    k: &Kernels,
+    case: &Case,
+    m: usize,
+    sink: DevicePtr,
+) -> Result<Vec<u16>> {
+    let values = m * HEADS * HEAD_DIM;
+    let q = upload(gpu, &bytes_of(&case.q[..values], u16::to_le_bytes))?;
+    let keys = upload(gpu, &bytes_of(&case.keys, u16::to_le_bytes))?;
+    let idx = upload(gpu, &bytes_of(&case.idx[..m * case.k], i32::to_le_bytes))?;
+    let out = gpu.alloc(values * 2)?;
+    let records = gpu.alloc(attn_records(m, HEADS))?;
+    let stream = gpu.default_stream();
+    sparse_attn(
+        gpu, k, q, keys, keys, idx, sink, out, records, m, HEADS, case.k, case.k, None, true,
+        stream,
+    )?;
+    let got = download(gpu, out, values)?;
+    for p in [q, keys, idx, out, records] {
+        gpu.free(p)?;
+    }
+    Ok(got)
+}
+
+#[test]
+#[ignore = "needs a GB10 GPU and the deepseek-v4.1-flash kernel target"]
+fn a_few_queries_spread_over_the_gpu_leave_a_batchs_bytes() -> Result<()> {
+    let gpu = backend()?;
+    let k = Kernels::load(gpu)?;
+    let mut rng = Rng(0x7c5a_11ce);
+    let sink: Vec<f32> = (0..HEADS).map(|h| h as f32 / 64.0 - 0.5).collect();
+    let sink_dev = upload(gpu, &bytes_of(&sink, f32::to_le_bytes))?;
+    // Key counts that end inside a step of 64 and on one, with keys missing.
+    for (keys, columns) in [(700usize, 640usize), (300, 133), (90, 64)] {
+        let m = 64;
+        let case = Case {
+            q: activations(&mut rng, m * HEADS * HEAD_DIM),
+            keys: activations(&mut rng, keys * HEAD_DIM),
+            idx: (0..m * columns)
+                .map(|_| match rng.next() % 9 {
+                    0 => -1,
+                    _ => (rng.next() % keys as u64) as i32,
+                })
+                .collect(),
+            reference: Vec::new(),
+            m,
+            k: columns,
+        };
+        let batch = run_on_tensor_cores(gpu, &k, &case, m, sink_dev)?;
+        for few in [1usize, 6, 16] {
+            let spread = run_on_tensor_cores(gpu, &k, &case, few, sink_dev)?;
+            assert!(
+                spread[..] == batch[..few * HEADS * HEAD_DIM],
+                "{few} queries over {columns} keys differ from the batch's"
+            );
+        }
+    }
+    gpu.free(sink_dev)
+}
