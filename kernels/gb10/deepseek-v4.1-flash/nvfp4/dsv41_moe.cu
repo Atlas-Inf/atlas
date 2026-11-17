@@ -89,24 +89,29 @@ extern "C" __global__ void __launch_bounds__(DSV41_MOE_THREADS) dsv41_moe_route(
 // where `dsv41_moe_route`'s adds 5,120. The scores are the same FP32 sums in
 // another order.
 //
-// score[t, e] = sqrt(softplus(x[t] . gate[e])). Grid (blocks, T): a block
-// takes ceil(experts / blocks) experts one after another. Few enough blocks
-// that the GPU holds them all at once let the kernels after this one start
-// beside it, and the experts' read their weights ahead while it runs.
+// score[t, e] = sqrt(softplus(x[t] . gate[e])). Grid (blocks, g): a block
+// takes ceil(experts / blocks) experts of every g-th of the T tokens, one
+// after another. Few enough blocks that the GPU holds them all at once let
+// the kernels after this one start beside it, and the experts' read their
+// weights ahead while it runs.
 extern "C" __global__ void __launch_bounds__(DSV41_MOE_THREADS) dsv41_moe_scores(
     const __nv_bfloat16* __restrict__ x,
     const unsigned char* __restrict__ gate_bytes,
     float* __restrict__ score,
     unsigned int H,
-    unsigned int experts) {
+    unsigned int experts,
+    unsigned int T) {
     atlas_pdl_enter_touch({gate_bytes, 2u * H, 2ull * H}, {gate_bytes, 0u, 0ull}, experts,
                           blockIdx.y * gridDim.x + blockIdx.x, dsv41_touchers(gridDim.x));
     const __nv_bfloat16* gate = (const __nv_bfloat16*)gate_bytes;
-    const unsigned int t = blockIdx.y, each = (experts + gridDim.x - 1u) / gridDim.x;
-    for (unsigned int e = blockIdx.x * each; e < experts && e < (blockIdx.x + 1u) * each; ++e) {
-        const float logit = dsv41_dot_wide(x + (size_t)t * H, gate + (size_t)e * H, H);
-        if (threadIdx.x == 0)
-            score[(size_t)t * experts + e] = sqrtf(logit > 20.0f ? logit : log1pf(expf(logit)));
+    const unsigned int each = (experts + gridDim.x - 1u) / gridDim.x;
+    for (unsigned int t = blockIdx.y; t < T; t += gridDim.y) {
+        for (unsigned int e = blockIdx.x * each; e < experts && e < (blockIdx.x + 1u) * each; ++e) {
+            const float logit = dsv41_dot_wide(x + (size_t)t * H, gate + (size_t)e * H, H);
+            if (threadIdx.x == 0)
+                score[(size_t)t * experts + e] =
+                    sqrtf(logit > 20.0f ? logit : log1pf(expf(logit)));
+        }
     }
 }
 

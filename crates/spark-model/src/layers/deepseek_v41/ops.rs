@@ -24,6 +24,17 @@ const ATTN_THREADS: u32 = 640;
 /// and `FEW_SHARED` bytes of shared memory each.
 const SPREAD_BELOW: usize = 64;
 const FEW_ACROSS: u32 = 16;
+/// How many (query, 16 heads) of a few queries a block of the output takes
+/// in turn, and how many queries a block of the schedule. A block a query
+/// is more blocks than the GPU's 48 multiprocessors hold at once from two
+/// queries on (one of the output's blocks each, for their shared memory),
+/// and the kernels queued behind, which read their weights ahead while they
+/// wait, then start only as these end; every query through one set of
+/// blocks leaves most of the GPU idle at six. Measured on a verify step of
+/// two rows and of six: a block a query 33.8 and 47.4 ms, one set of blocks
+/// 31.6 and 50.2.
+const FEW_IN_TURN: u32 = 3;
+const SCHEDULED_IN_TURN: u32 = 2;
 const FEW_THREADS: u32 = 128;
 const FEW_SHARED: u32 = ((MAX_KEYS * HEAD_DIM / 16 + ATTN_GROUP * MAX_KEYS) * 2) as u32;
 /// Heads a block of the shared form takes together, and the FP32 values it
@@ -223,13 +234,13 @@ pub fn sparse_attn(
     let groups = (queries * heads / ATTN_GROUP) as u32;
     let block = [(ATTN_GROUP * ATTN_GROUP) as u32, 1, 1];
     let steps = keys.div_ceil(64) as u32;
-    let turned = |launch: KernelLaunch<'_>| {
+    // The turn's arguments, which end every launch here but one.
+    fn turned<'a>(launch: KernelLaunch<'a>, turn: &Turn) -> KernelLaunch<'a> {
         launch
             .arg_ptr(turn.positions)
             .arg_ptr(turn.freqs)
             .arg_u32(turn.rope as u32)
-            .launch(stream)
-    };
+    }
     // A block a (query, heads) fills the GPU with a batch; a few queries
     // are spread over more blocks.
     let few = batch && queries < SPREAD_BELOW;
@@ -239,8 +250,9 @@ pub fn sparse_attn(
         (false, _) => (kernels.attn_logits, steps * (64 / ATTN_GROUP) as u32),
     };
     let output = match (batch, few) {
+        // A few queries a block, one after another: see the kernel.
         (true, true) => KernelLaunch::new(gpu, kernels.attn_output_few)
-            .grid([FEW_ACROSS, groups, 1])
+            .grid([FEW_ACROSS, groups.div_ceil(FEW_IN_TURN), 1])
             .block([FEW_THREADS, 1, 1])
             .shared_mem(FEW_SHARED),
         (true, false) => KernelLaunch::new(gpu, kernels.attn_output_tc)
@@ -264,20 +276,27 @@ pub fn sparse_attn(
             .arg_u32(keys as u32)
             .arg_u32(split as u32)
             .arg_f32((HEAD_DIM as f32).powf(-0.5)),
-    )?;
+        &turn,
+    )
+    .launch(stream)?;
     profile::end(gpu, stream, "attention: logits", began)?;
     let began = profile::begin(gpu, stream)?;
     KernelLaunch::new(gpu, kernels.attn_schedule)
-        .grid([queries as u32, heads as u32, 1])
+        .grid([
+            (queries as u32).div_ceil(if few { SCHEDULED_IN_TURN } else { 1 }),
+            heads as u32,
+            1,
+        ])
         .block([ATTN_THREADS, 1, 1])
         .arg_ptr(records)
         .arg_ptr(sink)
         .arg_u32(heads as u32)
         .arg_u32(keys as u32)
+        .arg_u32(queries as u32)
         .launch(stream)?;
     profile::end(gpu, stream, "attention: schedule", began)?;
     let began = profile::begin(gpu, stream)?;
-    turned(
+    let output = turned(
         output
             .arg_ptr(keys_a)
             .arg_ptr(keys_b)
@@ -287,7 +306,13 @@ pub fn sparse_attn(
             .arg_u32(heads as u32)
             .arg_u32(keys as u32)
             .arg_u32(split as u32),
-    )?;
+        &turn,
+    );
+    match few {
+        true => output.arg_u32(groups),
+        false => output,
+    }
+    .launch(stream)?;
     profile::end(gpu, stream, "attention: output", began)
 }
 

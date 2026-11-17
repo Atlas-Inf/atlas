@@ -268,7 +268,11 @@ extern "C" __global__ void __launch_bounds__(256) dsv41_attn_output_tc(
 // values each, with the same operands in the same k-slots, the same steps
 // and the same rescaling between them.
 //
-// Grid (16, m * h / 16), block 128, dynamic shared DSV41_FEW_SHARED bytes.
+// Grid (16, g), block 128, dynamic shared DSV41_FEW_SHARED bytes: a block
+// takes every g-th of the `units` (query, 16 heads), one after another. The
+// GPU holds one such block a multiprocessor, so a verify's queries as a
+// grid of their own were not all on it at once, and what is queued behind
+// this launch started only as it ended (`dsv41_attn_schedule`).
 #define DSV41_FEW_VALUES 32
 #define DSV41_FEW_THREADS 128
 #define DSV41_FEW_SHARED \
@@ -285,17 +289,19 @@ extern "C" __global__ void __launch_bounds__(DSV41_FEW_THREADS) dsv41_attn_outpu
     unsigned int split,
     const unsigned int* __restrict__ positions,
     const float* __restrict__ freqs,
-    unsigned int rope) {
+    unsigned int rope,
+    unsigned int units) {
     atlas_pdl_enter();
     extern __shared__ __align__(16) unsigned char dsv41_few_shared[];
     // [slots, 32] key values, then [16, slots] weights.
     unsigned short* skeys = (unsigned short*)dsv41_few_shared;
     unsigned short* sweights = skeys + DSV41_MAX_KEYS * DSV41_FEW_VALUES;
     const unsigned int groups = h / DSV41_GROUP;
-    const unsigned int query = blockIdx.y / groups, first = (blockIdx.y % groups) * DSV41_GROUP;
     const unsigned int base = blockIdx.x * DSV41_FEW_VALUES;
     const unsigned int t = threadIdx.x;
     const unsigned int steps = dsv41_tc_steps(k), slots = steps * DSV41_KEYS_PER_STEP;
+    for (unsigned int unit = blockIdx.y; unit < units; unit += gridDim.y) {
+    const unsigned int query = unit / groups, first = (unit % groups) * DSV41_GROUP;
     const int* ids = idx + (size_t)query * k;
     const float* heads = records + ((size_t)query * h + first) * DSV41_RECORD;
     const __nv_bfloat16* first_key = dsv41_tc_key(keys_a, keys_b, ids, 0, k, split);
@@ -365,5 +371,8 @@ extern "C" __global__ void __launch_bounds__(DSV41_FEW_THREADS) dsv41_attn_outpu
                               v1);
         o[d] = __float2bfloat16(v0);
         o[d + 1] = __float2bfloat16(v1);
+    }
+    // The next unit's keys and weights replace what the warps have read.
+    __syncthreads();
     }
 }

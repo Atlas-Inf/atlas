@@ -218,7 +218,7 @@ extern "C" __global__ void dsv41_experts_plan(
 // x [T, K] FP8-rounded BF16; gate_up [pairs, 2, rows]. A tile of no pairs is
 // none. Grid (ceil(rows / 16), 2 * tiles), block 256.
 //
-// With `shared_rows`, the grid's last two rows are the shared expert's w1
+// With `shared_rows`, the grid's first two rows are the shared expert's w1
 // and w3 (FP8, `rows` rows of K each) for the batch's first `shared_rows`
 // rows, into gate_up[pairs + r]: the bytes of `dsv41_fp8_gemv_tc8` on them,
 // without its launches.
@@ -239,20 +239,25 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_i
     const unsigned char* __restrict__ shared_s3,
     unsigned int pairs,
     unsigned int shared_rows) {
-    atlas_pdl_enter();
+    // The shared expert's weights by the launch's first blocks, and its two
+    // rows of the grid ahead of the tiles', as in `dsv41_expert_in`.
+    atlas_pdl_enter_touch({shared_w1, K, K}, {shared_w3, K, K}, shared_rows != 0u ? rows : 0u,
+                          blockIdx.y * gridDim.x + blockIdx.x, dsv41_touchers(gridDim.x));
     __shared__ F4Shared<4> sh;
     __shared__ F4Staged staged;
-    if (shared_rows != 0u && blockIdx.y + 2u >= gridDim.y) {
-        const unsigned int up = blockIdx.y + 1u == gridDim.y;
-        dsv41_gemv_staged_impl<4, false, false>(
-            sh, staged, x, up ? shared_w3 : shared_w1, up ? shared_s3 : shared_s1,
+    const unsigned int own = shared_rows != 0u ? 2u : 0u;
+    if (blockIdx.y < own) {
+        const unsigned int up = blockIdx.y;
+        dsv41_gemv_tc_impl<4, false, false>(
+            sh, x, up ? shared_w3 : shared_w1, up ? shared_s3 : shared_s1,
             gate_up + ((size_t)pairs * 2 + up) * rows, shared_rows, rows, K, 2 * rows, blockIdx.x,
             K);
         return;
     }
-    const Dsv41Tile tile = tiles[blockIdx.y / 2];
+    const unsigned int y = blockIdx.y - own;
+    const Dsv41Tile tile = tiles[y / 2];
     if (tile.count == 0u) return;
-    const unsigned int which = blockIdx.y & 1u;
+    const unsigned int which = y & 1u;
     const unsigned char* w = slab + (unsigned long long)tile.expert * stride +
                              (unsigned long long)which * (data + scales);
     dsv41_gemv_staged_impl<4, true, false>(
@@ -331,7 +336,7 @@ extern "C" __global__ void dsv41_experts_act_codes(
 // Pair q of piece p of `inner` is at inner[p * piece_stride + q * rows].
 // Grid (ceil(N / 16), tiles), block 256.
 //
-// With `shared_rows`, the grid's last row is the shared expert's w2 (FP8, N
+// With `shared_rows`, the grid's first row is the shared expert's w2 (FP8, N
 // rows) for the rows after the pairs, into the rows out_row[pairs + r]: the
 // bytes of `dsv41_fp8_gemv_pieces` on them.
 extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_out(
@@ -350,16 +355,21 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_o
     const unsigned char* __restrict__ shared_s2,
     unsigned int pairs,
     unsigned int shared_rows) {
-    atlas_pdl_enter();
+    atlas_pdl_enter_touch(
+        {shared_w2, rows * DSV41_PARTS, rows * DSV41_PARTS},
+        {shared_s2, rows * DSV41_PARTS / F4_BLOCK, rows * DSV41_PARTS / F4_BLOCK},
+        shared_rows != 0u ? N : 0u, blockIdx.y * gridDim.x + blockIdx.x,
+        dsv41_touchers(gridDim.x));
     __shared__ F4Shared<4> sh;
     __shared__ F4Staged staged;
-    if (shared_rows != 0u && blockIdx.y + 1u == gridDim.y) {
-        dsv41_gemv_staged_impl<4, false, false>(
-            sh, staged, inner + (size_t)pairs * rows, shared_w2, shared_s2, out, shared_rows, N,
+    const unsigned int own = shared_rows != 0u ? 1u : 0u;
+    if (blockIdx.y < own) {
+        dsv41_gemv_tc_impl<4, false, false>(
+            sh, inner + (size_t)pairs * rows, shared_w2, shared_s2, out, shared_rows, N,
             rows * DSV41_PARTS, N, blockIdx.x, rows, nullptr, out_row + pairs, rows, piece_stride);
         return;
     }
-    const Dsv41Tile tile = tiles[blockIdx.y];
+    const Dsv41Tile tile = tiles[blockIdx.y - own];
     if (tile.count == 0u) return;
     const unsigned char* w =
         slab + (unsigned long long)tile.expert * stride + 2ull * (data + scales);

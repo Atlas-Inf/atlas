@@ -153,9 +153,10 @@ pub fn route_fast(
                 .launch(stream)?;
         }
         false => KernelLaunch::new(gpu, kernels.scores)
+            // Up to three tokens a block, one after another: see the kernel.
             .grid([
                 div_ceil(experts as u32, SCORED_BY_A_BLOCK),
-                tokens as u32,
+                div_ceil(tokens as u32, 3),
                 1,
             ])
             .block([THREADS, 1, 1])
@@ -164,6 +165,7 @@ pub fn route_fast(
             .arg_ptr(scores)
             .arg_u32(hidden as u32)
             .arg_u32(experts as u32)
+            .arg_u32(tokens as u32)
             .launch(stream)?,
     }
     KernelLaunch::new(gpu, kernels.pick)

@@ -244,28 +244,37 @@ extern "C" __global__ void __launch_bounds__(DSV41_GROUP_THREADS) dsv41_attn_log
 
 // The shared form, second launch: each record's logits replaced by the
 // keys' weights, and its shrinks and denominator filled in. sink [h] FP32.
-// Grid (m, h), block 640.
+// Grid (g, h), block 640: a block takes every g-th of the m queries, one
+// after another. With a block a (query, head), a verify's few queries were
+// more blocks of 640 threads than the GPU holds at once, and the kernels
+// queued behind this one, which read their weights ahead while they wait,
+// started only as it ended; a few queries are launched with g = 1.
 extern "C" __global__ void __launch_bounds__(DSV41_THREADS) dsv41_attn_schedule(
     float* __restrict__ records,
     const float* __restrict__ sink,
     unsigned int h,
-    unsigned int k) {
+    unsigned int k,
+    unsigned int m) {
     atlas_pdl_enter();
-    const unsigned int query = blockIdx.x, head = blockIdx.y, t = threadIdx.x;
+    const unsigned int head = blockIdx.y, t = threadIdx.x;
     const unsigned int steps = dsv41_steps(k);
-    float* record = records + ((size_t)query * h + head) * DSV41_RECORD;
     __shared__ float logit[DSV41_MAX_KEYS];
     __shared__ float weight[DSV41_MAX_KEYS];
     __shared__ float step_top[DSV41_MAX_STEPS];
     __shared__ float step_sum[DSV41_MAX_STEPS];
     __shared__ float shrink[DSV41_MAX_STEPS];
     __shared__ float denominator;
-    if (t < steps * DSV41_KEYS_PER_STEP) logit[t] = record[t];
-    __syncthreads();
-    dsv41_schedule(logit, weight, step_top, step_sum, shrink, &denominator, steps, sink[head]);
-    if (t < steps * DSV41_KEYS_PER_STEP) record[t] = weight[t];
-    if (t < steps) record[DSV41_RECORD_SHRINK + t] = shrink[t];
-    if (t == 0) record[DSV41_RECORD_DENOMINATOR] = denominator;
+    for (unsigned int query = blockIdx.x; query < m; query += gridDim.x) {
+        float* record = records + ((size_t)query * h + head) * DSV41_RECORD;
+        if (t < steps * DSV41_KEYS_PER_STEP) logit[t] = record[t];
+        __syncthreads();
+        dsv41_schedule(logit, weight, step_top, step_sum, shrink, &denominator, steps, sink[head]);
+        if (t < steps * DSV41_KEYS_PER_STEP) record[t] = weight[t];
+        if (t < steps) record[DSV41_RECORD_SHRINK + t] = shrink[t];
+        if (t == 0) record[DSV41_RECORD_DENOMINATOR] = denominator;
+        // The next query's logits replace what these lines read.
+        __syncthreads();
+    }
 }
 
 // The shared form, third launch: out [m, h, 512] BF16 from the records and
