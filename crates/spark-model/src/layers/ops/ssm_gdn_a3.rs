@@ -322,6 +322,10 @@ pub fn gdn_prefill_fla(
                 (true, _, false) => cap_k("gated_delta_rule_chunk_delta_h_pipe_dv64_capn"),
                 (false, true, true) => cap_k("gated_delta_rule_chunk_delta_h_pipe_cap"),
                 (false, true, false) => cap_k("gated_delta_rule_chunk_delta_h_pipe_capn"),
+                // gfx1151's register-S fused spine (`_vfused`) has a single-point twin.
+                (false, false, true) if cfg!(atlas_scale) && use_fused => {
+                    cap_k("gated_delta_rule_chunk_delta_h_vfused_cap")
+                }
                 (false, false, _) => KernelHandle(0),
             };
             (k.0 != 0).then_some(k)

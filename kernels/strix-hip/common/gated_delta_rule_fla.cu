@@ -287,8 +287,8 @@ gated_delta_rule_recompute_wu(
 // the mask 64-bit — written here already widened for clarity on wave64).
 // smem: W(16K)+K(16K)+U(16K) bf16 single-buffered + decs[(C+1)] = 49,412 B —
 // the launcher's smem_fused formula — under the 64KB cap.
-extern "C" __global__ void __launch_bounds__(256, 1)
-gated_delta_rule_chunk_delta_h_vfused(
+template <bool CAP>
+__device__ __forceinline__ void cdh_vfused_core(
     float* __restrict__ h_state, const __nv_bfloat16* __restrict__ W_in,
     const __nv_bfloat16* __restrict__ U_in, const __nv_bfloat16* __restrict__ key,
     const float* __restrict__ gate, const float* __restrict__ gc_in,
@@ -298,7 +298,7 @@ gated_delta_rule_chunk_delta_h_vfused(
     unsigned int v_dim, unsigned int qk_stride, unsigned int gb_stride,
     unsigned int h_state_is_table,
     const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
-    unsigned int is_varlen
+    unsigned int is_varlen, float* __restrict__ cap_state, unsigned int cap_chunk
 ) {
     constexpr int SPLIT = 2, VT = 1;
     constexpr int KH = K_DIM / SPLIT;          // per-thread slice of state column
@@ -387,6 +387,16 @@ gated_delta_rule_chunk_delta_h_vfused(
             for (int vt = 0; vt < VT; vt++)
                 S_out[base * K_DIM * V_DIM + (k0 + kk) * V_DIM + v0 + vt] =
                     __float2bfloat16(Sold[kk][vt]);
+        if constexpr (CAP) {
+            // qwen4_exp mid-chunk checkpoint: chunk `cap_chunk`'s FP32 entry state (gb10's CAP layout).
+            if (c == cap_chunk) {
+                float* Hc = cap_state + ((unsigned long long)(b * num_v_heads + vh) * K_DIM * V_DIM);
+                #pragma unroll
+                for (int kk = 0; kk < KH; kk++)
+                    #pragma unroll
+                    for (int vt = 0; vt < VT; vt++) Hc[(k0 + kk) * V_DIM + v0 + vt] = Sold[kk][vt];
+            }
+        }
 
         const float edl = decs[0];
         float Snew[KH][VT];
@@ -435,6 +445,40 @@ gated_delta_rule_chunk_delta_h_vfused(
     for (int kk = 0; kk < KH; kk++)
         #pragma unroll
         for (int vt = 0; vt < VT; vt++) H[(k0 + kk) * V_DIM + v0 + vt] = Sold[kk][vt];
+}
+
+extern "C" __global__ void __launch_bounds__(256, 1)
+gated_delta_rule_chunk_delta_h_vfused(
+    float* __restrict__ h_state, const __nv_bfloat16* __restrict__ W_in,
+    const __nv_bfloat16* __restrict__ U_in, const __nv_bfloat16* __restrict__ key,
+    const float* __restrict__ gate, const float* __restrict__ gc_in,
+    __nv_bfloat16* __restrict__ S_out, __nv_bfloat16* __restrict__ uc_out,
+    unsigned int batch_size, unsigned int seq_len, unsigned int num_chunks,
+    unsigned int num_k_heads, unsigned int num_v_heads, unsigned int k_dim,
+    unsigned int v_dim, unsigned int qk_stride, unsigned int gb_stride,
+    unsigned int h_state_is_table,
+    const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
+    unsigned int is_varlen
+) {
+    cdh_vfused_core<false>(h_state, W_in, U_in, key, gate, gc_in, S_out, uc_out, batch_size, seq_len, num_chunks, num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, gb_stride, h_state_is_table, cu_seqlens, cu_chunks, is_varlen, nullptr, 0u);
+}
+
+// `..._vfused` that also stores chunk `cap_chunk`'s FP32 entry state to `cap_state`
+// (the qwen4_exp mid-chunk prefix-cache checkpoint; gb10's `_pipe_cap`).
+extern "C" __global__ void __launch_bounds__(256, 1)
+gated_delta_rule_chunk_delta_h_vfused_cap(
+    float* __restrict__ h_state, const __nv_bfloat16* __restrict__ W_in,
+    const __nv_bfloat16* __restrict__ U_in, const __nv_bfloat16* __restrict__ key,
+    const float* __restrict__ gate, const float* __restrict__ gc_in,
+    __nv_bfloat16* __restrict__ S_out, __nv_bfloat16* __restrict__ uc_out,
+    unsigned int batch_size, unsigned int seq_len, unsigned int num_chunks,
+    unsigned int num_k_heads, unsigned int num_v_heads, unsigned int k_dim,
+    unsigned int v_dim, unsigned int qk_stride, unsigned int gb_stride,
+    unsigned int h_state_is_table,
+    const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
+    unsigned int is_varlen, float* __restrict__ cap_state, unsigned int cap_chunk
+) {
+    cdh_vfused_core<true>(h_state, W_in, U_in, key, gate, gc_in, S_out, uc_out, batch_size, seq_len, num_chunks, num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, gb_stride, h_state_is_table, cu_seqlens, cu_chunks, is_varlen, cap_state, cap_chunk);
 }
 
 // ── KERNEL 3: chunk_fwd_o — scalar, slim-smem gfx1151 variant ────────────
