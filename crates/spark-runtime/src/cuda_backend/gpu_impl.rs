@@ -155,6 +155,7 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()> {
+        trace_copy("h2d_sync", src.len());
         AtlasCudaBackend::copy_h2d_impl(self, src, dst)
     }
 
@@ -297,6 +298,7 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn copy_h2d_async(&self, src: &[u8], dst: DevicePtr, stream: u64) -> Result<()> {
+        trace_copy("h2d", src.len());
         h2d_enqueue(src, dst, stream)?;
         // The trait promises the caller may drop `src` right now. From PAGEABLE
         // memory the driver already made that true by staging the bytes before
@@ -326,6 +328,7 @@ impl GpuBackend for AtlasCudaBackend {
         // The caller has promised `src` outlives the next sync on `stream`, so
         // no implicit ordering is added — that is the whole reason this variant
         // exists (a 60-chunk pinned scatter must not pay 60 stream drains).
+        trace_copy("h2d_r", src.len());
         h2d_enqueue(src, dst, stream)
     }
 
@@ -340,6 +343,7 @@ impl GpuBackend for AtlasCudaBackend {
         bytes: usize,
         stream: u64,
     ) -> Result<()> {
+        trace_copy("d2d", bytes);
         let status = unsafe { cuMemcpyDtoDAsync_v2(dst.0, src.0, bytes, stream) };
         if status != 0 {
             // See copy_d2d_impl: on 901 the backtrace names the reporter,
@@ -525,3 +529,20 @@ impl GpuBackend for AtlasCudaBackend {
 #[path = "gpu_impl/kernel_name.rs"]
 mod kernel_name;
 use kernel_name::kernel_name;
+
+/// DEBUG (debug/trace-d2d, never merged): ATLAS_TRACE_D2D=1 logs every 4096th copy of each kind
+/// with its size and a backtrace, to find who issues the prefill copy storm.
+fn trace_copy(kind: &'static str, bytes: usize) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static N: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static _U: AtomicBool = AtomicBool::new(false);
+    if !*ON.get_or_init(|| std::env::var("ATLAS_TRACE_D2D").is_ok()) {
+        return;
+    }
+    let i = match kind { "d2d" => 0, "h2d" => 1, "h2d_r" => 2, _ => 3 };
+    let n = N[i].fetch_add(1, Ordering::Relaxed);
+    if n % 4096 == 0 {
+        eprintln!("TRACE_D2D {kind} #{n} bytes={bytes}\n{}", std::backtrace::Backtrace::force_capture());
+    }
+}
