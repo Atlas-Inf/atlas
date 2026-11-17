@@ -70,8 +70,7 @@ comparison in `qwen3.8-27b-nvfp4-concurrency` (ISL 128 / OSL 1024, temp 0,
 FP8 KV, thinking off, MTP K=4). **26.3** is the median server decode rate from the
 decode-floor PR gate (3 runs, one pinned code prompt, `max_tokens = 1500`,
 `reasoning_effort: "none"`), served by the `qwen3.8-27b-nvfp4-agentic` profile
-(BF16 KV + head) at `f3f700ac`, single GB10, 2026-11-12. The README quotes the
-gate figure.
+(BF16 KV + head) at `f3f700ac`, single GB10, 2026-11-12.
 
 ### Single-node (fits one GB10)
 
