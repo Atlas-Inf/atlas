@@ -380,6 +380,7 @@ pub(super) async fn completions_stream(
     let mut content_decoded = String::new();
     let mut detok_prefix_offset: usize = 0;
     let mut detok_read_offset: usize = 0;
+    let mut logprobs_offset = 0;
     let token_stream = ReceiverStream::new(token_rx).flat_map(move |event| {
         let events: Vec<Result<Event, std::convert::Infallible>> = match event {
             // Echo + logprobs: prompt text and its logprobs, before any
@@ -396,12 +397,35 @@ pub(super) async fn completions_stream(
                     &[],
                     &[],
                 );
-                let chunk = CompletionChunk::echo_chunk(&model, &id, text, Some(lp));
+                logprobs_offset = lp.tokens.iter().map(String::len).sum();
+                let chunk = CompletionChunk::text_chunk(&model, &id, text, Some(lp));
                 vec![Ok(
                     Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
                 )]
             }
-            StreamEvent::Token(tok) | StreamEvent::TokenWithLogprobs(tok, _) => {
+            event @ (StreamEvent::Token(tok) | StreamEvent::TokenWithLogprobs(tok, _)) => {
+                let logprobs = logprobs_k.map(|_| {
+                    let lps = match &event {
+                        StreamEvent::TokenWithLogprobs(_, lp) => std::slice::from_ref(lp),
+                        _ => &[],
+                    };
+                    let decode = |tid| state.tokenizer.decode(&[tid]).unwrap_or_default();
+                    let mut lp = super::completions_logprobs::build_completion_logprobs(
+                        &decode,
+                        false,
+                        &[],
+                        &[],
+                        &[tok],
+                        lps,
+                    );
+                    // Match blocking offsets: cumulative per-token decoded lengths,
+                    // including the prompt when echoing, rather than chunk-local zero.
+                    for offset in &mut lp.text_offset {
+                        *offset += logprobs_offset;
+                    }
+                    logprobs_offset += lp.tokens.iter().map(String::len).sum::<usize>();
+                    lp
+                });
                 all_toks.push(tok);
                 content_decoded.push_str(&state.tokenizer.incremental_decode(
                     &all_toks,
@@ -416,7 +440,7 @@ pub(super) async fn completions_stream(
                     emitted = stable_end;
                     d
                 };
-                let chunk = CompletionChunk::text_chunk(&model, &id, delta);
+                let chunk = CompletionChunk::text_chunk(&model, &id, delta, logprobs);
                 vec![Ok(
                     Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
                 )]
@@ -481,7 +505,7 @@ pub(super) async fn completions_stream(
     // Echo WITHOUT logprobs: the scheduler emits no PromptLogprobs event
     // (nothing to collect), so prepend the prompt text chunk directly.
     let echo_prefix: Option<Event> = echo_only_text.map(|text| {
-        let chunk = CompletionChunk::echo_chunk(&model_name, &chunk_id, text, None);
+        let chunk = CompletionChunk::text_chunk(&model_name, &chunk_id, text, None);
         Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
     });
 
