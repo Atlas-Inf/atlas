@@ -4,6 +4,7 @@
 //! Engram are implemented. All activations/highway buffers are BF16 except
 //! FP32 routing scores and iHC gates. No implicit GLM environment policies.
 
+pub mod attention;
 pub mod ffn;
 mod ffn_forward;
 mod ffn_scratch;

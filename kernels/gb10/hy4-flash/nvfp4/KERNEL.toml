@@ -7,3 +7,5 @@ extra_nvcc_flags = ["--fmad=false"]
 [modules]
 hy4_hc = "hy4_hc"
 hy4_ffn = "hy4_ffn"
+hy4_mla = "hy4_mla"
+hy4_indexpool = "hy4_indexpool"

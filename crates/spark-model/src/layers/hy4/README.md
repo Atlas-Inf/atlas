@@ -1,7 +1,10 @@
-# Hy4 steps 2–3: standalone iHC and latent FFN
+# Hy4 standalone blocks
 
 These blocks do not remove the factory's full-model execution guard.
-Attention, Engram and model assembly still need implementation.
+Engram and model assembly still need implementation.
+
+The standalone gated MLA/SWA/IndexPool path is documented in
+[`attention/README.md`](attention/README.md).
 
 ## Numeric contract
 
