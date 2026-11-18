@@ -87,6 +87,50 @@ void selection(unsigned groups,bool ties) {
     expected.resize(2048,-1);
     if(got!=expected) {fprintf(stderr,"index selection mismatch groups=%u\n",groups);exit(1);}
 }
+
+void batch_attention(unsigned start,unsigned window,unsigned page_size,unsigned count_rows,bool masked) {
+    const unsigned heads=3,stride=2048;
+    unsigned columns=window?(window-1+page_size-1)/page_size+1:(start+count_rows+page_size-1)/page_size;
+    std::vector<unsigned> table(columns);
+    for(unsigned i=0;i<columns;i++)table[i]=columns-1-i;
+    std::vector<__nv_bfloat16> q(count_rows*heads*576),cache(columns*page_size*576);
+    for(unsigned i=0;i<q.size();i++)q[i]=__float2bfloat16_rn((int(i%29)-14)*.03125f);
+    std::vector<int> indices(count_rows*stride,-1);
+    auto keys=[&](unsigned p){return window?std::min(p+1,window):std::min(p/4,511u)*4+p%4+1;};
+    for(unsigned r=0;r<count_rows;r++)for(unsigned j=0;j<keys(start+r);j++)if(!masked) {
+        unsigned groups=std::min((start+r)/4,511u);
+        indices[r*stride+j]=j<groups*4?j:(start+r)/4*4+j-groups*4;
+    }
+    Buffer<__nv_bfloat16> dq(q.size()),dc(cache.size()),out(count_rows*heads*512),ref(count_rows*heads*512);
+    Buffer<unsigned> dt(table.size());Buffer<int> di(indices.size());Buffer<float> sink(heads),parts(8*heads*16*514);
+    dq.put(q);dt.put(table);di.put(indices);sink.put({-7.f,0.f,7.f});
+    auto fill=[&](unsigned last) {
+        for(unsigned p=0;p<=last;p++)for(unsigned d=0;d<576;d++) {
+            unsigned slot=table[(p/page_size)%columns]*page_size+p%page_size;
+            cache[(size_t)slot*576+d]=__float2bfloat16_rn((int((p*13+d)%37)-18)*.015625f);
+        }
+        dc.put(cache);
+    };
+    for(unsigned r=0;r<count_rows;r++) {
+        fill(start+r);unsigned count=keys(start+r),splits=(count+127)/128;
+        hy4_mla_partial<<<dim3(heads,splits),256>>>(dq.p+r*heads*576,dc.p,dt.p,window?nullptr:di.p+r*stride,
+            parts.p,start+r,page_size,columns,window,count,splits);
+        hy4_mla_merge<<<heads,256>>>(parts.p,sink.p,ref.p+r*heads*512,splits);
+    }
+    unsigned tile=window?std::min(8u,columns*page_size-(window-1)):8;
+    for(unsigned first=0;first<count_rows;first+=tile) {
+        unsigned rows=std::min(tile,count_rows-first),count=keys(start+first+rows-1),splits=(count+127)/128;
+        fill(start+first+rows-1);
+        hy4_mla_batch_partial<<<dim3(heads,splits,rows),256>>>(dq.p+first*heads*576,dc.p,dt.p,window?nullptr:di.p+first*stride,
+            parts.p,start+first,page_size,columns,window,count,splits,heads,stride);
+        hy4_mla_batch_merge<<<dim3(heads,rows),256>>>(parts.p,sink.p,out.p+first*heads*512,splits,heads);
+    }
+    CUDA(cudaGetLastError());
+    auto actual=out.get(count_rows*heads*512),expected=ref.get(count_rows*heads*512);
+    if(memcmp(actual.data(),expected.data(),actual.size()*sizeof(__nv_bfloat16))) {
+        fprintf(stderr,"batch attention mismatch start=%u window=%u page=%u rows=%u masked=%u\n",start,window,page_size,count_rows,masked);exit(1);
+    }
+}
 void index_scores() {
     const unsigned groups=79,heads=16,pages=2;
     std::vector<uint8_t> q(heads*128),pool(pages*8448,0);
@@ -134,6 +178,12 @@ void projection(unsigned n,unsigned k) {
     }
 }
 int main() {
+    for(unsigned rows:{1u,2u,4u,6u,9u})for(unsigned start:{0u,56u,125u,510u,2043u}) {
+        batch_attention(start,0,16,rows,false);
+        batch_attention(start,512,4,rows,false);
+        batch_attention(start,512,1,rows,false);
+    }
+    batch_attention(125,0,16,6,true);
     projection(512,192);projection(256,512);
     for(unsigned n:{0u,1u,79u,511u,512u,777u,1024u}) {selection(n,false);selection(n,true);}
     index_scores();

@@ -46,7 +46,7 @@ extern "C" __global__ void hy4_gate(__nv_bfloat16* out,
 }
 
 // Each head/128-key partition produces an unnormalized FP32 softmax partial.
-extern "C" __global__ void hy4_mla_partial(const __nv_bfloat16* q,
+__device__ __forceinline__ void hy4_mla_partial_impl(const __nv_bfloat16* q,
     const __nv_bfloat16* cache, const unsigned* table, const int* indices,
     float* partials, unsigned position, unsigned page_size,
     unsigned columns, unsigned window, unsigned count, unsigned splits) {
@@ -106,8 +106,27 @@ extern "C" __global__ void hy4_mla_partial(const __nv_bfloat16* q,
     if (tid==0) {out[512]=maximum;out[513]=denominator;}
 }
 
+extern "C" __global__ void hy4_mla_partial(const __nv_bfloat16* q,
+    const __nv_bfloat16* cache,const unsigned* table,const int* indices,
+    float* partials,unsigned position,unsigned page_size,
+    unsigned columns,unsigned window,unsigned count,unsigned splits) {
+    hy4_mla_partial_impl(q,cache,table,indices,partials,position,page_size,columns,window,count,splits);
+}
+
+extern "C" __global__ void hy4_mla_batch_partial(const __nv_bfloat16* q,
+    const __nv_bfloat16* cache,const unsigned* table,const int* indices,
+    float* partials,unsigned position,unsigned page_size,
+    unsigned columns,unsigned window,unsigned count,unsigned splits,
+    unsigned heads,unsigned index_stride) {
+    unsigned row=blockIdx.z;position+=row;
+    count=window?min(position+1,window):min(position/4,index_stride/4-1)*4+position%4+1;
+    hy4_mla_partial_impl(q+(size_t)row*heads*576,cache,table,
+        indices?indices+(size_t)row*index_stride:nullptr,
+        partials+(size_t)row*heads*splits*514,position,page_size,columns,window,count,splits);
+}
+
 // The zero-value sink participates once, including when every key is masked.
-extern "C" __global__ void hy4_mla_merge(const float* partials,const float* sink,
+__device__ __forceinline__ void hy4_mla_merge_impl(const float* partials,const float* sink,
     __nv_bfloat16* out,unsigned splits) {
     unsigned h=blockIdx.x,d=threadIdx.x;
     const float* parts=partials+(size_t)h*splits*514;
@@ -121,4 +140,15 @@ extern "C" __global__ void hy4_mla_merge(const float* partials,const float* sink
     }
     out[(size_t)h*512+d]=__float2bfloat16_rn(a/denominator);
     out[(size_t)h*512+d+256]=__float2bfloat16_rn(b/denominator);
+}
+
+extern "C" __global__ void hy4_mla_merge(const float* partials,const float* sink,
+    __nv_bfloat16* out,unsigned splits) {
+    hy4_mla_merge_impl(partials,sink,out,splits);
+}
+extern "C" __global__ void hy4_mla_batch_merge(const float* partials,const float* sink,
+    __nv_bfloat16* out,unsigned splits,unsigned heads) {
+    unsigned row=blockIdx.y;
+    hy4_mla_merge_impl(partials+(size_t)row*heads*splits*514,sink,
+        out+(size_t)row*heads*512,splits);
 }

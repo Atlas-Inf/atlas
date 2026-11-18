@@ -7,6 +7,13 @@ use anyhow::{Result, ensure};
 use spark_comm::CommBackend;
 use spark_runtime::{gpu::DevicePtr, kernel_args::KernelLaunch};
 
+const CAUSAL_ROWS: usize = 8;
+const INDEX_KEYS: usize = 2048;
+
+fn causal_rows(window: Option<usize>, slots: usize) -> usize {
+    window.map_or(CAUSAL_ROWS, |w| (slots - (w - 1)).min(CAUSAL_ROWS))
+}
+
 pub(super) struct BatchScratch<'a> {
     _memory: Owned<'a>,
     shares: DevicePtr,
@@ -21,6 +28,8 @@ pub(super) struct BatchScratch<'a> {
     key: DevicePtr,
     query: DevicePtr,
     hw: DevicePtr,
+    indices: DevicePtr,
+    softmax_parts: DevicePtr,
 }
 impl<'a> BatchScratch<'a> {
     fn new(a: &Hy4Attention<'a>) -> Result<Self> {
@@ -39,6 +48,10 @@ impl<'a> BatchScratch<'a> {
             key: alloc(128)?,
             query: alloc(a.index.as_ref().map_or(1, |ix| ix.heads * 128))?,
             hw: alloc(a.index.as_ref().map_or(1, |ix| ix.heads))?,
+            indices: m.alloc(CAUSAL_ROWS * INDEX_KEYS * 4)?,
+            softmax_parts: m.alloc(
+                CAUSAL_ROWS * a.heads * a.window.unwrap_or(INDEX_KEYS).div_ceil(128) * 514 * 4,
+            )?,
             _memory: m,
         })
     }
@@ -217,68 +230,86 @@ impl AttentionCache<'_, '_> {
             linear(b.qc, ix.query, b.query, ix.heads * 128, a.qrank)?;
             linear(input, ix.head, b.hw, ix.heads, a.hidden)?;
         }
-        for (row, &position) in positions.iter().enumerate() {
-            let _causal = timing::span("attn_causal_rows", stream)?;
-            let kv = b.kv.offset(row * 576 * 2);
-            let latent = self.latent.offset(self.layout.slot(self.len)? * 576 * 2);
-            a.norm(kv, a.kvn, latent, 512, stream)?;
-            let absorbed = b.absorbed.offset(row * a.heads * 576 * 2);
-            a.rotary(
-                b.q.offset(row * a.heads * 256 * 2),
-                absorbed,
-                a.heads,
-                [256, 576, 192, 512],
-                position,
-                false,
-                stream,
-            )?;
-            a.rotary(kv, latent, 1, [576, 576, 512, 512], position, false, stream)?;
-            if let Some(ix) = &a.index {
-                self.run_index_projected(
-                    input.offset(row * a.hidden * 2),
+        let causal_rows = causal_rows(a.window, self.layout.table.len() * self.layout.page_size);
+        for first in (0..rows).step_by(causal_rows) {
+            let end = (first + causal_rows).min(rows);
+            let start_position = self.len;
+            for (row, &position) in positions.iter().enumerate().take(end).skip(first) {
+                let _causal = timing::span("attn_causal_rows", stream)?;
+                let kv = b.kv.offset(row * 576 * 2);
+                let latent = self.latent.offset(self.layout.slot(self.len)? * 576 * 2);
+                a.norm(kv, a.kvn, latent, 512, stream)?;
+                let absorbed = b.absorbed.offset(row * a.heads * 576 * 2);
+                a.rotary(
+                    b.q.offset(row * a.heads * 256 * 2),
+                    absorbed,
+                    a.heads,
+                    [256, 576, 192, 512],
                     position,
-                    Some([
-                        b.key.offset(row * 128 * 2),
-                        b.query.offset(row * ix.heads * 128 * 2),
-                        b.hw.offset(row * ix.heads * 2),
-                    ]),
+                    false,
                     stream,
                 )?;
+                a.rotary(kv, latent, 1, [576, 576, 512, 512], position, false, stream)?;
+                if let Some(ix) = &a.index {
+                    self.run_index_projected(
+                        input.offset(row * a.hidden * 2),
+                        position,
+                        Some([
+                            b.key.offset(row * 128 * 2),
+                            b.query.offset(row * ix.heads * 128 * 2),
+                            b.hw.offset(row * ix.heads * 2),
+                        ]),
+                        stream,
+                    )?;
+                }
+                if a.window.is_none() {
+                    let count = (self.len / 4).min(INDEX_KEYS / 4 - 1) * 4 + self.len % 4 + 1;
+                    gpu.copy_d2d_async(
+                        self.scratch.indices,
+                        b.indices.offset((row - first) * INDEX_KEYS * 4),
+                        count * 4,
+                        stream,
+                    )?;
+                }
+                self.len += 1;
             }
-            let (indices, count) = match a.window {
-                Some(w) => (DevicePtr::NULL, (self.len + 1).min(w)),
-                None => (
-                    self.scratch.indices,
-                    (self.len / 4).min(511) * 4 + self.len % 4 + 1,
-                ),
-            };
+            let count = a.window.map_or_else(
+                || ((self.len - 1) / 4).min(INDEX_KEYS / 4 - 1) * 4 + (self.len - 1) % 4 + 1,
+                |w| self.len.min(w),
+            );
             let splits = count.div_ceil(128);
             let mla = timing::span("latent_attention", stream)?;
-            KernelLaunch::new(gpu, a.kernels.attention)
-                .grid([a.heads as u32, splits as u32, 1])
+            KernelLaunch::new(gpu, gpu.kernel("hy4_mla", "hy4_mla_batch_partial")?)
+                .grid([a.heads as u32, splits as u32, (end - first) as u32])
                 .block([256, 1, 1])
-                .arg_ptr(absorbed)
+                .arg_ptr(b.absorbed.offset(first * a.heads * 576 * 2))
                 .arg_ptr(self.latent)
                 .arg_ptr(self.table)
-                .arg_ptr(indices)
-                .arg_ptr(self.scratch.softmax_parts)
-                .arg_u32(self.len as u32)
+                .arg_ptr(if a.window.is_some() {
+                    DevicePtr::NULL
+                } else {
+                    b.indices
+                })
+                .arg_ptr(b.softmax_parts)
+                .arg_u32(start_position as u32)
                 .arg_u32(self.layout.page_size as u32)
                 .arg_u32(self.layout.table.len() as u32)
                 .arg_u32(a.window.unwrap_or(0) as u32)
                 .arg_u32(count as u32)
                 .arg_u32(splits as u32)
+                .arg_u32(a.heads as u32)
+                .arg_u32(INDEX_KEYS as u32)
                 .launch(stream)?;
-            KernelLaunch::new(gpu, a.kernels.merge)
-                .grid([a.heads as u32, 1, 1])
+            KernelLaunch::new(gpu, gpu.kernel("hy4_mla", "hy4_mla_batch_merge")?)
+                .grid([a.heads as u32, (end - first) as u32, 1])
                 .block([256, 1, 1])
-                .arg_ptr(self.scratch.softmax_parts)
+                .arg_ptr(b.softmax_parts)
                 .arg_ptr(a.sink)
-                .arg_ptr(b.latent.offset(row * a.heads * 512 * 2))
+                .arg_ptr(b.latent.offset(first * a.heads * 512 * 2))
                 .arg_u32(splits as u32)
+                .arg_u32(a.heads as u32)
                 .launch(stream)?;
             drop(mla);
-            self.len += 1;
         }
         a.batch_linear(
             b.latent,
@@ -310,5 +341,24 @@ impl AttentionCache<'_, '_> {
             comm.all_reduce_async(b.partial.0, rows * a.hidden * 2, stream)?;
         }
         a.batch_norm(b.partial, a.norm, output, a.hidden, rows, stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atlas_core::hy4_reference::paged::PagedLayout;
+
+    #[test]
+    fn causal_tiles_keep_the_earliest_query_window_resident() {
+        for window in [1, 2, 3, 127, 512] {
+            for page in [1, 4, 16, 128] {
+                let capacity = PagedLayout::window_pages(window, page).unwrap() * page;
+                let rows = causal_rows(Some(window), capacity);
+                assert!((1..=CAUSAL_ROWS).contains(&rows));
+                assert!(window - 1 + rows <= capacity);
+            }
+        }
+        assert_eq!(causal_rows(None, 1), CAUSAL_ROWS);
     }
 }
