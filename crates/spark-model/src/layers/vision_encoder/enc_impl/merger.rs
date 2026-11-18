@@ -37,22 +37,19 @@ impl VisionEncoder {
         stream: u64,
     ) -> Result<()> {
         let ms = self.spatial_merge_size as u32;
-        let hidden = self.hidden_size as u32; // 1152
         let merged_in = ms * ms * self.hidden_size as u32; // 4608
         let out_h_size = self.out_hidden_size as u32; // 2048
         let merged_p = (p / (self.spatial_merge_size * self.spatial_merge_size)) as u32;
 
         // 1. norm each of the p patches in place on hidden_src (D = hidden_size).
-        KernelLaunch::new(gpu, self.k_norm)
-            .grid([p as u32, 1, 1])
-            .block([hidden.min(1024), 1, 1])
-            .arg_ptr(hidden_src)
-            .arg_ptr(m.norm_w)
-            .arg_ptr(m.norm_b)
-            .arg_u32(p as u32)
-            .arg_u32(hidden)
-            .arg_f32(1e-6)
-            .launch(stream)?;
+        self.vit_norm(
+            gpu,
+            hidden_src,
+            hidden_src,
+            [m.norm_w, m.norm_b],
+            p as u32,
+            stream,
+        )?;
         // 2. spatial merge: hidden_src[p, 1152] → buf_merge_in[merged_p, 4608]
         KernelLaunch::new(gpu, self.k_merge)
             .grid([merged_p, 1, 1])

@@ -52,16 +52,41 @@ fn request_of_streams(plan: &ScorePlan) -> Vec<usize> {
     of
 }
 
+/// A pack's images as its streams stage them: merged (t, h, w) grids and
+/// content hashes, in pad order.
+pub(super) type PackVision<'a> = (&'a [(usize, usize, usize)], &'a [u128]);
+
 impl TransformerModel {
     /// Encode every image of the pass in one tower batch and point each
-    /// stream of an image request at its request's slice of the output.
+    /// stream of an image request at its request's slice of the output. A
+    /// stream on an image pack (`pack_vision`, by pack index) stages the
+    /// pack's grids only: its MRoPE walk from position 0 needs them, and its
+    /// computed rows start after the pack, so it splices nothing.
     pub(super) fn prepare_score_vision(
         &self,
         reqs: &[ScoreInput<'_>],
         plan: &ScorePlan,
         seqs: &mut [SequenceState],
+        pack_vision: &[PackVision<'_>],
         stream: u64,
     ) -> Result<()> {
+        for (i, seq) in seqs.iter_mut().enumerate() {
+            let Some((grids, hashes)) = plan.pack_of[i].map(|k| pack_vision[k]) else {
+                continue;
+            };
+            if grids.is_empty() {
+                continue;
+            }
+            seq.vision.grids = grids.to_vec();
+            seq.vision.hashes = hashes.to_vec();
+            seq.vision.items.clear();
+            seq.vision.rows_encoded = 0;
+            seq.vision.rows_base = 0;
+            seq.vision.skip_rows = 0;
+            seq.vision.computed_from = plan.starts[i];
+            seq.vision.deferred = false;
+            Self::set_vision_slice_base_entry(seq, 0, 0, 0, 0);
+        }
         if reqs.iter().all(|req| req.images.is_empty()) {
             return Ok(());
         }

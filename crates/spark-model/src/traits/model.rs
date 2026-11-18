@@ -137,6 +137,23 @@ pub struct ScorePackInfo {
     pub built: bool,
 }
 
+/// One pack for [`Model::score_packs`]: its tokens, the images of its image
+/// pads, and its attention mode.
+#[derive(Clone, Copy)]
+pub struct ScorePackSpec<'a> {
+    pub tokens: &'a [u32],
+    pub images: &'a [crate::VisionItem],
+    pub prefix_bidir: bool,
+}
+
+/// A queued job's pack, for [`Model::score_packs_prefetch`]: its spec (the
+/// model derives its address) or an id from an earlier response.
+#[derive(Clone, Copy)]
+pub enum ScorePackKey<'a> {
+    Spec(ScorePackSpec<'a>),
+    Id(u64),
+}
+
 /// [`Model::score_requests`] named a pack the model does not hold (never
 /// built, or evicted): the caller can send its tokens again.
 #[derive(Debug)]
@@ -416,16 +433,52 @@ pub trait Model: Send + Sync {
     /// pass of its own and held until evicted: its K/V blocks and its SSM
     /// state at its end, each holding one SSM slot. Content-addressed: the
     /// same tokens return the held pack. At most `limit` packs are held; the
-    /// least recently used goes first. Default: unsupported.
+    /// least recently used goes first. `images` are the images of the image
+    /// pads in `tokens` (part of the pack's address); requests on the pack
+    /// carry none of their own. Default: unsupported.
     fn score_pack(
         &self,
         _tokens: &[u32],
+        _images: &[crate::VisionItem],
         _prefix_bidir: bool,
         _limit: usize,
         _stream: u64,
     ) -> Result<ScorePackInfo> {
         anyhow::bail!("this model does not support score packs")
     }
+
+    /// [`Self::score_pack`] for several packs at once, in order: a model may
+    /// build the missing ones in shared passes (one read of the weights).
+    fn score_packs(
+        &self,
+        specs: &[ScorePackSpec<'_>],
+        limit: usize,
+        stream: u64,
+    ) -> Vec<Result<ScorePackInfo>> {
+        specs
+            .iter()
+            .map(|s| self.score_pack(s.tokens, s.images, s.prefix_bidir, limit, stream))
+            .collect()
+    }
+
+    /// Hold pack `id` for a pass: true when it is held, or was restored from
+    /// the model's pack store (`ATLAS_SCORE_STORE_GB`) evicting down to
+    /// `limit`; false when the model has neither. Default: false.
+    fn score_pack_by_id(&self, _id: u64, _limit: usize, _stream: u64) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Start reading `packs` back from the model's slower pack storage ahead
+    /// of their passes, and say which are ready now (held, in device memory,
+    /// or with nothing to read: a pack to build or an unknown id) and whether
+    /// reads are still running. Default: all ready, nothing running.
+    fn score_packs_prefetch(&self, packs: &[ScorePackKey<'_>]) -> (Vec<bool>, bool) {
+        (vec![true; packs.len()], false)
+    }
+
+    /// Wait up to `timeout` for a read [`Self::score_packs_prefetch`] started
+    /// to finish (at once when none is running). Default: returns at once.
+    fn score_packs_wait(&self, _timeout: std::time::Duration) {}
 
     /// Like `prefill_batch_chunk`, but each finishing stream's first-token
     /// logits land in row `row_base + stream_idx` of the shared logits arena

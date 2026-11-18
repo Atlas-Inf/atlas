@@ -18,10 +18,12 @@ use spark_runtime::cuda_backend::AtlasCudaBackend;
 /// its row's power-of-two token scale. Checks the quantizer on the way: the
 /// token scale is the smallest power of two that fits the row, each block
 /// scale is within E4M3 rounding of the block's amax / 6, and every code is
-/// a nearest grid point.
+/// a nearest grid point. `tiled`: NVFP4 codes and block scales in the
+/// K-tiled layout of `dl_quant_nvfp4_kt` (what the W4A4 twins read).
 fn lowp_activations(
     gpu: &dyn GpuBackend,
     nvfp4: bool,
+    tiled: bool,
     x: &[u16],
     [m, k]: [usize; 2],
     scratch: [DevicePtr; 2],
@@ -35,6 +37,15 @@ fn lowp_activations(
     };
     let mut sc = vec![0u8; nb + m * 4];
     gpu.copy_d2h(scratch[1], &mut sc)?;
+    if nvfp4 && tiled {
+        // Back to row-major: stage st of row r is 32 code bytes at
+        // (st * m + r) * 32 and 4 scale bytes at (st * m + r) * 4.
+        let (tq, ts) = (codes.clone(), sc[..m * k / 16].to_vec());
+        for (r, st) in (0..m).flat_map(|r| (0..k / 64).map(move |st| (r, st))) {
+            codes[r * (k / 2) + 32 * st..][..32].copy_from_slice(&tq[(st * m + r) * 32..][..32]);
+            sc[r * (k / 16) + 4 * st..][..4].copy_from_slice(&ts[(st * m + r) * 4..][..4]);
+        }
+    }
     let ts = |r: usize| f32::from_le_bytes(sc[nb + 4 * r..][..4].try_into().unwrap()) as f64;
     let lim = if nvfp4 { 6.0 * 448.0 } else { 448.0 };
     let mut out = vec![0u16; m * k];
@@ -179,6 +190,8 @@ fn lowp_case(mix: &str, a8: bool, slots: Option<u32>) -> Result<()> {
             scales: scratch[1],
         };
         let mu = m as u32;
+        // Whether the W4A4 launch for `kernel` ran a twin on K-tiled tokens.
+        let tiled = |kernel| !a8 && kernels.lowp_twin(kernel, mu).is_some_and(|t| t.tiled);
         kernels.gate_up_silu(
             &gpu,
             x_d,
@@ -189,7 +202,7 @@ fn lowp_case(mix: &str, a8: bool, slots: Option<u32>) -> Result<()> {
             stream,
         )?;
         gpu.synchronize(stream)?;
-        let xq = lowp_activations(&gpu, !a8, &x, [m, H], scratch)?;
+        let xq = lowp_activations(&gpu, !a8, tiled(kernels.w4a4_gate_up), &x, [m, H], scratch)?;
         let act_h = read_u16(&gpu, act, (m + SPARE_ROWS) * I)?;
         kernels.nvfp4(
             &gpu,
@@ -201,7 +214,7 @@ fn lowp_case(mix: &str, a8: bool, slots: Option<u32>) -> Result<()> {
             stream,
         )?;
         gpu.synchronize(stream)?;
-        let aq = lowp_activations(&gpu, !a8, &act_h, [m, I], scratch)?;
+        let aq = lowp_activations(&gpu, !a8, tiled(kernels.w4a4), &act_h, [m, I], scratch)?;
         kernels.fp8(
             &gpu,
             act,
@@ -213,7 +226,7 @@ fn lowp_case(mix: &str, a8: bool, slots: Option<u32>) -> Result<()> {
             stream,
         )?;
         gpu.synchronize(stream)?;
-        let act8 = lowp_activations(&gpu, false, &act_h, [m, I], scratch)?;
+        let act8 = lowp_activations(&gpu, false, false, &act_h, [m, I], scratch)?;
         // W8A8 on the transposed copy: the same MMA operands, bit for bit.
         let out8t = upload(&gpu, &bytes_of(&poison))?;
         kernels.fp8(
@@ -341,7 +354,7 @@ fn dense_mx_handoff_matches_reference() -> Result<()> {
             stream,
         )?;
         gpu.synchronize(stream)?;
-        let xq = lowp_activations(&gpu, false, &x, [m, H], scratch)?;
+        let xq = lowp_activations(&gpu, false, false, &x, [m, H], scratch)?;
         kernels.nvfp4(
             &gpu,
             act,
@@ -395,5 +408,124 @@ fn dense_mx_handoff_matches_reference() -> Result<()> {
             "M={m}: rows past M were written"
         );
     }
+    Ok(())
+}
+
+/// Timing at d3-ultra's shapes (Qwen3.6/3.8-27B: hidden 5120, MLP 17408, GDN
+/// qkvz 16384 and out 6144 -> 5120) on random weights, quantizer included:
+/// `DENSE_BENCH_M` rows (default 685, one image question at 1024x576).
+///
+///   DENSE_BENCH_M=685 cargo test --release -p spark-model --lib dense_lowp_bench -- --ignored --nocapture
+#[test]
+#[ignore = "needs a GB10 and a qwen3.8-27b kernel build"]
+fn dense_lowp_bench_d3_shapes() -> Result<()> {
+    const HD: usize = 5120;
+    const ID: usize = 17408;
+    let m: usize = std::env::var("DENSE_BENCH_M")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(685);
+    let reps: usize = 20;
+    let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
+    let kernels = DenseBf16mma::resolve_lowp(&gpu, LowpMix::parse("gu,dn,qkv,o,qkvz,gout"));
+    let stream = gpu.default_stream();
+    let mut rng = Rng(0xbe9c_d3d3);
+    let (gate, up, down) = (
+        Nvfp4::new(&mut rng, HD, ID, 0.02),
+        Nvfp4::new(&mut rng, HD, ID, 0.03),
+        Nvfp4::new(&mut rng, ID, HD, 0.05),
+    );
+    let (g_d, u_d, d_d) = (gate.upload(&gpu)?, up.upload(&gpu)?, down.upload(&gpu)?);
+    drop((gate, up, down));
+    // Transposed W8A8 copies: qkvz [5120 -> 16384], out [6144 -> 5120].
+    let f8t = |rng: &mut Rng, n: usize, k: usize| -> Result<(Fp8Weight, Fp8WeightTransposed)> {
+        let grid = vec![0.001f32; (n / 128) * (k / 128)];
+        let (w8, w) = fp8_weight(rng, &gpu, n, k, &grid)?;
+        let w8t: Vec<u8> = (0..n * k).map(|i| w8[i % k * n + i / k]).collect();
+        let t = Fp8WeightTransposed {
+            weight_t: upload(&gpu, &w8t)?,
+            scale_t: upload(&gpu, &bytes_of(&grid))?,
+            n: n as u32,
+            k: k as u32,
+        };
+        Ok((w, t))
+    };
+    let (qkvz, qkvz_t) = f8t(&mut rng, 16384, HD)?;
+    let (gout, gout_t) = f8t(&mut rng, HD, 6144)?;
+    let x: Vec<u16> = (0..m * ID).map(|_| bf16(rng.unit() * 2.0)).collect();
+    let (x_d, act, out) = (
+        upload(&gpu, &bytes_of(&x))?,
+        gpu.alloc((m + SPARE_ROWS) * ID * 2)?,
+        gpu.alloc((m + SPARE_ROWS) * 16384 * 2)?,
+    );
+    let scratch = [gpu.alloc(m * ID)?, gpu.alloc(m * ID / 16 * 4)?];
+    let lowp = |group| LowpArgs {
+        group,
+        codes: scratch[0],
+        scales: scratch[1],
+    };
+    let mu = m as u32;
+    let time = |name: &str, flops: f64, f: &dyn Fn() -> Result<()>| -> Result<()> {
+        f()?;
+        gpu.synchronize(stream)?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            f()?;
+        }
+        gpu.synchronize(stream)?;
+        let us = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
+        println!(
+            "M={m} {name:10} {us:8.1} us  {:6.1} TFLOPS",
+            flops / us * 1e-6
+        );
+        Ok(())
+    };
+    let fl = |n: usize, k: usize| 2.0 * (m * n * k) as f64;
+    time("gate_up", fl(2 * ID, HD), &|| {
+        kernels.gate_up_silu(
+            &gpu,
+            x_d,
+            [&g_d, &u_d],
+            act,
+            [mu, ID as u32, HD as u32],
+            lowp(LowpMix::GATE_UP),
+            stream,
+        )
+    })?;
+    time("down", fl(HD, ID), &|| {
+        kernels.nvfp4(
+            &gpu,
+            x_d,
+            &d_d,
+            out,
+            [mu, HD as u32, ID as u32],
+            lowp(LowpMix::DOWN),
+            stream,
+        )
+    })?;
+    time("gdn_qkvz", fl(16384, HD), &|| {
+        kernels.fp8(
+            &gpu,
+            x_d,
+            &qkvz,
+            Some(&qkvz_t),
+            out,
+            mu,
+            lowp(LowpMix::GDN_QKVZ),
+            stream,
+        )
+    })?;
+    time("gdn_out", fl(HD, 6144), &|| {
+        kernels.fp8(
+            &gpu,
+            x_d,
+            &gout,
+            Some(&gout_t),
+            out,
+            mu,
+            lowp(LowpMix::GDN_OUT),
+            stream,
+        )
+    })?;
     Ok(())
 }

@@ -1019,7 +1019,10 @@ impl Qwen3SsmLayer {
             // launches/step at R=32 across 48 layers.
             ops::gated_rms_norm_prefill(
                 ctx.gpu,
-                self.gated_rms_norm_prefill_k,
+                [
+                    self.gated_rms_norm_prefill_k,
+                    self.gated_rms_norm_prefill_warp_k,
+                ],
                 gdn_out_buf,
                 deinterleaved.offset(z_offset * bf16),
                 &self.ssm.norm,

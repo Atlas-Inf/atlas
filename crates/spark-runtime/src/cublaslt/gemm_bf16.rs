@@ -23,7 +23,56 @@ pub(super) fn gemm_bf16(
     } else {
         kchain_pin::Pick::First
     };
-    gemm_bf16_pick(act, weight, out, [m, n, k], op_a, pick, CUDA_R_16BF, stream).map(|_| ())
+    gemm_bf16_pick(
+        act,
+        weight,
+        out,
+        [m, n, k],
+        op_a,
+        pick,
+        CUDA_R_16BF,
+        Bf16Epilogue::default(),
+        stream,
+    )
+    .map(|_| ())
+}
+
+/// A cuBLASLt epilogue on the FP32 accumulator before its one BF16 rounding:
+/// `+ bias[n]` (non-null `bias`), then tanh-GELU (`gelu`, needs `bias`), then
+/// `+ resid[m, n]` (non-null `resid`, as `beta = 1` on C; may alias `out`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Bf16Epilogue {
+    pub bias: u64,
+    pub resid: u64,
+    pub gelu: bool,
+}
+
+/// Row-major `out[M,N] = epi(act[M,K] @ weight[N,K]ᵀ)`, all BF16, with the
+/// bias / GELU / residual of [`Bf16Epilogue`] fused. No fallback: callers keep
+/// their own kernel for an error.
+pub fn bf16_gemm_act_weight_t_epi(
+    act: u64,
+    weight: u64,
+    out: u64,
+    [m, n, k]: [u32; 3],
+    epi: Bf16Epilogue,
+    stream: u64,
+) -> Result<()> {
+    if epi.gelu && epi.bias == 0 {
+        bail!("cuBLASLt epilogue: GELU without a bias is not wired");
+    }
+    gemm_bf16_pick(
+        act,
+        weight,
+        out,
+        [m, n, k],
+        CUBLAS_OP_T,
+        kchain_pin::Pick::First,
+        CUDA_R_16BF,
+        epi,
+        stream,
+    )
+    .map(|_| ())
 }
 
 /// [`gemm_bf16`] with the algorithm choice explicit (`kchain_pin::Pick`) and
@@ -39,6 +88,7 @@ pub(super) fn gemm_bf16_pick(
     op_a: i32,
     pick: kchain_pin::Pick,
     out_type: i32,
+    epi: Bf16Epilogue,
     stream: u64,
 ) -> Result<bool> {
     let ctx = ctx()?;
@@ -68,6 +118,35 @@ pub(super) fn gemm_bf16_pick(
             ),
             "TRANSB",
         )?;
+        if epi.bias != 0 {
+            let kind: i32 = if epi.gelu {
+                EPILOGUE_GELU_BIAS
+            } else {
+                EPILOGUE_BIAS
+            };
+            let bias_type: i32 = CUDA_R_16BF;
+            for (attr, val, len) in [
+                (DESC_EPILOGUE, &kind as *const i32 as *const c_void, 4),
+                (
+                    DESC_BIAS_POINTER,
+                    &epi.bias as *const u64 as *const c_void,
+                    8,
+                ),
+                (
+                    DESC_BIAS_DATA_TYPE,
+                    &bias_type as *const i32 as *const c_void,
+                    4,
+                ),
+            ] {
+                if let Err(e) = chk(
+                    cublasLtMatmulDescSetAttribute(desc, attr, val, len),
+                    "Epilogue",
+                ) {
+                    cublasLtMatmulDescDestroy(desc);
+                    return Err(e);
+                }
+            }
+        }
         // A = weight stored row-major [N,K] == col-major [K,N], ld=K, opT → [N,K]
         // B = act    stored row-major [M,K] == col-major [K,M], ld=K, opN → [K,M]
         // D = out    row-major [M,N]        == col-major [N,M], ld=N
@@ -133,7 +212,11 @@ pub(super) fn gemm_bf16_pick(
             return Ok(false);
         };
         let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
+        // The residual rides in as C with beta = 1 (same layout as D).
+        let (beta, c): (f32, u64) = match epi.resid {
+            0 => (0.0, out),
+            r => (1.0, r),
+        };
         let status = cublasLtMatmul(
             ctx.handle,
             desc,
@@ -143,7 +226,7 @@ pub(super) fn gemm_bf16_pick(
             act as *const c_void,
             lb,
             &beta as *const f32 as *const c_void,
-            out as *const c_void,
+            c as *const c_void,
             ld_,
             out as *mut c_void,
             ld_,

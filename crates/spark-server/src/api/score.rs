@@ -27,7 +27,10 @@
 //! the state reads and that never reads the state. The response carries
 //! `"pack_id"` (and `"pack": "built" | "held"`), which a later request can
 //! send instead of the tokens; an id the model no longer holds answers 404,
-//! and the client sends the tokens again.
+//! and the client sends the tokens again. `"images"` with `"pack"` tokens are
+//! the pack's (every image pad in the pack, none in the prefix or branches):
+//! an image pack, e.g. a photo asked many questions, whose images are encoded
+//! once with it. Images with `"pack_id"` are refused.
 //!
 //! Scheduling: a score pass shares the prefill arena, KV pool and SSM slots
 //! with chat requests, so it runs only when the scheduler is quiescent (no
@@ -231,13 +234,11 @@ pub async fn score(
             );
         }
     };
-    if score_images::images_with_pack(
-        req.images.as_deref(),
-        req.pack.is_some() || req.pack_id.is_some(),
-    ) {
+    if score_images::images_with_pack_id(req.images.as_deref(), req.pack_id.is_some()) {
         return openai_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "score: images cannot be combined with pack or pack_id".into(),
+            "score: images cannot be combined with pack_id (send the pack's tokens with them)"
+                .into(),
         );
     }
     let Validated {
@@ -278,7 +279,18 @@ pub async fn score(
                 Ok(ids) => ids,
                 Err(msg) => return openai_error_response(StatusCode::UNPROCESSABLE_ENTITY, msg),
             };
-        match score_images::validate_image_tokens(&prefix, &branches, image_count, marker_ids) {
+        // With pack tokens the images are the pack's: their pads must all be
+        // in the pack, none in the prefix or a branch.
+        let checked = match &pack {
+            Some(PackRef::Tokens(pack_tokens)) => {
+                let rest: Vec<Vec<u32>> = std::iter::once(prefix.clone())
+                    .chain(branches.iter().cloned())
+                    .collect();
+                score_images::validate_image_tokens(pack_tokens, &rest, image_count, marker_ids)
+            }
+            _ => score_images::validate_image_tokens(&prefix, &branches, image_count, marker_ids),
+        };
+        match checked {
             Ok(counts) => counts,
             Err(msg) => return openai_error_response(StatusCode::UNPROCESSABLE_ENTITY, msg),
         }

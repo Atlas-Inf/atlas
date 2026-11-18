@@ -100,6 +100,10 @@ impl TransformerModel {
         let (req_pack, ids) = super::score_pack::resolve(&mut held, reqs)?;
         let packs: Vec<&SequenceState> = ids.iter().map(|id| &held.0[id].seq).collect();
         let pack_tokens: Vec<&[u32]> = ids.iter().map(|id| &held.0[id].tokens[..]).collect();
+        let pack_vision: Vec<super::score_vision::PackVision<'_>> = ids
+            .iter()
+            .map(|id| (&held.0[id].grids[..], &held.0[id].hashes[..]))
+            .collect();
         let plan_reqs: Vec<ScoreRequest<'_>> = reqs
             .iter()
             .zip(&req_pack)
@@ -155,7 +159,7 @@ impl TransformerModel {
                     self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream)?;
                 }
             }
-            self.prepare_score_vision(reqs, &plan, &mut seqs, stream)?;
+            self.prepare_score_vision(reqs, &plan, &mut seqs, &pack_vision, stream)?;
             marks[0] = t0.elapsed().as_micros();
             self.score_forward(&plan, &mut seqs, &packs, stream)?;
             if trace {

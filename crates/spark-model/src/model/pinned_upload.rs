@@ -48,6 +48,15 @@ impl PinnedUpload {
     /// `len` writable host bytes, ZEROED, once the previous upload from this
     /// buffer has been read. Grows (re-allocates) when `len` exceeds it.
     pub(crate) fn stage(&mut self, gpu: &dyn GpuBackend, len: usize) -> Result<&mut [u8]> {
+        let buf = self.stage_as_left(gpu, len)?;
+        buf.fill(0);
+        Ok(buf)
+    }
+
+    /// [`Self::stage`] without the zeroing: the bytes are whatever the last
+    /// user left (a fresh allocation is zeroed), for a caller that overwrites
+    /// them all — a 60 MB fill is milliseconds on these cores.
+    pub(crate) fn stage_as_left(&mut self, gpu: &dyn GpuBackend, len: usize) -> Result<&mut [u8]> {
         self.wait(gpu)?;
         if len == 0 {
             // No allocation yet, so no pointer a slice could be built on.
@@ -59,11 +68,10 @@ impl PinnedUpload {
             self.bytes = len;
         }
         // SAFETY: `ptr` spans `bytes >= len` page-locked bytes owned by `self`,
-        // no DMA reads them any more (`wait` above), and the borrow of `self`
-        // keeps them from being freed while the slice lives.
-        let buf = unsafe { std::slice::from_raw_parts_mut(self.ptr, len) };
-        buf.fill(0);
-        Ok(buf)
+        // initialized (zeroed at allocation, written since), no DMA reads them
+        // any more (`wait` above), and the borrow of `self` keeps them from
+        // being freed while the slice lives.
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.ptr, len) })
     }
 
     /// Upload the first `len` staged bytes to `dst` on `stream`, then mark the

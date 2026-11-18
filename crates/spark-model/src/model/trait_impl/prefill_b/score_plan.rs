@@ -147,22 +147,26 @@ impl ScorePlan {
         p
     }
 
-    /// A pack build (`score_pack.rs`): one stream over all of `tokens` from
-    /// position 0, no branches; under `bidir` every row reads every key.
-    pub(super) fn pack(tokens: &[u32], bidir: bool) -> Self {
-        let p = tokens.len();
+    /// Pack builds (`score_pack_build.rs`): per pack one stream over all of
+    /// its tokens from position 0, no branches; under `bidir` every row reads
+    /// every key of its pack.
+    pub(super) fn packs(packs: &[(&[u32], bool)]) -> Self {
+        let n = packs.len();
         Self {
-            tokens: vec![tokens.to_vec()],
-            starts: vec![0],
-            heads: 1,
-            head_of: vec![None],
-            shared_blocks: vec![0],
-            pack_of: vec![None],
+            tokens: packs.iter().map(|(t, _)| t.to_vec()).collect(),
+            starts: vec![0; n],
+            heads: n,
+            head_of: vec![None; n],
+            shared_blocks: vec![0; n],
+            pack_of: vec![None; n],
             branch_counts: Vec::new(),
-            state_end: vec![if bidir { p as i32 } else { -1 }],
-            kv_len: vec![p],
-            tail_from: vec![None],
-            readout_rows: vec![None],
+            state_end: packs
+                .iter()
+                .map(|&(t, bidir)| if bidir { t.len() as i32 } else { -1 })
+                .collect(),
+            kv_len: packs.iter().map(|(t, _)| t.len()).collect(),
+            tail_from: vec![None; n],
+            readout_rows: vec![None; n],
         }
     }
 
@@ -338,9 +342,9 @@ mod tests {
     }
 
     #[test]
-    fn a_pack_build_is_one_whole_stream() {
+    fn a_pack_build_is_one_whole_stream_a_pack() {
         let tokens: Vec<u32> = (0..40).collect();
-        let plan = ScorePlan::pack(&tokens, true);
+        let plan = ScorePlan::packs(&[(&tokens, true)]);
         assert_eq!((plan.heads, plan.streams(), plan.total_rows()), (1, 1, 40));
         assert_eq!(
             (plan.state_end.clone(), plan.kv_len.clone()),
@@ -348,7 +352,12 @@ mod tests {
         );
         assert_eq!(plan.own_blocks(16), 3);
         assert!(plan.branch_counts.is_empty());
-        assert_eq!(ScorePlan::pack(&tokens, false).state_end, vec![-1]);
+        assert_eq!(ScorePlan::packs(&[(&tokens, false)]).state_end, vec![-1]);
+        let short: Vec<u32> = (0..20).collect();
+        let two = ScorePlan::packs(&[(&tokens, true), (&short, false)]);
+        assert_eq!((two.heads, two.streams(), two.total_rows()), (2, 2, 60));
+        assert_eq!(two.own_blocks(16), 5);
+        assert_eq!((two.state_end, two.starts), (vec![40, -1], vec![0, 0]));
     }
 
     #[test]

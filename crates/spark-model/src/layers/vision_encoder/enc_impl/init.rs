@@ -211,6 +211,11 @@ impl VisionEncoder {
             k_gemm_pipelined: crate::layers::try_kernel(gpu, "gemm", "dense_gemm_bf16_pipelined"),
             k_add_bias: crate::layers::try_kernel(gpu, "vision_encoder", "vision_add_bias"),
             k_norm: gpu.kernel("vision_encoder", "vision_layer_norm")?,
+            k_norm_to: crate::layers::try_shipped_kernel(
+                gpu,
+                "vision_encoder",
+                "vision_layer_norm_to",
+            ),
             k_add: gpu.kernel("vision_encoder", "vision_add_inplace")?,
             k_gelu: gpu.kernel("vision_encoder", "vision_gelu")?,
             // Legacy warp-per-query ViT attention — present in EVERY vision
@@ -347,6 +352,7 @@ impl VisionEncoder {
             k_gemm_pipelined: KernelHandle(0),
             k_add_bias: KernelHandle(0),
             k_norm: KernelHandle(0),
+            k_norm_to: KernelHandle(0),
             k_add: KernelHandle(0),
             k_gelu: KernelHandle(0),
             k_attn: KernelHandle(0),

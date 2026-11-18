@@ -29,6 +29,13 @@ fn live(prefix: usize, branches: &[usize]) -> (ScoreJob, ScoreRx) {
 }
 type ScoreRx = tokio::sync::oneshot::Receiver<Result<ScoreOutput, ScoreError>>;
 
+/// A tick with every pack ready (`take_tick` after `prune`).
+fn tick(queue: &mut Vec<ScoreJob>, b: &ScoreBudget) -> Vec<ScoreJob> {
+    prune(queue);
+    let ready = vec![true; queue.len()];
+    take_tick(queue, b, &ready, false).expect("all ready")
+}
+
 fn budget(rows: usize, streams: usize) -> ScoreBudget {
     ScoreBudget {
         rows,
@@ -67,18 +74,18 @@ fn a_tick_takes_one_pass_and_leaves_the_rest_queued() {
         rxs.push(rx);
     }
     let b = budget(50, 8);
-    assert_eq!(take_tick(&mut queue, &b).len(), 2);
+    assert_eq!(tick(&mut queue, &b).len(), 2);
     assert_eq!(queue.len(), 3);
     // Abandoned jobs are dropped unrun.
     drop(rxs.remove(2));
     drop(rxs.remove(2));
-    assert_eq!(take_tick(&mut queue, &b).len(), 1);
+    assert_eq!(tick(&mut queue, &b).len(), 1);
     assert!(queue.is_empty());
     // An oversized job runs alone (split), its neighbours wait.
     let (big, _a) = live(40, &[10, 10, 10]);
     let (small, _b) = live(4, &[2]);
     queue.extend([big, small]);
-    let tick = take_tick(&mut queue, &b);
+    let tick = tick(&mut queue, &b);
     assert_eq!((tick.len(), tick[0].branches.len(), queue.len()), (1, 3, 1));
 }
 
@@ -99,9 +106,9 @@ fn image_jobs_share_passes_up_to_the_vision_row_budget() {
     let (d, _d) = live(4, &[2]);
     let mut queue = vec![text, with_image(a, 4), with_image(c, 6), with_image(d, 1)];
     // Text plus two images (4 + 6 = 10 rows); the third would make 11.
-    let first = take_tick(&mut queue, &b);
+    let first = tick(&mut queue, &b);
     assert_eq!(first.len(), 3);
-    let second = take_tick(&mut queue, &b);
+    let second = tick(&mut queue, &b);
     assert_eq!(second.len(), 1);
     assert_eq!(second[0].vision_rows, 1);
 }
@@ -114,13 +121,75 @@ fn image_jobs_are_taken_in_passes_of_their_own() {
     let image = with_image(image, 1);
     let (tail, _tail_rx) = live(4, &[2]);
     let mut queue = vec![text, image, tail];
-    let first = take_tick(&mut queue, &b);
+    let first = tick(&mut queue, &b);
     assert_eq!(first.len(), 1);
     assert!(first[0].images.is_empty());
-    let second = take_tick(&mut queue, &b);
+    let second = tick(&mut queue, &b);
     assert_eq!(second.len(), 1);
     assert_eq!(second[0].images.len(), 1);
-    assert_eq!(take_tick(&mut queue, &b).len(), 1);
+    assert_eq!(tick(&mut queue, &b).len(), 1);
+}
+
+/// Queued jobs `0..n`, told apart by their prefix length (10 + i).
+fn numbered(n: usize) -> (Vec<ScoreJob>, Vec<ScoreRx>) {
+    (0..n).map(|i| live(10 + i, &[2])).unzip()
+}
+
+fn names(jobs: &[ScoreJob]) -> Vec<usize> {
+    jobs.iter().map(|j| j.prefix.len() - 10).collect()
+}
+
+#[test]
+fn a_tick_runs_the_ready_packs_once_half_the_queue_is_ready() {
+    let b = budget(1000, 8);
+    let (mut queue, _rxs) = numbered(4);
+    // Under half ready while reads run: wait for them.
+    assert!(take_tick(&mut queue, &b, &[false, true, false, false], true).is_none());
+    assert_eq!(queue.len(), 4);
+    // Half ready: those run, in arrival order; the others keep reading.
+    let tick = take_tick(&mut queue, &b, &[false, true, false, true], true).unwrap();
+    assert_eq!(names(&tick), vec![1, 3]);
+    assert_eq!(names(&queue), vec![0, 2]);
+}
+
+#[test]
+fn a_tick_waits_for_no_read_that_is_not_running() {
+    let b = budget(1000, 8);
+    // Nothing reading: the ready jobs run however few they are...
+    let (mut queue, _rxs) = numbered(4);
+    let tick = take_tick(&mut queue, &b, &[false, false, true, false], false).unwrap();
+    assert_eq!(names(&tick), vec![2]);
+    // ...and with none ready the front jobs run (their reads happen in the
+    // pass's restore, as without read-ahead).
+    let tick = take_tick(&mut queue, &b, &[false, false, false], false).unwrap();
+    assert_eq!(names(&tick), vec![0, 1, 3]);
+    assert!(queue.is_empty());
+}
+
+#[test]
+fn ready_jobs_still_share_a_pass_only_within_its_budget() {
+    // Each job costs 10 + i + 17 rows: two of the ready ones fit 60.
+    let b = budget(60, 8);
+    let (mut queue, _rxs) = numbered(5);
+    let tick = take_tick(&mut queue, &b, &[true, false, true, true, false], true).unwrap();
+    assert_eq!(names(&tick), vec![0, 2]);
+    assert_eq!(names(&queue), vec![1, 3, 4]);
+}
+
+#[test]
+fn a_tick_takes_no_more_pack_jobs_than_the_model_holds() {
+    let b = budget(1000, 16);
+    let (mut queue, _rxs) = numbered(5);
+    for (k, job) in queue.iter_mut().enumerate() {
+        job.pack = Some(PackRef::Id(k as u64));
+        job.pack_limit = 2;
+    }
+    let tick = take_tick(&mut queue, &b, &[true; 5], false).unwrap();
+    assert_eq!(names(&tick), vec![0, 1]);
+    // A job without a pack still fits beside them.
+    queue[0].pack = None;
+    let tick = take_tick(&mut queue, &b, &[true; 3], false).unwrap();
+    assert_eq!(names(&tick), vec![2, 3, 4]);
 }
 
 #[test]

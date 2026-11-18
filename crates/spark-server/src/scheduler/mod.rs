@@ -644,7 +644,28 @@ pub fn run(
                 let budget =
                     score::ScoreBudget::new(model.score_capacity(), max_batch_size, block_size)
                         .with_vision_rows(model.vision_row_limits().0);
-                let jobs = score::take_tick(&mut pending.0.lock().scores, &budget);
+                // Wait for pack reads (bounded) while too few are ready. The
+                // queue is taken out of its lock while the model is asked
+                // (reads, host allocations), so handlers never wait on it;
+                // jobs admitted meanwhile go behind it (the backlog bound can
+                // be passed by those few).
+                let give_up = std::time::Instant::now() + score::READ_WAIT;
+                let jobs = loop {
+                    let mut queue = std::mem::take(&mut pending.0.lock().scores);
+                    score::prune(&mut queue);
+                    let (ready, reading) = score::readiness(&*model, &queue);
+                    let reading = reading && std::time::Instant::now() < give_up;
+                    let jobs = score::take_tick(&mut queue, &budget, &ready, reading);
+                    {
+                        let mut p = pending.0.lock();
+                        queue.append(&mut p.scores);
+                        p.scores = queue;
+                    }
+                    match jobs {
+                        Some(jobs) => break jobs,
+                        None => model.score_packs_wait(std::time::Duration::from_millis(20)),
+                    }
+                };
                 score::run_jobs(&*model, jobs, prefill_stream, &budget);
             }
         }

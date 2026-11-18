@@ -126,6 +126,7 @@ pub struct VisionEncoder {
     k_gemm_pipelined: KernelHandle, // dense_gemm_bf16_pipelined (tensor-core, ~40×; no bias)
     k_add_bias: KernelHandle, // vision_add_bias: C += bias[n] (fuses bias for the TC path)
     k_norm: KernelHandle, // vision_layer_norm (biased, in-place)
+    k_norm_to: KernelHandle, // vision_layer_norm_to (same bits, src → dst, 256 threads)
     k_add: KernelHandle,  // vision_add_inplace
     k_gelu: KernelHandle, // vision_gelu (in-place)
     k_attn: KernelHandle, // vision_attention_rope (legacy SDPA — ATLAS_VISION_ATTN_LEGACY=1)

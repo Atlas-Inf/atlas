@@ -25,8 +25,10 @@ pub(super) struct ImageTokenIds {
     pub video_pad: Option<u32>,
 }
 
-pub(super) fn images_with_pack(images: Option<&[ScoreImageInput]>, has_pack: bool) -> bool {
-    images.is_some() && has_pack
+/// Images with a `pack_id`: refused, a held pack already has its images (they
+/// go with the pack's tokens, `"pack"`).
+pub(super) fn images_with_pack_id(images: Option<&[ScoreImageInput]>, has_pack_id: bool) -> bool {
+    images.is_some() && has_pack_id
 }
 
 pub(super) fn vision_tower_missing(image_count: usize, has_tower: bool) -> bool {
@@ -275,14 +277,15 @@ mod tests {
     }
 
     #[test]
-    fn images_with_packs_are_refused() {
-        let image = ScoreImageInput {
+    fn images_with_pack_ids_are_refused() {
+        let image = || ScoreImageInput {
             data_base64: String::new(),
             format: "png".into(),
         };
-        assert!(images_with_pack(Some(&[image]), true));
-        assert!(images_with_pack(Some(&[]), true));
-        assert!(!images_with_pack(None, true));
+        assert!(images_with_pack_id(Some(&[image()]), true));
+        assert!(images_with_pack_id(Some(&[]), true));
+        assert!(!images_with_pack_id(None, true));
+        assert!(!images_with_pack_id(Some(&[image()]), false));
         assert!(vision_tower_missing(1, false));
         assert!(!vision_tower_missing(0, false));
         assert!(!vision_tower_missing(1, true));

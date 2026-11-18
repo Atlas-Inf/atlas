@@ -34,7 +34,10 @@ impl Qwen3SsmLayer {
         let normed_out_buf = ctx.buffers.ssm_qkvz();
         ops::gated_rms_norm_prefill(
             ctx.gpu,
-            self.gated_rms_norm_prefill_k,
+            [
+                self.gated_rms_norm_prefill_k,
+                self.gated_rms_norm_prefill_warp_k,
+            ],
             gdn_out_chunk,
             z_chunk,
             &self.ssm.norm,

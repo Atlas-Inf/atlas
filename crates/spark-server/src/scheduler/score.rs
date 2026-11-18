@@ -23,14 +23,23 @@
 //! A job may continue a knowledge pack (`"pack"` tokens or `"pack_id"`,
 //! `spark_model::traits::Model::score_pack`): before its pass the tick gets
 //! the pack from the model, encoding it on a miss, and the pass reads it
-//! instead of recomputing it.
+//! instead of recomputing it. A stored pack the model must read back from
+//! disk is read ahead (`Model::score_packs_prefetch`): a tick runs the jobs
+//! whose packs are ready once they are at least half the queue, and the rest
+//! keep reading during that pass, so the reads overlap the passes instead of
+//! adding to them.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use spark_model::traits::{Model, ScoreBranchProbs, ScoreInput, UnknownScorePack};
+use spark_model::traits::{
+    Model, ScoreBranchProbs, ScoreInput, ScorePackKey, ScorePackSpec, UnknownScorePack,
+};
 
 /// Most jobs waiting for a quiescent tick; further jobs are refused as busy.
 pub const MAX_PENDING_JOBS: usize = 64;
+
+/// Longest a tick waits for pack reads before running what it has.
+pub(super) const READ_WAIT: Duration = Duration::from_millis(500);
 
 /// Why a job produced no probabilities.
 #[derive(Debug, PartialEq, Eq)]
@@ -190,28 +199,91 @@ pub(super) fn admit(queue: &mut Vec<ScoreJob>, job: ScoreJob) -> bool {
     true
 }
 
-/// One tick's work: the front jobs (arrival order) that share one pass, at
-/// least one; an oversized job is taken alone (it runs split). Jobs whose
-/// client has gone are dropped unrun.
-pub(super) fn take_tick(queue: &mut Vec<ScoreJob>, budget: &ScoreBudget) -> Vec<ScoreJob> {
+/// Drop the queued jobs whose client has gone.
+pub(super) fn prune(queue: &mut Vec<ScoreJob>) {
     queue.retain(|j| !j.reply.is_closed());
-    let (mut n, mut rows, mut streams, mut vision) = (0, 0, 0, 0);
-    for job in queue.iter() {
+}
+
+/// Whether each queued job's pack is ready for a pass (held, in device
+/// memory, or nothing to read), and whether reads are still running, from
+/// the model; a read is started for each pack that is not.
+pub(super) fn readiness(model: &dyn Model, queue: &[ScoreJob]) -> (Vec<bool>, bool) {
+    let keyed: Vec<(usize, ScorePackKey<'_>)> = queue
+        .iter()
+        .enumerate()
+        .filter_map(|(i, job)| match &job.pack {
+            None => None,
+            Some(PackRef::Id(id)) => Some((i, ScorePackKey::Id(*id))),
+            Some(PackRef::Tokens(t)) => Some((
+                i,
+                ScorePackKey::Spec(ScorePackSpec {
+                    tokens: t,
+                    images: &job.images,
+                    prefix_bidir: job.prefix_bidir,
+                }),
+            )),
+        })
+        .collect();
+    let mut ready = vec![true; queue.len()];
+    if keyed.is_empty() {
+        return (ready, false);
+    }
+    let keys: Vec<ScorePackKey<'_>> = keyed.iter().map(|(_, k)| *k).collect();
+    let (flags, reading) = model.score_packs_prefetch(&keys);
+    for ((i, _), r) in keyed.iter().zip(flags) {
+        ready[*i] = r;
+    }
+    (ready, reading)
+}
+
+/// One tick's work: jobs in arrival order that share one pass, at least
+/// one, with no more on packs than the model holds (`pack_limit`: a tick's
+/// packs are all held through its pass); an oversized job is taken alone (it
+/// runs split). `ready` flags each
+/// queued job's pack and `reading` says reads are running (`readiness`).
+/// With every pack ready the front jobs are taken; with at least half ready
+/// (or some, and nothing reading) only the ready ones, the rest staying
+/// queued; with none ready and nothing reading the front jobs again (their
+/// restores read in the pass). `None`: too few ready while reads run, so
+/// wait for them.
+pub(super) fn take_tick(
+    queue: &mut Vec<ScoreJob>,
+    budget: &ScoreBudget,
+    ready: &[bool],
+    reading: bool,
+) -> Option<Vec<ScoreJob>> {
+    let n_ready = ready.iter().filter(|&&r| r).count();
+    let only_ready = match n_ready {
+        r if r == queue.len() => false,
+        r if 2 * r >= queue.len() || (r > 0 && !reading) => true,
+        _ if reading => return None,
+        _ => false,
+    };
+    let (mut take, mut rows, mut streams, mut vision, mut packs) = (Vec::new(), 0, 0, 0, 0);
+    for (i, job) in queue.iter().enumerate() {
+        if only_ready && !ready[i] {
+            continue;
+        }
         let (r, s) = cost(job, budget.block);
+        let on_pack = usize::from(job.pack.is_some());
         let fits = rows + r <= budget.rows
             && streams + s <= budget.streams
-            && budget.vision_fits(vision, job);
-        if n > 0 && !fits {
+            && budget.vision_fits(vision, job)
+            && (job.pack_limit == 0 || packs + on_pack <= job.pack_limit);
+        if !take.is_empty() && !fits {
             break;
         }
-        n += 1;
+        take.push(i);
         (rows, streams) = (rows + r, streams + s);
         vision += job.vision_rows;
+        packs += on_pack;
         if !fits {
             break;
         }
     }
-    queue.drain(..n).collect()
+    let mut jobs: Vec<ScoreJob> = take.iter().rev().map(|&i| queue.remove(i)).collect();
+    jobs.reverse();
+    Some(jobs)
 }
 
 /// Upper bound on a job's rows and sequences (a branch replays < one block;
@@ -234,27 +306,69 @@ fn resolve_packs(
     jobs: Vec<ScoreJob>,
     stream: u64,
 ) -> Vec<(ScoreJob, Option<PackUse>)> {
+    // A job's images on a pack are the pack's (its image pads are all in the
+    // pack tokens): the pack encodes them once and keeps their geometry; the
+    // job's own pass encodes nothing. The tick's packs go to the model
+    // together, so the missing ones are built in shared passes.
+    let mut jobs = jobs;
+    let images: Vec<Vec<spark_model::VisionItem>> = jobs
+        .iter_mut()
+        .map(|job| match job.pack {
+            Some(PackRef::Tokens(_)) => {
+                job.vision_rows = 0;
+                std::mem::take(&mut job.images)
+            }
+            _ => Vec::new(),
+        })
+        .collect();
+    let specs: Vec<spark_model::traits::ScorePackSpec<'_>> = jobs
+        .iter()
+        .zip(&images)
+        .filter_map(|(job, images)| match &job.pack {
+            Some(PackRef::Tokens(t)) => Some(spark_model::traits::ScorePackSpec {
+                tokens: t,
+                images,
+                prefix_bidir: job.prefix_bidir,
+            }),
+            _ => None,
+        })
+        .collect();
+    let limit = jobs.first().map_or(0, |job| job.pack_limit);
+    let mut built = model.score_packs(&specs, limit, stream).into_iter();
+    drop(specs);
     let mut out = Vec::with_capacity(jobs.len());
     for job in jobs {
         let pack = match &job.pack {
             None => None,
-            Some(PackRef::Id(id)) => Some(PackUse {
-                id: *id,
-                built: false,
-            }),
-            Some(PackRef::Tokens(t)) => {
-                match model.score_pack(t, job.prefix_bidir, job.pack_limit, stream) {
-                    Ok(info) => Some(PackUse {
-                        id: info.id,
-                        built: info.built,
-                    }),
-                    Err(e) => {
-                        tracing::warn!("score pack failed: {e:#}");
-                        let _ = job.reply.send(Err(ScoreError::Failed(format!("{e:#}"))));
-                        continue;
-                    }
+            Some(PackRef::Id(id)) => match model.score_pack_by_id(*id, job.pack_limit, stream) {
+                // Held, or restored from the model's pack store.
+                Ok(true) => Some(PackUse {
+                    id: *id,
+                    built: false,
+                }),
+                // Answered now (the client sends the tokens again), not in a
+                // merged pass, which one unknown pack would fail for all.
+                Ok(false) => {
+                    let _ = job.reply.send(Err(ScoreError::UnknownPack(*id)));
+                    continue;
                 }
-            }
+                Err(e) => {
+                    tracing::warn!("score pack restore failed: {e:#}");
+                    let _ = job.reply.send(Err(ScoreError::Failed(format!("{e:#}"))));
+                    continue;
+                }
+            },
+            Some(PackRef::Tokens(_)) => match built.next().expect("one result a pack") {
+                Ok(info) => Some(PackUse {
+                    id: info.id,
+                    built: info.built,
+                }),
+                Err(e) => {
+                    tracing::warn!("score pack failed: {e:#}");
+                    let _ = job.reply.send(Err(ScoreError::Failed(format!("{e:#}"))));
+                    continue;
+                }
+            },
         };
         out.push((job, pack));
     }
