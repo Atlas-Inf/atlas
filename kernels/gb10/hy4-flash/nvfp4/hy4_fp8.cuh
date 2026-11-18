@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 #pragma once
+#include <stdint.h>
 #include <cuda_fp8.h>
 #include "hy4_gemv.cuh"
 
