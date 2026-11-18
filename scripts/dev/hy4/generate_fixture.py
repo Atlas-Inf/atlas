@@ -2,7 +2,8 @@
 """Regenerate the independent CPU PyTorch equation snapshot (no CUDA calls).
 
 Run from any directory; requires torch, not needed by Rust tests.
-Equation reference is pinned in hy4_reference.rs. This does not import vLLM
+Equation reference is pinned in crates/atlas-core/src/hy4_reference.rs.
+This does not import vLLM
 or establish parity with any of its fused backend implementations.
 """
 import json
@@ -77,7 +78,9 @@ def encode(obj):
     raise TypeError(type(obj))
 
 
-Path(__file__).with_name("torch_fixture.json").write_text(json.dumps(
+fixture = (Path(__file__).resolve().parents[3] / "crates" / "atlas-core"
+           / "src" / "hy4_reference" / "torch_fixture.json")
+fixture.write_text(json.dumps(
     {"generator": "CPU PyTorch independent FP32 equations with BF16 boundaries",
      "torch_version": torch.__version__, "hc": hc, "moe": moe},
     default=encode, indent=2) + "\n")
