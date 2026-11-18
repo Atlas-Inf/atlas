@@ -2,12 +2,16 @@
 
 //! Scalar FP32 oracles for Hy4. Storage boundaries round to BF16, RNE.
 //! Equations: vLLM #68296, af127016aa1e14f1e597b546e14f5fdfbd05db11,
-//! HYV4HC{Pre,Post,Head}Layer and HYV4FlashMoE. Not a serving backend.
+//! HYV4HC{Pre,Post,Head}Layer, HYV4FlashMoE and Flash attention/IndexPool.
+//! Not a serving backend.
 
 use anyhow::{Result, ensure};
 
+pub mod attention;
 pub mod hc;
+pub mod indexpool;
 pub mod moe;
+pub mod paged;
 pub mod topology;
 
 #[cfg(test)]
