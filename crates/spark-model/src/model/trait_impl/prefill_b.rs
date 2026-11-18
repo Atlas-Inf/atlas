@@ -55,6 +55,7 @@ pub(in crate::model) mod score_pack;
 mod score_plan;
 mod score_profile;
 mod score_ssm;
+mod score_vision;
 mod stage_batched;
 mod upload_meta;
 mod upload_paged;

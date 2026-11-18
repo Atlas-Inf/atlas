@@ -17,6 +17,8 @@
 //! bad request cannot fail its neighbours. A job too big for one pass runs as
 //! several passes in its tick, each over the prefix and a subset of its
 //! branches, reassembled in order.
+//! Image jobs share a pass while their vision rows fit the tower's output
+//! window (`ScoreBudget::vision_rows`; 0 keeps every image job alone).
 //!
 //! A job may continue a knowledge pack (`"pack"` tokens or `"pack_id"`,
 //! `spark_model::traits::Model::score_pack`): before its pass the tick gets
@@ -25,7 +27,7 @@
 
 use std::time::Instant;
 
-use spark_model::traits::{Model, ScoreInput, UnknownScorePack};
+use spark_model::traits::{Model, ScoreBranchProbs, ScoreInput, UnknownScorePack};
 
 /// Most jobs waiting for a quiescent tick; further jobs are refused as busy.
 pub const MAX_PENDING_JOBS: usize = 64;
@@ -79,6 +81,7 @@ impl ScoreQueue {
             rows,
             streams,
             block,
+            ..
         } = self.budget;
         let need_streams = 1 + usize::from(prefix.len() >= block);
         if need_streams > streams {
@@ -108,6 +111,12 @@ pub struct ScoreJob {
     pub prefix_bidir: bool,
     /// The knowledge pack the prefix continues, if any.
     pub pack: Option<PackRef>,
+    /// Images referenced by image-pad runs in `prefix`.
+    pub images: Vec<spark_model::VisionItem>,
+    /// Merged vision rows those images take (the prefix's image pads).
+    pub vision_rows: usize,
+    /// Per branch, offsets back from its last token to score.
+    pub readouts: Option<Vec<Vec<usize>>>,
     /// Most packs the model may hold when this job's pack is encoded.
     pub pack_limit: usize,
     /// When the HTTP handler queued the job (for `queue_us`).
@@ -117,7 +126,7 @@ pub struct ScoreJob {
 
 /// Per-branch option probabilities plus the engine time for the job.
 pub struct ScoreOutput {
-    pub probs: Vec<Vec<f32>>,
+    pub probs: Vec<ScoreBranchProbs>,
     pub engine_us: u64,
     /// Time from the handler queuing the job to the scheduler starting it.
     pub queue_us: u64,
@@ -136,6 +145,9 @@ pub struct ScoreBudget {
     pub streams: usize,
     /// KV block size (a branch replays under one block of its prefix).
     pub block: usize,
+    /// Merged vision rows one pass's images may take (the tower's output
+    /// window). 0: image jobs run alone.
+    pub vision_rows: usize,
 }
 
 impl ScoreBudget {
@@ -146,7 +158,22 @@ impl ScoreBudget {
             rows: rows.max(1),
             streams: streams.clamp(1, max_batch.max(1)),
             block: block.max(1),
+            vision_rows: 0,
         }
+    }
+
+    /// Let image jobs share a pass up to `rows` merged vision rows
+    /// (`Model::vision_row_limits().0`).
+    pub fn with_vision_rows(self, rows: usize) -> Self {
+        Self {
+            vision_rows: rows,
+            ..self
+        }
+    }
+
+    /// Whether `job`'s images still fit a pass already holding `used` rows.
+    fn vision_fits(&self, used: usize, job: &ScoreJob) -> bool {
+        job.images.is_empty() || used + job.vision_rows <= self.vision_rows
     }
 }
 
@@ -168,15 +195,18 @@ pub(super) fn admit(queue: &mut Vec<ScoreJob>, job: ScoreJob) -> bool {
 /// client has gone are dropped unrun.
 pub(super) fn take_tick(queue: &mut Vec<ScoreJob>, budget: &ScoreBudget) -> Vec<ScoreJob> {
     queue.retain(|j| !j.reply.is_closed());
-    let (mut n, mut rows, mut streams) = (0, 0, 0);
+    let (mut n, mut rows, mut streams, mut vision) = (0, 0, 0, 0);
     for job in queue.iter() {
         let (r, s) = cost(job, budget.block);
-        let fits = rows + r <= budget.rows && streams + s <= budget.streams;
+        let fits = rows + r <= budget.rows
+            && streams + s <= budget.streams
+            && budget.vision_fits(vision, job);
         if n > 0 && !fits {
             break;
         }
         n += 1;
         (rows, streams) = (rows + r, streams + s);
+        vision += job.vision_rows;
         if !fits {
             break;
         }
@@ -249,19 +279,24 @@ pub(super) fn run_jobs(model: &dyn Model, jobs: Vec<ScoreJob>, stream: u64, budg
         ..*budget
     };
     let mut batch: Vec<(ScoreJob, Option<PackUse>)> = Vec::new();
-    let (mut rows, mut streams) = (0, 0);
+    let (mut rows, mut streams, mut vision) = (0, 0, 0);
     for (job, pack) in jobs {
         let (r, s) = cost(&job, block);
         if job.branches.len() > 1 && (r > budget.rows || s > budget.streams) {
             run_split(model, job, pack, stream, budget, block);
             continue;
         }
-        if !batch.is_empty() && (rows + r > budget.rows || streams + s > budget.streams) {
+        if !batch.is_empty()
+            && (rows + r > budget.rows
+                || streams + s > budget.streams
+                || !budget.vision_fits(vision, &job))
+        {
             run_batch(model, std::mem::take(&mut batch), stream);
-            (rows, streams) = (0, 0);
+            (rows, streams, vision) = (0, 0, 0);
         }
         rows += r;
         streams += s;
+        vision += job.vision_rows;
         batch.push((job, pack));
     }
     if !batch.is_empty() {
@@ -310,6 +345,8 @@ fn run_split(
             options: &job.options[g.clone()],
             prefix_bidir: job.prefix_bidir,
             pack: pack.map(|p| p.id),
+            images: &job.images,
+            readouts: job.readouts.as_ref().map(|readouts| &readouts[g.clone()]),
         };
         match model.score_requests(std::slice::from_ref(&input), stream) {
             Ok(mut out) if out.len() == 1 => probs.append(&mut out[0]),
@@ -347,6 +384,8 @@ fn run_batch(model: &dyn Model, batch: Vec<(ScoreJob, Option<PackUse>)>, stream:
             options: &j.options,
             prefix_bidir: j.prefix_bidir,
             pack: pack.map(|p| p.id),
+            images: &j.images,
+            readouts: j.readouts.as_deref(),
         })
         .collect();
     let res = model.score_requests(&inputs, stream).and_then(|r| {

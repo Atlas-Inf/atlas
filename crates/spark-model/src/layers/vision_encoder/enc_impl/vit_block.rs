@@ -82,7 +82,19 @@ impl VisionEncoder {
         k: u32,
         stream: u64,
     ) -> Result<()> {
-        if self.k_gemm_pipelined.0 != 0 && self.k_add_bias.0 != 0 {
+        if self.vit_fused() {
+            self.vit_gemm_epi(
+                gpu,
+                a,
+                b,
+                bias,
+                DevicePtr::NULL,
+                c,
+                (m, n, k),
+                false,
+                stream,
+            )
+        } else if self.k_gemm_pipelined.0 != 0 && self.k_add_bias.0 != 0 {
             KernelLaunch::new(gpu, self.k_gemm_pipelined)
                 .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
                 .block([256, 1, 1])
@@ -114,6 +126,109 @@ impl VisionEncoder {
                 .arg_u32(k)
                 .launch(stream)
         }
+    }
+
+    /// ViT GEMM with a fused epilogue: C = [gelu](A·Bᵀ + bias) [+ resid], one
+    /// BF16 rounding (`dense_gemm_bf16_pipelined_epi`). `resid` may alias C.
+    #[allow(clippy::too_many_arguments)]
+    fn vit_gemm_epi(
+        &self,
+        gpu: &dyn GpuBackend,
+        a: DevicePtr,
+        b: DevicePtr,
+        bias: DevicePtr,
+        resid: DevicePtr,
+        c: DevicePtr,
+        (m, n, k): (u32, u32, u32),
+        gelu: bool,
+        stream: u64,
+    ) -> Result<()> {
+        KernelLaunch::new(gpu, self.k_gemm_epi)
+            .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
+            .block([256, 1, 1])
+            .arg_ptr(a)
+            .arg_ptr(b)
+            .arg_ptr(c)
+            .arg_ptr(bias)
+            .arg_ptr(resid)
+            .arg_u32(m)
+            .arg_u32(n)
+            .arg_u32(k)
+            .arg_u32(u32::from(gelu))
+            .launch(stream)
+    }
+
+    /// Whether the fused-epilogue kernels serve the ViT (`ATLAS_VISION_UNFUSED`
+    /// keeps the separate bias / GELU / residual passes for A/B checks).
+    fn vit_fused(&self) -> bool {
+        self.k_gemm_epi.0 != 0 && std::env::var("ATLAS_VISION_UNFUSED").is_err()
+    }
+
+    /// Steps 5-13 of a block with the fused epilogue, shared by the single and
+    /// batched blocks so an image's rows do not depend on how it was batched:
+    /// proj + bias + residual in place in buf_h2 (x'), norm2 on a copy in
+    /// buf_h1, fc1 + bias + GELU into buf_wide, fc2 + bias + x' into buf_h1.
+    /// Each output is rounded to BF16 once.
+    fn vit_block_fused_tail(
+        &self,
+        blk: &ViTBlock,
+        pt: u32,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let h = self.hidden_size as u32;
+        let inter = self.intermediate_size as u32;
+        let n_h = pt as usize * self.hidden_size;
+        self.vit_gemm_epi(
+            gpu,
+            self.buf_h1,
+            self.vit_weight_ptr(gpu, &blk.proj_w, stream)?,
+            blk.proj_b,
+            self.buf_h2,
+            self.buf_h2,
+            (pt, h, h),
+            false,
+            stream,
+        )?;
+        KernelLaunch::new(gpu, self.k_copy)
+            .grid([div_ceil(n_h as u32, 256), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(self.buf_h2)
+            .arg_ptr(self.buf_h1)
+            .arg_u32(n_h as u32)
+            .launch(stream)?;
+        KernelLaunch::new(gpu, self.k_norm)
+            .grid([pt, 1, 1])
+            .block([h.min(1024), 1, 1])
+            .arg_ptr(self.buf_h1)
+            .arg_ptr(blk.norm2_w)
+            .arg_ptr(blk.norm2_b)
+            .arg_u32(pt)
+            .arg_u32(h)
+            .arg_f32(1e-6)
+            .launch(stream)?;
+        self.vit_gemm_epi(
+            gpu,
+            self.buf_h1,
+            self.vit_weight_ptr(gpu, &blk.fc1_w, stream)?,
+            blk.fc1_b,
+            DevicePtr::NULL,
+            self.buf_wide,
+            (pt, inter, h),
+            true,
+            stream,
+        )?;
+        self.vit_gemm_epi(
+            gpu,
+            self.buf_wide,
+            self.vit_weight_ptr(gpu, &blk.fc2_w, stream)?,
+            blk.fc2_b,
+            self.buf_h2,
+            self.buf_h1,
+            (pt, h, inter),
+            false,
+            stream,
+        )
     }
 
     /// GEMM-based SDPA for one image's [seq, 3*H*D] QKV slice → O[seq, H*D].
@@ -160,6 +275,20 @@ impl VisionEncoder {
             .arg_u32(d)
             .launch(stream)?;
 
+        // One fused launch over every head (head_dim 72; ATLAS_VISION_ATTN_GEMM
+        // keeps the per-head GEMM loop below for A/B checks).
+        if self.k_flash72.0 != 0 && d == 72 && std::env::var("ATLAS_VISION_ATTN_GEMM").is_err() {
+            return KernelLaunch::new(gpu, self.k_flash72)
+                .grid([div_ceil(seq, 64), h_n, 1])
+                .block([128, 1, 1])
+                .arg_ptr(self.buf_qr)
+                .arg_ptr(self.buf_kr)
+                .arg_ptr(qkv)
+                .arg_ptr(o)
+                .arg_u32(seq)
+                .arg_u32(h_n)
+                .launch(stream);
+        }
         let qk_head = (seq * d) as usize; // Qr/Kr head stride (seq*D elems)
         let v_head = (d * seq) as usize; // Vt head stride (D*seq elems)
         for head in 0..self.num_heads {
@@ -294,6 +423,9 @@ impl VisionEncoder {
                 p32,
                 stream,
             )?;
+        }
+        if self.vit_fused() {
+            return self.vit_block_fused_tail(blk, p32, gpu, stream);
         }
         // 5. proj GEMM → buf_wide (reuse)
         self.vit_gemm_bias(
@@ -474,6 +606,9 @@ impl VisionEncoder {
             } else {
                 self.vit_attention_gemm(gpu, qkv, o, cos, sin, p32, stream)?;
             }
+        }
+        if self.vit_fused() {
+            return self.vit_block_fused_tail(blk, pt, gpu, stream);
         }
         // 5. proj GEMM over M=p_total → buf_wide (reuse)
         self.vit_gemm_bias(

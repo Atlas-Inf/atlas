@@ -462,10 +462,12 @@ __device__ __forceinline__ void dm_mma_kstep(
     }
 }
 
-/// The `dense_gemm_bf16_pipelined` body for the output tile at (cta_m, cta_n).
-/// Multi-plane twins call it unchanged, so each plane is bit-identical to its
-/// own single-weight launch.
-__device__ __forceinline__ void dense_gemm_bf16_pipelined_tile(
+/// The `dense_gemm_bf16_pipelined` body for the output tile at (cta_m, cta_n),
+/// with `epi(acc, row, col)` applied to each in-bounds FP32 accumulator before
+/// its single BF16 rounding. Multi-plane twins call the identity wrapper
+/// below unchanged, so each plane is bit-identical to its own launch.
+template <typename Epi>
+__device__ __forceinline__ void dense_gemm_bf16_pipelined_tile_epi(
     const __nv_bfloat16* __restrict__ A,   // [M, K] BF16 activations
     const __nv_bfloat16* __restrict__ B,   // [N, K] BF16 weights (read transposed)
     __nv_bfloat16* __restrict__ C,          // [M, N] BF16 output
@@ -473,7 +475,8 @@ __device__ __forceinline__ void dense_gemm_bf16_pipelined_tile(
     unsigned int N,
     unsigned int K,
     unsigned int cta_m,
-    unsigned int cta_n
+    unsigned int cta_n,
+    const Epi& epi
 ) {
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
@@ -605,6 +608,10 @@ __device__ __forceinline__ void dense_gemm_bf16_pipelined_tile(
         unsigned int col1 = col0 + 1;
         unsigned int row0 = cta_m + warp_m_offset + group_id;
         unsigned int row1 = row0 + 8;
+        if (row0 < M && col0 < N) acc[n_tile][0] = epi(acc[n_tile][0], row0, col0);
+        if (row0 < M && col1 < N) acc[n_tile][1] = epi(acc[n_tile][1], row0, col1);
+        if (row1 < M && col0 < N) acc[n_tile][2] = epi(acc[n_tile][2], row1, col0);
+        if (row1 < M && col1 < N) acc[n_tile][3] = epi(acc[n_tile][3], row1, col1);
 
         if (pairs) {
             if (col0 < N && row0 < M)
@@ -618,6 +625,62 @@ __device__ __forceinline__ void dense_gemm_bf16_pipelined_tile(
         if (row1 < M && col0 < N) C[row1 * N + col0] = __float2bfloat16(acc[n_tile][2]);
         if (row1 < M && col1 < N) C[row1 * N + col1] = __float2bfloat16(acc[n_tile][3]);
     }
+}
+
+struct DmIdentityEpi {
+    __device__ __forceinline__ float operator()(float acc, unsigned int, unsigned int) const {
+        return acc;
+    }
+};
+
+/// The plain tile (no epilogue): every existing caller.
+__device__ __forceinline__ void dense_gemm_bf16_pipelined_tile(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int cta_m,
+    unsigned int cta_n
+) {
+    dense_gemm_bf16_pipelined_tile_epi(A, B, C, M, N, K, cta_m, cta_n, DmIdentityEpi{});
+}
+
+/// ViT epilogue: acc + bias[col], then optionally tanh-GELU (gelu_pytorch_tanh),
+/// then optionally + resid[row, col]; one BF16 rounding at the end. `resid` may
+/// alias C: each element is read by the thread that writes it, before the write.
+struct DmBiasGeluResidEpi {
+    const __nv_bfloat16* bias;
+    const __nv_bfloat16* resid;
+    unsigned int N;
+    unsigned int gelu;
+    __device__ __forceinline__ float operator()(float acc, unsigned int row, unsigned int col) const {
+        float v = acc + __bfloat162float(bias[col]);
+        if (gelu) {
+            const float inner = 0.7978845608028654f * (v + 0.044715f * v * v * v);
+            v = 0.5f * v * (1.0f + tanhf(inner));
+        }
+        if (resid) v += __bfloat162float(resid[(size_t)row * N + col]);
+        return v;
+    }
+};
+
+/// `dense_gemm_bf16_pipelined` + DmBiasGeluResidEpi: C = [gelu](A·Bᵀ + bias) [+ resid].
+/// Same grid, block and tiles as the plain kernel.
+extern "C" __global__ void dense_gemm_bf16_pipelined_epi(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* C,
+    const __nv_bfloat16* __restrict__ bias,
+    const __nv_bfloat16* resid,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int gelu
+) {
+    dense_gemm_bf16_pipelined_tile_epi(A, B, C, M, N, K, blockIdx.y * DM_M_TILE,
+        blockIdx.x * DM_N_TILE, DmBiasGeluResidEpi{bias, resid, N, gelu});
 }
 
 /// Tensor-core pipelined BF16 dense GEMM: C[M,N] = A[M,K] · B[N,K]^T.

@@ -132,6 +132,8 @@ pub struct VisionEncoder {
     k_rope_deint: KernelHandle, // vit_rope_deinterleave (rope + head-contig Qr/Kr + V transpose)
     k_softmax: KernelHandle, // vit_softmax_rows (parallel row softmax)
     k_scatter_head: KernelHandle, // vit_scatter_head (contig → interleaved O slot)
+    k_flash72: KernelHandle, // vit_flash_attention_d72 (fused all-head attention, head_dim 72)
+    k_gemm_epi: KernelHandle, // dense_gemm_bf16_pipelined_epi (bias [+GELU] [+residual] epilogue)
     k_gemm_f32: KernelHandle, // dense_gemm_bf16_f32out (raw QKᵀ scores, f32 out)
     k_merge: KernelHandle, // vision_spatial_merge (2×2)
     k_f32_bf16: KernelHandle, // vision_f32_to_bf16
@@ -184,6 +186,9 @@ mod glm_oracle_tests;
 #[cfg(all(test, feature = "cuda"))]
 #[path = "vision_encoder/glm_attention_gpu_tests.rs"]
 mod glm_attention_gpu_tests;
+#[cfg(all(test, feature = "cuda"))]
+#[path = "vision_encoder/vit_flash72_gpu_tests.rs"]
+mod vit_flash72_gpu_tests;
 
 #[cfg(test)]
 mod receive_only_tests {

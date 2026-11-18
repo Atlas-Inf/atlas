@@ -225,6 +225,8 @@ impl VisionEncoder {
             k_rope_deint: crate::layers::try_kernel(gpu, "vision_encoder", "vit_rope_deinterleave"),
             k_softmax: crate::layers::try_kernel(gpu, "vision_encoder", "vit_softmax_rows"),
             k_scatter_head: crate::layers::try_kernel(gpu, "vision_encoder", "vit_scatter_head"),
+            k_flash72: crate::layers::try_kernel(gpu, "vision_encoder", "vit_flash_attention_d72"),
+            k_gemm_epi: crate::layers::try_kernel(gpu, "gemm", "dense_gemm_bf16_pipelined_epi"),
             // f32-out dense GEMM for raw QKᵀ scores (GEMM-ViT path only). SOFT,
             // paired with the kernels above.
             k_gemm_f32: crate::layers::try_kernel(gpu, "gemm", "dense_gemm_bf16_f32out"),
@@ -351,6 +353,8 @@ impl VisionEncoder {
             k_rope_deint: KernelHandle(0),
             k_softmax: KernelHandle(0),
             k_scatter_head: KernelHandle(0),
+            k_flash72: KernelHandle(0),
+            k_gemm_epi: KernelHandle(0),
             k_gemm_f32: KernelHandle(0),
             k_merge: KernelHandle(0),
             k_f32_bf16: KernelHandle(0),

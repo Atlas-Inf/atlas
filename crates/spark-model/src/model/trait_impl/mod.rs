@@ -322,7 +322,7 @@ impl Model for TransformerModel {
         &self,
         reqs: &[crate::traits::ScoreInput<'_>],
         stream: u64,
-    ) -> Result<Vec<Vec<Vec<f32>>>> {
+    ) -> Result<Vec<Vec<crate::traits::ScoreBranchProbs>>> {
         self.score_requests_impl(reqs, stream)
     }
     fn score_capacity(&self) -> (usize, usize) {

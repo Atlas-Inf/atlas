@@ -642,7 +642,8 @@ pub fn run(
             // One score pass per quiescent tick; the rest stay queued.
             if !pending.0.lock().scores.is_empty() {
                 let budget =
-                    score::ScoreBudget::new(model.score_capacity(), max_batch_size, block_size);
+                    score::ScoreBudget::new(model.score_capacity(), max_batch_size, block_size)
+                        .with_vision_rows(model.vision_row_limits().0);
                 let jobs = score::take_tick(&mut pending.0.lock().scores, &budget);
                 score::run_jobs(&*model, jobs, prefill_stream, &budget);
             }

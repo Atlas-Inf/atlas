@@ -12,6 +12,9 @@ fn job(prefix: usize, branches: &[usize]) -> ScoreJob {
         options: branches.iter().map(|_| vec![3, 4]).collect(),
         prefix_bidir: false,
         pack: None,
+        images: Vec::new(),
+        vision_rows: 0,
+        readouts: None,
         pack_limit: 0,
         enqueued: Instant::now(),
         reply,
@@ -31,6 +34,7 @@ fn budget(rows: usize, streams: usize) -> ScoreBudget {
         rows,
         streams,
         block: 16,
+        vision_rows: 0,
     }
 }
 
@@ -76,6 +80,47 @@ fn a_tick_takes_one_pass_and_leaves_the_rest_queued() {
     queue.extend([big, small]);
     let tick = take_tick(&mut queue, &b);
     assert_eq!((tick.len(), tick[0].branches.len(), queue.len()), (1, 3, 1));
+}
+
+fn with_image(job: ScoreJob, vision_rows: usize) -> ScoreJob {
+    ScoreJob {
+        images: vec![spark_model::VisionItem::image(vec![0.0; 12], 2, 2)],
+        vision_rows,
+        ..job
+    }
+}
+
+#[test]
+fn image_jobs_share_passes_up_to_the_vision_row_budget() {
+    let b = budget(1000, 8).with_vision_rows(10);
+    let (text, _t) = live(4, &[2]);
+    let (a, _a) = live(4, &[2]);
+    let (c, _c) = live(4, &[2]);
+    let (d, _d) = live(4, &[2]);
+    let mut queue = vec![text, with_image(a, 4), with_image(c, 6), with_image(d, 1)];
+    // Text plus two images (4 + 6 = 10 rows); the third would make 11.
+    let first = take_tick(&mut queue, &b);
+    assert_eq!(first.len(), 3);
+    let second = take_tick(&mut queue, &b);
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].vision_rows, 1);
+}
+
+#[test]
+fn image_jobs_are_taken_in_passes_of_their_own() {
+    let b = budget(1000, 8);
+    let (text, _text_rx) = live(4, &[2]);
+    let (image, _image_rx) = live(4, &[2]);
+    let image = with_image(image, 1);
+    let (tail, _tail_rx) = live(4, &[2]);
+    let mut queue = vec![text, image, tail];
+    let first = take_tick(&mut queue, &b);
+    assert_eq!(first.len(), 1);
+    assert!(first[0].images.is_empty());
+    let second = take_tick(&mut queue, &b);
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].images.len(), 1);
+    assert_eq!(take_tick(&mut queue, &b).len(), 1);
 }
 
 #[test]

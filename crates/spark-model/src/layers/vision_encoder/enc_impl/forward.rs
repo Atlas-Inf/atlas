@@ -250,7 +250,7 @@ impl VisionEncoder {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<Vec<(usize, usize, usize)>> {
-        debug_assert!(
+        anyhow::ensure!(
             mp_off.last().map(|o| o + mp_i.last().unwrap()).unwrap_or(0) <= self.p_max,
             "oversized vision batch: Σmerged_p exceeds buf_out rows"
         );

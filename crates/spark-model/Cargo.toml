@@ -58,6 +58,7 @@ base64 = "0.22"
 # decodable in pure Rust with no system dependency, so the whole temporal
 # pipeline can be proven before committing to an H.264 decoder.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico"] }
+turbojpeg = "1.5.1"
 parking_lot = { workspace = true }
 
 # Used by the `metal_qwen35_inference` example only — gated by

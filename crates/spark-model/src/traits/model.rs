@@ -97,7 +97,7 @@ pub fn padded_batch_n(n: usize) -> usize {
 pub struct ScoreInput<'a> {
     /// Shared prefix, read once.
     pub prefix: &'a [u32],
-    /// Continuations of `prefix`, each scored at its last row.
+    /// Continuations of `prefix`, each scored at its last row or readouts.
     pub branches: &'a [Vec<u32>],
     /// Per branch, the single option token ids to score.
     pub options: &'a [Vec<u32>],
@@ -112,6 +112,18 @@ pub struct ScoreInput<'a> {
     /// `prefix_bidir` the state block also reads the pack; the pack never reads
     /// the state. `None`: no pack.
     pub pack: Option<u64>,
+    /// Images referenced by image-pad runs in `prefix`.
+    pub images: &'a [crate::VisionItem],
+    /// Per branch, offsets back from its last token to score. `None` scores
+    /// only the last token, preserving the original response shape.
+    pub readouts: Option<&'a [Vec<usize>]>,
+}
+
+/// One branch's probability output.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScoreBranchProbs {
+    Last(Vec<f32>),
+    Readouts(Vec<Vec<f32>>),
 }
 
 /// A knowledge pack held by the model ([`Model::score_pack`]).
@@ -381,10 +393,14 @@ pub trait Model: Send + Sync {
 
     /// Prefill-only scoring: for each request, run `prefix` once and each
     /// branch as its continuation — every request in ONE forward pass — and
-    /// return, per request and branch, the softmax over that branch's single
-    /// option tokens at its last row. Nothing is sampled, decoded or cached.
+    /// return each branch's option probabilities at the last row or readouts.
+    /// Nothing is sampled, decoded or cached.
     /// Default: unsupported.
-    fn score_requests(&self, _reqs: &[ScoreInput<'_>], _stream: u64) -> Result<Vec<Vec<Vec<f32>>>> {
+    fn score_requests(
+        &self,
+        _reqs: &[ScoreInput<'_>],
+        _stream: u64,
+    ) -> Result<Vec<Vec<ScoreBranchProbs>>> {
         anyhow::bail!("this model does not support prefill-only scoring")
     }
 
