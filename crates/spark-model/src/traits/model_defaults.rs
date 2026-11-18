@@ -12,6 +12,11 @@ use crate::traits::SequenceState;
 /// prefill (`ATLAS_GLM_PC_INFLIGHT`). Followed by one word, the position.
 pub const EP_CMD_PC_PLANT: u32 = 0xFFFF_FFED;
 
+/// Head → worker: the addressed sequence's next prefill chunk command runs a
+/// slice ([`Model::prefill_chunk_slice`]). Followed by one word, the layer
+/// count. A chunk command with no slice word before it runs to its end.
+pub const EP_CMD_PREFILL_SLICE: u32 = 0xFFFF_FFEE;
+
 /// Default [`Model::pc_plant`]: send the worker the same request, then record
 /// it. The prefill decides at each chunk, on both ranks alike, whether it is
 /// still ahead (`pc_inflight`).

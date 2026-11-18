@@ -34,7 +34,7 @@
 use anyhow::{Result, bail};
 use spark_runtime::gpu::DevicePtr;
 
-use super::{MixedBatchResult, MixedForwardResult, PrefillSlice, SequenceState};
+use super::{ChunkStep, MixedBatchResult, MixedForwardResult, PrefillSlice, SequenceState};
 
 /// One beam-search request for a translation model (NLLB). Carries the resolved
 /// per-request parameters the scheduler stamps onto the sequence; the model runs
@@ -213,6 +213,35 @@ pub trait Model: Send + Sync {
         is_last_chunk: bool,
         stream: u64,
     ) -> Result<DevicePtr>;
+
+    /// Whether [`Self::prefill_chunk_slice`] can stop a pass between layers.
+    fn prefill_slices(&self) -> bool {
+        false
+    }
+
+    /// [`Self::prefill_chunk`] in slices: with `layers` set, the chunk's
+    /// current pass runs at most that many more layers and the call returns
+    /// [`ChunkStep::Paused`] if any are left. The same call again, with the
+    /// same chunk, continues it. Between the two the caller may run decode
+    /// and verify steps of other sequences and free them, and nothing else:
+    /// no other prefill, and no free of `seq` without
+    /// [`Self::free_sequence`]. Every pass runs the layers, rows and kernels
+    /// of the unsliced chunk in the same order, so the result is the same
+    /// bits. `layers: None` runs to the end of the chunk.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_chunk_slice(
+        &self,
+        tokens: &[u32],
+        seq: &mut SequenceState,
+        chunk_start: usize,
+        chunk_len: usize,
+        is_last_chunk: bool,
+        stream: u64,
+        _layers: Option<usize>,
+    ) -> Result<ChunkStep> {
+        self.prefill_chunk(tokens, seq, chunk_start, chunk_len, is_last_chunk, stream)
+            .map(ChunkStep::Done)
+    }
 
     /// Run one decode step: process a single new token.
     ///

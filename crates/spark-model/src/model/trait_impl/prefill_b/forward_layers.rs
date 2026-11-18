@@ -40,7 +40,10 @@ impl TransformerModel {
             &crate::model::glm_fused_chunk::PassengerRun,
         )>,
         stream: u64,
-    ) -> Result<()> {
+        // The first layer to run: past 0 for a pass that paused
+        // (`pass_slice`), whose earlier layers and capture ran already.
+        first_layer: usize,
+    ) -> Result<Option<super::pass_slice::Stopped>> {
         let h = self.config.hidden_size;
         // BF16 residual is the shipping config (2 bytes/element).
         let elem_bytes = 2usize;
@@ -258,7 +261,15 @@ impl TransformerModel {
             && !profile_now
             && !host_timing
             && sync_every == 0;
-        if let Some(rows) = self.glm_pipe2_rows(proc_count, plain, &ctx) {
+        // A pass may stop between layers on what both ranks know alike.
+        let pausable = self.pass_slices()
+            && passengers.is_none()
+            && midcap.is_none()
+            && host_ids.is_none()
+            && proc_count >= super::pass_slice::MIN_ROWS;
+        if first_layer == 0
+            && let Some(rows) = self.glm_pipe2_rows(proc_count, plain, &ctx)
+        {
             self.glm_prefill_pipe2(
                 seq,
                 kv_cache,
@@ -276,7 +287,8 @@ impl TransformerModel {
                 hidden,
                 stream,
             )?;
-            return self.try_mtp_prefill_capture(seq, effective_seq_len_start, proc_count, stream);
+            self.try_mtp_prefill_capture(seq, effective_seq_len_start, proc_count, stream)?;
+            return Ok(None);
         }
         let mut sp = self.glm_prefill_sp_rows(proc_count, sp_excluded, &ctx);
         let mut sp_scope = sp.map(crate::layers::glm_sp::enter);
@@ -291,7 +303,7 @@ impl TransformerModel {
         det.tap("emb", hidden, (0, proc_count), h * 2);
         let hc_elem = crate::layers::ops::hc_elem_bytes(&self.config.model_type);
         let hc_row = self.config.hc_mult * h * hc_elem;
-        for (i, layer) in self.layers.iter().enumerate() {
+        for (i, layer) in self.layers.iter().enumerate().skip(first_layer) {
             crate::det_trace::set_layer(i);
             if let Some(p) = qsp.filter(|p| p.active && i == p.first_layer) {
                 self.qwen4exp_sp_compact(p.sp, stream)?;
@@ -536,6 +548,18 @@ impl TransformerModel {
                     &vals[..2.min(vals.len())]
                 );
             }
+            // The slice's layers are spent: stop here, after this layer's
+            // capture, with the rows a decode step may write put aside.
+            if pausable && i + 1 < self.layers.len() && super::pass_slice::layer_done() {
+                let rows = sp.map_or(proc_count, |sp| sp.rows);
+                return Ok(Some(self.pass_stash(
+                    i + 1,
+                    rows,
+                    hc_row,
+                    chunk_len,
+                    stream,
+                )?));
+            }
         }
         drop(sp_scope);
         if let Some(sp) = sp {
@@ -577,6 +601,7 @@ impl TransformerModel {
             &layer_times,
             prefill_t0,
             stream,
-        )
+        )?;
+        Ok(None)
     }
 }

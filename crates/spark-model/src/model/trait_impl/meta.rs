@@ -403,6 +403,7 @@ impl TransformerModel {
             prefix_lookup_skip: false,
             pc_branch_at: None,
             pc_plant_at: None,
+            paused_pass: None,
             finish_leaf: Default::default(),
             kv_valid_tokens: 0,
             last_decode_ckpt_block: 0,

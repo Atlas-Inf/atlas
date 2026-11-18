@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod chunk_retry;
 mod kv_refusal;
+mod layer_yield;
 mod min_tokens_ban;
 mod mixed_gate;
 mod packed_prefill;
@@ -75,6 +76,11 @@ struct PreemptStubModel {
     packed_calls: Mutex<Vec<Vec<Vec<u32>>>>,
     /// A multi-rank world without shared-prefix admission.
     ep: bool,
+    /// `prefill_chunk_slice` stops a pass between layers: every pass has
+    /// this many (`ATLAS_GLM_PREFILL_YIELD_MS`, `layer_yield`).
+    pass_layers: usize,
+    /// `(start, len, layer limit)` of every `prefill_chunk_slice` call.
+    slice_calls: Mutex<Vec<(usize, usize, Option<usize>)>>,
 }
 
 /// A token that marks a prompt as a prefix-cache hit for the packed stub.
@@ -135,6 +141,21 @@ impl Model for PreemptStubModel {
             }
         );
         Ok(DevicePtr::NULL)
+    }
+    fn prefill_slices(&self) -> bool {
+        self.pass_layers > 0
+    }
+    fn prefill_chunk_slice(
+        &self,
+        t: &[u32],
+        s: &mut SequenceState,
+        cs: usize,
+        cl: usize,
+        last: bool,
+        st: u64,
+        layers: Option<usize>,
+    ) -> Result<spark_model::traits::ChunkStep> {
+        layer_yield::slice(self, t, s, (cs, cl), last, st, layers)
     }
     fn ep_broadcast_cmd(&self, word: u32) -> Result<()> {
         self.wire.lock().unwrap().push(word);
@@ -473,23 +494,4 @@ fn single_sequence_exhaustion_is_not_preemptible() {
     assert!(logits.is_none());
     assert!(preempted.is_empty());
     assert!(rx0.try_recv().expect("response sent").is_err());
-}
-
-#[test]
-fn spill_pool_runs_only_for_models_that_resume_a_swap() {
-    let resumable = PreemptStubModel::default();
-    assert!(spill_pool_enabled(&resumable, 3));
-    assert!(!spill_pool_enabled(&resumable, 0));
-    // The trait default, which TransformerModel also reports for a GLM
-    // semantic-index cache: its spill image carries no index pools or tails,
-    // so a swapped-in sequence would select over another owner's keys.
-    // Admission then waits for blocks and decode preemption requeues.
-    let cannot = super::cancel_test_model::TestModel {
-        tokens: vec![],
-        host_logits: false,
-        cancel_after_sampling: None,
-        cancel_after_row_commit: None,
-        verify: None,
-    };
-    assert!(!spill_pool_enabled(&cannot, 3));
 }

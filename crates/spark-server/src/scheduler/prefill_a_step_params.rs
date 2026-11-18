@@ -62,6 +62,7 @@ pub(super) fn build_prefill_in_progress(
     PrefillInProgress {
         multi: false,
         queued_first_chunk: None,
+        paused: None,
         prompt_tokens,
         session_hash,
         seq,

@@ -328,6 +328,8 @@ pub(super) fn start_new_requests(
                     req.has_image_pixels(),
                     req.num_beams() > 1,
                     req.prompt_len() <= budget,
+                    !active.is_empty()
+                        && super::phase_continue_prefills::layer_yield::on(&sched.levers, model),
                 )
             };
             match start_chunked_prefill(

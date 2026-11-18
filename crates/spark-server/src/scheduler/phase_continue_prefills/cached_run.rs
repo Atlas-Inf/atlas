@@ -40,7 +40,9 @@ fn enabled() -> bool {
 
 /// Whether the chunk `p` just ran computed nothing and another follows.
 pub(super) fn chunk_was_cached(p: &PrefillInProgress) -> bool {
-    p.chunk_offset < p.prompt_tokens.len() && p.seq.prefill_chunk_cached(p.chunk_offset, false)
+    p.paused.is_none()
+        && p.chunk_offset < p.prompt_tokens.len()
+        && p.seq.prefill_chunk_cached(p.chunk_offset, false)
 }
 
 /// Whether the tick goes on to the second chunk of the prompt whose first

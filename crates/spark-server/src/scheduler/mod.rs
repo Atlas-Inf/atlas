@@ -501,18 +501,26 @@ pub fn run(
         // records one scheduler-tick section. `record` no-ops when the env is
         // unset; the Instant::now() reads are the documented residual cost.
         let t_loop = std::time::Instant::now();
-        let new_reqs = drain_pending_requests(
-            &pending,
-            &active,
-            &prefilling,
-            &*policy,
-            max_batch_size,
-            model.has_shared_prompt_capture(),
-            // Parked sequences (spilled or requeued) are waiting on blocks,
-            // not on new requests — never block on the request condvar while
-            // any exist, or an empty active set would strand them forever.
-            !(swapped.is_empty() && preempted.is_empty()),
-        );
+        // A prefill pass paused between layers (`layer_yield`) holds the
+        // arena until it ends: nothing is admitted meanwhile, as nothing was
+        // while its chunk ran whole. Requests wait in `pending`.
+        let pass_paused = prefilling.iter().any(|p| p.paused.is_some());
+        let new_reqs = if pass_paused {
+            Vec::new()
+        } else {
+            drain_pending_requests(
+                &pending,
+                &active,
+                &prefilling,
+                &*policy,
+                max_batch_size,
+                model.has_shared_prompt_capture(),
+                // Parked sequences (spilled or requeued) are waiting on blocks,
+                // not on new requests — never block on the request condvar while
+                // any exist, or an empty active set would strand them forever.
+                !(swapped.is_empty() && preempted.is_empty()),
+            )
+        };
         // ── Depth-aware admission: queue what cannot fit its decode depth ──
         // (admit-then-preempt was the C=128 thrash; see `admission` docs).
         let new_reqs = admission::gate_admissions(
@@ -767,12 +775,15 @@ pub fn run(
         // the tick before its second chunk: decoders get their step, and
         // prompts that arrived during the first chunk are admitted at the
         // next boundary (two back-to-back 8K chunks held both ~6 s).
-        // (ATLAS_GLM_WARM_CHUNK_RUN: not when that chunk computed nothing.)
+        // (ATLAS_GLM_WARM_CHUNK_RUN: not when that chunk computed nothing.
+        // ATLAS_GLM_PREFILL_YIELD_MS: nor when it queued its first chunk for
+        // the continue phase, which then ran nothing yet.)
         let head_just_started = (model.is_ep() || phase_continue_prefills::decode_share::enabled())
             && prefill_queue_was_empty
-            && prefilling
-                .first()
-                .is_some_and(|p| !phase_continue_prefills::follows_first_chunk(p));
+            && prefilling.first().is_some_and(|p| {
+                !phase_continue_prefills::follows_first_chunk(p)
+                    && !phase_continue_prefills::layer_yield::queued(&sched.levers, &*model, p)
+            });
         let did_mixed_step = !head_just_started
             && continue_in_progress_prefills(
                 &*model,
@@ -809,7 +820,8 @@ pub fn run(
             // loop sit AFTER decode, which this `continue` skips — so give
             // requeued victims their resume chance here or an otherwise
             // idle server would strand them.
-            if !preempted.is_empty() {
+            // Not beside a paused prefill pass: a resume prefills, on its arena.
+            if !preempted.is_empty() && !prefilling.iter().any(|p| p.paused.is_some()) {
                 preempt::resume_preempted_seqs(
                     &*model,
                     &mut active,
@@ -1317,7 +1329,11 @@ pub fn run(
 
         // ── Swap-in: resume swapped sequences when blocks free up ──
         let t_loop = std::time::Instant::now();
-        if let Some(ref mut spill) = spill_manager {
+        // Not beside a paused prefill pass, which admits nothing either.
+        let pass_paused = prefilling.iter().any(|p| p.paused.is_some());
+        if let Some(ref mut spill) = spill_manager
+            && !pass_paused
+        {
             preempt::discard_disconnected_swapped(&mut swapped, spill);
             let mut resumed_any = true;
             while resumed_any && !swapped.is_empty() && active.len() < max_batch_size {
@@ -1386,13 +1402,15 @@ pub fn run(
             }
         }
         // ── Resume requeued (decode-preempted) sequences when blocks free ──
-        preempt::resume_preempted_seqs(
-            &*model,
-            &mut active,
-            &mut preempted,
-            max_batch_size,
-            block_size,
-        );
+        if !pass_paused {
+            preempt::resume_preempted_seqs(
+                &*model,
+                &mut active,
+                &mut preempted,
+                max_batch_size,
+                block_size,
+            );
+        }
         sched.timing.record(mtp_timing::Phase::LoopSwap, t_loop);
     }
 

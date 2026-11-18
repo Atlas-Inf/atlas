@@ -29,6 +29,8 @@
 mod cached_run;
 #[path = "phase_continue_prefills/decode_share.rs"]
 pub(super) mod decode_share;
+#[path = "phase_continue_prefills/layer_yield.rs"]
+pub(super) mod layer_yield;
 #[path = "phase_continue_prefills/prefill_waves.rs"]
 mod prefill_waves;
 #[path = "phase_continue_prefills/queued_first.rs"]
@@ -351,9 +353,8 @@ pub(super) fn continue_in_progress_prefills(
     // Process the FIRST in-progress prefill. When no active decode
     // sequences, run all remaining chunks in a tight loop to minimize
     // TTFT. Otherwise, run 1 chunk and yield to decode.
-    if let Some(p) = prefilling.first_mut() {
-        let idx = 0usize;
-
+    let idx = layer_yield::next(prefilling);
+    if let Some(p) = prefilling.get_mut(idx) {
         // Two-phase SSM prefill: when the full sequence hasn't started
         // chunking yet (chunk_offset == 0) and is longer than one chunk,
         // use the two-phase path for better SSM state quality.

@@ -44,6 +44,10 @@ pub struct SchedLevers {
     /// admitted behind a prefill in flight waits in the queue for its first
     /// chunk instead of running it at admission (`phase_start_prefills::queue_first`).
     pub prefill_queue_first_chunk: bool,
+    /// `ATLAS_GLM_PREFILL_YIELD_MS=T`: while sequences decode, a prefill pass
+    /// runs as slices of whole layers about `T` ms long with a decode step
+    /// between them (`phase_continue_prefills::layer_yield`).
+    pub prefill_yield: Option<std::time::Duration>,
 
     // ── DFlash speculation ──
     pub dflash_masked_verify: bool,
@@ -173,6 +177,9 @@ impl SchedLevers {
             mtp_verify_sample: on_unless("ATLAS_NO_MTP_VERIFY_SAMPLE"),
             prefill_srpt: opt_in("ATLAS_PREFILL_SRPT"),
             prefill_queue_first_chunk: opt_in("ATLAS_PREFILL_QUEUE_FIRST_CHUNK"),
+            prefill_yield: super::phase_continue_prefills::layer_yield::parse(
+                std::env::var("ATLAS_GLM_PREFILL_YIELD_MS").ok().as_deref(),
+            ),
 
             dflash_masked_verify: opt_in("ATLAS_DFLASH_MASKED_VERIFY"),
             dflash_seam_serial: opt_in("ATLAS_DFLASH_SEAM_SERIAL"),
@@ -227,6 +234,7 @@ impl SchedLevers {
             mtp_verify_sample: true,
             prefill_srpt: false,
             prefill_queue_first_chunk: false,
+            prefill_yield: None,
             dflash_masked_verify: false,
             dflash_seam_serial: false,
             dflash_adaptive: false,

@@ -36,6 +36,7 @@ mod midchunk_capture;
 mod multi;
 mod multi_ep;
 mod multi_head;
+pub(in crate::model) mod pass_slice;
 pub use multi_ep::{multi_cached, multi_requested};
 #[path = "prefill_b/dispatch.rs"]
 mod dispatch;
