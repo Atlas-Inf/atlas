@@ -91,8 +91,8 @@ impl Runtime<'_> {
                 )?;
                 self.norm(s, self.collapsed, self.final_norm, self.normed, stream)?;
                 KernelLaunch::new(gpu, self.kernels[2])
-                    .grid([(c.vocab_size as u32).div_ceil(128), 1, 1])
-                    .block([128, 1, 1])
+                    .grid([(c.vocab_size as u32).div_ceil(8), 1, 1])
+                    .block([256, 1, 1])
                     .arg_ptr(self.normed)
                     .arg_ptr(self.lm_head)
                     .arg_ptr(self.logits)

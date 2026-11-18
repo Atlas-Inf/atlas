@@ -50,8 +50,8 @@ impl Hy4Attention<'_> {
         stream: u64,
     ) -> Result<()> {
         KernelLaunch::new(self.memory.gpu, self.kernels.linear)
-            .grid([n.div_ceil(128) as u32, 1, 1])
-            .block([128, 1, 1])
+            .grid([n.div_ceil(8) as u32, 1, 1])
+            .block([256, 1, 1])
             .arg_ptr(x)
             .arg_ptr(w)
             .arg_ptr(y)

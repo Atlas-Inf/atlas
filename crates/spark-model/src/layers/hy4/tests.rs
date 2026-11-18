@@ -195,6 +195,14 @@ fn ep2_reads_only_local_experts_reduces_routed_before_shared_and_norm() {
             .unwrap();
         assert_eq!(*comm.calls.lock().unwrap(), [(3 * 32 * 2, 17, 6)]);
         assert_eq!(gpu.launch_count(), 9);
+        let launches = gpu.launches_snapshot();
+        assert_eq!(launches[0].grid, [1, 3, 1]);
+        assert_eq!(launches[0].block, [256, 1, 1]);
+        assert_eq!(launches[1].block, [512, 1, 1]);
+        assert_eq!(launches[3].grid, [2, 3, 2]);
+        assert_eq!(launches[3].block, [256, 1, 1]);
+        assert_eq!(launches[4].grid, [16, 3, 1]);
+        assert_eq!(launches[4].block, [256, 1, 1]);
         assert_eq!(
             gpu.launches_snapshot()
                 .iter()
@@ -229,6 +237,11 @@ fn dense_zero_uses_unclamped_full_width_mlp_then_post_fc_norm_without_collective
         .unwrap();
     assert!(comm.calls.lock().unwrap().is_empty());
     assert_eq!(gpu.launch_count(), 3);
+    let launches = gpu.launches_snapshot();
+    assert_eq!(launches[0].grid, [8, 1, 1]);
+    assert_eq!(launches[0].block, [256, 1, 1]);
+    assert_eq!(launches[1].grid, [32, 1, 1]);
+    assert_eq!(launches[1].block, [256, 1, 1]);
 }
 
 #[test]

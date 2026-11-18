@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include <math.h>
 #include <stdint.h>
+#include "hy4_gemv.cuh"
 
 extern "C" __global__ void hy4_model_embed(
     const __nv_bfloat16* table,__nv_bfloat16* out,unsigned token,unsigned h) {
@@ -23,13 +24,9 @@ extern "C" __global__ void hy4_model_norm(
 }
 extern "C" __global__ void hy4_model_head(
     const __nv_bfloat16* x,const void* weight,float* logits,unsigned vocab,unsigned h,unsigned weight_f32) {
-    unsigned n=blockIdx.x*blockDim.x+threadIdx.x;if(n>=vocab)return;
-    float sum=0.f;for(unsigned d=0;d<h;d++) {
-        size_t offset=(size_t)n*h+d;
-        float w=weight_f32?((const float*)weight)[offset]:(float)((const __nv_bfloat16*)weight)[offset];
-        sum+=(float)x[d]*w;
-    }
-    logits[n]=sum;
+    unsigned n=blockIdx.x*8+threadIdx.x/32;if(n>=vocab)return;
+    float sum=hy4_dense_dot(x,weight,n,h,weight_f32);
+    if(threadIdx.x%32==0)logits[n]=sum;
 }
 extern "C" __global__ void hy4_model_argmax(const float* logits,unsigned* out,unsigned vocab) {
     if(threadIdx.x || blockIdx.x)return;

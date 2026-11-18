@@ -66,11 +66,13 @@ requests or streams. Caller-provided buffers must cover the documented
 tensor extents and may not overlap inputs/scratch. Drain the stream before
 releasing any source or scratch. Empty batches launch nothing.
 
-The CUDA FFN is intentionally a **correctness-first scalar W4A16 path**,
-not the optimized grouped/tensor-core MoE. It supports prefill/decode rows
-without host routing or tensor readbacks. It is not performance-qualified.
-Before production, compare checkpoints and all intermediate BF16 boundaries
-against the selected executable reference, then optimize under those tests.
+The CUDA FFN uses warp-cooperative W4A16 GEMVs over the original ModelOpt
+layout, not the generic grouped/tensor-core MoE (which assumes routed width
+equals H and different clamp/combine boundaries). Down projections compute
+selected experts in parallel, round each result to BF16, then combine in
+selection order. Routing is block-parallel with deterministic lower-ID ties.
+It supports prefill/decode rows without host routing or tensor readbacks.
+`scripts/dev/hy4_fast_kernels_test.cu` checks the CUDA arithmetic and tails.
 
 ## Verification boundary
 
