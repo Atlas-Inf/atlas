@@ -8,6 +8,7 @@
 use anyhow::{Result, ensure};
 
 pub mod attention;
+pub mod engram;
 pub mod hc;
 pub mod indexpool;
 pub mod moe;
