@@ -262,7 +262,7 @@ impl Model for Hy4Model {
         let r = self.borrow_dependent();
         KernelLaunch::new(s.gpu.as_ref(), r.kernels[3])
             .grid([1, 1, 1])
-            .block([1, 1, 1])
+            .block([256, 1, 1])
             .arg_ptr(ptr)
             .arg_ptr(r.post)
             .arg_u32(s.config.vocab_size as u32)

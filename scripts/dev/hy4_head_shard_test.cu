@@ -5,9 +5,49 @@
 #include <cstdlib>
 #include <vector>
 #include <cstring>
+#include <algorithm>
 
 #define CUDA(call) do { auto e=(call); if(e!=cudaSuccess) { \
     fprintf(stderr,"%s: %s\n",#call,cudaGetErrorString(e));exit(1); } } while(0)
+__global__ void serial_argmax(const float* logits,unsigned* out,unsigned vocab) {
+    unsigned best=0;for(unsigned i=1;i<vocab;i++)if(logits[i]>logits[best])best=i;
+    *out=best;
+}
+static void argmax_test() {
+    const unsigned capacity=120832;
+    std::vector<float> logits(capacity);
+    float *device;unsigned *result;
+    CUDA(cudaMalloc(&device,capacity*4));CUDA(cudaMalloc(&result,4));
+    for(unsigned n:{1u,33u,capacity})for(unsigned kind=0;kind<5;kind++) {
+        for(unsigned i=0;i<n;i++)logits[i]=float(int(i%97)-48);
+        if(kind==1)logits[n/3]=logits[n-1]=1000.f;
+        if(kind==2)logits[0]=NAN;
+        if(kind==3)logits[n-1]=NAN;
+        if(kind==4)std::fill(logits.begin(),logits.begin()+n,-INFINITY);
+        unsigned expected=0;
+        for(unsigned i=1;i<n;i++)if(logits[i]>logits[expected])expected=i;
+        CUDA(cudaMemcpy(device,logits.data(),n*4,cudaMemcpyHostToDevice));
+        for(unsigned threads:{1u,256u}) {
+            hy4_model_argmax<<<1,threads>>>(device,result,n);
+            unsigned actual;CUDA(cudaMemcpy(&actual,result,4,cudaMemcpyDeviceToHost));
+            if(actual!=expected) {puts("argmax values/ties/NaN mismatch");exit(1);}
+        }
+    }
+    for(unsigned threads:{1u,256u}) {
+        cudaEvent_t begin,end;CUDA(cudaEventCreate(&begin));CUDA(cudaEventCreate(&end));
+        CUDA(cudaEventRecord(begin));
+        for(unsigned i=0;i<10;i++) {
+            if(threads==1)serial_argmax<<<1,1>>>(device,result,capacity);
+            else hy4_model_argmax<<<1,threads>>>(device,result,capacity);
+        }
+        CUDA(cudaEventRecord(end));CUDA(cudaEventSynchronize(end));
+        float ms;CUDA(cudaEventElapsedTime(&ms,begin,end));
+        printf("HY4 argmax vocab=%u threads=%u ms=%.6f\n",capacity,threads,ms/10);
+        CUDA(cudaEventDestroy(begin));CUDA(cudaEventDestroy(end));
+    }
+    CUDA(cudaFree(device));CUDA(cudaFree(result));
+    puts("HY4 argmax: FP32 values, uneven tails, first-index ties, NaNs and negative infinity passed");
+}
 int main() {
     const unsigned vocab=34,h=16,half=vocab/2;
     std::vector<float> w(vocab*h),logits(vocab),expected(vocab);
@@ -35,5 +75,6 @@ int main() {
         if(fabsf(sum-logits[r])>1e-6f) {puts("sharded head mismatch");return 1;}
     }
     CUDA(cudaFree(dw));CUDA(cudaFree(dy));CUDA(cudaFree(dx));CUDA(cudaFree(local));
+    argmax_test();
     puts("HY4 BF16 head: FP32 conversion, uneven block tails, both vocab shards and full FP32 logits passed");
 }
