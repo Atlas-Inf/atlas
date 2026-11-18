@@ -9,6 +9,8 @@ use spark_runtime::{
 
 pub(super) struct Kernels {
     pub linear: KernelHandle,
+    pub fp8: KernelHandle,
+    pub join: KernelHandle,
     pub norm: KernelHandle,
     pub gemv: KernelHandle,
     pub rotary: KernelHandle,
@@ -24,6 +26,8 @@ impl Kernels {
     pub fn load(gpu: &dyn GpuBackend) -> Result<Self> {
         Ok(Self {
             linear: gpu.kernel("hy4_ffn", "hy4_linear")?,
+            fp8: gpu.kernel("hy4_mla", "hy4_fp8_gemv")?,
+            join: gpu.kernel("hy4_mla", "hy4_join_qkv")?,
             norm: gpu.kernel("hy4_ffn", "hy4_norm_add")?,
             gemv: gpu.kernel("hy4_mla", "hy4_head_gemv")?,
             rotary: gpu.kernel("hy4_mla", "hy4_rotary")?,
@@ -47,6 +51,9 @@ impl Hy4Attention<'_> {
         k: usize,
         stream: u64,
     ) -> Result<()> {
+        if self.scales.contains_key(&w) {
+            return self.fp8(x, w, y, [n, k, 0, 0], 1, stream);
+        }
         KernelLaunch::new(self.memory.gpu, self.kernels.linear)
             .grid([n.div_ceil(8) as u32, 1, 1])
             .block([256, 1, 1])
@@ -120,11 +127,38 @@ impl Hy4Attention<'_> {
         stream: u64,
     ) -> Result<()> {
         let [n, k, input_stride, output_stride] = dimensions;
+        if self.scales.contains_key(&w) {
+            return self.fp8(x, w, y, dimensions, self.heads, stream);
+        }
         KernelLaunch::new(self.memory.gpu, self.kernels.gemv)
             .grid([n.div_ceil(8) as u32, self.heads as u32, 1])
             .block([256, 1, 1])
             .arg_ptr(x)
             .arg_ptr(w)
+            .arg_ptr(y)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .arg_u32(input_stride as u32)
+            .arg_u32(output_stride as u32)
+            .launch(stream)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn fp8(
+        &self,
+        x: DevicePtr,
+        w: DevicePtr,
+        y: DevicePtr,
+        dimensions: [usize; 4],
+        heads: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let [n, k, input_stride, output_stride] = dimensions;
+        KernelLaunch::new(self.memory.gpu, self.kernels.fp8)
+            .grid([n.div_ceil(8) as u32, heads as u32, 1])
+            .block([256, 1, 1])
+            .arg_ptr(x)
+            .arg_ptr(w)
+            .arg_ptr(self.scales[&w])
             .arg_ptr(y)
             .arg_u32(n as u32)
             .arg_u32(k as u32)

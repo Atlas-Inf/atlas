@@ -36,6 +36,8 @@ pub struct Hy4Ropes {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Hy4Config {
+    #[serde(skip)]
+    pub attention_projection_fp8: bool,
     pub layer_types: Vec<Hy4Attention>,
     pub swa_pattern: Vec<u8>,
     pub mlp_layer_types: Vec<Hy4Mlp>,

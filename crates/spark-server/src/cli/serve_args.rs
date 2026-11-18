@@ -425,7 +425,8 @@ pub struct ServeArgs {
     /// load), `bf16` = keep checkpoint BF16 (the BF16 Q/K/V are resident
     /// anyway; O keeps a BF16 copy; decode/prefill use the dense GEMV/GEMM
     /// arms), `nvfp4` = force the quantized arms (today identical to
-    /// `default`). Quality lever in the spirit of --lm-head-dtype: 4-bit q/k
+    /// `default`), `fp8` = HY4-only load-time E4M3 with FP32 per-row scales.
+    /// Quality lever in the spirit of --lm-head-dtype: 4-bit q/k
     /// perturbations reroute attention on long prompts (see the
     /// ATLAS_ATTN_W4A4 note in the prefill path). Quality-gate per model.
     #[arg(long, default_value = "default")]

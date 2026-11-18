@@ -105,16 +105,19 @@ impl Runtime<'_> {
                 drop(hc);
                 let head = timing::span("lm_head", stream)?;
                 KernelLaunch::new(gpu, self.kernels[2])
-                    .grid([(c.vocab_size as u32).div_ceil(8), 1, 1])
+                    .grid([(self.vocab.rows as u32).div_ceil(8), 1, 1])
                     .block([256, 1, 1])
                     .arg_ptr(self.normed)
-                    .arg_ptr(self.lm_head)
-                    .arg_ptr(self.logits)
-                    .arg_u32(c.vocab_size as u32)
+                    .arg_ptr(self.vocab.weight)
+                    .arg_ptr(self.logits.offset(self.vocab.start * 4))
+                    .arg_u32(self.vocab.rows as u32)
                     .arg_u32(h as u32)
-                    .arg_u32(u32::from(self.lm_head_f32))
+                    .arg_u32(0)
                     .launch(stream)?;
                 drop(head);
+                let gather = timing::span("logits_gather", stream)?;
+                self.vocab.gather(s, self.logits, stream)?;
+                drop(gather);
                 drop(row_span);
                 gpu.synchronize(stream)?;
                 timer.finish()?;

@@ -10,6 +10,42 @@ use atlas_core::config::ModelConfig;
 
 use crate::cli;
 
+pub(crate) fn configure_attn_projection(config: &mut ModelConfig, dtype: &str) -> Result<()> {
+    anyhow::ensure!(
+        dtype != "fp8" || config.model_type == "hy_v4_flash",
+        "--attn-proj-dtype fp8 is currently supported only by HY4"
+    );
+    config.attn_proj_bf16 = dtype == "bf16";
+    if let Some(hy4) = &mut config.hy4 {
+        hy4.attention_projection_fp8 = dtype == "fp8";
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod attention_projection_tests {
+    use super::*;
+
+    #[test]
+    fn fp8_requires_explicit_hy4_opt_in_and_can_be_disabled() {
+        let mut c = atlas_core::config::parse_config(include_str!(
+            "../../../../atlas-core/src/config/fixtures/hy4/config.json"
+        ))
+        .unwrap();
+        assert!(!c.hy4.as_ref().unwrap().attention_projection_fp8);
+        configure_attn_projection(&mut c, "fp8").unwrap();
+        assert!(c.hy4.as_ref().unwrap().attention_projection_fp8);
+        assert!(!c.attn_proj_bf16);
+        configure_attn_projection(&mut c, "bf16").unwrap();
+        assert!(c.attn_proj_bf16);
+        assert!(!c.hy4.as_ref().unwrap().attention_projection_fp8);
+        configure_attn_projection(&mut c, "default").unwrap();
+        assert!(!c.hy4.as_ref().unwrap().attention_projection_fp8);
+        c.model_type = "qwen3".into();
+        assert!(configure_attn_projection(&mut c, "fp8").is_err());
+    }
+}
+
 pub(crate) fn merge_sidecar_quant_config(model_dir: &Path, config: &mut ModelConfig) {
     if config.quantization_config.is_some() {
         return;
