@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::layers::hy4::batch::{self, MAX_ROWS};
+use crate::layers::hy4::timing;
 use spark_runtime::kernel_args::KernelLaunch;
 use std::sync::atomic::Ordering;
 
@@ -74,6 +75,9 @@ impl Runtime<'_> {
                 let w = &self.multi;
                 let n = tokens.len();
                 let start = data.history.len();
+                let timer = (mode == VERIFY)
+                    .then(|| timing::Token::begin_batch(gpu, stream, s.config.tp_rank, start, n));
+                let row_span = timing::span("other", stream)?;
                 let mut history = data.history.clone();
                 history.extend_from_slice(tokens);
                 let positions = (start..start + n)
@@ -90,6 +94,7 @@ impl Runtime<'_> {
                 for (cell, state) in owner.layers.iter().zip(&mut data.layers) {
                     let b = cell.borrow_dependent();
                     if let Some(e) = &b.engram {
+                        let _engram = timing::span("engram", stream)?;
                         e.forward_batch(
                             w.highway,
                             &history,
@@ -99,9 +104,12 @@ impl Runtime<'_> {
                             stream,
                         )?;
                     }
+                    let hc = timing::span("ihc_norms", stream)?;
                     b.hc_attn
                         .collapse(gpu, w.highway, w.collapsed, w.post, n as u32, stream)?;
                     self.batch_norm(s, w.collapsed, b.input_norm, w.normed, n, stream)?;
+                    drop(hc);
+                    let attn = timing::span("attention", stream)?;
                     state.attn.forward(
                         w.normed,
                         w.output,
@@ -109,6 +117,8 @@ impl Runtime<'_> {
                         s.comm.as_deref(),
                         stream,
                     )?;
+                    drop(attn);
+                    let hc = timing::span("ihc_norms", stream)?;
                     b.hc_attn.scatter(
                         gpu,
                         [w.output, w.highway, w.post, w.highway],
@@ -118,6 +128,7 @@ impl Runtime<'_> {
                     b.hc_mlp
                         .collapse(gpu, w.highway, w.collapsed, w.post, n as u32, stream)?;
                     self.batch_norm(s, w.collapsed, b.mlp_norm, w.normed, n, stream)?;
+                    drop(hc);
                     b.ffn.forward(
                         w.normed,
                         w.output,
@@ -126,6 +137,7 @@ impl Runtime<'_> {
                         s.comm.as_deref(),
                         stream,
                     )?;
+                    let _hc = timing::span("ihc_norms", stream)?;
                     b.hc_mlp.scatter(
                         gpu,
                         [w.output, w.highway, w.post, w.highway],
@@ -141,6 +153,7 @@ impl Runtime<'_> {
                     } else {
                         (w.highway, n)
                     };
+                    let hc = timing::span("ihc_norms", stream)?;
                     self.head.collapse(
                         gpu,
                         input,
@@ -150,7 +163,9 @@ impl Runtime<'_> {
                         stream,
                     )?;
                     self.batch_norm(s, w.collapsed, self.final_norm, w.normed, rows, stream)?;
+                    drop(hc);
                     if mode == LAST {
+                        let head = timing::span("lm_head", stream)?;
                         KernelLaunch::new(gpu, self.kernels[2])
                             .grid([self.vocab.rows.div_ceil(8) as u32, 1, 1])
                             .block([256, 1, 1])
@@ -161,9 +176,12 @@ impl Runtime<'_> {
                             .arg_u32(h as u32)
                             .arg_u32(0)
                             .launch(stream)?;
+                        drop(head);
+                        let _gather = timing::span("logits_gather", stream)?;
                         self.vocab.gather(s, self.logits, stream)?;
                         self.logits
                     } else {
+                        let head = timing::span("lm_head", stream)?;
                         batch::gemm(
                             gpu,
                             [
@@ -176,6 +194,8 @@ impl Runtime<'_> {
                             [0, 1],
                             stream,
                         )?;
+                        drop(head);
+                        let _gather = timing::span("logits_gather", stream)?;
                         for row in 0..rows {
                             self.vocab.gather(
                                 s,
@@ -186,7 +206,11 @@ impl Runtime<'_> {
                         w.logits
                     }
                 };
+                drop(row_span);
                 gpu.synchronize(stream)?;
+                if let Some(timer) = timer {
+                    timer.finish()?;
+                }
                 Ok(logits)
             })();
             if result.is_ok() {

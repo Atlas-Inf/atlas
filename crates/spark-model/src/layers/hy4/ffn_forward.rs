@@ -169,6 +169,16 @@ impl Hy4Ffn<'_> {
         stream: u64,
     ) -> Result<()> {
         let [n, k] = dims;
+        let _linear = timing::span(
+            if w == self.down {
+                "ffn_latent_down"
+            } else if w == self.up {
+                "ffn_latent_up"
+            } else {
+                "ffn_router_linear"
+            },
+            stream,
+        )?;
         if rows > 1 {
             return super::batch::linear(
                 self.gpu,
