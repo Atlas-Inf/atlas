@@ -11,6 +11,8 @@ pub struct Hy4FfnScratch<'a> {
     pub(super) capacity: usize,
     pub(super) signature: [usize; 7],
     pub(super) ptrs: [DevicePtr; 8],
+    pub(super) groups: DevicePtr,
+    pub(super) partials: DevicePtr,
 }
 impl Hy4Ffn<'_> {
     pub(super) fn scratch_signature(&self) -> [usize; 7] {
@@ -45,8 +47,10 @@ impl<'a> Hy4FfnScratch<'a> {
             l * 2,
             h * 2,
             h * 2,
+            e * 12,
+            k * h.max(l) * 2,
         ];
-        let mut offsets = [0; 8];
+        let mut offsets = [0; 10];
         let mut bytes = 0usize;
         for (at, width) in widths.into_iter().enumerate() {
             offsets[at] = bytes;
@@ -67,13 +71,15 @@ impl<'a> Hy4FfnScratch<'a> {
             allocation,
             capacity,
             signature: block.scratch_signature(),
-            ptrs: offsets.map(|n| {
+            ptrs: std::array::from_fn(|i| {
                 if allocation.is_null() {
                     allocation
                 } else {
-                    allocation.offset(n)
+                    allocation.offset(offsets[i])
                 }
             }),
+            groups: allocation.offset(offsets[8]),
+            partials: allocation.offset(offsets[9]),
         })
     }
     pub fn release(&mut self) -> Result<()> {
@@ -83,6 +89,8 @@ impl<'a> Hy4FfnScratch<'a> {
         }
         self.capacity = 0;
         self.ptrs = [DevicePtr::NULL; 8];
+        self.groups = DevicePtr::NULL;
+        self.partials = DevicePtr::NULL;
         Ok(())
     }
 }

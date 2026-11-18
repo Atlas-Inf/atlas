@@ -19,6 +19,8 @@ use spark_runtime::{
 };
 use std::{collections::HashMap, sync::Arc};
 
+mod batch;
+mod benchmark;
 mod collectives;
 mod compute;
 mod model_trait;
@@ -95,6 +97,11 @@ struct Runtime<'a> {
     vocab: vocab::VocabHead,
     kernels: [KernelHandle; 4],
     max_batch: usize,
+    multi: batch::Workspace<'a>,
+    verify_logits: std::sync::atomic::AtomicBool,
+    head_rows: std::sync::atomic::AtomicUsize,
+    benchmark: bool,
+    benchmark_done: std::sync::atomic::AtomicBool,
 }
 self_cell::self_cell! {
     struct ModelCell {owner:Arc<Shared>,#[covariant] dependent:Runtime,}
@@ -264,6 +271,11 @@ impl Hy4Model {
                 batch_logits,
                 command,
                 max_batch,
+                multi: batch::Workspace::new(s)?,
+                verify_logits: std::sync::atomic::AtomicBool::new(false),
+                head_rows: std::sync::atomic::AtomicUsize::new(0),
+                benchmark: benchmark::enabled()?,
+                benchmark_done: std::sync::atomic::AtomicBool::new(false),
             })
         })
         .map(|cell| Self { cell: Some(cell) })
@@ -320,7 +332,7 @@ impl Runtime<'_> {
                             owner.shared.max_seq,
                             owner.shared.page_size,
                         )?,
-                        ffn: Hy4FfnScratch::new(&b.ffn, 1)?,
+                        ffn: Hy4FfnScratch::new(&b.ffn, self.multi.capacity)?,
                         engram: b.engram.as_ref().map(Hy4Engram::scratch).transpose()?,
                     });
                 }

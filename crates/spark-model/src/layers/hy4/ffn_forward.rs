@@ -66,6 +66,7 @@ impl Hy4Ffn<'_> {
                 [self.h, self.inter, 1, 0],
                 0.0,
                 rows,
+                [scratch.groups, scratch.partials],
                 stream,
             )?;
         } else {
@@ -112,6 +113,7 @@ impl Hy4Ffn<'_> {
                 [self.latent, self.inter, self.routing.top_k, 0],
                 self.limit,
                 rows,
+                [scratch.groups, scratch.partials],
                 stream,
             )?;
             self.linear(
@@ -138,6 +140,7 @@ impl Hy4Ffn<'_> {
                 [self.h, self.shared_inter, 1, self.ep.experts],
                 0.0,
                 rows,
+                [scratch.groups, scratch.partials],
                 stream,
             )?;
         }
@@ -166,6 +169,15 @@ impl Hy4Ffn<'_> {
         stream: u64,
     ) -> Result<()> {
         let [n, k] = dims;
+        if rows > 1 {
+            return super::batch::linear(
+                self.gpu,
+                [x, w, DevicePtr::NULL, y],
+                [n, k, rows as usize],
+                [0, u32::from(float_output)],
+                stream,
+            );
+        }
         KernelLaunch::new(self.gpu, self.kernels[0])
             .grid([n.div_ceil(8) as u32, rows, 1])
             .block([256, 1, 1])
@@ -190,9 +202,15 @@ impl Hy4Ffn<'_> {
         dims: [usize; 4],
         limit: f32,
         rows: u32,
+        batch: [DevicePtr; 2],
         stream: u64,
     ) -> Result<()> {
         let [h, i, slots, group] = dims;
+        if rows > 1 && rows as usize <= super::batch::MAX_ROWS {
+            return self.batch_mlp(
+                x, activated, out, ids, weights, dims, limit, rows, batch, stream,
+            );
+        }
         KernelLaunch::new(self.gpu, self.kernels[2])
             .grid([i.div_ceil(8) as u32, rows, slots as u32])
             .block([256, 1, 1])

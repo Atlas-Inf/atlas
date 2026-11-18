@@ -271,24 +271,23 @@ fn swa_has_no_pool_reduces_before_post_norm_and_includes_sink_for_prefill_and_de
             17,
         )
         .unwrap();
-    assert_eq!(gpu.launch_count(), 32);
-    assert_eq!(*comm.calls.lock().unwrap(), [(32, 17, 15), (32, 17, 31)]);
+    assert_eq!(gpu.launch_count(), 21);
+    assert_eq!(*comm.calls.lock().unwrap(), [(64, 17, 20)]);
+    assert_eq!(*comm.exchanges.lock().unwrap(), [(1184, 17, 2)]);
+    let args: Vec<_> = gpu.launches_snapshot().iter().map(|l| l.args).collect();
     assert_eq!(
-        *comm.exchanges.lock().unwrap(),
-        [(592, 17, 2), (592, 17, 18)]
+        args,
+        [
+            15, 15, 5, 6, 15, 15, 15, 6, 14, 14, 11, 4, 6, 14, 14, 11, 4, 15, 3, 15, 6
+        ]
     );
-    let args: Vec<_> = gpu.launches_snapshot()[..16]
-        .iter()
-        .map(|l| l.args)
-        .collect();
-    assert_eq!(args, [7, 7, 4, 6, 7, 6, 7, 14, 14, 11, 4, 7, 7, 3, 7, 6]);
     assert_eq!(cache.committed_len(), 2);
     assert!(
         cache
             .forward(DevicePtr(1), DevicePtr(2), &[[2; 3]], None, 17)
             .is_err()
     );
-    assert_eq!(gpu.launch_count(), 32);
+    assert_eq!(gpu.launch_count(), 21);
 }
 #[test]
 fn dsa_partial_group_survives_chunk_and_prefix_fork_and_uses_all_score_stages() {
@@ -307,7 +306,7 @@ fn dsa_partial_group_survives_chunk_and_prefix_fork_and_uses_all_score_stages() 
             9,
         )
         .unwrap();
-    assert_eq!(gpu.launch_count(), 66);
+    assert_eq!(gpu.launch_count(), 40);
     let copies = gpu.d2d_count();
     let mut fork = cache.fork(9).unwrap();
     assert_eq!(fork.committed_len(), 3);
@@ -319,7 +318,7 @@ fn dsa_partial_group_survives_chunk_and_prefix_fork_and_uses_all_score_stages() 
         .unwrap();
     assert_eq!(fork.committed_len(), 5);
     assert_eq!(cache.committed_len(), 3);
-    assert_eq!(gpu.launch_count(), 66 + 25 + 23);
+    assert_eq!(gpu.launch_count(), 40 + 35);
     assert_eq!(fork.first_group_position, Some([4; 3]));
     assert!(fork.fork(0).is_err());
     cache

@@ -57,6 +57,22 @@ impl AttentionCache<'_, '_> {
             None
         };
         self.stream = Some(stream);
+        if positions.len() > 1 {
+            for (i, chunk) in positions
+                .chunks(crate::layers::hy4::batch::MAX_ROWS)
+                .enumerate()
+            {
+                let offset = i * crate::layers::hy4::batch::MAX_ROWS * self.layer.hidden * 2;
+                self.forward_batch(
+                    input.offset(offset),
+                    output.offset(offset),
+                    chunk,
+                    comm,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
         for (row, &position) in positions.iter().enumerate() {
             let offset = row * self.layer.hidden * 2;
             if let Err(e) = self.forward_one(

@@ -45,8 +45,14 @@ impl Model for Hy4Model {
     fn trim_proposer_state(&self, _s: &mut SequenceState, _n: usize, _st: u64) -> Result<()> {
         Self::unavailable()
     }
-    fn decode_verify(&self, _t: &[u32], _s: &mut SequenceState, _st: u64) -> Result<Vec<u32>> {
-        Self::unavailable()
+    fn decode_verify(
+        &self,
+        tokens: &[u32],
+        seq: &mut SequenceState,
+        stream: u64,
+    ) -> Result<Vec<u32>> {
+        let ptr = self.forward_rows(tokens, seq, super::batch::VERIFY, stream)?;
+        self.argmax_batch(ptr, tokens.len(), stream)
     }
     fn checkpoint_ssm_states(&self, _s: &mut SequenceState) -> Result<()> {
         Self::unavailable()
@@ -114,9 +120,17 @@ impl Model for Hy4Model {
                     .all(|t| (*t as usize) < self.vocab_size()),
             "Hy4 invalid/empty/discontinuous prefill chunk"
         );
+        if start == 0 {
+            self.maybe_verify_benchmark(tokens, seq, stream)?;
+        }
         let mut logits = DevicePtr::NULL;
-        for &token in &tokens[start..end] {
-            logits = self.forward_token(token, seq, stream)?;
+        for chunk in tokens[start..end].chunks(self.borrow_dependent().multi.capacity) {
+            let mode = if last && seq.seq_len + chunk.len() == end {
+                super::batch::LAST
+            } else {
+                super::batch::BATCH
+            };
+            logits = self.forward_rows(chunk, seq, mode, stream)?;
         }
         seq.prompt_len = tokens.len();
         Ok(if last { logits } else { DevicePtr::NULL })
@@ -202,7 +216,12 @@ impl Model for Hy4Model {
         self.logits_buffer_ptr()
     }
     fn logits_buffer_ptr(&self) -> DevicePtr {
-        self.borrow_dependent().logits
+        let r = self.borrow_dependent();
+        if r.verify_logits.load(std::sync::atomic::Ordering::Relaxed) {
+            r.multi.logits
+        } else {
+            r.logits
+        }
     }
     fn argmax_on_device(&self, ptr: DevicePtr, stream: u64) -> Result<u32> {
         let s = self.borrow_owner();
@@ -221,7 +240,11 @@ impl Model for Hy4Model {
     }
     fn argmax_batch(&self, ptr: DevicePtr, n: usize, stream: u64) -> Result<Vec<u32>> {
         ensure!(
-            n <= self.borrow_dependent().max_batch,
+            n <= if ptr == self.borrow_dependent().multi.logits {
+                self.borrow_dependent().multi.capacity
+            } else {
+                self.borrow_dependent().max_batch
+            },
             "Hy4 argmax batch capacity"
         );
         (0..n)
@@ -229,7 +252,15 @@ impl Model for Hy4Model {
             .collect()
     }
     fn hidden_after_norm(&self) -> DevicePtr {
-        self.borrow_dependent().normed
+        let r = self.borrow_dependent();
+        let rows = r.head_rows.load(std::sync::atomic::Ordering::Relaxed);
+        if rows > 0 {
+            r.multi
+                .normed
+                .offset((rows - 1) * self.borrow_owner().config.hidden_size * 2)
+        } else {
+            r.normed
+        }
     }
     fn ep_worker_step(&self, _slots: &mut [Option<SequenceState>]) -> Result<bool> {
         self.worker()

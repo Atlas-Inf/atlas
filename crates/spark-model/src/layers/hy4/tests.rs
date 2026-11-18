@@ -193,25 +193,25 @@ fn ep2_reads_only_local_experts_reduces_routed_before_shared_and_norm() {
         block
             .forward(x, out, 3, &mut scratch, Some(&comm), 17)
             .unwrap();
-        assert_eq!(*comm.calls.lock().unwrap(), [(3 * 32 * 2, 17, 6)]);
-        assert_eq!(gpu.launch_count(), 9);
+        assert_eq!(*comm.calls.lock().unwrap(), [(3 * 32 * 2, 17, 9)]);
+        assert_eq!(gpu.launch_count(), 15);
         let launches = gpu.launches_snapshot();
-        assert_eq!(launches[0].grid, [1, 3, 1]);
+        assert_eq!(launches[0].grid, [1, 1, 1]);
         assert_eq!(launches[0].block, [256, 1, 1]);
         assert_eq!(launches[1].block, [512, 1, 1]);
-        assert_eq!(launches[3].grid, [2, 3, 2]);
-        assert_eq!(launches[3].block, [256, 1, 1]);
-        assert_eq!(launches[4].grid, [16, 3, 1]);
-        assert_eq!(launches[4].block, [256, 1, 1]);
+        assert_eq!(launches[5].grid, [2, 1, 4]);
+        assert_eq!(launches[5].block, [256, 1, 1]);
+        assert_eq!(launches[6].grid, [2, 1, 4]);
+        assert_eq!(launches[6].block, [256, 1, 1]);
         assert_eq!(
             gpu.launches_snapshot()
                 .iter()
                 .map(|l| l.args)
                 .collect::<Vec<_>>(),
-            [7, 8, 7, 9, 9, 7, 9, 9, 6]
+            [15, 8, 15, 3, 4, 12, 12, 5, 15, 3, 4, 12, 12, 5, 6]
         );
         assert!(block.forward(x, out, 3, &mut scratch, None, 17).is_err());
-        assert_eq!(gpu.launch_count(), 9);
+        assert_eq!(gpu.launch_count(), 15);
         scratch.release().unwrap();
         scratch.release().unwrap();
         block.release().unwrap();

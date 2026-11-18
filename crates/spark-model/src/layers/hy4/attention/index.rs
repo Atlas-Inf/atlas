@@ -12,6 +12,16 @@ impl AttentionCache<'_, '_> {
         position: [i64; 3],
         stream: u64,
     ) -> Result<()> {
+        self.run_index_projected(x, position, None, stream)
+    }
+
+    pub(super) fn run_index_projected(
+        &mut self,
+        x: DevicePtr,
+        position: [i64; 3],
+        projected: Option<[DevicePtr; 3]>,
+        stream: u64,
+    ) -> Result<()> {
         let a = self.layer;
         let s = &self.scratch;
         let gpu = a.memory.gpu;
@@ -20,10 +30,13 @@ impl AttentionCache<'_, '_> {
             self.first_group_position = Some(position);
         }
         let phase = timing::span("dsa_key_projection", stream)?;
-        a.linear(x, ix.key, s.key, 128, a.hidden, stream)?;
+        let [key, query, hw] = projected.unwrap_or([s.key, s.query, s.hw]);
+        if projected.is_none() {
+            a.linear(x, ix.key, key, 128, a.hidden, stream)?;
+        }
         drop(phase);
         a.norm(
-            s.key,
+            key,
             ix.key_norm,
             self.tail.offset((self.len % 4) * 128 * 2),
             128,
@@ -67,11 +80,13 @@ impl AttentionCache<'_, '_> {
             drop(phase);
         }
         let phase = timing::span("dsa_query_projection", stream)?;
-        a.linear(s.qc, ix.query, s.query, ix.heads * 128, a.qrank, stream)?;
+        if projected.is_none() {
+            a.linear(s.qc, ix.query, query, ix.heads * 128, a.qrank, stream)?;
+        }
         drop(phase);
         a.rotary(
-            s.query,
-            s.query,
+            query,
+            query,
             ix.heads,
             [128, 128, 64, 64],
             position,
@@ -82,13 +97,15 @@ impl AttentionCache<'_, '_> {
         KernelLaunch::new(gpu, a.kernels.fwht)
             .grid([ix.heads as u32, 1, 1])
             .block([128, 1, 1])
-            .arg_ptr(s.query)
+            .arg_ptr(query)
             .arg_ptr(s.quant)
             .arg_ptr(s.scales)
             .launch(stream)?;
         drop(phase);
         let phase = timing::span("dsa_head_projection", stream)?;
-        a.linear(x, ix.head, s.hw, ix.heads, a.hidden, stream)?;
+        if projected.is_none() {
+            a.linear(x, ix.head, hw, ix.heads, a.hidden, stream)?;
+        }
         drop(phase);
         let groups = self.len / 4;
         if groups > 0 {
@@ -98,7 +115,7 @@ impl AttentionCache<'_, '_> {
                 .block([256, 1, 1])
                 .arg_ptr(s.quant)
                 .arg_ptr(s.scales)
-                .arg_ptr(s.hw)
+                .arg_ptr(hw)
                 .arg_ptr(self.pool)
                 .arg_ptr(self.pool_table)
                 .arg_ptr(s.scores)

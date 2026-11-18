@@ -57,8 +57,12 @@ are retained in the host metadata. No attention content is compressed.
 
 SWA attends only `[max(0,p-511),p]`. Its circular table reserves
 `ceil((512-1)/page_size)+1` pages, including the extra boundary page needed
-when the window spans partial pages. Rows enqueue sequentially so prefill
-cannot overwrite keys needed by an earlier query. This same path serves
+when the window spans partial pages. Cache writes and queries enqueue
+sequentially so prefill cannot overwrite keys needed by an earlier query.
+Projections for contiguous prefill rows run together before this ordered
+causal/cache stage, followed by batched value/output projections and one
+`N*H` reduction. Indexer projections are batched, while each four-key pool
+is committed at the original row boundary. This path serves
 chunked prefill and decode, including sinks; there is no dense-prefill
 fallback that omits sinks.
 
@@ -71,9 +75,8 @@ poison the cache; do not resume it. One stream is bound to each cache.
 Drain it before explicit release or Drop. Caller buffers must cover
 `[rows,H]` and may not overlap each other or internal state.
 
-This is an eager, correctness-first implementation, not a throughput
-claim: projections/scoring/top-k are not optimized, per-row launches are
-serial, and prefix forks copy rather than COW-share pages. The eager model
+This is eager execution: causal cache/query stages remain ordered, and
+prefix forks copy rather than COW-share pages. The eager model
 owns request caches and Engram lookback; Marconi prefix reuse, graph capture
 and DFly reuse are not provided.
 

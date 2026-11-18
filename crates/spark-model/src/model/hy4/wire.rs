@@ -75,6 +75,31 @@ impl Hy4Model {
                 drop(requests);
                 r.row(s, slot, words[2], stream)?;
             }
+            batch::BATCH | batch::LAST | batch::VERIFY => {
+                let count = words[2] as usize;
+                ensure!(
+                    count > 0 && count <= r.multi.capacity,
+                    "Hy4 worker batch geometry"
+                );
+                {
+                    let requests = r.requests.lock();
+                    let request = requests
+                        .get(&slot)
+                        .context("Hy4 worker batch slot missing")?;
+                    ensure!(
+                        request.borrow_dependent().history.len() == words[3] as usize,
+                        "Hy4 worker batch position mismatch"
+                    );
+                }
+                c.broadcast(r.multi.tokens.0, count * 4, 0)?;
+                let mut bytes = vec![0; count * 4];
+                s.gpu.copy_d2h(r.multi.tokens, &mut bytes)?;
+                let tokens = bytes
+                    .chunks_exact(4)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                r.rows(s, slot, &tokens, words[0], stream)?;
+            }
             FREE => {
                 s.gpu.synchronize(stream)?;
                 r.requests.lock().remove(&slot);
@@ -120,6 +145,9 @@ impl Hy4Model {
             );
         }
         let ptr = r.row(s, seq.slot_idx, token, stream)?;
+        r.verify_logits
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        r.head_rows.store(0, std::sync::atomic::Ordering::Relaxed);
         seq.tokens.push(token);
         seq.seq_len += 1;
         Ok(ptr)

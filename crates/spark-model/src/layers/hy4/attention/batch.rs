@@ -1,0 +1,288 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+use super::{AttentionCache, Hy4Attention, memory::Owned};
+use crate::layers::hy4::batch::{self, MAX_ROWS};
+use anyhow::{Result, ensure};
+use spark_comm::CommBackend;
+use spark_runtime::{gpu::DevicePtr, kernel_args::KernelLaunch};
+
+pub(super) struct BatchScratch<'a> {
+    _memory: Owned<'a>,
+    shares: DevicePtr,
+    qc: DevicePtr,
+    kv: DevicePtr,
+    q: DevicePtr,
+    absorbed: DevicePtr,
+    latent: DevicePtr,
+    values: DevicePtr,
+    gates: DevicePtr,
+    partial: DevicePtr,
+    key: DevicePtr,
+    query: DevicePtr,
+    hw: DevicePtr,
+}
+impl<'a> BatchScratch<'a> {
+    fn new(a: &Hy4Attention<'a>) -> Result<Self> {
+        let mut m = Owned::new(a.memory.gpu);
+        let mut alloc = |n| m.alloc(MAX_ROWS * n * 2);
+        Ok(Self {
+            shares: alloc(a.qrank + 576)?,
+            qc: alloc(a.qrank)?,
+            kv: alloc(576)?,
+            q: alloc(a.heads * 256)?,
+            absorbed: alloc(a.heads * 576)?,
+            latent: alloc(a.heads * 512)?,
+            values: alloc(a.heads * 256)?,
+            gates: alloc(a.heads * 256)?,
+            partial: alloc(a.hidden)?,
+            key: alloc(128)?,
+            query: alloc(a.index.as_ref().map_or(1, |ix| ix.heads * 128))?,
+            hw: alloc(a.index.as_ref().map_or(1, |ix| ix.heads))?,
+            _memory: m,
+        })
+    }
+}
+
+impl Hy4Attention<'_> {
+    fn batch_linear(
+        &self,
+        x: DevicePtr,
+        w: DevicePtr,
+        y: DevicePtr,
+        dimensions: [usize; 9],
+        stream: u64,
+    ) -> Result<()> {
+        let scale = self.scales.get(&w).copied().unwrap_or(DevicePtr::NULL);
+        batch::gemm(
+            self.memory.gpu,
+            [x, w, scale, y],
+            dimensions,
+            [u32::from(!scale.is_null()), 0],
+            stream,
+        )
+    }
+    fn batch_norm(
+        &self,
+        x: DevicePtr,
+        w: DevicePtr,
+        out: DevicePtr,
+        n: usize,
+        rows: usize,
+        stream: u64,
+    ) -> Result<()> {
+        KernelLaunch::new(self.memory.gpu, self.kernels.norm)
+            .grid([rows as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(DevicePtr::NULL)
+            .arg_ptr(x)
+            .arg_ptr(w)
+            .arg_ptr(out)
+            .arg_u32(n as u32)
+            .arg_f32(self.eps)
+            .launch(stream)
+    }
+}
+
+impl AttentionCache<'_, '_> {
+    pub(super) fn forward_batch(
+        &mut self,
+        input: DevicePtr,
+        output: DevicePtr,
+        positions: &[[i64; 3]],
+        comm: Option<&dyn CommBackend>,
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(
+            positions.len() <= MAX_ROWS,
+            "Hy4 attention batch exceeds workspace"
+        );
+        let scratch = match self.batch.take() {
+            Some(s) => s,
+            None => BatchScratch::new(self.layer)?,
+        };
+        let result = self.batch_rows(input, output, positions, comm, &scratch, stream);
+        self.batch = Some(scratch);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn batch_rows(
+        &mut self,
+        input: DevicePtr,
+        output: DevicePtr,
+        positions: &[[i64; 3]],
+        comm: Option<&dyn CommBackend>,
+        b: &BatchScratch<'_>,
+        stream: u64,
+    ) -> Result<()> {
+        let a = self.layer;
+        let gpu = a.memory.gpu;
+        let rows = positions.len();
+        let linear =
+            |x, w, y, n, k| a.batch_linear(x, w, y, [n, k, rows, 1, 0, 0, k, n, k], stream);
+        if let Some(comm) = comm {
+            let stride = (a.qrank + 576) / a.world;
+            let share = b.shares.offset(a.rank * rows * stride * 2);
+            a.batch_linear(
+                input,
+                a.qa,
+                share,
+                [
+                    a.qrank / 2,
+                    a.hidden,
+                    rows,
+                    1,
+                    0,
+                    0,
+                    a.hidden,
+                    stride,
+                    a.hidden,
+                ],
+                stream,
+            )?;
+            a.batch_linear(
+                input,
+                a.kva,
+                share.offset(a.qrank),
+                [288, a.hidden, rows, 1, 0, 0, a.hidden, stride, a.hidden],
+                stream,
+            )?;
+            crate::layers::glm_kv_shard::pair_exchange(
+                comm,
+                share,
+                b.shares.offset((1 - a.rank) * rows * stride * 2),
+                rows * stride * 2,
+                stream,
+            )?;
+            KernelLaunch::new(gpu, gpu.kernel("hy4_mla", "hy4_batch_join_qkv")?)
+                .grid([rows as u32, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(b.shares)
+                .arg_ptr(b.qc)
+                .arg_ptr(b.kv)
+                .arg_u32(a.qrank as u32)
+                .arg_u32(rows as u32)
+                .launch(stream)?;
+        } else {
+            linear(input, a.qa, b.qc, a.qrank, a.hidden)?;
+            linear(input, a.kva, b.kv, 576, a.hidden)?;
+        }
+        a.batch_norm(b.qc, a.qan, b.qc, a.qrank, rows, stream)?;
+        linear(b.qc, a.qb, b.q, a.heads * 256, a.qrank)?;
+        a.batch_linear(
+            b.q,
+            a.wk,
+            b.absorbed,
+            [
+                512,
+                192,
+                rows,
+                a.heads,
+                256,
+                576,
+                a.heads * 256,
+                a.heads * 576,
+                192,
+            ],
+            stream,
+        )?;
+        linear(input, a.gate, b.gates, a.heads * 256, a.hidden)?;
+        if let Some(ix) = &a.index {
+            linear(input, ix.key, b.key, 128, a.hidden)?;
+            linear(b.qc, ix.query, b.query, ix.heads * 128, a.qrank)?;
+            linear(input, ix.head, b.hw, ix.heads, a.hidden)?;
+        }
+        for (row, &position) in positions.iter().enumerate() {
+            let kv = b.kv.offset(row * 576 * 2);
+            let latent = self.latent.offset(self.layout.slot(self.len)? * 576 * 2);
+            a.norm(kv, a.kvn, latent, 512, stream)?;
+            let absorbed = b.absorbed.offset(row * a.heads * 576 * 2);
+            a.rotary(
+                b.q.offset(row * a.heads * 256 * 2),
+                absorbed,
+                a.heads,
+                [256, 576, 192, 512],
+                position,
+                false,
+                stream,
+            )?;
+            a.rotary(kv, latent, 1, [576, 576, 512, 512], position, false, stream)?;
+            if let Some(ix) = &a.index {
+                self.run_index_projected(
+                    input.offset(row * a.hidden * 2),
+                    position,
+                    Some([
+                        b.key.offset(row * 128 * 2),
+                        b.query.offset(row * ix.heads * 128 * 2),
+                        b.hw.offset(row * ix.heads * 2),
+                    ]),
+                    stream,
+                )?;
+            }
+            let (indices, count) = match a.window {
+                Some(w) => (DevicePtr::NULL, (self.len + 1).min(w)),
+                None => (
+                    self.scratch.indices,
+                    (self.len / 4).min(511) * 4 + self.len % 4 + 1,
+                ),
+            };
+            let splits = count.div_ceil(128);
+            KernelLaunch::new(gpu, a.kernels.attention)
+                .grid([a.heads as u32, splits as u32, 1])
+                .block([256, 1, 1])
+                .arg_ptr(absorbed)
+                .arg_ptr(self.latent)
+                .arg_ptr(self.table)
+                .arg_ptr(indices)
+                .arg_ptr(self.scratch.softmax_parts)
+                .arg_u32(self.len as u32)
+                .arg_u32(self.layout.page_size as u32)
+                .arg_u32(self.layout.table.len() as u32)
+                .arg_u32(a.window.unwrap_or(0) as u32)
+                .arg_u32(count as u32)
+                .arg_u32(splits as u32)
+                .launch(stream)?;
+            KernelLaunch::new(gpu, a.kernels.merge)
+                .grid([a.heads as u32, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(self.scratch.softmax_parts)
+                .arg_ptr(a.sink)
+                .arg_ptr(b.latent.offset(row * a.heads * 512 * 2))
+                .arg_u32(splits as u32)
+                .launch(stream)?;
+            self.len += 1;
+        }
+        a.batch_linear(
+            b.latent,
+            a.wv,
+            b.values,
+            [
+                256,
+                512,
+                rows,
+                a.heads,
+                512,
+                256,
+                a.heads * 512,
+                a.heads * 256,
+                512,
+            ],
+            stream,
+        )?;
+        KernelLaunch::new(gpu, a.kernels.gate)
+            .grid([(rows * a.heads * 256).div_ceil(256) as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(b.values)
+            .arg_ptr(b.gates)
+            .arg_u32((rows * a.heads * 256) as u32)
+            .launch(stream)?;
+        linear(b.values, a.output, b.partial, a.hidden, a.heads * 256)?;
+        if let Some(comm) = comm {
+            comm.all_reduce_async(b.partial.0, rows * a.hidden * 2, stream)?;
+        }
+        a.batch_norm(b.partial, a.norm, output, a.hidden, rows, stream)
+    }
+}

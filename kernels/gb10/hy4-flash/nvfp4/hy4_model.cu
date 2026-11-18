@@ -17,8 +17,14 @@ extern "C" __global__ void hy4_model_embed(
     unsigned d=blockIdx.x*blockDim.x+threadIdx.x;
     if(d<4*h)out[d]=table[(size_t)token*h+d%h];
 }
+extern "C" __global__ void hy4_model_batch_embed(
+    const __nv_bfloat16* table,const unsigned* tokens,__nv_bfloat16* out,unsigned h) {
+    unsigned d=blockIdx.x*blockDim.x+threadIdx.x,row=blockIdx.y;
+    if(d<4*h)out[(size_t)row*4*h+d]=table[(size_t)tokens[row]*h+d%h];
+}
 extern "C" __global__ void hy4_model_norm(
     const __nv_bfloat16* x,const __nv_bfloat16* weight,__nv_bfloat16* out,unsigned h,float eps) {
+    x+=(size_t)blockIdx.x*h;out+=(size_t)blockIdx.x*h;
     __shared__ float values[256];float ss=0.f;
     for(unsigned d=threadIdx.x;d<h;d+=blockDim.x) {float v=(float)x[d];ss+=v*v;}
     values[threadIdx.x]=ss;__syncthreads();
