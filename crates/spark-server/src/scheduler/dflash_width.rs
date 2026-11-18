@@ -14,7 +14,10 @@
 //!
 //! `ATLAS_DFLASH_FIXED_WIDTH=w` pins the width instead (cost sweeps).
 //! `ATLAS_DFLASH_CONF_WIDTH=1` sizes it from the drafter's confidence in
-//! this step's drafts where that is measured (`dflash_conf_width`).
+//! this step's drafts where that is measured (`dflash_conf_width`). With it,
+//! the chain, and the pair under `ATLAS_GLM_PAIR_LIVE_WIDTHS=1`
+//! (`dflash_pair_live`), let each owner verify its own number of drafts
+//! inside the uniform batch ([`choose_live`]).
 
 use std::sync::OnceLock;
 
@@ -277,6 +280,30 @@ pub(super) fn chain_step_ms_live(owners: usize, rows: usize, live: usize) -> f32
     chain_step_ms(owners, rows) - dead * saved.max(0.0)
 }
 
+/// Whose measured step costs price a batch with dead rows ([`choose_live`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LiveLane {
+    /// The TP4 chain's ([`chain_step_ms_live`]).
+    Chain,
+    /// The pair's, under `ATLAS_GLM_PAIR_LIVE_WIDTHS`
+    /// (`dflash_pair_live::step_ms_live`).
+    Pair,
+}
+
+impl LiveLane {
+    /// The lane of a verify that runs on the chain or not (`on_chain`), the
+    /// pair's switch on or not (`pair_live`). The chain's is its own
+    /// whatever the switch says; a pair without the switch has none, and its
+    /// owners share one width.
+    pub(super) fn of(on_chain: bool, pair_live: bool) -> Option<Self> {
+        if on_chain {
+            Some(Self::Chain)
+        } else {
+            pair_live.then_some(Self::Pair)
+        }
+    }
+}
+
 /// Measured verify step cost in ms for `owners` sequences of `rows` rows
 /// each: median scheduler step interval (verify + re-propose) on GLM-5.3
 /// Flash TP2 GB10, prose, 2026-09-28 (`ATLAS_DFLASH_FIXED_WIDTH` sweeps; 5..=8
@@ -359,19 +386,22 @@ pub(crate) fn choose<'a>(
     enabled().then(|| best(owners.map(|(survival, _)| survival), max))
 }
 
-/// With dead rows (the chain; `glm_long_owner::DEAD_ROW`): the batch width
-/// and each owner's verified drafts (1..=width, in `owners` order), from the
-/// drafter's confidence (`dflash_conf_width::choose_live`). `None` leaves
-/// [`choose`] in place: off the chain, a pinned width, or unmeasured drafts.
+/// With dead rows (`glm_long_owner::DEAD_ROW`; the chain, and the pair
+/// under `ATLAS_GLM_PAIR_LIVE_WIDTHS`): the batch width and each owner's
+/// verified drafts (1..=width, in `owners` order), from the drafter's
+/// confidence (`dflash_conf_width::choose_live`) at that lane's step costs
+/// ([`LiveLane`]). `None` leaves [`choose`] in place: a pair without the
+/// switch, a pinned width, or unmeasured drafts.
 pub(crate) fn choose_live<'a>(
     owners: impl ExactSizeIterator<Item = &'a [f32]> + Clone,
     max: usize,
 ) -> Option<(usize, Vec<usize>)> {
     let max = max.min(MAX_DRAFTS);
-    if max == 0 || fixed().is_some() || !on_chain() {
+    if max == 0 || fixed().is_some() {
         return None;
     }
-    super::dflash_conf_width::choose_live(owners, max)
+    let lane = LiveLane::of(on_chain(), super::dflash_pair_live::enabled())?;
+    super::dflash_conf_width::choose_live(owners, max, lane)
 }
 
 /// The width maximizing the owners' expected tokens per step millisecond.

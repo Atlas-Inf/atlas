@@ -71,6 +71,13 @@ fn dead_marked<'a>(
 /// (`strict_spec::owner_masks`), and each owner's tail then runs unchanged.
 /// The walks are not repeated here: read again, a dead first draft could
 /// pass as an ordinary one.
+///
+/// Dead rows (`verified`) compose with the masks row for row: a walk is cut
+/// to the group's width, not to its owner's `verified` drafts, so a strict
+/// owner's dead rows still carry the walk's own mask rows. Their picks are
+/// never read (the verdict judges `verified[o]` drafts and takes its bonus
+/// from the row after the last accepted one, which is live and masked by
+/// the matcher state after exactly those drafts).
 #[allow(clippy::too_many_arguments)]
 pub(in crate::scheduler) fn step_verify_glm_long_strict(
     model: &dyn Model,

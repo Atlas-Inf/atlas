@@ -362,3 +362,79 @@ fn dead_rows_probe_verifies_every_draft() {
         None
     );
 }
+
+/// The pair's live widths (`ATLAS_GLM_PAIR_LIVE_WIDTHS`), without the probe.
+fn live_pair(owners: &[&[f32]], max: usize) -> (usize, Vec<usize>) {
+    Policy::default()
+        .choose_live_pair(owners.iter().copied(), max, NO_PROBE)
+        .unwrap()
+}
+
+#[test]
+fn pair_live_widths_follow_each_owners_confidence() {
+    // One owner sure of all seven drafts, three unsure of every one: the
+    // sure owner verifies them all and the others one draft each, their
+    // other rows dead. The width is the most any owner verifies.
+    let (sure, unsure): (&[f32], &[f32]) = (&[SURE; 7], &[UNSURE; 7]);
+    let (width, counts) = live_pair(&[sure, unsure, unsure, unsure], 7);
+    assert_eq!((width, counts), (7, vec![7, 1, 1, 1]));
+    // Whichever owner it is.
+    let (width, counts) = live_pair(&[unsure, unsure, sure, unsure], 7);
+    assert_eq!((width, counts), (7, vec![1, 1, 7, 1]));
+    // Never past the drafts every owner holds.
+    let (width, counts) = live_pair(&[sure, unsure, unsure, unsure], 3);
+    assert_eq!((width, counts), (3, vec![3, 1, 1, 1]));
+}
+
+#[test]
+fn pair_live_widths_are_equal_for_equal_owners() {
+    // Four prose owners: a second draft does not pay for the first owner
+    // alone (it widens the batch by a row for every owner) but does for all
+    // four, so all four verify it; the third pays for none.
+    let prose: &[f32] = &[-0.05, -0.3, -0.6, -0.9, -1.2, -1.6, -2.0];
+    assert_eq!(live_pair(&[prose; 4], 7), (2, vec![2; 4]));
+    for n in 2..=4 {
+        let (width, counts) = live_pair(&vec![prose; n], 7);
+        assert!(counts.iter().all(|&c| c == width), "{n}: {counts:?}");
+    }
+    // Sure owners verify everything, unsure ones their first draft.
+    let (sure, unsure): (&[f32], &[f32]) = (&[SURE; 7], &[UNSURE; 7]);
+    assert_eq!(live_pair(&[sure; 4], 7), (7, vec![7; 4]));
+    assert_eq!(live_pair(&[unsure; 4], 7), (1, vec![1; 4]));
+}
+
+#[test]
+fn pair_live_widths_keep_the_probe_and_the_callers_fallback() {
+    let unsure = [UNSURE; 3];
+    let owners: [&[f32]; 2] = [&unsure, &unsure];
+    let params = Params {
+        probe: 1,
+        ..NO_PROBE
+    };
+    assert_eq!(
+        Policy::default().choose_live_pair(owners.iter().copied(), 3, params),
+        Some((3, vec![3, 3]))
+    );
+    // Unmeasured drafts leave the caller's policy.
+    let short = [SURE; 2];
+    let owners: [&[f32]; 2] = [&short, &unsure];
+    assert_eq!(
+        Policy::default().choose_live_pair(owners.iter().copied(), 3, NO_PROBE),
+        None
+    );
+}
+
+#[test]
+fn the_chains_live_widths_do_not_read_the_pairs_costs() {
+    // The chain's rule is `choose_live`, priced by the chain's own costs:
+    // two sure and two unsure owners verify what they did before the pair
+    // had a lane (`dead_rows_widen_the_sure_owners_and_keep_the_unsure_short`),
+    // and the pair's costs give its own answer for the same owners.
+    let (sure, unsure) = ([SURE; 7], [UNSURE; 7]);
+    let owners: [&[f32]; 4] = [&sure, &unsure, &sure, &unsure];
+    let step_ms = crate::scheduler::dflash_width::chain_step_ms_live;
+    let chain = Policy::default().choose_live(owners.iter().copied(), 7, NO_PROBE);
+    let at = Policy::default().choose_live_at(owners.iter().copied(), 7, NO_PROBE, step_ms);
+    assert_eq!(chain, at);
+    assert_eq!(live_pair(&owners, 7), (7, vec![7, 1, 7, 1]));
+}
