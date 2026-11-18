@@ -20,10 +20,10 @@ const FENCE: u32 = b'`' as u32;
 const BRACE: u32 = b'{' as u32;
 
 /// One scripted logits row for this thread, cleared on drop.
-struct Row;
+pub(super) struct Row;
 
 impl Row {
-    fn new(pairs: &[(u32, f32)]) -> Self {
+    pub(super) fn new(pairs: &[(u32, f32)]) -> Self {
         let mut row = vec![0.0f32; GRAMMAR_VOCAB];
         for &(t, v) in pairs {
             row[t as usize] = v;
@@ -44,7 +44,7 @@ impl Drop for Row {
     }
 }
 
-fn model() -> TestModel {
+pub(super) fn model() -> TestModel {
     TestModel {
         tokens: vec![],
         host_logits: false,

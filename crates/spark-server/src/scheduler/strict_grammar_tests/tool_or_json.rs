@@ -12,20 +12,24 @@ use crate::tool_parser::{FunctionDefinition, PoolsideV1Parser, ToolDefinition};
 
 const CALL_BODY: &str = "get_weather<arg_key>location</arg_key><arg_value>Boston</arg_value>";
 
+pub(super) fn tools() -> Vec<ToolDefinition> {
+    vec![ToolDefinition {
+        tool_type: "function".into(),
+        function: FunctionDefinition {
+            name: "get_weather".into(),
+            description: None,
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"]
+            })),
+        },
+    }]
+}
+
 fn union_spec(schema: Option<&str>) -> GrammarSpec {
     GrammarSpec::ToolCallOrJson {
-        tools: vec![ToolDefinition {
-            tool_type: "function".into(),
-            function: FunctionDefinition {
-                name: "get_weather".into(),
-                description: None,
-                parameters: Some(serde_json::json!({
-                    "type": "object",
-                    "properties": {"location": {"type": "string"}},
-                    "required": ["location"]
-                })),
-            },
-        }],
+        tools: tools(),
         parser: std::sync::Arc::new(PoolsideV1Parser),
         schema: schema.map(str::to_string),
     }

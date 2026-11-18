@@ -78,6 +78,9 @@ pub struct GrammarState {
     opens_in_thinking: bool,
     /// Native tool token forbidden during a deferred required-tool preamble.
     first_token_suppress: Option<u32>,
+    /// The native tool opener a required tool call must start with
+    /// ([`Self::require_native_opener`]).
+    required_opener: Option<u32>,
     /// GLM's native tool opener, which ends reasoning without a `</think>`
     /// (`first_token_thinking::apply_native_tool_boundary`) and is itself the
     /// first output token. Set for a grammar with a tool branch beside its
@@ -163,6 +166,7 @@ impl GrammarState {
             strict: false,
             opens_in_thinking: false,
             first_token_suppress: None,
+            required_opener: None,
             native_opener: None,
             answer_start: None,
             auto_literal_dispatch: false,
@@ -264,6 +268,9 @@ impl GrammarState {
             .fill_next_token_bitmask(&mut self.bitmask_data, 0, false);
         self.timing
             .record(crate::scheduler::mtp_timing::Phase::GrammarFill, t_fill);
+        if filled {
+            self.pin_required_opener();
+        }
         self.bitmask_valid = true;
         self.bitmask_fill_result = filled;
         if filled && self.auto_literal_dispatch && self.matcher.is_grammar_completed() {
