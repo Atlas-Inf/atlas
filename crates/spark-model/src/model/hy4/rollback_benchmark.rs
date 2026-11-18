@@ -11,11 +11,13 @@ impl Hy4Model {
         stream: u64,
     ) -> Result<()> {
         let vocab = self.vocab_size() as u32;
-        for length in [tokens.len(), 515] {
-            ensure!(
-                length + 10 <= self.borrow_owner().max_seq,
-                "Hy4 rollback benchmark capacity"
-            );
+        let max_seq = self.borrow_owner().max_seq;
+        ensure!(
+            tokens.len() + 10 <= max_seq,
+            "Hy4 rollback benchmark capacity"
+        );
+        let long = Some(515).filter(|&n| n + 10 <= max_seq);
+        for length in std::iter::once(tokens.len()).chain(long) {
             let prefix: Vec<_> = tokens.iter().copied().cycle().take(length).collect();
             let mut reference = self.benchmark_sequence(slot)?;
             let logits = self.prefill(&prefix, &mut reference, stream)?;
