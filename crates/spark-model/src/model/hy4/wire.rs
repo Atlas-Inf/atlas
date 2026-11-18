@@ -6,6 +6,14 @@ pub(super) const ROW: u32 = 2;
 pub(super) const FREE: u32 = 3;
 pub(super) const STOP: u32 = u32::MAX;
 impl Hy4Model {
+    pub(super) fn eager_stream(&self, caller: u64) -> Result<u64> {
+        let gpu = self.borrow_owner().gpu.as_ref();
+        let stream = gpu.default_stream();
+        if caller != stream {
+            gpu.synchronize(caller)?;
+        }
+        Ok(stream)
+    }
     pub(super) fn send(&self, words: [u32; 4]) -> Result<()> {
         let s = self.borrow_owner();
         let r = self.borrow_dependent();
@@ -84,10 +92,7 @@ impl Hy4Model {
     ) -> Result<DevicePtr> {
         let s = self.borrow_owner();
         let r = self.borrow_dependent();
-        ensure!(
-            stream == s.gpu.default_stream(),
-            "Hy4 eager backend requires its default stream"
-        );
+        let stream = self.eager_stream(stream)?;
         {
             let requests = r.requests.lock();
             let request = requests

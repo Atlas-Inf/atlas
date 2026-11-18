@@ -136,6 +136,7 @@ impl Model for Hy4Model {
             !tokens.is_empty() && tokens.len() == seqs.len() && tokens.len() <= r.max_batch,
             "Hy4 decode batch geometry"
         );
+        let stream = self.eager_stream(stream)?;
         for (i, (&token, seq)) in tokens.iter().zip(seqs).enumerate() {
             let ptr = self.forward_token(token, seq, stream)?;
             s.gpu.copy_d2d_async(

@@ -190,6 +190,28 @@ fn eager_dispatch_preserves_chunk_decode_and_slot_isolation() {
         0
     );
 }
+
+#[test]
+fn scheduler_streams_are_bridged_to_the_serial_eager_stream() {
+    let model = model();
+    let stream = model.default_stream() + 1;
+    assert_ne!(stream, model.default_stream());
+    let mut a = model.alloc_sequence().unwrap();
+    let mut b = model.alloc_sequence().unwrap();
+    model.prefill(&[1, 2], &mut a, stream).unwrap();
+    model.decode(3, &mut a, stream).unwrap();
+    model.prefill(&[9], &mut b, stream).unwrap();
+    model
+        .decode_batch(&[4, 10], &mut [&mut a, &mut b], stream)
+        .unwrap();
+    let requests = model.borrow_dependent().requests.lock();
+    assert_eq!(
+        requests[&a.slot_idx].borrow_dependent().history,
+        [1, 2, 3, 4]
+    );
+    assert_eq!(requests[&b.slot_idx].borrow_dependent().history, [9, 10]);
+    drop(requests);
+}
 #[test]
 fn empty_invalid_and_discontinuous_inputs_do_not_advance_state() {
     let model = model();
