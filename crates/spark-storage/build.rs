@@ -28,6 +28,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ATLAS_SKIP_BUILD");
     println!("cargo:rerun-if-env-changed=SKIP_ATLAS_BUILD");
     println!("cargo:rerun-if-env-changed=ATLAS_TARGET_HW");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
     // FIRST, before any early return: `rustc-check-cfg` does not cross crates,
     // so this crate must declare the cfg name or every `#[cfg(atlas_rdma_verbs)]`
     // below trips `unexpected_cfgs` (a hard error under `warnings = "deny"`).
@@ -187,6 +188,14 @@ fn compile_kernels() {
 }
 
 fn find_nvcc() -> PathBuf {
+    // Honour CUDA_HOME first (same contract as atlas-kernels' find_cuda_dir):
+    // an x86 host may need a non-default toolkit / wrapper nvcc.
+    if let Ok(home) = std::env::var("CUDA_HOME") {
+        let p = Path::new(&home).join("bin/nvcc");
+        if p.is_file() {
+            return p;
+        }
+    }
     let candidates = ["/usr/local/cuda/bin/nvcc", "/usr/local/cuda-13.0/bin/nvcc"];
     for c in candidates {
         if Path::new(c).is_file() {
