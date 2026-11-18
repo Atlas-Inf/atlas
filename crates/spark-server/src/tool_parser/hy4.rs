@@ -53,7 +53,19 @@ impl ToolCallParser for Hy4Parser {
         true
     }
     fn leak_markers(&self) -> LeakMarkers {
-        PoolsideV1Parser.leak_markers()
+        // `canonical` strips the native `<tool_calls:opensource>` envelope
+        // token, but a model that spells it with ordinary BPE pieces reaches
+        // the stream as literal text no single decode window can strip.
+        LeakMarkers {
+            close: &[
+                "</arg_key>",
+                "</arg_value>",
+                "</tool_call>",
+                "<tool_calls:opensource>",
+                "</tool_calls:opensource>",
+            ],
+            ..PoolsideV1Parser.leak_markers()
+        }
     }
 }
 #[cfg(test)]
