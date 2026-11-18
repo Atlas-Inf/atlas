@@ -19,6 +19,7 @@ use spark_runtime::{
 };
 use std::{collections::HashMap, sync::Arc};
 
+mod collectives;
 mod compute;
 mod model_trait;
 #[cfg(test)]
@@ -148,6 +149,7 @@ impl Hy4Model {
                 "Hy4 communicator rank/world mismatch"
             );
         }
+        collectives::register(gpu.as_ref(), comm.as_deref());
         let owner = Arc::new(Shared {
             gpu,
             store,
