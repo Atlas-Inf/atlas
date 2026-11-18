@@ -6,6 +6,7 @@
 
 mod batch;
 mod cache;
+mod dfly;
 mod forward;
 mod index;
 mod kernels;

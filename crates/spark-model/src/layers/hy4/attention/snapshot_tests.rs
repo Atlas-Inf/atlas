@@ -48,3 +48,49 @@ fn snapshots_restore_overwritten_window_and_partial_dsa_group_bytes_and_cursors(
         assert_eq!(cache.len, 515);
     }
 }
+
+#[test]
+fn dfly_alias_requires_live_contiguous_dsa_cache_on_its_stream() {
+    let c = config(0, 1);
+    let swa = c
+        .hy4
+        .as_ref()
+        .unwrap()
+        .layer_types
+        .iter()
+        .position(|kind| *kind == Kind::SlidingAttention)
+        .unwrap();
+    let dsa = c
+        .hy4
+        .as_ref()
+        .unwrap()
+        .layer_types
+        .iter()
+        .position(|kind| *kind != Kind::SlidingAttention)
+        .unwrap();
+    for layer in [swa, dsa] {
+        let gpu = MockGpuBackend::new();
+        let c = config(0, 1);
+        let store = store(&gpu, &c, layer);
+        let a = Hy4Attention::load(&store, layer, &c, &gpu).unwrap();
+        let mut cache = AttentionCache::new(&a, 1024, 4).unwrap();
+        assert!(cache.dfly_target(17).is_err());
+        cache.len = 57;
+        cache.stream = Some(17);
+        assert!(cache.dfly_target(18).is_err());
+        if layer == dsa {
+            let view = cache.dfly_target(17).unwrap();
+            assert_eq!(view.latent, cache.latent);
+            assert_eq!(view.indices, cache.scratch.indices);
+            assert_eq!(view.len, 57);
+            assert_eq!(view.capacity, 1024);
+            cache.layout.table.swap(0, 1);
+            assert!(cache.dfly_target(17).is_err());
+            cache.layout.table.swap(0, 1);
+            cache.poisoned = true;
+            assert!(cache.dfly_target(17).is_err());
+        } else {
+            assert!(cache.dfly_target(17).is_err());
+        }
+    }
+}

@@ -6,6 +6,7 @@
 
 pub mod attention;
 pub mod batch;
+pub mod dfly;
 pub mod engram;
 pub mod ffn;
 mod ffn_batch;
