@@ -11,6 +11,7 @@ use spark_runtime::{
     weights::{WeightDtype, WeightStore},
 };
 
+mod batch;
 mod forward;
 #[cfg(test)]
 mod tests;
@@ -46,6 +47,7 @@ pub struct EngramScratch<'a> {
     queries: DevicePtr,
     value: DevicePtr,
     signature: [usize; 3],
+    batch: Option<batch::BatchScratch<'a>>,
 }
 impl<'a> Hy4Engram<'a> {
     pub(crate) fn token_map(&self) -> &[u32] {
@@ -263,6 +265,7 @@ impl<'a> Hy4Engram<'a> {
             queries,
             value,
             signature: [self.h, self.heads.start, self.heads.end],
+            batch: None,
         })
     }
 }

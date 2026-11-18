@@ -4,6 +4,7 @@
 //! rows are enqueued sequentially so circular SWA writes cannot evict keys
 //! still needed by an earlier prefill row.
 
+mod batch;
 mod cache;
 mod forward;
 mod index;

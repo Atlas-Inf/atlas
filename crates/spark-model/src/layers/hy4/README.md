@@ -74,11 +74,40 @@ selection order. Routing is block-parallel with deterministic lower-ID ties.
 It supports prefill/decode rows without host routing or tensor readbacks.
 `scripts/dev/hy4_fast_kernels_test.cu` checks the CUDA arithmetic and tails.
 
+## Contiguous token rows
+
+`model/hy4` processes prefill chunks layer-major, with at most 128 contiguous
+rows per internal chunk and the scheduler's `--max-prefill-tokens` budget
+unchanged. BF16/FP8 projections reuse weights across eight-row tiles.
+NVFP4 routing compacts rows by expert on device, reuses weights across the
+group, and restores the original top-k combination order and BF16 boundaries.
+Engram hashes use each row's actual two preceding tokens; its projections
+preserve the original accumulation order. iHC and reductions cover all rows.
+
+Intermediate prefill chunks omit the head; the final chunk evaluates only
+its last row. `Model::decode_verify` evaluates every row and exposes contiguous
+`[N,vocab]` FP32 logits through `logits_buffer_ptr`, as well as returning
+per-row argmax IDs. It commits all N tokens and supports one sequence,
+not a packed batch of independent sequences. Draft proposals, acceptance,
+cache rollback and DFly execution are not implemented by this primitive.
+Single-token decode retains the existing GEMV path.
+
+For a benchmark-only deployment, `ATLAS_HY4_VERIFY_BENCH=1` benchmarks
+N=1/2/4/6 on the first prefill request, with a prefix of up to 57 tokens.
+Inputs are six greedy tokens obtained with single-row decode; per-row argmax
+is compared with that reference. Each size has one warmup and three timed
+forwards, including all-row logits
+and synchronization but excluding argmax. Request caches are recreated
+outside timing and restored empty before the real prefill. The environment
+variable is startup-latched and off by default; disable it for normal serving.
+
 ## Verification boundary
 
 CPU tests cover arithmetic, extreme/tied routing, clamp asymmetry, shape
 errors, ownership, collective placement, buffer ABI and cleanup. Mock GPU
 tests prove dispatch/ownership, not CUDA numerical correctness.
-GB10 PTX is compile-tested on robert2, not executed. GPU reduction ordering,
-NVFP4 numerical parity, real collectives, memory/throughput and quality remain
-unverified. No Spark access is needed or permitted for these checks.
+`scripts/dev/hy4_batch_test.cu` compares batched projection/expert/Engram
+arithmetic with the single-row CUDA kernels, including strided rows, tails,
+remote experts, empty groups and TP2 Q/KV joins. Full-model continuation
+parity, quality and throughput require the real TP2/EP2 deployment; mock
+tests cannot establish them.

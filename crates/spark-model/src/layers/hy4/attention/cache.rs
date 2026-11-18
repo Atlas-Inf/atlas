@@ -24,6 +24,7 @@ pub struct AttentionCache<'layer, 'gpu> {
     pub(super) stream: Option<u64>,
     pub(super) poisoned: bool,
     pub(super) scratch: Scratch,
+    pub(super) batch: Option<super::batch::BatchScratch<'gpu>>,
 }
 pub(super) struct Scratch {
     pub qkv: DevicePtr,
@@ -171,6 +172,7 @@ impl<'layer, 'gpu> AttentionCache<'layer, 'gpu> {
             stream: None,
             poisoned: false,
             scratch,
+            batch: None,
         })
     }
     pub fn committed_len(&self) -> usize {
@@ -179,6 +181,7 @@ impl<'layer, 'gpu> AttentionCache<'layer, 'gpu> {
     /// Drain the bound compute stream first. A failed free can be retried.
     pub fn release(&mut self) -> Result<()> {
         self.poisoned = true;
+        self.batch = None;
         self._memory.release()
     }
 

@@ -161,3 +161,5 @@ extern "C" __global__ void hy4_norm_add(const __nv_bfloat16* routed,
         out[(size_t)t*H+d]=__float2bfloat16_rn(norm?v*r*(float)norm[d]:v);
     }
 }
+
+#include "hy4_batch.cuh"

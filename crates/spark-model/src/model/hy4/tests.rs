@@ -7,6 +7,9 @@ use spark_runtime::{
     weights::{WeightDtype as D, WeightTensor},
 };
 
+#[path = "batch_tests.rs"]
+mod batch_tests;
+
 fn config() -> ModelConfig {
     use atlas_core::config::{Hy4Attention as A, Hy4Mlp};
     let mut c = atlas_core::config::parse_config(include_str!(

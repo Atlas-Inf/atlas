@@ -60,6 +60,27 @@ extern "C" __global__ void hy4_engram_project(
     output[n]=__float2bfloat16_rn(sum);
 }
 
+extern "C" __global__ void hy4_engram_batch_project(
+    const __nv_bfloat16* x,const __nv_bfloat16* w,const __nv_bfloat16* bias,
+    __nv_bfloat16* out,unsigned h,unsigned full,unsigned start,unsigned k,
+    unsigned add_bias,unsigned rows,unsigned stride) {
+    unsigned n=blockIdx.x*blockDim.x+threadIdx.x,first=blockIdx.y*8;
+    if(n>=h)return;
+    float sums[8]={};
+    for(unsigned c=0;c<k;c++) {
+        float weight=(float)w[(size_t)n*full+start+c];
+        #pragma unroll
+        for(unsigned r=0;r<8;r++)if(first+r<rows)
+            sums[r]+=(float)x[(size_t)(first+r)*k+c]*weight;
+    }
+    #pragma unroll
+    for(unsigned r=0;r<8;r++)if(first+r<rows) {
+        float sum=sums[r];
+        if(add_bias)sum+=(float)bias[n];
+        out[(size_t)(first+r)*stride+n]=__float2bfloat16_rn(sum);
+    }
+}
+
 extern "C" __global__ void hy4_engram_norm(
     const __nv_bfloat16* x,const __nv_bfloat16* weight,__nv_bfloat16* output,unsigned h) {
     unsigned c=blockIdx.x;float ss=0.f;

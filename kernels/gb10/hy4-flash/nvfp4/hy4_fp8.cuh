@@ -58,3 +58,12 @@ extern "C" __global__ void hy4_join_qkv(const __nv_bfloat16* shares,
     for(unsigned i=threadIdx.x;i<qrank;i+=blockDim.x) q[i]=shares[(i/qa)*stride+i%qa];
     for(unsigned i=threadIdx.x;i<576;i+=blockDim.x) kv[i]=shares[(i/ka)*stride+qa+i%ka];
 }
+
+extern "C" __global__ void hy4_batch_join_qkv(const __nv_bfloat16* shares,
+    __nv_bfloat16* q,__nv_bfloat16* kv,unsigned qrank,unsigned rows) {
+    unsigned qa=qrank/2,stride=qa+288,row=blockIdx.x;
+    for(unsigned i=threadIdx.x;i<qrank;i+=blockDim.x)
+        q[(size_t)row*qrank+i]=shares[(size_t)(i/qa)*rows*stride+row*stride+i%qa];
+    for(unsigned i=threadIdx.x;i<576;i+=blockDim.x)
+        kv[(size_t)row*576+i]=shares[(size_t)(i/288)*rows*stride+row*stride+qa+i%288];
+}

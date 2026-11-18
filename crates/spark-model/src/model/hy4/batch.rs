@@ -1,0 +1,288 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+use super::*;
+use crate::layers::hy4::batch::{self, MAX_ROWS};
+use spark_runtime::kernel_args::KernelLaunch;
+use std::sync::atomic::Ordering;
+
+pub(super) const BATCH: u32 = 4;
+pub(super) const LAST: u32 = 5;
+pub(super) const VERIFY: u32 = 6;
+
+pub(super) struct Workspace<'a> {
+    _memory: Owned<'a>,
+    pub capacity: usize,
+    pub tokens: DevicePtr,
+    highway: DevicePtr,
+    collapsed: DevicePtr,
+    pub normed: DevicePtr,
+    output: DevicePtr,
+    post: DevicePtr,
+    pub logits: DevicePtr,
+}
+impl<'a> Workspace<'a> {
+    pub fn new(s: &'a Shared) -> Result<Self> {
+        let capacity = MAX_ROWS.min(s.max_seq);
+        let h = s.config.hidden_size;
+        let mut m = Owned::new(s.gpu.as_ref());
+        Ok(Self {
+            capacity,
+            tokens: m.alloc(capacity * 4)?,
+            highway: m.alloc(capacity * 4 * h * 2)?,
+            collapsed: m.alloc(capacity * h * 2)?,
+            normed: m.alloc(capacity * h * 2)?,
+            output: m.alloc(capacity * h * 2)?,
+            post: m.alloc(capacity * 4 * 4)?,
+            logits: m.alloc(capacity * s.config.vocab_size * 4)?,
+            _memory: m,
+        })
+    }
+}
+impl Runtime<'_> {
+    pub(super) fn rows(
+        &self,
+        s: &Shared,
+        slot: usize,
+        tokens: &[u32],
+        mode: u32,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        ensure!(
+            !tokens.is_empty()
+                && tokens.len() <= self.multi.capacity
+                && matches!(mode, BATCH | LAST | VERIFY),
+            "Hy4 invalid batch geometry/logit mode"
+        );
+        let mut requests = self.requests.lock();
+        let cell = requests
+            .get_mut(&slot)
+            .context("Hy4 batch request missing")?;
+        cell.with_dependent_mut(|owner, data| {
+            ensure!(
+                !data.poisoned
+                    && data
+                        .history
+                        .len()
+                        .checked_add(tokens.len())
+                        .is_some_and(|n| n <= s.max_seq)
+                    && tokens.iter().all(|t| (*t as usize) < s.config.vocab_size),
+                "Hy4 batch state/token/capacity"
+            );
+            let result = (|| {
+                let gpu = s.gpu.as_ref();
+                let h = s.config.hidden_size;
+                let w = &self.multi;
+                let n = tokens.len();
+                let start = data.history.len();
+                let mut history = data.history.clone();
+                history.extend_from_slice(tokens);
+                let positions = (start..start + n)
+                    .map(|p| [p as i64; 3])
+                    .collect::<Vec<_>>();
+                KernelLaunch::new(gpu, gpu.kernel("hy4_model", "hy4_model_batch_embed")?)
+                    .grid([(4 * h).div_ceil(256) as u32, n as u32, 1])
+                    .block([256, 1, 1])
+                    .arg_ptr(self.embed)
+                    .arg_ptr(w.tokens)
+                    .arg_ptr(w.highway)
+                    .arg_u32(h as u32)
+                    .launch(stream)?;
+                for (cell, state) in owner.layers.iter().zip(&mut data.layers) {
+                    let b = cell.borrow_dependent();
+                    if let Some(e) = &b.engram {
+                        e.forward_batch(
+                            w.highway,
+                            &history,
+                            start,
+                            state.engram.as_mut().context("Hy4 batch Engram scratch")?,
+                            s.comm.as_deref(),
+                            stream,
+                        )?;
+                    }
+                    b.hc_attn
+                        .collapse(gpu, w.highway, w.collapsed, w.post, n as u32, stream)?;
+                    self.batch_norm(s, w.collapsed, b.input_norm, w.normed, n, stream)?;
+                    state.attn.forward(
+                        w.normed,
+                        w.output,
+                        &positions,
+                        s.comm.as_deref(),
+                        stream,
+                    )?;
+                    b.hc_attn.scatter(
+                        gpu,
+                        [w.output, w.highway, w.post, w.highway],
+                        n as u32,
+                        stream,
+                    )?;
+                    b.hc_mlp
+                        .collapse(gpu, w.highway, w.collapsed, w.post, n as u32, stream)?;
+                    self.batch_norm(s, w.collapsed, b.mlp_norm, w.normed, n, stream)?;
+                    b.ffn.forward(
+                        w.normed,
+                        w.output,
+                        n as u32,
+                        &mut state.ffn,
+                        s.comm.as_deref(),
+                        stream,
+                    )?;
+                    b.hc_mlp.scatter(
+                        gpu,
+                        [w.output, w.highway, w.post, w.highway],
+                        n as u32,
+                        stream,
+                    )?;
+                }
+                let logits = if mode == BATCH {
+                    DevicePtr::NULL
+                } else {
+                    let (input, rows) = if mode == LAST {
+                        (w.highway.offset((n - 1) * 4 * h * 2), 1)
+                    } else {
+                        (w.highway, n)
+                    };
+                    self.head.collapse(
+                        gpu,
+                        input,
+                        w.collapsed,
+                        DevicePtr::NULL,
+                        rows as u32,
+                        stream,
+                    )?;
+                    self.batch_norm(s, w.collapsed, self.final_norm, w.normed, rows, stream)?;
+                    if mode == LAST {
+                        KernelLaunch::new(gpu, self.kernels[2])
+                            .grid([self.vocab.rows.div_ceil(8) as u32, 1, 1])
+                            .block([256, 1, 1])
+                            .arg_ptr(w.normed)
+                            .arg_ptr(self.vocab.weight)
+                            .arg_ptr(self.logits.offset(self.vocab.start * 4))
+                            .arg_u32(self.vocab.rows as u32)
+                            .arg_u32(h as u32)
+                            .arg_u32(0)
+                            .launch(stream)?;
+                        self.vocab.gather(s, self.logits, stream)?;
+                        self.logits
+                    } else {
+                        batch::gemm(
+                            gpu,
+                            [
+                                w.normed,
+                                self.vocab.weight,
+                                DevicePtr::NULL,
+                                w.logits.offset(self.vocab.start * 4),
+                            ],
+                            [self.vocab.rows, h, rows, 1, 0, 0, h, s.config.vocab_size, h],
+                            [0, 1],
+                            stream,
+                        )?;
+                        for row in 0..rows {
+                            self.vocab.gather(
+                                s,
+                                w.logits.offset(row * s.config.vocab_size * 4),
+                                stream,
+                            )?;
+                        }
+                        w.logits
+                    }
+                };
+                gpu.synchronize(stream)?;
+                Ok(logits)
+            })();
+            if result.is_ok() {
+                data.history.extend_from_slice(tokens);
+                self.verify_logits.store(mode == VERIFY, Ordering::Relaxed);
+                self.head_rows.store(
+                    if mode == LAST {
+                        1
+                    } else if mode == VERIFY {
+                        tokens.len()
+                    } else {
+                        0
+                    },
+                    Ordering::Relaxed,
+                );
+            } else {
+                data.poisoned = true;
+            }
+            result
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn batch_norm(
+        &self,
+        s: &Shared,
+        x: DevicePtr,
+        weight: DevicePtr,
+        out: DevicePtr,
+        rows: usize,
+        stream: u64,
+    ) -> Result<()> {
+        KernelLaunch::new(s.gpu.as_ref(), self.kernels[1])
+            .grid([rows as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(x)
+            .arg_ptr(weight)
+            .arg_ptr(out)
+            .arg_u32(s.config.hidden_size as u32)
+            .arg_f32(s.config.rms_norm_eps as f32)
+            .launch(stream)
+    }
+}
+
+impl Hy4Model {
+    pub(super) fn forward_rows(
+        &self,
+        tokens: &[u32],
+        seq: &mut crate::traits::SequenceState,
+        mode: u32,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        let s = self.borrow_owner();
+        let r = self.borrow_dependent();
+        let stream = self.eager_stream(stream)?;
+        ensure!(
+            !tokens.is_empty()
+                && tokens.len() <= r.multi.capacity
+                && matches!(mode, BATCH | LAST | VERIFY)
+                && seq
+                    .seq_len
+                    .checked_add(tokens.len())
+                    .is_some_and(|n| n <= s.max_seq)
+                && tokens.iter().all(|t| (*t as usize) < s.config.vocab_size),
+            "Hy4 batch input bounds"
+        );
+        {
+            let requests = r.requests.lock();
+            let request = requests
+                .get(&seq.slot_idx)
+                .context("Hy4 batch slot not allocated")?;
+            ensure!(
+                !request.borrow_dependent().poisoned
+                    && request.borrow_dependent().history.len() == seq.seq_len,
+                "Hy4 batch position mismatch"
+            );
+        }
+        s.gpu.copy_h2d(
+            &tokens
+                .iter()
+                .flat_map(|t| t.to_le_bytes())
+                .collect::<Vec<_>>(),
+            r.multi.tokens,
+        )?;
+        self.send([
+            mode,
+            u32::try_from(seq.slot_idx)?,
+            tokens.len() as u32,
+            u32::try_from(seq.seq_len)?,
+        ])?;
+        if let Some(c) = s.comm.as_deref().filter(|c| c.world_size() > 1) {
+            c.broadcast(r.multi.tokens.0, tokens.len() * 4, 0)?;
+        }
+        let ptr = r.rows(s, seq.slot_idx, tokens, mode, stream)?;
+        seq.tokens.extend_from_slice(tokens);
+        seq.seq_len += tokens.len();
+        Ok(ptr)
+    }
+}
