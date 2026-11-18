@@ -83,6 +83,7 @@ impl<'a> Hy4Engram<'a> {
         let heads = self.layout.sizes.len();
         let local = self.heads.len() * self.dim;
         for row in 0..rows {
+            let _lookup = super::super::timing::span("engram_lookup", stream)?;
             let p = start + row;
             let hashes = b.hashes.offset(row * heads * 4);
             KernelLaunch::new(gpu, self.kernels[0])
@@ -116,6 +117,7 @@ impl<'a> Hy4Engram<'a> {
                 .launch(stream)?;
         }
         for i in 0..5 {
+            let _project = super::super::timing::span("engram_project", stream)?;
             let (out, stride) = if i == 4 {
                 (b.value, self.h)
             } else {
@@ -138,6 +140,7 @@ impl<'a> Hy4Engram<'a> {
                 .launch(stream)?;
         }
         if let Some(comm) = comm.filter(|_| self.topology[1] > 1) {
+            let _reduce = super::super::timing::span("all_reduce", stream)?;
             let bytes = rows * self.h * 2;
             for part in 0..4 {
                 comm.all_reduce_async(b.keys.offset(part * bytes).0, bytes, stream)?;
@@ -145,6 +148,7 @@ impl<'a> Hy4Engram<'a> {
             comm.all_reduce_async(b.value.0, rows * self.h * 2, stream)?;
         }
         for row in 0..rows {
+            let _finish = super::super::timing::span("engram_norm_gate", stream)?;
             let highway = hidden.offset(row * 4 * self.h * 2);
             let norm_keys = b.norm_keys.offset(row * 4 * self.h * 2);
             let queries = b.queries.offset(row * 4 * self.h * 2);

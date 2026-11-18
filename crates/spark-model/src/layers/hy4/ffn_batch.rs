@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::ffn::Hy4Ffn;
+use super::timing;
 use anyhow::Result;
 use spark_runtime::{gpu::DevicePtr, kernel_args::KernelLaunch};
 
@@ -22,6 +23,14 @@ impl Hy4Ffn<'_> {
         let [h, i, slots, group] = dims;
         let [groups, partials] = batch;
         let experts = if ids.is_null() { 1 } else { self.ep.experts };
+        let grouping = timing::span(
+            if ids.is_null() {
+                "dense_grouping"
+            } else {
+                "expert_grouping"
+            },
+            stream,
+        )?;
         KernelLaunch::new(self.gpu, self.gpu.kernel("hy4_ffn", "hy4_group_init")?)
             .grid([1, 1, 1])
             .block([1, 1, 1])
@@ -37,8 +46,18 @@ impl Hy4Ffn<'_> {
             .arg_u32(rows)
             .arg_u32(slots as u32)
             .launch(stream)?;
+        drop(grouping);
         for (input, output, n, k, down) in [(x, activated, i, h, 0), (activated, partials, h, i, 1)]
         {
+            let _phase = timing::span(
+                match (ids.is_null(), down) {
+                    (true, 0) => "dense_gate_up",
+                    (true, _) => "dense_down",
+                    (false, 0) => "expert_gate_up",
+                    _ => "expert_down",
+                },
+                stream,
+            )?;
             KernelLaunch::new(self.gpu, self.gpu.kernel("hy4_ffn", "hy4_batch_expert")?)
                 .grid([
                     n.div_ceil(8) as u32,
@@ -60,6 +79,14 @@ impl Hy4Ffn<'_> {
                 .arg_u32(experts as u32)
                 .launch(stream)?;
         }
+        let _combine = timing::span(
+            if ids.is_null() {
+                "dense_combine"
+            } else {
+                "expert_combine"
+            },
+            stream,
+        )?;
         KernelLaunch::new(self.gpu, self.gpu.kernel("hy4_ffn", "hy4_batch_combine")?)
             .grid([h.div_ceil(256) as u32, rows, 1])
             .block([256, 1, 1])

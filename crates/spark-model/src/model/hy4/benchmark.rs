@@ -44,8 +44,9 @@ impl Hy4Model {
             next = self.argmax_on_device(logits, stream)?;
             expected.push(next);
         }
-        for rows in [1, 2, 4, 6] {
-            for trial in 0..4 {
+        for rows in 1..=6 {
+            let trials = if matches!(rows, 3 | 5) { 1 } else { 4 };
+            for trial in 0..trials {
                 let mut temporary = self.benchmark_sequence(seq.slot_idx)?;
                 self.forward_rows(prefix, &mut temporary, super::batch::BATCH, stream)?;
                 let begin = std::time::Instant::now();
@@ -61,7 +62,7 @@ impl Hy4Model {
                     prefix.len(),
                     trial == 0
                 );
-                if trial == 3 {
+                if trial + 1 == trials {
                     let actual = self.argmax_batch(ptr, rows, stream)?;
                     let first_divergence = actual.iter().zip(&expected).position(|(a, b)| a != b);
                     tracing::info!(

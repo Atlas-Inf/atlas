@@ -2,6 +2,7 @@
 
 use super::{AttentionCache, Hy4Attention, memory::Owned};
 use crate::layers::hy4::batch::{self, MAX_ROWS};
+use crate::layers::hy4::timing;
 use anyhow::{Result, ensure};
 use spark_comm::CommBackend;
 use spark_runtime::{gpu::DevicePtr, kernel_args::KernelLaunch};
@@ -52,6 +53,24 @@ impl Hy4Attention<'_> {
         dimensions: [usize; 9],
         stream: u64,
     ) -> Result<()> {
+        let name = if w == self.qa {
+            "attn_q_a"
+        } else if w == self.qb {
+            "attn_q_b"
+        } else if w == self.kva {
+            "attn_kv_a"
+        } else if w == self.wk {
+            "attn_absorb"
+        } else if w == self.wv {
+            "attn_value"
+        } else if w == self.gate {
+            "attn_gate"
+        } else if w == self.output {
+            "attn_output"
+        } else {
+            "dsa_projection"
+        };
+        let _phase = timing::span(name, stream)?;
         let scale = self.scales.get(&w).copied().unwrap_or(DevicePtr::NULL);
         batch::gemm(
             self.memory.gpu,
@@ -70,6 +89,7 @@ impl Hy4Attention<'_> {
         rows: usize,
         stream: u64,
     ) -> Result<()> {
+        let _norm = timing::span("attn_norm", stream)?;
         KernelLaunch::new(self.memory.gpu, self.kernels.norm)
             .grid([rows as u32, 1, 1])
             .block([256, 1, 1])
@@ -150,6 +170,7 @@ impl AttentionCache<'_, '_> {
                 [288, a.hidden, rows, 1, 0, 0, a.hidden, stride, a.hidden],
                 stream,
             )?;
+            let exchange = timing::span("attn_qkv_exchange", stream)?;
             crate::layers::glm_kv_shard::pair_exchange(
                 comm,
                 share,
@@ -166,6 +187,7 @@ impl AttentionCache<'_, '_> {
                 .arg_u32(a.qrank as u32)
                 .arg_u32(rows as u32)
                 .launch(stream)?;
+            drop(exchange);
         } else {
             linear(input, a.qa, b.qc, a.qrank, a.hidden)?;
             linear(input, a.kva, b.kv, 576, a.hidden)?;
@@ -196,6 +218,7 @@ impl AttentionCache<'_, '_> {
             linear(input, ix.head, b.hw, ix.heads, a.hidden)?;
         }
         for (row, &position) in positions.iter().enumerate() {
+            let _causal = timing::span("attn_causal_rows", stream)?;
             let kv = b.kv.offset(row * 576 * 2);
             let latent = self.latent.offset(self.layout.slot(self.len)? * 576 * 2);
             a.norm(kv, a.kvn, latent, 512, stream)?;
@@ -230,6 +253,7 @@ impl AttentionCache<'_, '_> {
                 ),
             };
             let splits = count.div_ceil(128);
+            let mla = timing::span("latent_attention", stream)?;
             KernelLaunch::new(gpu, a.kernels.attention)
                 .grid([a.heads as u32, splits as u32, 1])
                 .block([256, 1, 1])
@@ -253,6 +277,7 @@ impl AttentionCache<'_, '_> {
                 .arg_ptr(b.latent.offset(row * a.heads * 512 * 2))
                 .arg_u32(splits as u32)
                 .launch(stream)?;
+            drop(mla);
             self.len += 1;
         }
         a.batch_linear(
@@ -281,6 +306,7 @@ impl AttentionCache<'_, '_> {
             .launch(stream)?;
         linear(b.values, a.output, b.partial, a.hidden, a.heads * 256)?;
         if let Some(comm) = comm {
+            let _reduce = timing::span("all_reduce", stream)?;
             comm.all_reduce_async(b.partial.0, rows * a.hidden * 2, stream)?;
         }
         a.batch_norm(b.partial, a.norm, output, a.hidden, rows, stream)

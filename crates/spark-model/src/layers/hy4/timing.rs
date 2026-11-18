@@ -73,9 +73,19 @@ pub struct Token<'a> {
     stream: u64,
     rank: usize,
     position: usize,
+    rows: usize,
 }
 impl<'a> Token<'a> {
     pub fn begin(gpu: &'a dyn GpuBackend, stream: u64, rank: usize, position: usize) -> Self {
+        Self::begin_batch(gpu, stream, rank, position, 1)
+    }
+    pub fn begin_batch(
+        gpu: &'a dyn GpuBackend,
+        stream: u64,
+        rank: usize,
+        position: usize,
+        rows: usize,
+    ) -> Self {
         if enabled() {
             STATE.with(|state| {
                 *state.borrow_mut() = State {
@@ -89,6 +99,7 @@ impl<'a> Token<'a> {
             stream,
             rank,
             position,
+            rows,
         }
     }
 
@@ -110,9 +121,10 @@ impl<'a> Token<'a> {
             let ms = exclusive(&rows)?;
             let total: f64 = ms.values().sum();
             tracing::info!(
-                "HY4_TIMING rank={} position={} total_ms={total:.6} gpu_ms={ms:?}",
+                "HY4_TIMING rank={} position={} rows={} total_ms={total:.6} gpu_ms={ms:?}",
                 self.rank,
                 self.position,
+                self.rows,
             );
             s.records.clear();
             s.active = false;
