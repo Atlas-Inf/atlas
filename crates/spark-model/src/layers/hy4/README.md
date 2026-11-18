@@ -1,7 +1,8 @@
-# Hy4 standalone blocks
+# Hy4 eager text model blocks
 
-These blocks do not remove the factory's full-model execution guard.
-Engram and model assembly still need implementation.
+The factory uses the dedicated eager model in `model/hy4`, including Engram.
+See [`docs/HY4_TWO_SPARK.md`](../../../../../docs/HY4_TWO_SPARK.md) for the
+unexecuted TP2/EP2 launch and validation limits.
 
 The standalone gated MLA/SWA/IndexPool path is documented in
 [`attention/README.md`](attention/README.md).

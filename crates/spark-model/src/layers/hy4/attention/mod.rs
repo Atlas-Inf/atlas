@@ -9,7 +9,7 @@ mod forward;
 mod index;
 mod kernels;
 mod loader;
-mod memory;
+pub(crate) mod memory;
 #[cfg(test)]
 mod tests;
 

@@ -19,6 +19,7 @@ pub mod dflash_loader;
 pub mod dflash_preshrink;
 mod gemma4;
 pub(crate) mod glm5;
+pub(crate) mod hy4;
 mod laguna;
 mod longcat;
 mod minimax;

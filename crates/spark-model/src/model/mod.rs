@@ -117,6 +117,7 @@ pub use vision_transport::VisionCapacityError;
 mod warm_turn;
 
 // Served NLLB-200 / M2M-100 encoder-decoder model (CUDA/GB10 serving path).
+pub(crate) mod hy4;
 #[cfg(feature = "cuda")]
 pub mod nllb;
 

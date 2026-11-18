@@ -3,7 +3,7 @@
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
-pub(super) struct Owned<'a> {
+pub(crate) struct Owned<'a> {
     pub gpu: &'a dyn GpuBackend,
     ptrs: Vec<DevicePtr>,
     live: bool,

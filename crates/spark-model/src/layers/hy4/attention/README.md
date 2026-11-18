@@ -1,6 +1,6 @@
 # Hy4 gated MLA and coarse IndexPool
 
-These are standalone blocks, not full-model factory integration. They follow
+These blocks are also used by the dedicated eager Hy4 model. They follow
 the pinned reference in the parent README, Flash `attention.py`,
 `compressed_indexer.py`, `indexpool_ops.py` and `indexpool_prepare.py`.
 No vLLM source is copied into the engine.
@@ -73,9 +73,9 @@ Drain it before explicit release or Drop. Caller buffers must cover
 
 This is an eager, correctness-first implementation, not a throughput
 claim: projections/scoring/top-k are not optimized, per-row launches are
-serial, and prefix forks copy rather than COW-share pages. Scheduler
-allocation/Marconi integration, graph capture, Engram/model assembly and
-DFly reuse are not provided here.
+serial, and prefix forks copy rather than COW-share pages. The eager model
+owns request caches and Engram lookback; Marconi prefix reuse, graph capture
+and DFly reuse are not provided.
 
 ## Verification limits
 

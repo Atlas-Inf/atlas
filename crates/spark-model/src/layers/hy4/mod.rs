@@ -5,6 +5,7 @@
 //! FP32 routing scores and iHC gates. No implicit GLM environment policies.
 
 pub mod attention;
+pub mod engram;
 pub mod ffn;
 mod ffn_forward;
 mod ffn_scratch;
