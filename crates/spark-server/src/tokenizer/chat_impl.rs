@@ -67,6 +67,11 @@ impl ChatTokenizer {
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        if super::hy4::is_native(&self.tokenizer)
+            && let Some(id) = super::hy4::think_alias(&self.tokenizer, text)
+        {
+            return Ok(vec![id]);
+        }
         // HF's normalized splits/offsets can consume hundreds of MiB for a
         // long prompt. Acquire before touching the tokenizer and retain the
         // permit until the Encoding is dropped, including on error/unwind.
@@ -80,8 +85,10 @@ impl ChatTokenizer {
     }
 
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
+        let native = super::hy4::is_native(&self.tokenizer);
         self.tokenizer
-            .decode(ids, true)
+            .decode(ids, !native)
+            .map(|s| super::hy4::canonical(s, native))
             .map_err(|e| anyhow::anyhow!("Tokenizer decode error: {e}"))
     }
 
@@ -91,6 +98,7 @@ impl ChatTokenizer {
     pub fn decode_with_special(&self, ids: &[u32]) -> Result<String> {
         self.tokenizer
             .decode(ids, false)
+            .map(|s| super::hy4::canonical(s, super::hy4::is_native(&self.tokenizer)))
             .map_err(|e| anyhow::anyhow!("Tokenizer decode error: {e}"))
     }
 
@@ -143,7 +151,10 @@ impl ChatTokenizer {
     /// or `Ok(None)` for incomplete multi-byte sequences.
     pub fn streaming_decoder(&self, skip_special_tokens: bool) -> StreamingDecoder<'_> {
         StreamingDecoder {
-            inner: self.tokenizer.decode_stream(skip_special_tokens),
+            hy4: super::hy4::is_native(&self.tokenizer),
+            inner: self
+                .tokenizer
+                .decode_stream(skip_special_tokens && !super::hy4::is_native(&self.tokenizer)),
         }
     }
 

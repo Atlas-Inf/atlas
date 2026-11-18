@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
-# Registration only. The model factory rejects execution until the Hy4
-# attention, independent HC and Engram forward paths are implemented.
+# Eager text-only target. DFly, vision and graphs are unsupported.
 [model]
 name = "hy4-flash"
 hf_id = "atakans/Hy4-flash-NVFP4"
@@ -57,5 +56,9 @@ top_k = 0
 min_p = 0.0
 
 [behavior]
+thinking_default = true
+verbatim_prompt = true
+jinja_template = "hy_v4_flash"
+tool_call_parser = "hy4"
 default_num_drafts = 0
 default_kv_dtype = "bf16"

@@ -64,6 +64,7 @@ fn normalize_tool_call_arguments(messages: &[serde_json::Value]) -> Vec<serde_js
 mod chat_impl;
 mod chat_render;
 mod deepseek_v4;
+pub(crate) mod hy4;
 mod ids_only;
 mod jinja_helpers;
 mod large_encode;
@@ -152,6 +153,7 @@ pub(crate) struct QwenVisionPlaceholder {
 /// Wrapper around tokenizers::DecodeStream that hides the generic parameters.
 /// O(1) per step vs O(n) for full re-decode.
 pub struct StreamingDecoder<'a> {
+    hy4: bool,
     inner: tokenizers::DecodeStream<
         'a,
         tokenizers::models::ModelWrapper,
@@ -167,6 +169,7 @@ impl StreamingDecoder<'_> {
     pub fn step(&mut self, id: u32) -> Result<Option<String>> {
         self.inner
             .step(id)
+            .map(|chunk| chunk.map(|s| hy4::canonical(s, self.hy4)))
             .map_err(|e| anyhow::anyhow!("Streaming decode error: {e}"))
     }
 }

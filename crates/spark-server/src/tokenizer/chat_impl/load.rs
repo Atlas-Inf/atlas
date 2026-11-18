@@ -138,6 +138,9 @@ impl ChatTokenizer {
             None
         };
 
+        if model_type == "hy_v4_flash" {
+            super::super::hy4::validate(&tokenizer)?;
+        }
         tracing::info!("Loaded tokenizer from {}", tokenizer_path.display());
         Ok(Self {
             tokenizer,

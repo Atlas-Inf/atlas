@@ -15,8 +15,9 @@ impl std::str::FromStr for ToolCallFormat {
             "deepseek_v4" | "dsml" => Ok(Self::DeepseekV4),
             "bare_json" => Ok(Self::BareJson),
             "poolside_v1" => Ok(Self::PoolsideV1),
+            "hy4" => Ok(Self::Hy4),
             other => Err(format!(
-                "Unknown tool call parser '{other}'. Supported: hermes, qwen3_coder, qwen3_xml, gemma4, mistral, minimax_xml, deepseek_v4, bare_json, poolside_v1",
+                "Unknown tool call parser '{other}'. Supported: hermes, qwen3_coder, qwen3_xml, gemma4, mistral, minimax_xml, deepseek_v4, bare_json, poolside_v1, hy4",
             )),
         }
     }
@@ -35,6 +36,7 @@ impl ToolCallFormat {
             Self::DeepseekV4 => Box::new(DeepseekV4DsmlParser),
             Self::BareJson => Box::new(BareJsonParser),
             Self::PoolsideV1 => Box::new(PoolsideV1Parser),
+            Self::Hy4 => Box::new(hy4::Hy4Parser),
         }
     }
 
@@ -63,6 +65,7 @@ impl ToolCallFormat {
             Self::DeepseekV4 => "deepseek_v4",
             Self::BareJson => "bare_json",
             Self::PoolsideV1 => "poolside_v1",
+            Self::Hy4 => "hy4",
         }
     }
 }
@@ -77,6 +80,7 @@ mod gemma4;
 mod helpers_a;
 mod helpers_b;
 mod hermes;
+mod hy4;
 mod minimax_xml;
 mod mistral;
 mod parse_dispatch;

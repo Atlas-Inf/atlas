@@ -398,6 +398,7 @@ pub enum ToolCallFormat {
     DeepseekV4,
     BareJson,
     PoolsideV1,
+    Hy4,
 }
 
 #[path = "tool_parser/tail.rs"]
