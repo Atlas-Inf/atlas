@@ -110,6 +110,13 @@ hidden_size = 5120
 # is SGLang's verified block (--speculative-num-draft-tokens 32): 1 anchor +
 # 31 drafts. Serve with --dflash-window-size 16384 (the full draft layer's
 # training context); `window_size` here is documentation only.
+#
+# DFlash2 output follows the target's distribution but is not serial-exact,
+# unlike qwen3.8-27b's exact verify: a verify pass runs the multi-row W4A4
+# FFN and target-only decode the single-token W4A16 one, and at temperature 0
+# the two diverge (first divergence at tokens 7-74 on six prompts, #328).
+# SGLang's speculative decode diverges from its own target-only decode on five
+# of the same six prompts.
 [dflash]
 draft_model = "ricursiveAI/Ripple-65B-Preview-DFlash2"
 gamma = 32
