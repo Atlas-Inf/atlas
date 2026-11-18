@@ -2,44 +2,66 @@
 
 #pragma once
 
-extern "C" __global__ void hy4_batch_linear(
+template<unsigned KIND>
+__device__ __forceinline__ void hy4_batch_linear_impl(
     const __nv_bfloat16* x,const void* weights,const float* scales,void* out,
     unsigned n,unsigned k,unsigned rows,unsigned heads,unsigned xh,unsigned yh,
     unsigned xr,unsigned yr,unsigned wr,unsigned kind,unsigned float_out) {
     unsigned o=blockIdx.x*8+threadIdx.x/32,first=blockIdx.y*8,head=blockIdx.z;
     if(o>=n || head>=heads)return;
-    unsigned lane=threadIdx.x%32,width=kind==1?16:8;
+    constexpr unsigned width=KIND==1?16:8;
+    unsigned lane=threadIdx.x%32;
     size_t wi=((size_t)head*n+o)*wr;
     float sums[8]={};
     for(unsigned col=lane*width;col<k;col+=32*width) {
         unsigned packed[8]={};
-        const char* base=(const char*)weights+wi*(kind==1?1:kind==2?4:2);
-        bool vector=col+width<=k && ((uintptr_t)(base+col*(kind==1?1:kind==2?4:2))%16)==0;
+        const char* base=(const char*)weights+wi*(KIND==1?1:KIND==2?4:2);
+        bool vector=col+width<=k && ((uintptr_t)(base+col*(KIND==1?1:KIND==2?4:2))%16)==0;
         if(vector) {
-            const uint4 a=*(const uint4*)(base+col*(kind==1?1:kind==2?4:2));
+            const uint4 a=*(const uint4*)(base+col*(KIND==1?1:KIND==2?4:2));
             packed[0]=a.x;packed[1]=a.y;packed[2]=a.z;packed[3]=a.w;
-            if(kind==2) {
+            if(KIND==2) {
                 const uint4 b=*(const uint4*)(base+col*4+16);
                 packed[4]=b.x;packed[5]=b.y;packed[6]=b.z;packed[7]=b.w;
             }
         }
-        for(unsigned j=0;j<width && col+j<k;j++) {
+        float values[width];
+        #pragma unroll
+        for(unsigned j=0;j<width;j++) {
             float w;
-            if(kind==1) {
+            if(KIND==1) {
                 __nv_fp8_e4m3 v;
-                v.__x=vector?(packed[j/4]>>(8*(j%4)))&255:((const unsigned char*)weights)[wi+col+j];
+                v.__x=vector?(packed[j/4]>>(8*(j%4)))&255:col+j<k?((const unsigned char*)weights)[wi+col+j]:0;
                 w=(float)v*scales[(size_t)head*n+o];
-            } else if(kind==2) {
-                w=vector?__uint_as_float(packed[j]):((const float*)weights)[wi+col+j];
+            } else if(KIND==2) {
+                w=vector?__uint_as_float(packed[j]):col+j<k?((const float*)weights)[wi+col+j]:0.f;
             } else {
                 __nv_bfloat16 v;
                 if(vector) {unsigned short b=(packed[j/2]>>(16*(j%2)))&65535;v=*(const __nv_bfloat16*)&b;}
-                else v=((const __nv_bfloat16*)weights)[wi+col+j];
+                else v=col+j<k?((const __nv_bfloat16*)weights)[wi+col+j]:__float2bfloat16_rn(0.f);
                 w=(float)v;
             }
+            values[j]=w;
+        }
+        #pragma unroll
+        for(unsigned r=0;r<8;r++)if(first+r<rows) {
+            const __nv_bfloat16* input=x+(size_t)(first+r)*xr+(size_t)head*xh+col;
+            bool xv=col+width<=k && (uintptr_t)input%16==0;
+            unsigned data[8]={};
+            if(xv) {
+                uint4 a=*(const uint4*)input;
+                data[0]=a.x;data[1]=a.y;data[2]=a.z;data[3]=a.w;
+                if(width==16) {
+                    uint4 b=*(const uint4*)(input+8);
+                    data[4]=b.x;data[5]=b.y;data[6]=b.z;data[7]=b.w;
+                }
+            }
             #pragma unroll
-            for(unsigned r=0;r<8;r++)
-                if(first+r<rows)sums[r]+=(float)x[(size_t)(first+r)*xr+(size_t)head*xh+col+j]*w;
+            for(unsigned j=0;j<width;j++)if(col+j<k) {
+                unsigned short bits=(data[j/2]>>(16*(j%2)))&65535;
+                float value=xv?(float)*(const __nv_bfloat16*)&bits:(float)input[j];
+                sums[r]+=value*values[j];
+            }
         }
     }
     #pragma unroll
@@ -51,6 +73,15 @@ extern "C" __global__ void hy4_batch_linear(
             else ((__nv_bfloat16*)out)[at]=__float2bfloat16_rn(v);
         }
     }
+}
+
+extern "C" __global__ void hy4_batch_linear(
+    const __nv_bfloat16* x,const void* weights,const float* scales,void* out,
+    unsigned n,unsigned k,unsigned rows,unsigned heads,unsigned xh,unsigned yh,
+    unsigned xr,unsigned yr,unsigned wr,unsigned kind,unsigned float_out) {
+    if(kind==1)hy4_batch_linear_impl<1>(x,weights,scales,out,n,k,rows,heads,xh,yh,xr,yr,wr,kind,float_out);
+    else if(kind==2)hy4_batch_linear_impl<2>(x,weights,scales,out,n,k,rows,heads,xh,yh,xr,yr,wr,kind,float_out);
+    else hy4_batch_linear_impl<0>(x,weights,scales,out,n,k,rows,heads,xh,yh,xr,yr,wr,kind,float_out);
 }
 
 extern "C" __global__ void hy4_group_init(unsigned* groups,unsigned rows,unsigned experts) {
@@ -78,11 +109,16 @@ extern "C" __global__ void hy4_group_rows(const unsigned* ids,unsigned* groups,
     if(slot<slots)list[prefix[t]] = t*slots+slot;
 }
 
-__device__ void hy4_qdots(const __nv_bfloat16* x,Hy4Q4 q,unsigned o,unsigned k,
+__device__ __forceinline__ void hy4_qdots(const __nv_bfloat16* x,Hy4Q4 q,unsigned o,unsigned k,
     const unsigned* entries,unsigned count,unsigned slots,bool activated,float* sums,const float* lut) {
     unsigned lane=threadIdx.x%32;
     #pragma unroll
     for(unsigned r=0;r<8;r++)sums[r]=0.f;
+    if(count==1) {
+        unsigned row=activated?entries[0]:entries[0]/slots;
+        sums[0]=hy4_qdot(x+(size_t)row*k,q,o,k,lut);
+        return;
+    }
     if(q.w)for(unsigned col=lane*32;col<k;col+=1024) {
         unsigned count_k=min(32u,k-col);
         const unsigned char* p=q.w+(size_t)o*(k/2)+col/2;
@@ -94,17 +130,26 @@ __device__ void hy4_qdots(const __nv_bfloat16* x,Hy4Q4 q,unsigned o,unsigned k,
             packed=make_uint4(words[0],words[1],words[2],words[3]);
         }
         unsigned words[4]={packed.x,packed.y,packed.z,packed.w};
-        for(unsigned g=0;g<count_k/16;g++) {
+        #pragma unroll
+        for(unsigned g=0;g<2;g++)if(g<count_k/16) {
             __nv_fp8_e4m3 sf;sf.__x=q.s[(size_t)o*(k/16)+col/16+g];
             float scale=(float)sf*q.scale;
+            float values[16];
             #pragma unroll
             for(unsigned j=0;j<16;j++) {
                 unsigned at=g*16+j;
-                float w=lut[(words[at/8]>>(4*(at%8)))&15]*scale;
+                values[j]=lut[(words[at/8]>>(4*(at%8)))&15]*scale;
+            }
+            #pragma unroll
+            for(unsigned r=0;r<8;r++)if(r<count) {
+                unsigned entry=entries[r],row=activated?entry:entry/slots;
+                const __nv_bfloat16* input=x+(size_t)row*k+col+g*16;
+                uint4 lo=*(const uint4*)input,hi=*(const uint4*)(input+8);
+                unsigned data[8]={lo.x,lo.y,lo.z,lo.w,hi.x,hi.y,hi.z,hi.w};
                 #pragma unroll
-                for(unsigned r=0;r<8;r++)if(r<count) {
-                    unsigned entry=entries[r],row=activated?entry:entry/slots;
-                    sums[r]+=w*(float)x[(size_t)row*k+col+at];
+                for(unsigned j=0;j<16;j++) {
+                    unsigned short bits=(data[j/2]>>(16*(j%2)))&65535;
+                    sums[r]+=values[j]*(float)*(const __nv_bfloat16*)&bits;
                 }
             }
         }
