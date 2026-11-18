@@ -45,7 +45,18 @@ impl Hy4Model {
         let slot = words[1] as usize;
         let stream = s.gpu.default_stream();
         match words[0] {
-            ALLOC => r.allocate(s, slot)?,
+            ALLOC => {
+                let requests = r.requests.lock();
+                if let Some(request) = requests.get(&slot) {
+                    ensure!(
+                        request.borrow_dependent().history.is_empty(),
+                        "Hy4 cannot reallocate an active worker slot"
+                    );
+                } else {
+                    drop(requests);
+                    r.allocate(s, slot)?;
+                }
+            }
             ROW => {
                 let requests = r.requests.lock();
                 let request = requests.get(&slot).context("Hy4 worker slot missing")?;

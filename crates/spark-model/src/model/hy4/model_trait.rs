@@ -156,7 +156,9 @@ impl Model for Hy4Model {
             .find(|i| !requests.contains_key(i))
             .context("Hy4 no free request slots")?;
         drop(requests);
-        self.send([ALLOC, slot as u32, 0, 0])?;
+        if s.config.tp_rank == 0 {
+            self.send([ALLOC, slot as u32, 0, 0])?;
+        }
         r.allocate(s, slot)?;
         Ok(SequenceState::host_only(slot))
     }
@@ -164,7 +166,9 @@ impl Model for Hy4Model {
         if seq.slot_idx == usize::MAX {
             return Ok(());
         }
-        self.send([FREE, seq.slot_idx as u32, 0, 0])?;
+        if self.borrow_owner().config.tp_rank == 0 {
+            self.send([FREE, seq.slot_idx as u32, 0, 0])?;
+        }
         self.borrow_owner().gpu.synchronize(self.default_stream())?;
         self.borrow_dependent()
             .requests

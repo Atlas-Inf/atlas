@@ -262,10 +262,10 @@ fn teardown_drops_request_and_weight_owners_once() {
     assert!(model.cell.is_none());
     model.teardown().unwrap();
 }
-struct StopComm(Mutex<Vec<usize>>);
+struct StopComm(Mutex<Vec<usize>>, usize);
 impl CommBackend for StopComm {
     fn rank(&self) -> usize {
-        0
+        self.1
     }
     fn world_size(&self) -> usize {
         2
@@ -301,7 +301,7 @@ fn scheduler_stop_reaches_worker_but_legacy_prefill_headers_do_not() {
     let mut c = config();
     c.tp_world_size = 2;
     c.ep_world_size = 2;
-    let comm = Arc::new(StopComm(Mutex::new(Vec::new())));
+    let comm = Arc::new(StopComm(Mutex::new(Vec::new()), 0));
     let model = Hy4Model::new(c, weights, Box::new(gpu), Some(comm.clone()), 32, 2, 2).unwrap();
     model.ep_broadcast_cmd_for_seq(0, 0xFFFFFFF0).unwrap();
     model.ep_broadcast_cmd(4).unwrap();
@@ -310,4 +310,53 @@ fn scheduler_stop_reaches_worker_but_legacy_prefill_headers_do_not() {
         .ep_broadcast_cmd_for_seq(0, super::wire::STOP)
         .unwrap();
     assert_eq!(*comm.0.lock(), [4, 12]);
+}
+
+#[test]
+fn worker_bootstrap_slots_do_not_send_commands_and_accept_head_allocation() {
+    let gpu = MockGpuBackend::new();
+    let weights = store(&gpu);
+    let mut c = config();
+    c.tp_world_size = 2;
+    c.ep_world_size = 2;
+    c.tp_rank = 1;
+    c.ep_rank = 1;
+    let comm = Arc::new(StopComm(Mutex::new(Vec::new()), 1));
+    let model = Hy4Model::new(c, weights, Box::new(gpu), Some(comm.clone()), 32, 2, 2).unwrap();
+    let mut a = model.alloc_sequence().unwrap();
+    let mut b = model.alloc_sequence().unwrap();
+    assert!(model.alloc_sequence().is_err());
+    assert_eq!([a.slot_idx, b.slot_idx], [0, 1]);
+    assert!(comm.0.lock().is_empty());
+    let write_alloc = || {
+        model
+            .borrow_owner()
+            .gpu
+            .copy_h2d(
+                &[super::wire::ALLOC, 0, 0, 0]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+                model.borrow_dependent().command,
+            )
+            .unwrap();
+    };
+    write_alloc();
+    assert!(model.ep_worker_step(&mut []).unwrap());
+    assert_eq!(model.borrow_dependent().requests.lock().len(), 2);
+    model
+        .borrow_dependent()
+        .requests
+        .lock()
+        .get_mut(&0)
+        .unwrap()
+        .with_dependent_mut(|_, data| data.history.push(1));
+    write_alloc();
+    assert!(model.ep_worker_step(&mut []).is_err());
+    let before = comm.0.lock().len();
+    model.free_sequence(&mut a).unwrap();
+    model.free_sequence(&mut b).unwrap();
+    model.free_sequence(&mut b).unwrap();
+    assert!(model.borrow_dependent().requests.lock().is_empty());
+    assert_eq!(comm.0.lock().len(), before);
 }
