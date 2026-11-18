@@ -94,7 +94,8 @@ impl AttentionCache<'_, '_> {
         let phase = timing::span("attn_kv_a", stream)?;
         a.linear(x, a.kva, s.kv, 576, a.hidden, stream)?;
         drop(phase);
-        a.norm(s.kv, a.kvn, s.kv_norm, 512, stream)?;
+        let row = self.latent.offset(self.layout.slot(self.len)? * 576 * 2);
+        a.norm(s.kv, a.kvn, row, 512, stream)?;
         let phase = timing::span("attn_q_absorb", stream)?;
         a.gemv(s.q, a.wk, s.absorbed, [512, 192, 256, 576], stream)?;
         drop(phase);
@@ -107,15 +108,6 @@ impl AttentionCache<'_, '_> {
             false,
             stream,
         )?;
-        let row = self.latent.offset(self.layout.slot(self.len)? * 576 * 2);
-        let phase = timing::span("attn_cache_write", stream)?;
-        KernelLaunch::new(gpu, a.kernels.cache)
-            .grid([1, 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(s.kv_norm)
-            .arg_ptr(row)
-            .launch(stream)?;
-        drop(phase);
         a.rotary(s.kv, row, 1, [576, 576, 512, 512], position, false, stream)?;
         if a.index.is_some() {
             let _index = timing::span("dsa_index", stream)?;
@@ -124,23 +116,32 @@ impl AttentionCache<'_, '_> {
         let s = &self.scratch;
         let (indices, count) = match a.window {
             Some(window) => (DevicePtr::NULL, (self.len + 1).min(window)),
-            None => (s.indices, 2048),
+            None => (s.indices, (self.len / 4).min(511) * 4 + self.len % 4 + 1),
         };
+        let splits = count.div_ceil(128);
         let phase = timing::span("attn_latent", stream)?;
         KernelLaunch::new(gpu, a.kernels.attention)
-            .grid([a.heads as u32, 1, 1])
+            .grid([a.heads as u32, splits as u32, 1])
             .block([256, 1, 1])
             .arg_ptr(s.absorbed)
             .arg_ptr(self.latent)
             .arg_ptr(self.table)
             .arg_ptr(indices)
-            .arg_ptr(a.sink)
-            .arg_ptr(s.latent_out)
+            .arg_ptr(s.softmax_parts)
             .arg_u32(self.len as u32)
             .arg_u32(self.layout.page_size as u32)
             .arg_u32(self.layout.table.len() as u32)
             .arg_u32(a.window.unwrap_or(0) as u32)
             .arg_u32(count as u32)
+            .arg_u32(splits as u32)
+            .launch(stream)?;
+        KernelLaunch::new(gpu, a.kernels.merge)
+            .grid([a.heads as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(s.softmax_parts)
+            .arg_ptr(a.sink)
+            .arg_ptr(s.latent_out)
+            .arg_u32(splits as u32)
             .launch(stream)?;
         drop(phase);
         let phase = timing::span("attn_value_extract", stream)?;

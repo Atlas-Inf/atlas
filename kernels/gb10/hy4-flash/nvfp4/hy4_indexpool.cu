@@ -62,42 +62,69 @@ extern "C" __global__ void hy4_fwht(const __nv_bfloat16* input, uint8_t* output,
 extern "C" __global__ void hy4_index_scores(const uint8_t* query,
     const float* q_scale, const __nv_bfloat16* weights, const uint8_t* pool,
     const unsigned* table, float* scores, unsigned groups, unsigned heads) {
-    unsigned group=blockIdx.x*128+threadIdx.x;
+    unsigned group=blockIdx.x,tid=threadIdx.x,lane=tid%32,warp=tid/32;
     if (group>=groups) return;
     unsigned physical=table[group/64],row=group%64;
     const uint8_t* key=pool+(size_t)physical*8448+row*128;
     float key_scale=*(const float*)(pool+(size_t)physical*8448+8192+row*4);
+    __shared__ float sums[8];
     float sum=0.f;
-    for (unsigned h=0;h<heads;++h) {
+    for (unsigned h=warp;h<heads;h+=8) {
         float dot=0.f;
-        for (unsigned d=0;d<128;++d) {
-            __nv_fp8_e4m3 q,k;q.__x=query[h*128+d];k.__x=key[d];
+        unsigned qv=*(const unsigned*)(query+h*128+lane*4);
+        unsigned kv=*(const unsigned*)(key+lane*4);
+        #pragma unroll
+        for (unsigned d=0;d<4;++d) {
+            __nv_fp8_e4m3 q,k;q.__x=(qv>>(8*d))&255;k.__x=(kv>>(8*d))&255;
             dot+=(float)q*(float)k;
         }
-        sum+=(float)weights[h]*q_scale[h]*key_scale*fmaxf(0.f,dot);
+        for (unsigned offset=16;offset;offset>>=1) dot+=__shfl_down_sync(0xffffffff,dot,offset);
+        if (lane==0) sum+=(float)weights[h]*q_scale[h]*key_scale*fmaxf(0.f,dot);
     }
-    scores[group]=sum*rsqrtf((float)heads*128.f);
+    if (lane==0) sums[warp]=sum;
+    __syncthreads();
+    if (tid==0) {
+        float total=0.f;
+        for (unsigned i=0;i<8;i++) total+=sums[i];
+        scores[group]=total*rsqrtf((float)heads*128.f);
+    }
 }
 
 // The trained budget is 511 historical groups plus the current four-token tail.
 extern "C" __global__ void hy4_index_select(const float* scores, int* output,
     unsigned groups, unsigned position) {
-    float best[511];int ids[511];
-    for (unsigned j=0;j<511;++j) {best[j]=-INFINITY;ids[j]=-1;}
-    for (unsigned g=0;g<groups;++g) {
-        float s=scores[g];unsigned at=511;
-        for (unsigned j=0;j<511;++j)
-            if (ids[j]<0 || s>best[j]) {at=j;break;}
-        if (at<511) {
-            for (unsigned j=510;j>at;--j) {best[j]=best[j-1];ids[j]=ids[j-1];}
-            best[at]=s;ids[at]=(int)g;
+    unsigned tid=threadIdx.x;
+    __shared__ unsigned prefix[256],base;
+    if (tid==0) base=0;
+    __syncthreads();
+    if (groups<=511) {
+        for (unsigned g=tid;g<groups;g+=256)
+            for (unsigned j=0;j<4;j++) output[g*4+j]=(int)(g*4+j);
+    } else {
+        for (unsigned batch=0;batch<groups;batch+=256) {
+            unsigned g=batch+tid,rank=0;
+            if (g<groups) {
+                float value=scores[g];
+                for (unsigned other=0;other<groups;other++)
+                    rank+=scores[other]>value || (scores[other]==value && other<g);
+            }
+            unsigned keep=g<groups && rank<511;
+            prefix[tid]=keep;
+            __syncthreads();
+            for (unsigned stride=1;stride<256;stride*=2) {
+                unsigned add=tid>=stride?prefix[tid-stride]:0;
+                __syncthreads();
+                prefix[tid]+=add;
+                __syncthreads();
+            }
+            if (keep) for (unsigned j=0;j<4;j++)
+                output[(base+prefix[tid]-1)*4+j]=(int)(g*4+j);
+            __syncthreads();
+            if (tid==0) base+=prefix[255];
+            __syncthreads();
         }
     }
-    unsigned n=min(groups,511u);
-    for (unsigned i=0;i<n;++i) for (unsigned j=i+1;j<n;++j)
-        if (ids[j]<ids[i]) {int tmp=ids[i];ids[i]=ids[j];ids[j]=tmp;}
-    unsigned count=0;
-    for (unsigned i=0;i<n;++i) for (unsigned j=0;j<4;++j) output[count++]=ids[i]*4+j;
-    for (unsigned j=position/4*4;j<=position;++j) output[count++]=(int)j;
-    while (count<2048) output[count++]=-1;
+    unsigned historical=min(groups,511u)*4,tail=position%4+1;
+    if (tid<tail) output[historical+tid]=(int)(position/4*4+tid);
+    for (unsigned i=historical+tail+tid;i<2048;i+=256) output[i]=-1;
 }

@@ -22,16 +22,13 @@ impl AttentionCache<'_, '_> {
         let phase = timing::span("dsa_key_projection", stream)?;
         a.linear(x, ix.key, s.key, 128, a.hidden, stream)?;
         drop(phase);
-        a.norm(s.key, ix.key_norm, s.key, 128, stream)?;
-        let phase = timing::span("dsa_tail_write", stream)?;
-        KernelLaunch::new(gpu, a.kernels.tail)
-            .grid([1, 1, 1])
-            .block([128, 1, 1])
-            .arg_ptr(s.key)
-            .arg_ptr(self.tail)
-            .arg_u32((self.len % 4) as u32)
-            .launch(stream)?;
-        drop(phase);
+        a.norm(
+            s.key,
+            ix.key_norm,
+            self.tail.offset((self.len % 4) * 128 * 2),
+            128,
+            stream,
+        )?;
         if self.len % 4 == 3 {
             let phase = timing::span("dsa_pool", stream)?;
             KernelLaunch::new(gpu, a.kernels.pool)
@@ -97,8 +94,8 @@ impl AttentionCache<'_, '_> {
         if groups > 0 {
             let _phase = timing::span("dsa_score", stream)?;
             KernelLaunch::new(gpu, a.kernels.score)
-                .grid([groups.div_ceil(128) as u32, 1, 1])
-                .block([128, 1, 1])
+                .grid([groups as u32, 1, 1])
+                .block([256, 1, 1])
                 .arg_ptr(s.quant)
                 .arg_ptr(s.scales)
                 .arg_ptr(s.hw)
@@ -112,7 +109,7 @@ impl AttentionCache<'_, '_> {
         let _phase = timing::span("dsa_select", stream)?;
         KernelLaunch::new(gpu, a.kernels.select)
             .grid([1, 1, 1])
-            .block([1, 1, 1])
+            .block([256, 1, 1])
             .arg_ptr(s.scores)
             .arg_ptr(s.indices)
             .arg_u32(groups as u32)
