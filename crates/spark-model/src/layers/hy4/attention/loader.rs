@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::super::weights::tensor;
-use super::{kernels::Kernels, memory::Owned};
+use super::{kernels::Kernels, memory::Owned, projections};
 use anyhow::{Context, Result, ensure};
 use atlas_core::{
     config::{Hy4Attention as Kind, Hy4Rope, ModelConfig},
@@ -16,6 +16,7 @@ pub struct Hy4Attention<'a> {
     _store: &'a WeightStore,
     pub(super) memory: Owned<'a>,
     pub(super) kernels: Kernels,
+    pub(super) scales: projections::Scales,
     pub(super) hidden: usize,
     pub(super) heads: usize,
     pub(super) qrank: usize,
@@ -82,6 +83,7 @@ impl<'a> Hy4Attention<'a> {
                 && c.qk_rope_head_dim == 64
                 && c.v_head_dim == 256
                 && c.q_lora_rank > 0
+                && c.q_lora_rank.is_multiple_of(c.tp_world_size)
                 && c.hidden_size > 0
                 && global <= 64
                 && c.q_lora_rank <= u32::MAX as usize
@@ -198,6 +200,7 @@ impl<'a> Hy4Attention<'a> {
         };
         let kernels = Kernels::load(gpu)?;
         let mut memory = Owned::new(gpu);
+        let mut scales = projections::Scales::new();
         let mut kv = vec![0; plan.local * 448 * 512 * 2];
         gpu.copy_d2h(kvb.offset(plan.start * 448 * 512 * 2), &mut kv)?;
         let mut key = vec![0; plan.local * 512 * 192 * 2];
@@ -213,8 +216,6 @@ impl<'a> Hy4Attention<'a> {
             let start = (h * 448 + 192) * 512 * 2;
             value.extend_from_slice(&kv[start..start + 256 * 512 * 2]);
         }
-        let wk = memory.upload(&key)?;
-        let wv = memory.upload(&value)?;
         let mut full_o = vec![0; c.hidden_size * global * 256 * 2];
         gpu.copy_d2h(o, &mut full_o)?;
         let mut local_o = Vec::with_capacity(c.hidden_size * plan.local * 256 * 2);
@@ -222,11 +223,73 @@ impl<'a> Hy4Attention<'a> {
             local_o
                 .extend_from_slice(&row[plan.start * 256 * 2..(plan.start + plan.local) * 256 * 2]);
         }
-        let output = memory.upload(&local_o)?;
+        let fp8 = hy.attention_projection_fp8;
+        let qa = projections::retain(
+            &mut memory,
+            qa.offset(c.tp_rank * c.q_lora_rank / c.tp_world_size * c.hidden_size * 2),
+            c.q_lora_rank / c.tp_world_size,
+            c.hidden_size,
+            fp8,
+            &mut scales,
+        )?;
+        let kva = projections::retain(
+            &mut memory,
+            kva.offset(c.tp_rank * 576 / c.tp_world_size * c.hidden_size * 2),
+            576 / c.tp_world_size,
+            c.hidden_size,
+            fp8,
+            &mut scales,
+        )?;
+        let qb = projections::retain(
+            &mut memory,
+            qb,
+            plan.local * 256,
+            c.q_lora_rank,
+            fp8,
+            &mut scales,
+        )?;
+        let gate = projections::retain(
+            &mut memory,
+            gate,
+            plan.local * 256,
+            c.hidden_size,
+            fp8,
+            &mut scales,
+        )?;
+        let wk = projections::upload(&mut memory, &key, plan.local * 512, 192, fp8, &mut scales)?;
+        let wv = projections::upload(&mut memory, &value, plan.local * 256, 512, fp8, &mut scales)?;
+        let output = projections::upload(
+            &mut memory,
+            &local_o,
+            c.hidden_size,
+            plan.local * 256,
+            fp8,
+            &mut scales,
+        )?;
+        for suffix in [
+            "q_a_proj.weight",
+            "q_b_proj.weight",
+            "kv_a_proj_with_mqa.weight",
+            "kv_b_proj.weight",
+            "linear_gate.weight",
+            "o_proj.weight",
+        ] {
+            store.reclaim(gpu, &format!("{p}.{suffix}"))?;
+        }
+        tracing::info!(
+            "HY4 attention layer={layer} rank={} projections={} TP-local; full sources reclaimed",
+            c.tp_rank,
+            if fp8 {
+                "FP8 E4M3 per-row FP32 scales"
+            } else {
+                "BF16"
+            }
+        );
         Ok(Self {
             _store: store,
             memory,
             kernels,
+            scales,
             hidden: c.hidden_size,
             heads: plan.local,
             qrank: c.q_lora_rank,

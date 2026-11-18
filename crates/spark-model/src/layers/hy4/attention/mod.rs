@@ -10,6 +10,7 @@ mod index;
 mod kernels;
 mod loader;
 pub(crate) mod memory;
+mod projections;
 #[cfg(test)]
 mod tests;
 

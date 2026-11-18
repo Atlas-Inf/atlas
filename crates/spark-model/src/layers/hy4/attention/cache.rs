@@ -26,6 +26,7 @@ pub struct AttentionCache<'layer, 'gpu> {
     pub(super) scratch: Scratch,
 }
 pub(super) struct Scratch {
+    pub qkv: DevicePtr,
     pub qc: DevicePtr,
     pub kv: DevicePtr,
     pub q: DevicePtr,
@@ -134,6 +135,7 @@ impl<'layer, 'gpu> AttentionCache<'layer, 'gpu> {
                 )
             };
         let scratch = Scratch {
+            qkv: memory.alloc((layer.qrank + 576) * 2)?,
             qc,
             kv,
             q,

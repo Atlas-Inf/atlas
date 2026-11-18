@@ -85,14 +85,40 @@ impl AttentionCache<'_, '_> {
         let s = &self.scratch;
         let gpu = a.memory.gpu;
         let phase = timing::span("attn_q_a", stream)?;
-        a.linear(x, a.qa, s.qc, a.qrank, a.hidden, stream)?;
+        let share = s.qkv.offset(a.rank * (a.qrank + 576) / a.world * 2);
+        let qc = if a.world == 1 { s.qc } else { share };
+        let kv = if a.world == 1 {
+            s.kv
+        } else {
+            share.offset(a.qrank / a.world * 2)
+        };
+        a.linear(x, a.qa, qc, a.qrank / a.world, a.hidden, stream)?;
         drop(phase);
+        let phase = timing::span("attn_kv_a", stream)?;
+        a.linear(x, a.kva, kv, 576 / a.world, a.hidden, stream)?;
+        drop(phase);
+        if let Some(comm) = comm {
+            let phase = timing::span("attn_qkv_gather", stream)?;
+            crate::layers::glm_kv_shard::pair_exchange(
+                comm,
+                share,
+                s.qkv.offset((1 - a.rank) * (a.qrank + 576)),
+                (a.qrank + 576) * 2 / a.world,
+                stream,
+            )?;
+            KernelLaunch::new(gpu, a.kernels.join)
+                .grid([1, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(s.qkv)
+                .arg_ptr(s.qc)
+                .arg_ptr(s.kv)
+                .arg_u32(a.qrank as u32)
+                .launch(stream)?;
+            drop(phase);
+        }
         a.norm(s.qc, a.qan, s.qc, a.qrank, stream)?;
         let phase = timing::span("attn_q_b", stream)?;
         a.linear(s.qc, a.qb, s.q, a.heads * 256, a.qrank, stream)?;
-        drop(phase);
-        let phase = timing::span("attn_kv_a", stream)?;
-        a.linear(x, a.kva, s.kv, 576, a.hidden, stream)?;
         drop(phase);
         let row = self.latent.offset(self.layout.slot(self.len)? * 576 * 2);
         a.norm(s.kv, a.kvn, row, 512, stream)?;

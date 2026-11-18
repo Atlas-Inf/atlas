@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 #include "hy4_gemv.cuh"
+#include "hy4_fp8.cuh"
+#include "../../common/quant_rowwise_fp8.cu"
 #include <math.h>
 
 extern "C" __global__ void hy4_head_gemv(const __nv_bfloat16* x,

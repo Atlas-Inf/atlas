@@ -39,6 +39,13 @@ impl<'a> Owned<'a> {
         self.gpu.copy_h2d(bytes, ptr)?;
         Ok(ptr)
     }
+    pub fn free(&mut self, ptr: DevicePtr) -> Result<()> {
+        let index = self.ptrs.iter().position(|p| *p == ptr);
+        ensure!(index.is_some(), "Hy4 allocation is not owned");
+        self.gpu.free(ptr)?;
+        self.ptrs.swap_remove(index.unwrap());
+        Ok(())
+    }
 }
 impl Drop for Owned<'_> {
     fn drop(&mut self) {

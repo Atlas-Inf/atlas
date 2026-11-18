@@ -20,7 +20,7 @@ pub(super) use build::{
 };
 pub(super) use config::{
     apply_model_default_dflash_gamma, apply_model_default_num_drafts, cap_vocab_size_to_tokenizer,
-    load_model_config, merge_sidecar_quant_config, resolve_model_dir,
+    configure_attn_projection, load_model_config, merge_sidecar_quant_config, resolve_model_dir,
 };
 pub(super) use kernel_gate::audit_and_gate;
 pub(super) use kv_cache::{
