@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
-# Registry skeleton inherits common kernels only; no existing model's
-# HC/attention shadows are compatible with the Hy4 forward contract.
+# Standalone iHC and latent FFN. Full-model attention/Engram remain guarded.
 [build]
 extra_nvcc_flags = ["--fmad=false"]
+
+[modules]
+hy4_hc = "hy4_hc"
+hy4_ffn = "hy4_ffn"

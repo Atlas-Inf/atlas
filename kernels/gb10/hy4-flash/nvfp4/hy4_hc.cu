@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+#include <cuda_bf16.h>
+
+// BF16 highway; FP32 gate projection and accumulation, no comb matrix.
+__device__ float hy4_sum(float* v) {
+    for (unsigned s=128;s;s>>=1) {
+        if (threadIdx.x<s) v[threadIdx.x]+=v[threadIdx.x+s];
+        __syncthreads();
+    }
+    return v[0];
+}
+
+template<bool HEAD>
+__device__ void hy4_collapse(const __nv_bfloat16* streams, const float* fn,
+    const float* scale, const float* base, __nv_bfloat16* y, float* post,
+    unsigned h, float norm_eps, float gate_eps, float magnitude) {
+    const unsigned t=blockIdx.x, tid=threadIdx.x, dim=4*h;
+    const __nv_bfloat16* x=streams+(size_t)t*dim;
+    __shared__ float red[256], r, gates[8];
+    float ss=0.f;
+    for (unsigned k=tid;k<dim;k+=256) {float v=(float)x[k]; ss+=v*v;}
+    red[tid]=ss;
+    __syncthreads();
+    float total=hy4_sum(red);
+    if (tid==0) r=rsqrtf(total/dim+norm_eps);
+    __syncthreads();
+    for (unsigned m=0;m<(HEAD?4u:8u);++m) {
+        float dot=0.f;
+        for (unsigned k=tid;k<dim;k+=256) dot+=fn[(size_t)m*dim+k]*(float)x[k];
+        red[tid]=dot;
+        __syncthreads();
+        total=hy4_sum(red);
+        if (tid==0) {
+            bool is_post=!HEAD && m>=4;
+            float z=total*r*scale[is_post?1:0]+base[m];
+            gates[m]=(is_post?magnitude:1.f)/(1.f+expf(-z))+gate_eps;
+            if (is_post) post[(size_t)t*4+m-4]=gates[m];
+        }
+        __syncthreads();
+    }
+    for (unsigned d=tid;d<h;d+=256) {
+        float sum=0.f;
+        for (unsigned i=0;i<4;++i) sum+=gates[i]*(float)x[i*h+d];
+        y[(size_t)t*h+d]=__float2bfloat16_rn(sum);
+    }
+}
+
+extern "C" __global__ void hy4_hc_pre(const __nv_bfloat16* x, const float* fn,
+    const float* scale, const float* base, __nv_bfloat16* y, float* post,
+    unsigned h, float norm_eps, float gate_eps, float magnitude) {
+    hy4_collapse<false>(x,fn,scale,base,y,post,h,norm_eps,gate_eps,magnitude);
+}
+
+extern "C" __global__ void hy4_hc_head(const __nv_bfloat16* x, const float* fn,
+    const float* scale, const float* base, __nv_bfloat16* y,
+    unsigned h, float norm_eps, float gate_eps) {
+    hy4_collapse<true>(x,fn,scale,base,y,nullptr,h,norm_eps,gate_eps,1.f);
+}
+
+extern "C" __global__ void hy4_hc_post(const __nv_bfloat16* block,
+    const __nv_bfloat16* residual, const float* post, __nv_bfloat16* out, unsigned h) {
+    size_t t=blockIdx.x;
+    for (unsigned k=threadIdx.x;k<4*h;k+=256)
+        out[t*4*h+k]=__float2bfloat16_rn((float)residual[t*4*h+k]
+            +post[t*4+k/h]*(float)block[t*h+k%h]);
+}
