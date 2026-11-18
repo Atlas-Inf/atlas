@@ -60,6 +60,8 @@ mod prepick;
 pub(in crate::scheduler) mod scored;
 mod scratch;
 pub(in crate::scheduler) use scratch::HostRows;
+#[cfg(test)]
+mod eager_tests;
 mod selection;
 mod selection_io;
 mod split_rows;
@@ -363,4 +365,32 @@ pub fn verify_pick_all_with_pipeline_checked(
         row_base,
         selection_io::CopyFailurePolicy::Propagate,
     )
+}
+
+pub fn verify_pick_eager_fp32(
+    model: &dyn Model,
+    argmax_ids: &[u32],
+    a: &mut ActiveSeq,
+    ctx: &LogitsContext,
+) -> anyhow::Result<Vec<u32>> {
+    anyhow::ensure!(
+        a.grammar_state.is_none() && a.temperature == 0.0 && model.decode_logits_fp32(),
+        "native lookup verification requires greedy grammarless FP32 logits"
+    );
+    crate::scheduler::emit_step::PickEffects::clear(a);
+    if argmax_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let vocab = model.vocab_size();
+    let mut buf = HostRows::take(&ctx.scratch.host_bytes, argmax_ids.len() * vocab * 4);
+    model.copy_logits_to_host(model.logits_buffer_ptr(), &mut buf)?;
+    selection::span_picks(argmax_ids.len(), a, ctx, None, |i, a| {
+        Ok::<_, anyhow::Error>(verify_pick_with_pipeline(
+            &buf[i * vocab * 4..(i + 1) * vocab * 4],
+            true,
+            vocab,
+            a,
+            ctx,
+        ))
+    })
 }

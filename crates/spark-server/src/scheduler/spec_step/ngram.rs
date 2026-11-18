@@ -96,13 +96,22 @@ pub fn step_ngram(
         // searchable context ends at the emitted token, not tokens.last().
         let mut ngram_ctx = a.seq.tokens.clone();
         ngram_ctx.push(a.last_token);
-        let chain = proposer.propose_chain(&ngram_ctx);
+        let mut chain = proposer.propose_chain(&ngram_ctx);
+        if model.eager_prompt_lookup()
+            && let Some(limit) = model.verify_context_limit()
+        {
+            chain.truncate(limit.saturating_sub(a.seq.seq_len + 1));
+        }
         if !chain.is_empty() {
             a.pending_drafts = chain;
 
             // Checkpoint SSM for potential rollback during verify
             if let Err(e) = model.start_checkpoint_async(&mut a.seq) {
                 tracing::error!("ngram start_checkpoint_async: {e:#}");
+                if model.eager_prompt_lookup() {
+                    a.engine_error = Some(format!("{e:#}"));
+                    a.finished = true;
+                }
             }
         }
         // If no proposal: next iteration will be another bootstrap (regular decode)
@@ -128,7 +137,11 @@ pub fn step_ngram_verify(
     let sync_us = t_sync.elapsed().as_micros();
 
     // Verify width k = drafts + 1; the graphed verifies top out at K=4.
-    let nd = drafts.len().min(3);
+    let nd = drafts.len().min(if model.eager_prompt_lookup() {
+        model.verify_max_drafts().unwrap_or(0)
+    } else {
+        3
+    });
     let k = nd + 1;
     let ep_cmd = match k {
         2 => 0xFFFFFFF2u32,
@@ -156,16 +169,24 @@ pub fn step_ngram_verify(
     }
 
     let t_verify = Instant::now();
-    let verified_raw: Vec<u32> = match k {
-        2 => model
-            .decode_verify_graphed(&[tokens[0], tokens[1]], &mut a.seq, 0)
-            .map(|r| r.to_vec()),
-        3 => model
-            .decode_verify_graphed_k3(&[tokens[0], tokens[1], tokens[2]], &mut a.seq, 0)
-            .map(|r| r.to_vec()),
-        _ => model
-            .decode_verify_graphed_k4(&[tokens[0], tokens[1], tokens[2], tokens[3]], &mut a.seq, 0)
-            .map(|r| r.to_vec()),
+    let verified_raw: Vec<u32> = if model.eager_prompt_lookup() {
+        model.decode_verify(&tokens, &mut a.seq, 0)
+    } else {
+        match k {
+            2 => model
+                .decode_verify_graphed(&[tokens[0], tokens[1]], &mut a.seq, 0)
+                .map(|r| r.to_vec()),
+            3 => model
+                .decode_verify_graphed_k3(&[tokens[0], tokens[1], tokens[2]], &mut a.seq, 0)
+                .map(|r| r.to_vec()),
+            _ => model
+                .decode_verify_graphed_k4(
+                    &[tokens[0], tokens[1], tokens[2], tokens[3]],
+                    &mut a.seq,
+                    0,
+                )
+                .map(|r| r.to_vec()),
+        }
     }
     .unwrap_or_else(|e| {
         tracing::error!("ngram decode_verify_graphed (k={k}): {e:#}");
@@ -180,13 +201,29 @@ pub fn step_ngram_verify(
     a.last_token_time = Instant::now();
 
     // Pipeline picks per verify row (penalties/masks honored).
-    let processed = crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
-        model,
-        &verified_raw,
-        a,
-        verify_ctx,
-        0,
-    );
+    let processed = if model.eager_prompt_lookup() {
+        match crate::scheduler::verify_pipeline_helper::verify_pick_eager_fp32(
+            model,
+            &verified_raw,
+            a,
+            verify_ctx,
+        ) {
+            Ok(picks) => picks,
+            Err(e) => {
+                a.engine_error = Some(format!("{e:#}"));
+                a.finished = true;
+                return;
+            }
+        }
+    } else {
+        crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
+            model,
+            &verified_raw,
+            a,
+            verify_ctx,
+            0,
+        )
+    };
     let v: Vec<u32> = (0..k)
         .map(|i| processed.get(i).copied().unwrap_or(verified_raw[i]))
         .collect();
@@ -220,6 +257,7 @@ pub fn step_ngram_verify(
             a.seq.tokens.pop();
         }
     }
+    let commit_started = Instant::now();
     if let Err(e) = model.commit_accepted_prefix(&mut a.seq, na + 1, k) {
         tracing::error!("ngram commit_accepted_prefix (k={k} na={na}): {e:#}");
         a.engine_error = Some(format!("{e:#}"));
@@ -233,7 +271,18 @@ pub fn step_ngram_verify(
         // Full accept: commit was a no-op; checkpoint for the next verify.
         if let Err(e) = model.start_checkpoint_async(&mut a.seq) {
             tracing::error!("ngram accept checkpoint: {e:#}");
+            if model.eager_prompt_lookup() {
+                a.engine_error = Some(format!("{e:#}"));
+                a.finished = true;
+                return;
+            }
         }
+    }
+    if model.eager_prompt_lookup() {
+        tracing::info!(
+            "HY4_LOOKUP_VERIFY proposed={nd} accepted={na} verify_us={verify_us} commit_us={}",
+            commit_started.elapsed().as_micros()
+        );
     }
 
     // Learn each accepted draft with its true preceding context — the
@@ -267,7 +316,12 @@ pub fn step_ngram_verify(
     // yet pushed to seq.tokens.
     let mut ngram_ctx = a.seq.tokens.clone();
     ngram_ctx.push(a.last_token);
-    let chain = proposer.propose_chain(&ngram_ctx);
+    let mut chain = proposer.propose_chain(&ngram_ctx);
+    if model.eager_prompt_lookup()
+        && let Some(limit) = model.verify_context_limit()
+    {
+        chain.truncate(limit.saturating_sub(a.seq.seq_len + 1));
+    }
     if !chain.is_empty() {
         a.pending_drafts = chain;
     }

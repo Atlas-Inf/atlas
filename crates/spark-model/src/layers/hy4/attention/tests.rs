@@ -10,6 +10,9 @@ use spark_runtime::{
 };
 use std::{collections::HashMap, sync::Mutex};
 
+#[path = "snapshot_tests.rs"]
+mod snapshots;
+
 fn config(rank: usize, world: usize) -> ModelConfig {
     let mut c = parse_config(include_str!(
         "../../../../../atlas-core/src/config/fixtures/hy4/config.json"

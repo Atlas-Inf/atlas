@@ -194,15 +194,31 @@ impl<'layer, 'gpu> AttentionCache<'layer, 'gpu> {
             "Hy4 invalid cache fork/stream"
         );
         let mut copy = Self::new(self.layer, self.max_tokens, self.layout.page_size)?;
-        let gpu = self.layer.memory.gpu;
-        gpu.copy_d2d_async(self.latent, copy.latent, self.latent_bytes, stream)?;
-        if self.pool_bytes > 0 {
-            gpu.copy_d2d_async(self.pool, copy.pool, self.pool_bytes, stream)?;
-            gpu.copy_d2d_async(self.tail, copy.tail, 4 * 128 * 2, stream)?;
-        }
-        copy.len = self.len;
-        copy.first_group_position = self.first_group_position;
-        copy.stream = Some(stream);
+        copy.copy_state_from(self, stream)?;
         Ok(copy)
+    }
+
+    pub fn copy_state_from(&mut self, source: &Self, stream: u64) -> Result<()> {
+        ensure!(
+            !source.poisoned
+                && std::ptr::eq(self.layer, source.layer)
+                && self.max_tokens == source.max_tokens
+                && self.layout.page_size == source.layout.page_size
+                && self.layout.table == source.layout.table
+                && self.stream.is_none_or(|s| s == stream)
+                && source.stream.is_none_or(|s| s == stream),
+            "Hy4 invalid attention snapshot"
+        );
+        let gpu = self.layer.memory.gpu;
+        gpu.copy_d2d_async(source.latent, self.latent, self.latent_bytes, stream)?;
+        if self.pool_bytes > 0 {
+            gpu.copy_d2d_async(source.pool, self.pool, self.pool_bytes, stream)?;
+            gpu.copy_d2d_async(source.tail, self.tail, 4 * 128 * 2, stream)?;
+        }
+        self.len = source.len;
+        self.first_group_position = source.first_group_position;
+        self.stream = Some(stream);
+        self.poisoned = false;
+        Ok(())
     }
 }
