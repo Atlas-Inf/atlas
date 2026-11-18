@@ -13,6 +13,8 @@ use crate::scheduler::{
 
 #[path = "strict_grammar_tests/decode.rs"]
 mod decode;
+#[path = "strict_grammar_tests/required_opener.rs"]
+mod required_opener;
 #[path = "strict_grammar_tests/tool_or_json.rs"]
 mod tool_or_json;
 #[path = "strict_grammar_tests/tool_or_json_branch.rs"]

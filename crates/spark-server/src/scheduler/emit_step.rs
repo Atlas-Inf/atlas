@@ -535,6 +535,17 @@ pub fn compile_grammar_state(
                 ..
             }
         );
+    // On that path a required call opens with the native token, never with
+    // the tag spelled out as text (`GrammarState::pin_required_opener`).
+    let required_opener = native_opener.filter(|_| {
+        matches!(
+            spec,
+            GrammarSpec::ToolCall {
+                use_triggers: false,
+                ..
+            }
+        )
+    });
     let native_opener =
         native_opener.filter(|_| matches!(spec, GrammarSpec::ToolCallOrJson { .. }));
     let compiled = match engine.as_mut() {
@@ -554,7 +565,7 @@ pub fn compile_grammar_state(
         Ok(state) if defer_required_tool => {
             Ok(state.map(|s| s.defer_first_token(tool_call_start_token)))
         }
-        Ok(state) => Ok(state),
+        Ok(state) => Ok(state.map(|s| s.require_native_opener(required_opener))),
         // A request the server cannot serve as asked: HTTP 400 for a blocking
         // client, not a retryable 500. A tool grammar too large to compile is
         // one too: serving it unconstrained would hide the cause.
