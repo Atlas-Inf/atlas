@@ -7,6 +7,7 @@ mod deepseek_v4;
 mod exl3;
 mod gemma4;
 mod glm5_next;
+pub(crate) mod hy4;
 mod laguna;
 mod longcat;
 mod lora;

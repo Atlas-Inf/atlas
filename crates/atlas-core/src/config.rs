@@ -30,6 +30,9 @@ pub enum LayerType {
 /// parameters and buffer sizes derive from this struct.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelConfig {
+    /// Independent HC, IndexPool and Engram metadata; not an executable model.
+    #[serde(skip)]
+    pub hy4: Option<Hy4Config>,
     // ── Core dimensions ──
     pub hidden_size: usize,
     #[serde(default)]
@@ -806,10 +809,12 @@ mod dispatch;
 mod dispatch_nemotron;
 mod factory;
 mod gguf;
+mod hy4;
 mod methods;
 mod ngram;
 mod ngram_qwen4exp;
 mod parsers;
+pub use hy4::{Hy4Attention, Hy4Config, Hy4Mlp, Hy4Rope, Hy4Ropes};
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

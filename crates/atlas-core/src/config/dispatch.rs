@@ -73,6 +73,7 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
         .unwrap_or("");
 
     match top_model_type {
+        "hy_v4_flash" => super::parsers::hy4::parse_hy4(&raw),
         "qwen3_vl_moe" | "qwen3_5_moe" | "qwen3_5" => {
             let text_config = raw
                 .get("text_config")
