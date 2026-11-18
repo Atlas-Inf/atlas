@@ -5,6 +5,19 @@
 
 use super::*;
 
+/// Flag on the E9 width word: one grammar mask per verify row follows the
+/// tokens (`ATLAS_GLM_STRICT_OWNER_BATCH`). Only the head reads that switch;
+/// a worker learns a masked batch from this bit, so the ranks cannot
+/// disagree. It lies above both half-words `encode_width` uses, so an
+/// unmasked batch keeps its wire.
+pub(super) const MASKED_OWNERS: u32 = 1 << 31;
+
+/// A received E9 width word: its `encode_width` word, and whether row masks
+/// follow the tokens.
+pub(super) fn split_masked(raw: u32) -> (u32, bool) {
+    (raw & !MASKED_OWNERS, raw & MASKED_OWNERS != 0)
+}
+
 impl TransformerModel {
     /// Put owner `owner`'s final `rows` verify rows back at arena rows
     /// [0, rows).
@@ -28,23 +41,41 @@ impl TransformerModel {
     }
 
     /// Head: announce and run the batched traversal of `seqs.len()` owners
-    /// of `rows` rows each (`tokens` owner-major).
+    /// of `rows` rows each (`tokens` owner-major). With `masks` (one
+    /// full-vocabulary bitmask per row, owner-major like the tokens) every
+    /// rank picks each row under its mask (`glm_verify_masks`).
     pub(in crate::model) fn decode_verify_glm_long_owners_impl(
         &self,
         rows: usize,
         tokens: &[u32],
         seqs: &mut [&mut SequenceState],
+        masks: Option<&[u32]>,
     ) -> Result<Vec<u32>> {
         ensure!(
             self.can_batch_glm_long_verify_impl(seqs.len(), rows)
                 && tokens.len() == seqs.len() * rows,
             "GLM long owner verify is not available"
         );
+        // Validated and uploaded before any word is sent: a refusal here
+        // leaves every rank untouched.
+        if let Some(masks) = masks {
+            ensure!(
+                self.glm_verify_logits_argmax_only(),
+                "masked owner verify needs the GLM vocab-split head"
+            );
+            self.upload_row_masks(tokens.len(), masks)?;
+        }
         let slots: Vec<u32> = seqs.iter().map(|s| s.slot_idx as u32).collect();
+        let flag = if masks.is_some() { MASKED_OWNERS } else { 0 };
         self.ep_broadcast_seq_and_cmd(0, EP_CMD_GLM_LONG_VERIFY, true)?;
-        self.ep_broadcast_u32(encode_width(slots.len(), rows))?;
+        self.ep_broadcast_u32(encode_width(slots.len(), rows) | flag)?;
         self.ep_broadcast_tokens(&slots)?;
         self.ep_broadcast_tokens(tokens)?;
+        if masks.is_some() {
+            // Only this broadcast follows the flag, so nothing that can fail
+            // locally separates the ranks once the worker expects masks.
+            self.send_row_masks(tokens.len())?;
+        }
         self.glm_long_owner_compute(rows, tokens, seqs)
     }
 
@@ -73,13 +104,21 @@ impl TransformerModel {
         &self,
         slots: &mut [Option<SequenceState>],
     ) -> Result<bool> {
-        let (n, rows) = decode_width(self.ep_broadcast_u32(0)?);
+        // Nothing staged before anything that can fail (`glm_verify_masks`).
+        self.verify_row_masks.reset();
+        let (word, masked) = split_masked(self.ep_broadcast_u32(0)?);
+        let (n, rows) = decode_width(word);
         ensure!(
             owner::width_supported(n, rows) && n <= slots.len(),
             "GLM long owner verify width {n} x {rows} rows"
         );
         let ids = self.ep_broadcast_tokens(&vec![0u32; n])?;
         let tokens = self.ep_broadcast_tokens(&vec![0u32; n * rows])?;
+        if masked {
+            // Strict structured output: the head's per-row grammar masks,
+            // received before any local check below can fail.
+            self.send_row_masks(n * rows)?;
+        }
         let mut seen = [false; 64];
         for &id in &ids {
             let id = id as usize;

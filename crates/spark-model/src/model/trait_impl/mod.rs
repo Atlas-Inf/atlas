@@ -664,7 +664,16 @@ impl Model for TransformerModel {
         tokens: &[u32],
         seqs: &mut [&mut SequenceState],
     ) -> Result<Vec<u32>> {
-        self.decode_verify_glm_long_owners_impl(rows, tokens, seqs)
+        self.decode_verify_glm_long_owners_impl(rows, tokens, seqs, None)
+    }
+    fn decode_verify_glm_long_owner_rows_masked(
+        &self,
+        rows: usize,
+        tokens: &[u32],
+        seqs: &mut [&mut SequenceState],
+        masks: &[u32],
+    ) -> Result<Vec<u32>> {
+        self.decode_verify_glm_long_owners_impl(rows, tokens, seqs, Some(masks))
     }
     fn has_shared_prompt_capture(&self) -> bool {
         self.has_shared_prompt_capture_impl()

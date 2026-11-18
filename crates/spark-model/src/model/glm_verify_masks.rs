@@ -30,6 +30,9 @@ use super::types::TransformerModel;
 pub const MASKED_VERIFY: u32 = 1 << 16;
 /// Widest masked verify (the worker's generic-verify width bound).
 const MAX_ROWS: usize = 32;
+// A masked owner batch (`glm_long_verify`) stages a mask for every row of the
+// batch, so the buffer must hold the widest batch the head may admit.
+const _: () = assert!(MAX_ROWS >= crate::layer::glm_long_owner::ROW_BUDGET);
 
 /// The worker's reading of a generic-verify width word: `(rows, masked)`.
 pub(super) fn split_verify_width(word: u32) -> (usize, bool) {
@@ -136,6 +139,26 @@ impl TransformerModel {
         }
         Ok(Some(self.verify_mask_buffer(rows)?.0))
     }
+
+    /// Oracle only (`ATLAS_GLM_LONG_BATCH_ORACLE`): stage owner `owner`'s
+    /// `rows` rows of a masked owner batch for that owner's serial verify,
+    /// which reads its masks from the front of the buffer. The oracle visits
+    /// owners in ascending order, so a later owner's rows are still intact
+    /// when its turn comes.
+    pub(super) fn stage_owner_row_masks(&self, owner: usize, rows: usize) -> Result<()> {
+        ensure!(
+            (owner + 1) * rows <= MAX_ROWS,
+            "masked verify: owner {owner} of {rows} rows is outside the mask buffer"
+        );
+        let (buf, bytes) = self.verify_mask_buffer(rows)?;
+        if owner > 0 {
+            let stream = self.gpu.default_stream();
+            self.gpu
+                .copy_d2d_async(buf.offset(owner * bytes), buf, bytes, stream)?;
+        }
+        self.verify_row_masks.arm(rows);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -170,5 +193,21 @@ mod tests {
         m.arm(3);
         m.reset();
         assert!(!m.take(3).unwrap(), "the worker resets before each command");
+    }
+
+    #[test]
+    fn a_masked_owner_batch_stages_every_row_of_the_batch_for_one_verify() {
+        // The owner batch arms the batch's total rows, not one owner's: a
+        // take sized for a single owner is the protocol error it should be,
+        // and either way nothing is left for the verify after it.
+        let (owners, rows) = (4usize, 8usize);
+        assert!(owners * rows <= super::MAX_ROWS);
+        let m = VerifyRowMasks::default();
+        m.arm(owners * rows);
+        assert!(m.take(owners * rows).unwrap());
+        assert!(!m.take(owners * rows).unwrap());
+        m.arm(owners * rows);
+        assert!(m.take(rows).is_err());
+        assert!(!m.take(rows).unwrap());
     }
 }

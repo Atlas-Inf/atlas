@@ -873,6 +873,25 @@ pub trait Model: Send + Sync {
         bail!("decode_verify_glm_long_owner_rows: unsupported by this model")
     }
 
+    /// [`Self::decode_verify_glm_long_owner_rows`] with every row picked
+    /// under a grammar mask (`ATLAS_GLM_STRICT_OWNER_BATCH`): `masks` holds
+    /// one full-vocabulary bitmask per verify row, owner-major like `tokens`
+    /// (`tokens.len() * ceil(vocab / 32)` words). A strict structured-output
+    /// owner's rows carry its grammar states; every other owner's rows allow
+    /// everything, which picks the plain argmax. The model validates and
+    /// uploads the masks before it announces the traversal, so a refusal
+    /// leaves every rank untouched. A model that cannot mask its verify
+    /// refuses, so strict output is never unmasked.
+    fn decode_verify_glm_long_owner_rows_masked(
+        &self,
+        _rows: usize,
+        _tokens: &[u32],
+        _seqs: &mut [&mut SequenceState],
+        _masks: &[u32],
+    ) -> Result<Vec<u32>> {
+        bail!("this model cannot grammar-mask an owner-batched verify")
+    }
+
     /// Whether prompt prefills share one capture buffer (one writer), so a
     /// new prompt may not start while another is chunking. Conservatively
     /// true unless the model knows otherwise.

@@ -495,6 +495,13 @@ pub(super) fn strict_refusal(tok: u32, at: usize) -> String {
     )
 }
 
+/// Whether `error` is a [`strict_refusal`]. It ends one request, at its
+/// emission: the verify that picked the token has been judged and committed
+/// by then, so an owner batch goes on with its other owners.
+pub(super) fn is_strict_refusal(error: &str) -> bool {
+    error.starts_with("structured output: token ")
+}
+
 /// Compile a grammar state from a grammar specification + engine.
 ///
 /// Returns `Ok(Some(GrammarState))` if compilation succeeds, `Ok(None)` when

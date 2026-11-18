@@ -31,22 +31,95 @@ pub fn step_verify_glm_long_batched(
         dflash_verify_raw_argmax,
         verified,
         &mut |rows, tokens, seqs| {
-            if verified.is_empty() {
-                return model.decode_verify_glm_long_owner_rows(rows, tokens, seqs);
+            let tokens = dead_marked(verified, rows, tokens);
+            model.decode_verify_glm_long_owner_rows(rows, &tokens, seqs)
+        },
+    );
+}
+
+/// Owner-major `tokens` with each owner's rows past its `verified` drafts
+/// marked dead (`glm_long_owner::DEAD_ROW`); as they are when every owner
+/// verifies every draft (`verified` empty).
+fn dead_marked<'a>(
+    verified: &[usize],
+    rows: usize,
+    tokens: &'a [u32],
+) -> std::borrow::Cow<'a, [u32]> {
+    if verified.is_empty() {
+        return tokens.into();
+    }
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(row, &t)| {
+            let kept = verified.get(row / rows).map_or(rows, |&d| d + 1);
+            if row % rows < kept {
+                t
+            } else {
+                t | spark_model::layer::glm_long_owner::DEAD_ROW
             }
-            let marked: Vec<u32> = tokens
-                .iter()
-                .enumerate()
-                .map(|(row, &t)| {
-                    let kept = verified.get(row / rows).map_or(rows, |&d| d + 1);
-                    if row % rows < kept {
-                        t
-                    } else {
-                        t | spark_model::layer::glm_long_owner::DEAD_ROW
-                    }
-                })
-                .collect();
-            model.decode_verify_glm_long_owner_rows(rows, &marked, seqs)
+        })
+        .collect::<Vec<u32>>()
+        .into()
+}
+
+/// [`step_verify_glm_long_batched`] for a group that holds strict
+/// structured-output owners (`ATLAS_GLM_STRICT_OWNER_BATCH`). `strict[o]` is
+/// owner `o`'s walk (`strict_spec::prepare`), cut to the group's width, whose
+/// drafts are the ones that owner holds; `None` for an owner that is not
+/// strict. Every row of the one traversal is picked under a mask
+/// (`strict_spec::owner_masks`), and each owner's tail then runs unchanged.
+/// The walks are not repeated here: read again, a dead first draft could
+/// pass as an ordinary one.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::scheduler) fn step_verify_glm_long_strict(
+    model: &dyn Model,
+    group: &mut [&mut ActiveSeq],
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    num_drafts: usize,
+    verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
+    dflash_verify_raw_argmax: bool,
+    verified: &[usize],
+    strict: &[Option<crate::scheduler::strict_spec::StrictVerify>],
+) {
+    let rows = group.first().map_or(0, |a| a.pending_drafts.len() + 1);
+    let words = model.vocab_size().div_ceil(32);
+    let built = if strict.len() == group.len() {
+        crate::scheduler::strict_spec::owner_masks(strict, rows, words)
+    } else {
+        Err(anyhow::anyhow!(
+            "{} walks for {} owners",
+            strict.len(),
+            group.len()
+        ))
+    };
+    let masks = match built {
+        Ok(masks) => masks,
+        Err(e) => {
+            // Nothing was sent: the group ends before any rank hears of it.
+            for a in group.iter_mut() {
+                a.abort_on_engine_error(format_args!("strict verify: {e:#}"));
+            }
+            return;
+        }
+    };
+    // A dead draft says nothing about the drafter (`strict_spec`).
+    let dead: Vec<bool> = strict
+        .iter()
+        .map(|walk| walk.as_ref().is_some_and(|walk| walk.dead))
+        .collect();
+    owner_step(
+        model,
+        group,
+        sched,
+        num_drafts,
+        verify_ctx,
+        dflash_verify_raw_argmax,
+        verified,
+        &dead,
+        &mut |rows, tokens, seqs| {
+            let tokens = dead_marked(verified, rows, tokens);
+            model.decode_verify_glm_long_owner_rows_masked(rows, &tokens, seqs, &masks)
         },
     );
 }
@@ -66,6 +139,34 @@ pub fn step_verify_glm_long_with(
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
     verified: &[usize],
+    traverse: &mut OwnerTraverse<'_>,
+) {
+    owner_step(
+        model,
+        group,
+        sched,
+        num_drafts,
+        verify_ctx,
+        dflash_verify_raw_argmax,
+        verified,
+        &[],
+        traverse,
+    );
+}
+
+/// [`step_verify_glm_long_with`], with the owners whose only draft is a
+/// dead one (`dead[o]`; none when empty): such an owner's verdict feeds no
+/// drafter statistics.
+#[allow(clippy::too_many_arguments)]
+fn owner_step(
+    model: &dyn Model,
+    group: &mut [&mut ActiveSeq],
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    num_drafts: usize,
+    verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
+    dflash_verify_raw_argmax: bool,
+    verified: &[usize],
+    dead: &[bool],
     traverse: &mut OwnerTraverse<'_>,
 ) {
     // Admission precedes the traversal (including a fused prompt chunk),
@@ -180,7 +281,7 @@ pub fn step_verify_glm_long_with(
             step_timing,
             verify_ms,
             dflash_verify_raw_argmax,
-            true,
+            !dead.get(owner).copied().unwrap_or(false),
         ) {
             deferred.push((owner, next));
         }
@@ -188,6 +289,12 @@ pub fn step_verify_glm_long_with(
         // return a request error: do not start another owner or proposal
         // after a tail failed, either.
         if let Some(error) = group[owner].engine_error.clone() {
+            // A strict grammar refusing an emitted token ends that request
+            // alone, as on the per-sequence path. Emission follows the
+            // owner's verdict and commit, so the ranks are in step.
+            if crate::scheduler::emit_step::is_strict_refusal(&error) {
+                continue;
+            }
             for a in group.iter_mut() {
                 a.abort_on_engine_error(format_args!("GLM owner tail failed: {error}"));
             }

@@ -5,7 +5,7 @@
 //! drafts before it, the bonus row masked, trimming at the first rejected
 //! draft or `-1` pad, an exact rollback, and the `</think>` boundary.
 
-use super::{StrictVerify, enabled, prepare, rides_batch, row_masks, width_word};
+use super::{StrictVerify, enabled, owner_masks, prepare, rides_batch, row_masks, width_word};
 use crate::grammar::GrammarState;
 use crate::scheduler::test_support::{
     GRAMMAR_VOCAB as VOCAB, THINK_END, THINK_START, grammar_engine, test_seq,
@@ -243,6 +243,46 @@ fn enabled_arms_by_verify_capability() {
     assert!(!rides_batch(&levers, &full_logits, false));
     levers.glm_strict_spec = true;
     assert!(!rides_batch(&levers, &argmax_only, true));
+}
+
+#[test]
+fn a_cut_walk_is_the_walk_of_the_shorter_drafts() {
+    // An owner batch verifies one width: cutting a walk to it must give the
+    // rows a walk of just those drafts gives, with no second walk.
+    let drafts = bytes(r#"{"bridge":"#);
+    for width in 1..=drafts.len() {
+        let mut cut = row_masks(&mut strict(), false, TAGS, &drafts, VOCAB).unwrap();
+        cut.truncate(width);
+        let short = row_masks(&mut strict(), false, TAGS, &drafts[..width], VOCAB).unwrap();
+        assert_eq!(cut, short, "width {width}");
+    }
+    // A dead draft keeps its draft and both rows at any width.
+    let mut dead = row_masks(&mut strict(), false, TAGS, &bytes("Z"), VOCAB).unwrap();
+    let rows_before = dead.masks.clone();
+    dead.truncate(1);
+    assert!(dead.dead && dead.drafts.len() == 1);
+    assert_eq!(dead.masks, rows_before);
+}
+
+#[test]
+fn owner_masks_are_owner_major_and_open_for_unmasked_owners() {
+    // Three owners of three rows each; only the middle one is strict.
+    let drafts = bytes(r#"{""#);
+    let walk = || row_masks(&mut strict(), false, TAGS, &drafts, VOCAB).unwrap();
+    let rows = drafts.len() + 1;
+    let masks = owner_masks(&[None, Some(walk()), None], rows, WORDS).unwrap();
+    assert_eq!(masks.len(), 3 * rows * WORDS);
+    let owner = |o: usize| &masks[o * rows * WORDS..(o + 1) * rows * WORDS];
+    assert!(
+        owner(0).iter().chain(owner(2)).all(|&w| w == u32::MAX),
+        "an unmasked owner's rows allow everything"
+    );
+    for (r, row) in owner(1).chunks(WORDS).enumerate() {
+        assert_eq!(row, mask_after(&drafts[..r]), "strict owner row {r}");
+    }
+    // A walk that is not the batch's width is refused, never padded.
+    assert!(owner_masks(&[Some(walk())], rows + 1, WORDS).is_err());
+    assert!(owner_masks(&[], rows, WORDS).unwrap().is_empty());
 }
 
 mod step {

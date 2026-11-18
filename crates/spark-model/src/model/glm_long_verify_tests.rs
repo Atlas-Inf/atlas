@@ -61,6 +61,25 @@ fn width_word_keeps_the_k3_wire_and_round_trips_other_widths() {
 }
 
 #[test]
+fn masked_owner_flag_collides_with_no_width_and_round_trips() {
+    // Every width the head can announce, and every owner index of a tail.
+    for word in 0..MAX_OWNERS + 1 {
+        for rows in WIDTHS {
+            let plain = encode_width(word, rows);
+            assert_eq!(plain & ep::MASKED_OWNERS, 0, "{word}x{rows} sets the flag");
+            // An unmasked batch keeps its wire and reads back unmasked.
+            assert_eq!(ep::split_masked(plain), (plain, false));
+            let (wire, masked) = ep::split_masked(plain | ep::MASKED_OWNERS);
+            assert!(masked);
+            assert_eq!(decode_width(wire), (word, rows), "{word}x{rows}");
+        }
+    }
+    // The flag is one bit, clear of the generic verify's own mask flag.
+    assert_eq!(ep::MASKED_OWNERS.count_ones(), 1);
+    assert_ne!(ep::MASKED_OWNERS, crate::model::MASKED_VERIFY);
+}
+
+#[test]
 fn owner_index_is_bounded_by_owners_and_width() {
     for rows in WIDTHS {
         for o in 0..MAX_OWNERS {

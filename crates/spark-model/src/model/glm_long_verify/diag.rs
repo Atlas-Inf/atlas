@@ -156,7 +156,9 @@ impl TransformerModel {
     /// `ATLAS_GLM_LONG_BATCH_ORACLE=1`: compare the batched verify against the
     /// ordinary serial verify of every owner from the same state, then continue
     /// with the SERIAL results. Logs argmax agreement, max |logit delta| and the
-    /// serial top-2 margin per row.
+    /// serial top-2 margin per row. On a `masked` batch each owner's serial
+    /// verify picks under that owner's row masks, as the batch did.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn glm_long_oracle(
         &self,
         rows: usize,
@@ -165,6 +167,7 @@ impl TransformerModel {
         stage: &GlmLongStage,
         snapshot: DevicePtr,
         batched_ids: &[u32],
+        masked: bool,
     ) -> Result<Vec<u32>> {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         static ROWS_SEEN: AtomicU64 = AtomicU64::new(0);
@@ -182,6 +185,9 @@ impl TransformerModel {
         };
         let mut out = Vec::with_capacity(n * rows);
         for ((o, seq), t) in seqs.iter_mut().enumerate().zip(tokens.chunks_exact(rows)) {
+            if masked {
+                self.stage_owner_row_masks(o, rows)?;
+            }
             let ids = self.decode_verify_graphed_kgamma(t, seq, 0)?;
             ensure!(
                 ids.len() == rows,
