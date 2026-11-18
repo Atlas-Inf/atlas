@@ -60,7 +60,23 @@ fn main() -> Result<()> {
     );
     let set = atlas_kernels::ptx_for_config("hy_v4_flash", 3072, &[], None)?
         .context("HY4 kernels missing")?;
-    let gpu = AtlasCudaBackend::new(0, &set.modules)?;
+    let required = ["hy4_dfly", "hy4_mla", "hy4_model", "bf16_add"];
+    let modules: Vec<_> = set
+        .modules
+        .iter()
+        .copied()
+        .filter(|(name, _)| required.contains(name))
+        .collect();
+    ensure!(
+        modules.len() == required.len(),
+        "DFly kernel module missing"
+    );
+    println!(
+        "DFLY_MODULES loaded={} available={}",
+        modules.len(),
+        set.modules.len()
+    );
+    let gpu = AtlasCudaBackend::new(0, &modules)?;
     let g: &dyn GpuBackend = &gpu;
     let stream = g.default_stream();
     io::guard(g, reserve, budget)?;
