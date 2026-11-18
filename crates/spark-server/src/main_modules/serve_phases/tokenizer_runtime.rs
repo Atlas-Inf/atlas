@@ -264,10 +264,7 @@ pub(crate) fn resolve_tokenizer_runtime(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-    let (tc_start_str, tc_end_str): (&str, &str) = match tool_call_format_name.as_deref() {
-        Some("minimax_xml") => ("<minimax:tool_call>", "</minimax:tool_call>"),
-        _ => ("<tool_call>", "</tool_call>"),
-    };
+    let (tc_start_str, tc_end_str) = tool_call_markers(tool_call_format_name.as_deref());
     let tool_call_start_token = tokenizer
         .encode(tc_start_str)
         .ok()
@@ -340,5 +337,38 @@ pub(crate) fn resolve_tokenizer_runtime(
         tool_call_start_token,
         tool_call_end_token,
         grammar_engine,
+    }
+}
+
+/// The opener/closer token strings of one tool call in `format`. Hy4's
+/// tokenizer has only namespaced call tokens, so the generic pair would leave
+/// the tool-body, finish-reason and tool-choice token paths unresolved.
+fn tool_call_markers(format: Option<&str>) -> (&'static str, &'static str) {
+    match format {
+        Some("minimax_xml") => ("<minimax:tool_call>", "</minimax:tool_call>"),
+        Some("hy4") => ("<tool_call:opensource>", "</tool_call:opensource>"),
+        _ => ("<tool_call>", "</tool_call>"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tool_call_markers;
+
+    #[test]
+    fn tool_call_markers_follow_the_native_block_of_each_format() {
+        assert_eq!(
+            tool_call_markers(Some("hy4")),
+            ("<tool_call:opensource>", "</tool_call:opensource>")
+        );
+        assert_eq!(
+            tool_call_markers(Some("minimax_xml")),
+            ("<minimax:tool_call>", "</minimax:tool_call>")
+        );
+        assert_eq!(
+            tool_call_markers(Some("hermes")),
+            ("<tool_call>", "</tool_call>")
+        );
+        assert_eq!(tool_call_markers(None), ("<tool_call>", "</tool_call>"));
     }
 }

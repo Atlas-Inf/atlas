@@ -9,6 +9,7 @@ use xgrammar::CompiledGrammar;
 use crate::tool_parser::ToolDefinition;
 
 use super::engine::{GrammarEngine, GrammarError};
+use super::poolside_tags::{POOLSIDE_V1_TAGS, PoolsideTags};
 use super::schema::{enforce_min_length_on_required_strings, sanitize_schema_for_grammar};
 
 /// Escape a single char for use inside an EBNF char class `[^ … ]`.
@@ -718,8 +719,25 @@ impl GrammarEngine {
         use_triggers: bool,
         value_close: &str,
     ) -> Result<CompiledGrammar, GrammarError> {
+        self.compile_poolside_family_tool_grammar(
+            tools,
+            use_triggers,
+            &POOLSIDE_V1_TAGS,
+            value_close,
+        )
+    }
+
+    /// [`Self::compile_poolside_v1_tool_grammar`] over the tag names of any
+    /// Poolside-layout format (Hy4 namespaces them and adds an envelope).
+    pub fn compile_poolside_family_tool_grammar(
+        &mut self,
+        tools: &[ToolDefinition],
+        use_triggers: bool,
+        tags: &PoolsideTags,
+        value_close: &str,
+    ) -> Result<CompiledGrammar, GrammarError> {
         if !use_triggers {
-            match self.compile_poolside_v1_grammar(tools, false, value_close, true) {
+            match self.compile_poolside_v1_grammar(tools, false, tags, value_close, true) {
                 Err(GrammarError::NoTools) => return Err(GrammarError::NoTools),
                 Err(error) => tracing::warn!(
                     "Poolside closed argument values did not compile ({error}); \
@@ -728,13 +746,14 @@ impl GrammarEngine {
                 compiled => return compiled,
             }
         }
-        self.compile_poolside_v1_grammar(tools, use_triggers, value_close, false)
+        self.compile_poolside_v1_grammar(tools, use_triggers, tags, value_close, false)
     }
 
     fn compile_poolside_v1_grammar(
         &mut self,
         tools: &[ToolDefinition],
         use_triggers: bool,
+        tags: &PoolsideTags,
         value_close: &str,
         closed_values: bool,
     ) -> Result<CompiledGrammar, GrammarError> {
@@ -742,6 +761,13 @@ impl GrammarEngine {
             return Err(GrammarError::NoTools);
         }
 
+        let key_to_value = tags.key_to_value();
+        let (call_open, call_close) = if use_triggers {
+            (format!("<{}>", tags.call), format!("</{}>", tags.call))
+        } else {
+            tags.forced_frame()
+        };
+        let key = tags.key;
         let mut tag_entries = Vec::with_capacity(tools.len());
         for tool in tools {
             let name = &tool.function.name;
@@ -781,11 +807,16 @@ impl GrammarEngine {
                 .as_deref()
                 .filter(|_| closed_values)
                 .and_then(|names| {
-                    super::poolside_values::closed_pair_rules(&schema, names, value_close)
+                    super::poolside_values::closed_pair_rules(
+                        &schema,
+                        names,
+                        &key_to_value,
+                        value_close,
+                    )
                 })
                 .unwrap_or_else(|| {
                     format!(
-                        "pair_body ::= paramname \"</arg_key><arg_value>\" value \"{value_close}\"\n\
+                        "pair_body ::= paramname \"{key_to_value}\" value \"{value_close}\"\n\
                          {paramname_rule}"
                     )
                 });
@@ -794,8 +825,8 @@ impl GrammarEngine {
             } else {
                 let body_ebnf = format!(
                     "root ::= first_pair pair*\n\
-                     first_pair ::= \"arg_key>\" pair_body\n\
-                     pair ::= \"<arg_key>\" pair_body\n\
+                     first_pair ::= \"{key}>\" pair_body\n\
+                     pair ::= \"<{key}>\" pair_body\n\
                      {pair_rules}\n\
                      value ::= value_part*\n\
                      value_part ::= {value_ladder}"
@@ -807,9 +838,10 @@ impl GrammarEngine {
             // The first `<` is consumed here; the grammar's first pair starts
             // at `arg_key>`, while the zero-argument end consumes `tool_call>`.
             let (begin, end) = if has_no_parameters {
-                (format!("<tool_call>{name}</"), "tool_call>".to_string())
+                let end = call_close.strip_prefix("</").unwrap_or(&call_close);
+                (format!("{call_open}{name}</"), end.to_string())
             } else {
-                (format!("<tool_call>{name}<"), "</tool_call>".to_string())
+                (format!("{call_open}{name}<"), call_close.clone())
             };
             tag_entries.push(serde_json::json!({
                 "type": "tag",
@@ -835,7 +867,7 @@ impl GrammarEngine {
                 .filter(|trigger| seen.insert(trigger.clone(), true).is_none())
                 .collect::<Vec<_>>()
         } else {
-            vec!["<tool_call>".to_string()]
+            vec![call_open]
         };
 
         self.compile_structural_tag_raw(&triggers, &tag_entries, !use_triggers, !use_triggers)
