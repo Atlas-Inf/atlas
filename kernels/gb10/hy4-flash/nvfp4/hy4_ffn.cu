@@ -4,18 +4,45 @@
 #include <cuda_fp8.h>
 #include <stdint.h>
 #include <math.h>
+#include "hy4_gemv.cuh"
 
-// Correctness-first W4A16 path: checkpoint nibbles/scales are never repacked.
+// Row-major ModelOpt nibbles/scales are consumed without repacking.
 struct Hy4Q4 { const uint8_t* w; const uint8_t* s; float scale; uint32_t pad; };
 static_assert(sizeof(Hy4Q4)==24, "Hy4 descriptor ABI");
 __device__ __constant__ float HY4_FP4[16]={
     0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f,-0.f,-.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
 
-__device__ float hy4_weight(Hy4Q4 q, unsigned n, unsigned k, unsigned K) {
-    uint8_t packed=q.w[(size_t)n*(K/2)+k/2];
-    __nv_fp8_e4m3 scale;
-    scale.__x=q.s[(size_t)n*(K/16)+k/16];
-    return HY4_FP4[(packed>>((k&1)*4))&15]*((float)scale*q.scale);
+__device__ __forceinline__ float hy4_qdot(const __nv_bfloat16* x,Hy4Q4 q,
+    unsigned row,unsigned k,const float* lut) {
+    float sum=0.f;
+    if (q.w) for (unsigned col=(threadIdx.x%32)*32;col<k;col+=1024) {
+        unsigned count=min(32u,k-col);
+        uint4 packed;
+        if (count==32 && k%32==0) packed=*(const uint4*)(q.w+(size_t)row*(k/2)+col/2);
+        else {
+            const uint2* p=(const uint2*)(q.w+(size_t)row*(k/2)+col/2);
+            const uint2 lo=p[0],hi=count==32?p[1]:make_uint2(0,0);
+            packed=make_uint4(lo.x,lo.y,hi.x,hi.y);
+        }
+        const unsigned words[4]={packed.x,packed.y,packed.z,packed.w};
+        for (unsigned group=0;group<count/16;group++) {
+            __nv_fp8_e4m3 sf;sf.__x=q.s[(size_t)row*(k/16)+col/16+group];
+            float scale=(float)sf*q.scale;
+            #pragma unroll
+            for (unsigned v=0;v<2;v++) {
+                uint4 a=*(const uint4*)(x+col+group*16+v*8);
+                const unsigned ar[4]={a.x,a.y,a.z,a.w};
+                unsigned w=words[group*2+v];
+                #pragma unroll
+                for (unsigned j=0;j<4;j++) {
+                    float2 values=__bfloat1622float2(*((const __nv_bfloat162*)&ar[j]));
+                    sum+=(lut[(w>>(j*8))&15]*scale)*values.x;
+                    sum+=(lut[(w>>(j*8+4))&15]*scale)*values.y;
+                }
+            }
+        }
+    }
+    return hy4_warp_sum(sum);
 }
 __device__ float hy4_sigmoid(float v) {
     if (v>=0.f) return 1.f/(1.f+expf(-v));
@@ -26,54 +53,62 @@ __device__ float hy4_round(float x) {return (float)__float2bfloat16_rn(x);}
 // FP32 dot products. Router emits FP32 logits; latent transforms emit BF16.
 extern "C" __global__ void hy4_linear(const __nv_bfloat16* x, const void* w,
     void* y, unsigned N, unsigned K, unsigned weights_f32, unsigned output_f32) {
-    unsigned n=blockIdx.x*128+threadIdx.x, t=blockIdx.y;
+    unsigned n=blockIdx.x*8+threadIdx.x/32, t=blockIdx.y;
     if (n>=N) return;
-    float sum=0.f;
-    for (unsigned k=0;k<K;++k) {
-        size_t at=(size_t)n*K+k;
-        float weight=weights_f32?((const float*)w)[at]:(float)((const __nv_bfloat16*)w)[at];
-        sum+=(float)x[(size_t)t*K+k]*weight;
+    float sum=hy4_dense_dot(x+(size_t)t*K,w,n,K,weights_f32);
+    if (threadIdx.x%32==0) {
+        if (output_f32) ((float*)y)[(size_t)t*N+n]=sum;
+        else ((__nv_bfloat16*)y)[(size_t)t*N+n]=__float2bfloat16_rn(sum);
     }
-    if (output_f32) ((float*)y)[(size_t)t*N+n]=sum;
-    else ((__nv_bfloat16*)y)[(size_t)t*N+n]=__float2bfloat16_rn(sum);
 }
 
 // Bias is selection-only. Ties deterministically choose the lower ID.
 extern "C" __global__ void hy4_topk(const float* logits, const float* bias,
     unsigned* ids, float* weights, unsigned E, unsigned topk, unsigned renorm, float scaling) {
-    unsigned t=blockIdx.x;
-    float scores[512]; bool used[512];
-    for (unsigned e=0;e<E;++e) {
-        scores[e]=hy4_sigmoid(logits[(size_t)t*E+e]); used[e]=false;
-    }
-    float sum=0.f;
+    unsigned t=blockIdx.x,e=threadIdx.x;
+    __shared__ float candidate[512],selected[512],sum;
+    __shared__ unsigned index[512],chosen;
+    float score=e<E?hy4_sigmoid(logits[(size_t)t*E+e]):0.f;
+    float corrected=e<E?score+bias[e]:-INFINITY;
+    bool used=false;
+    if (e==0) sum=0.f;
     for (unsigned j=0;j<topk;++j) {
-        unsigned best=E; float mx=-INFINITY;
-        for (unsigned e=0;e<E;++e) {
-            float s=scores[e]+bias[e];
-            if (!used[e] && (best==E || s>mx)) {best=e;mx=s;}
+        candidate[e]=used?-INFINITY:corrected;
+        index[e]=e<E && !used?e:E;
+        __syncthreads();
+        for (unsigned stride=256;stride;stride>>=1) {
+            if (e<stride) {
+                float a=candidate[e],b=candidate[e+stride];
+                if (b>a || (b==a && index[e+stride]<index[e])) {
+                    candidate[e]=b;index[e]=index[e+stride];
+                }
+            }
+            __syncthreads();
         }
-        used[best]=true; ids[(size_t)t*topk+j]=best;
-        weights[(size_t)t*topk+j]=scores[best]; sum+=scores[best];
+        if (e==0) {chosen=index[0];ids[(size_t)t*topk+j]=chosen;}
+        __syncthreads();
+        if (e==chosen) {selected[j]=score;used=true;}
+        __syncthreads();
+        if (e==0) sum+=selected[j];
     }
-    for (unsigned j=0;j<topk;++j)
-        weights[(size_t)t*topk+j]=weights[(size_t)t*topk+j]/(renorm?sum+1e-20f:1.f)*scaling;
+    __syncthreads();
+    if (e<topk)
+        weights[(size_t)t*topk+e]=selected[e]/(renorm?sum+1e-20f:1.f)*scaling;
 }
 
 extern "C" __global__ void hy4_qgate_up(const __nv_bfloat16* x, const Hy4Q4* table,
     const unsigned* ids, __nv_bfloat16* activated, unsigned K, unsigned I,
     unsigned slots, unsigned group, float limit) {
-    unsigned n=blockIdx.x*128+threadIdx.x, t=blockIdx.y, slot=blockIdx.z;
+    __shared__ float lut[16];
+    if (threadIdx.x<16)lut[threadIdx.x]=HY4_FP4[threadIdx.x];
+    __syncthreads();
+    unsigned n=blockIdx.x*8+threadIdx.x/32, t=blockIdx.y, slot=blockIdx.z;
     if (n>=I) return;
     unsigned e=ids?ids[(size_t)t*slots+slot]:group;
     Hy4Q4 g=table[e*3], u=table[e*3+1];
-    float a=0.f,b=0.f;
-    if (g.w) {
-        for (unsigned k=0;k<K;++k) {
-            float v=(float)x[(size_t)t*K+k];
-            a+=hy4_weight(g,n,k,K)*v; b+=hy4_weight(u,n,k,K)*v;
-        }
-    }
+    float a=hy4_qdot(x+(size_t)t*K,g,n,K,lut);
+    float b=hy4_qdot(x+(size_t)t*K,u,n,K,lut);
+    if (threadIdx.x%32!=0)return;
     a=hy4_round(a); b=hy4_round(b);
     if (limit>0.f) {a=fminf(a,limit); b=fminf(limit,fmaxf(-limit,b));}
     activated[((size_t)t*slots+slot)*I+n]=__float2bfloat16_rn(a*hy4_sigmoid(a)*b);
@@ -83,17 +118,22 @@ extern "C" __global__ void hy4_qgate_up(const __nv_bfloat16* x, const Hy4Q4* tab
 extern "C" __global__ void hy4_qdown(const __nv_bfloat16* activated, const Hy4Q4* table,
     const unsigned* ids, const float* weights, __nv_bfloat16* out, unsigned N,
     unsigned I, unsigned slots, unsigned group) {
-    unsigned n=blockIdx.x*128+threadIdx.x, t=blockIdx.y;
-    if (n>=N) return;
-    float sum=0.f;
-    for (unsigned slot=0;slot<slots;++slot) {
+    __shared__ float lut[16],partial[512];
+    if (threadIdx.x<16)lut[threadIdx.x]=HY4_FP4[threadIdx.x];
+    __syncthreads();
+    unsigned n=blockIdx.x,t=blockIdx.y;
+    if (n>=N)return;
+    for (unsigned slot=threadIdx.x/32;slot<slots;slot+=8) {
         unsigned e=ids?ids[(size_t)t*slots+slot]:group;
-        Hy4Q4 d=table[e*3+2]; float v=0.f;
-        if (d.w) for (unsigned k=0;k<I;++k)
-            v+=hy4_weight(d,n,k,I)*(float)activated[((size_t)t*slots+slot)*I+k];
-        sum+=hy4_round(v)*(weights?weights[(size_t)t*slots+slot]:1.f);
+        float v=hy4_qdot(activated+((size_t)t*slots+slot)*I,table[e*3+2],n,I,lut);
+        if (threadIdx.x%32==0)partial[slot]=hy4_round(v)*(weights?weights[(size_t)t*slots+slot]:1.f);
     }
-    out[(size_t)t*N+n]=__float2bfloat16_rn(sum);
+    __syncthreads();
+    if (threadIdx.x==0) {
+        float sum=0.f;
+        for (unsigned slot=0;slot<slots;slot++)sum+=partial[slot];
+        out[(size_t)t*N+n]=__float2bfloat16_rn(sum);
+    }
 }
 
 // Combine before sandwich RMSNorm. Dense/shared SwiGLU has no clamp.

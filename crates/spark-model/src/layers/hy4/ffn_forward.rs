@@ -79,7 +79,7 @@ impl Hy4Ffn<'_> {
             )?;
             KernelLaunch::new(self.gpu, self.kernels[1])
                 .grid([rows, 1, 1])
-                .block([1, 1, 1])
+                .block([512, 1, 1])
                 .arg_ptr(logits)
                 .arg_ptr(self.bias)
                 .arg_ptr(ids)
@@ -158,8 +158,8 @@ impl Hy4Ffn<'_> {
     ) -> Result<()> {
         let [n, k] = dims;
         KernelLaunch::new(self.gpu, self.kernels[0])
-            .grid([n.div_ceil(128) as u32, rows, 1])
-            .block([128, 1, 1])
+            .grid([n.div_ceil(8) as u32, rows, 1])
+            .block([256, 1, 1])
             .arg_ptr(x)
             .arg_ptr(w)
             .arg_ptr(y)
@@ -185,8 +185,8 @@ impl Hy4Ffn<'_> {
     ) -> Result<()> {
         let [h, i, slots, group] = dims;
         KernelLaunch::new(self.gpu, self.kernels[2])
-            .grid([i.div_ceil(128) as u32, rows, slots as u32])
-            .block([128, 1, 1])
+            .grid([i.div_ceil(8) as u32, rows, slots as u32])
+            .block([256, 1, 1])
             .arg_ptr(x)
             .arg_ptr(self.table)
             .arg_ptr(ids)
@@ -198,8 +198,8 @@ impl Hy4Ffn<'_> {
             .arg_f32(limit)
             .launch(stream)?;
         KernelLaunch::new(self.gpu, self.kernels[3])
-            .grid([h.div_ceil(128) as u32, rows, 1])
-            .block([128, 1, 1])
+            .grid([h as u32, rows, 1])
+            .block([256, 1, 1])
             .arg_ptr(activated)
             .arg_ptr(self.table)
             .arg_ptr(ids)
