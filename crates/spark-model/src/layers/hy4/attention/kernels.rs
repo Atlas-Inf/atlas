@@ -12,10 +12,9 @@ pub(super) struct Kernels {
     pub norm: KernelHandle,
     pub gemv: KernelHandle,
     pub rotary: KernelHandle,
-    pub cache: KernelHandle,
     pub gate: KernelHandle,
     pub attention: KernelHandle,
-    pub tail: KernelHandle,
+    pub merge: KernelHandle,
     pub pool: KernelHandle,
     pub fwht: KernelHandle,
     pub score: KernelHandle,
@@ -26,12 +25,11 @@ impl Kernels {
         Ok(Self {
             linear: gpu.kernel("hy4_ffn", "hy4_linear")?,
             norm: gpu.kernel("hy4_ffn", "hy4_norm_add")?,
-            gemv: gpu.kernel("hy4_mla", "mla_batched_gemv")?,
+            gemv: gpu.kernel("hy4_mla", "hy4_head_gemv")?,
             rotary: gpu.kernel("hy4_mla", "hy4_rotary")?,
-            cache: gpu.kernel("hy4_mla", "hy4_cache_latent")?,
             gate: gpu.kernel("hy4_mla", "hy4_gate")?,
-            attention: gpu.kernel("hy4_mla", "hy4_paged_mla")?,
-            tail: gpu.kernel("hy4_indexpool", "hy4_tail_write")?,
+            attention: gpu.kernel("hy4_mla", "hy4_mla_partial")?,
+            merge: gpu.kernel("hy4_mla", "hy4_mla_merge")?,
             pool: gpu.kernel("hy4_indexpool", "hy4_pool")?,
             fwht: gpu.kernel("hy4_indexpool", "hy4_fwht")?,
             score: gpu.kernel("hy4_indexpool", "hy4_index_scores")?,
@@ -69,6 +67,7 @@ impl Hy4Attention<'_> {
         n: usize,
         stream: u64,
     ) -> Result<()> {
+        let _phase = crate::layers::hy4::timing::span("attn_norm", stream)?;
         KernelLaunch::new(self.memory.gpu, self.kernels.norm)
             .grid([1, 1, 1])
             .block([256, 1, 1])
@@ -91,6 +90,7 @@ impl Hy4Attention<'_> {
         split: bool,
         stream: u64,
     ) -> Result<()> {
+        let _phase = crate::layers::hy4::timing::span("attn_rope", stream)?;
         let [input_stride, output_stride, input_offset, output_offset] = layout;
         KernelLaunch::new(self.memory.gpu, self.kernels.rotary)
             .grid([heads as u32, 1, 1])

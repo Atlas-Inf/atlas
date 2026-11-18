@@ -242,7 +242,7 @@ fn swa_has_no_pool_reduces_before_post_norm_and_includes_sink_for_prefill_and_de
         .iter()
         .map(|l| l.args)
         .collect();
-    assert_eq!(args, [7, 6, 7, 7, 6, 7, 14, 2, 14, 11, 7, 7, 3, 7, 6]);
+    assert_eq!(args, [7, 6, 7, 7, 6, 7, 14, 14, 11, 4, 7, 7, 3, 7, 6]);
     assert_eq!(cache.committed_len(), 2);
     assert!(
         cache
@@ -268,7 +268,7 @@ fn dsa_partial_group_survives_chunk_and_prefix_fork_and_uses_all_score_stages() 
             9,
         )
         .unwrap();
-    assert_eq!(gpu.launch_count(), 69);
+    assert_eq!(gpu.launch_count(), 66);
     let mut fork = cache.fork(9).unwrap();
     assert_eq!(fork.committed_len(), 3);
     assert_eq!(gpu.d2d_count(), 3);
@@ -279,7 +279,7 @@ fn dsa_partial_group_survives_chunk_and_prefix_fork_and_uses_all_score_stages() 
         .unwrap();
     assert_eq!(fork.committed_len(), 5);
     assert_eq!(cache.committed_len(), 3);
-    assert_eq!(gpu.launch_count(), 69 + 26 + 24);
+    assert_eq!(gpu.launch_count(), 66 + 25 + 23);
     assert_eq!(fork.first_group_position, Some([4; 3]));
     assert!(fork.fork(0).is_err());
     cache

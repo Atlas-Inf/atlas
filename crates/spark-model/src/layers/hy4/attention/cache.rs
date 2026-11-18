@@ -28,10 +28,10 @@ pub struct AttentionCache<'layer, 'gpu> {
 pub(super) struct Scratch {
     pub qc: DevicePtr,
     pub kv: DevicePtr,
-    pub kv_norm: DevicePtr,
     pub q: DevicePtr,
     pub absorbed: DevicePtr,
     pub latent_out: DevicePtr,
+    pub softmax_parts: DevicePtr,
     pub values: DevicePtr,
     pub gates: DevicePtr,
     pub partial: DevicePtr,
@@ -100,13 +100,15 @@ impl<'layer, 'gpu> AttentionCache<'layer, 'gpu> {
         let mut bf = |elements| memory.alloc(elements * 2);
         let qc = bf(layer.qrank)?;
         let kv = bf(576)?;
-        let kv_norm = bf(512)?;
         let q = bf(layer.heads * 256)?;
         let absorbed = bf(layer.heads * 576)?;
         let latent_out = bf(layer.heads * 512)?;
         let values = bf(layer.heads * 256)?;
         let gates = bf(layer.heads * 256)?;
         let partial = bf(layer.hidden)?;
+        let softmax_parts = memory.alloc(
+            layer.heads * layer.window.unwrap_or(2048).min(max_tokens).div_ceil(128) * 514 * 4,
+        )?;
         let (key, pooled, query, hw, quant, scales, scores, indices) =
             if let Some(ix) = &layer.index {
                 (
@@ -134,10 +136,10 @@ impl<'layer, 'gpu> AttentionCache<'layer, 'gpu> {
         let scratch = Scratch {
             qc,
             kv,
-            kv_norm,
             q,
             absorbed,
             latent_out,
+            softmax_parts,
             values,
             gates,
             partial,

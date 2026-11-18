@@ -1,8 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Reuse the generic Q-absorption and V-extraction GEMVs without changing the
-// DeepSeek target. Its cache/sink attention ABIs do not match latent576 here.
-#include "../../deepseek-v4-flash/nvfp4/mla_absorbed.cu"
+#include "hy4_gemv.cuh"
+#include <math.h>
+
+extern "C" __global__ void hy4_head_gemv(const __nv_bfloat16* x,
+    const __nv_bfloat16* w, __nv_bfloat16* y, unsigned n, unsigned k,
+    unsigned input_stride, unsigned output_stride) {
+    unsigned row=blockIdx.x*8+threadIdx.x/32,head=blockIdx.y;
+    if (row>=n) return;
+    float value=hy4_dense_dot(x+(size_t)head*input_stride,
+        w+(size_t)head*n*k,row,k,0);
+    if (threadIdx.x%32==0) y[(size_t)head*output_stride+row]=__float2bfloat16_rn(value);
+}
 
 extern "C" __global__ void hy4_rotary(const __nv_bfloat16* x, __nv_bfloat16* y,
     unsigned in_stride, unsigned out_stride, unsigned in_offset, unsigned out_offset,
@@ -24,11 +33,6 @@ extern "C" __global__ void hy4_rotary(const __nv_bfloat16* x, __nv_bfloat16* y,
     dst[split?32+i:i*2+1]=__float2bfloat16_rn(a*s+b*c);
 }
 
-extern "C" __global__ void hy4_cache_latent(const __nv_bfloat16* latent,
-    __nv_bfloat16* row) {
-    for (unsigned d=threadIdx.x;d<512;d+=256) row[d]=latent[d];
-}
-
 extern "C" __global__ void hy4_gate(__nv_bfloat16* out,
     const __nv_bfloat16* logits, unsigned width) {
     unsigned d=blockIdx.x*256+threadIdx.x;
@@ -39,41 +43,80 @@ extern "C" __global__ void hy4_gate(__nv_bfloat16* out,
     }
 }
 
-// One accepted token at a time; request-local page tables. Online softmax is
-// initialized by the zero-value sink, which participates even with no real keys.
-extern "C" __global__ void hy4_paged_mla(const __nv_bfloat16* q,
+// Each head/128-key partition produces an unnormalized FP32 softmax partial.
+extern "C" __global__ void hy4_mla_partial(const __nv_bfloat16* q,
     const __nv_bfloat16* cache, const unsigned* table, const int* indices,
-    const float* sink, __nv_bfloat16* out, unsigned position, unsigned page_size,
-    unsigned columns, unsigned window, unsigned count) {
-    unsigned h=blockIdx.x,tid=threadIdx.x;
-    __shared__ float red[256],maximum,denominator,alpha,beta;
-    if (tid==0) {maximum=sink[h];denominator=1.f;}
-    float a=0.f,b=0.f;
+    float* partials, unsigned position, unsigned page_size,
+    unsigned columns, unsigned window, unsigned count, unsigned splits) {
+    unsigned h=blockIdx.x,part=blockIdx.y,tid=threadIdx.x,lane=tid%32,warp=tid/32;
+    __shared__ float scores[128],red[256],query[576],maximum,denominator;
+    __shared__ int rows[128];
+    for (unsigned d=tid;d<576;d+=256) query[d]=(float)q[(size_t)h*576+d];
     __syncthreads();
     unsigned begin=window && position+1>window?position+1-window:0;
-    for (unsigned j=0;j<count;++j) {
-        int logical=indices?indices[j]:(int)(begin+j);
-        if (logical<0 || (unsigned)logical>position || (unsigned)logical<begin) continue;
-        unsigned page=(unsigned)logical/page_size;
-        unsigned physical=table[window?page%columns:page];
-        const __nv_bfloat16* kv=cache+((size_t)physical*page_size+logical%page_size)*576;
+    for (unsigned j=warp;j<128;j+=8) {
+        unsigned at=part*128+j;
+        int logical=at<count?(indices?indices[at]:(int)(begin+at)):-1;
+        bool valid=logical>=0 && (unsigned)logical<=position && (unsigned)logical>=begin;
+        size_t row=0;
+        if (valid) {
+            unsigned page=(unsigned)logical/page_size;
+            row=(size_t)table[window?page%columns:page]*page_size+(unsigned)logical%page_size;
+        }
+        const __nv_bfloat16* kv=cache+row*576;
         float dot=0.f;
-        for (unsigned d=tid;d<576;d+=256) dot+=(float)q[(size_t)h*576+d]*(float)kv[d];
-        red[tid]=dot; __syncthreads();
-        for (unsigned s=128;s;s>>=1) {
-            if (tid<s) red[tid]+=red[tid+s];
-            __syncthreads();
+        if (valid) for (unsigned d=lane*8;d<576;d+=256) {
+            uint4 v=*(const uint4*)(kv+d);
+            const unsigned words[4]={v.x,v.y,v.z,v.w};
+            #pragma unroll
+            for (unsigned k=0;k<4;k++) {
+                float2 b=__bfloat1622float2(*((const __nv_bfloat162*)&words[k]));
+                dot+=query[d+k*2]*b.x;dot+=query[d+k*2+1]*b.y;
+            }
         }
-        if (tid==0) {
-            float score=red[0]*(1.f/16.f),next=fmaxf(maximum,score);
-            alpha=expf(maximum-next);beta=expf(score-next);
-            denominator=denominator*alpha+beta;maximum=next;
-        }
-        __syncthreads();
-        a=a*alpha+beta*(float)kv[tid];
-        b=b*alpha+beta*(float)kv[tid+256];
-        __syncthreads();
+        dot=hy4_warp_sum(dot);
+        if (lane==0) { scores[j]=valid?dot*(1.f/16.f):-INFINITY;rows[j]=valid?(int)row:-1; }
     }
-    out[(size_t)h*512+tid]=__float2bfloat16_rn(a/denominator);
-    out[(size_t)h*512+tid+256]=__float2bfloat16_rn(b/denominator);
+    __syncthreads();
+    red[tid]=tid<128?scores[tid]:-INFINITY;
+    for (unsigned s=128;s;s>>=1) {
+        __syncthreads();
+        if (tid<s) red[tid]=fmaxf(red[tid],red[tid+s]);
+    }
+    if (tid==0) maximum=red[0];
+    __syncthreads();
+    float weight=tid<128 && rows[tid]>=0?expf(scores[tid]-maximum):0.f;
+    if (tid<128) scores[tid]=weight;
+    red[tid]=weight;
+    for (unsigned s=128;s;s>>=1) {
+        __syncthreads();
+        if (tid<s) red[tid]+=red[tid+s];
+    }
+    if (tid==0) denominator=red[0];
+    __syncthreads();
+    float a=0.f,b=0.f;
+    for (unsigned j=0;j<128;j++) if (rows[j]>=0) {
+        const __nv_bfloat16* kv=cache+(size_t)rows[j]*576;
+        a+=scores[j]*(float)kv[tid];b+=scores[j]*(float)kv[tid+256];
+    }
+    float* out=partials+((size_t)h*splits+part)*514;
+    out[tid]=a;out[tid+256]=b;
+    if (tid==0) {out[512]=maximum;out[513]=denominator;}
+}
+
+// The zero-value sink participates once, including when every key is masked.
+extern "C" __global__ void hy4_mla_merge(const float* partials,const float* sink,
+    __nv_bfloat16* out,unsigned splits) {
+    unsigned h=blockIdx.x,d=threadIdx.x;
+    const float* parts=partials+(size_t)h*splits*514;
+    float maximum=sink[h];
+    for (unsigned p=0;p<splits;p++) maximum=fmaxf(maximum,parts[p*514+512]);
+    float denominator=expf(sink[h]-maximum),a=0.f,b=0.f;
+    for (unsigned p=0;p<splits;p++) {
+        float scale=expf(parts[p*514+512]-maximum);
+        denominator+=scale*parts[p*514+513];
+        a+=scale*parts[p*514+d];b+=scale*parts[p*514+d+256];
+    }
+    out[(size_t)h*512+d]=__float2bfloat16_rn(a/denominator);
+    out[(size_t)h*512+d+256]=__float2bfloat16_rn(b/denominator);
 }
