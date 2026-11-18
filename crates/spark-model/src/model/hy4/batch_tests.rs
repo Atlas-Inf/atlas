@@ -3,6 +3,56 @@
 use super::*;
 
 #[test]
+fn verify_checkpoint_discards_rejected_cache_rows_and_replays_only_the_prefix() {
+    for accepted in [1, 2, 4] {
+        let m = model();
+        let stream = m.default_stream();
+        let mut seq = m.alloc_sequence().unwrap();
+        m.prefill(&[1, 2], &mut seq, stream).unwrap();
+        m.checkpoint_ssm_states(&mut seq).unwrap();
+        m.decode_verify(&[3, 4, 5, 6], &mut seq, stream).unwrap();
+        seq.tokens.truncate(2 + accepted);
+        seq.seq_len = seq.tokens.len();
+        m.commit_accepted_prefix(&mut seq, accepted, 4).unwrap();
+        {
+            let requests = m.borrow_dependent().requests.lock();
+            let data = requests[&seq.slot_idx].borrow_dependent();
+            assert_eq!(data.history, seq.tokens);
+            assert_eq!(data.layers[0].attn.committed_len(), seq.seq_len);
+        }
+        m.checkpoint_ssm_states(&mut seq).unwrap();
+        m.decode_verify(&[7, 8], &mut seq, stream).unwrap();
+        seq.seq_len -= 1;
+        seq.tokens.pop();
+        m.commit_accepted_prefix(&mut seq, 1, 2).unwrap();
+        assert_eq!(seq.tokens.last(), Some(&7));
+    }
+}
+
+#[test]
+fn invalid_verify_commit_requires_checkpoint_and_an_exact_accepted_prefix() {
+    let m = model();
+    let stream = m.default_stream();
+    let mut seq = m.alloc_sequence().unwrap();
+    assert!(m.commit_accepted_prefix(&mut seq, 1, 1).is_err());
+    m.checkpoint_ssm_states(&mut seq).unwrap();
+    m.decode_verify(&[1, 2], &mut seq, stream).unwrap();
+    for (accepted, rows) in [(0, 2), (3, 2), (1, 0), (1, 3), (1, 2)] {
+        assert!(m.commit_accepted_prefix(&mut seq, accepted, rows).is_err());
+        assert_eq!(seq.tokens, [1, 2]);
+    }
+    seq.tokens.pop();
+    seq.seq_len -= 1;
+    m.commit_accepted_prefix(&mut seq, 1, 2).unwrap();
+    assert_eq!(
+        m.borrow_dependent().requests.lock()[&seq.slot_idx]
+            .borrow_dependent()
+            .history,
+        [1]
+    );
+}
+
+#[test]
 fn multi_row_prefill_and_verify_preserve_history_and_expose_all_logits() {
     let m = model();
     let stream = m.default_stream();

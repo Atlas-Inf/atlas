@@ -704,6 +704,11 @@ pub trait Model: Send + Sync {
         None
     }
 
+    /// Request-local prompt lookup using native `decode_verify`, not graph-K verifies.
+    fn eager_prompt_lookup(&self) -> bool {
+        false
+    }
+
     /// True when every row of a single-sequence verify (K = 2..=num_drafts+1,
     /// within `verify_max_drafts`) is bitwise the serial decode step at its
     /// position, so a T=0 speculative run commits exactly the tokens and

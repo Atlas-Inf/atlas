@@ -12,8 +12,8 @@ use super::streaming_frag::tool_def;
 use super::streaming_leak::stream_through_pipeline_with;
 use crate::tool_parser::tail::hy4::Hy4Parser;
 
-const SPELLED_OPEN: [&str; 7] = ["<", "tool", "_calls", ":", "opens", "ource", ">"];
-const SPELLED_CLOSE: [&str; 7] = ["</", "tool", "_calls", ":", "opens", "ource", ">"];
+const SPELLED_OPEN: [&str; 7] = ["<", "tool", "_calls", ":", "open", "source", ">"];
+const SPELLED_CLOSE: [&str; 7] = ["</", "tool", "_calls", ":", "open", "source", ">"];
 
 fn weather_call(city: &'static str) -> [&'static str; 8] {
     [

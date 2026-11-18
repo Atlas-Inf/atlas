@@ -28,6 +28,7 @@ pub(super) use kv_cache::{
 };
 pub(super) use preflight::{
     ReservePreflight, init_gpu_backend, post_load_memory_audit, prepare_reserve,
+    validate_hy4_speculation,
 };
 pub(super) use runtime::{
     SamplingDefaults, load_eos_tokens, load_sampling_defaults, log_behavior_audit,

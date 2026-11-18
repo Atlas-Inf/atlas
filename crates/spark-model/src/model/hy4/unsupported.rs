@@ -5,7 +5,7 @@ use super::*;
 impl Hy4Model {
     pub(super) fn unavailable<T>() -> Result<T> {
         anyhow::bail!(
-            "Hy4 supports eager accepted text tokens only; no speculation, graph capture, DFly or vision"
+            "Hy4 supports eager text and prompt lookup; no native MTP/DFly, graph capture or vision"
         )
     }
 }

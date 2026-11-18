@@ -73,11 +73,12 @@ impl Hy4Model {
                 }
             }
         }
+        self.benchmark_rollback(prefix, seq.slot_idx, stream)?;
         self.benchmark_sequence(seq.slot_idx)?;
         Ok(())
     }
 
-    fn benchmark_sequence(&self, slot: usize) -> Result<SequenceState> {
+    pub(super) fn benchmark_sequence(&self, slot: usize) -> Result<SequenceState> {
         let mut temporary = SequenceState::host_only(slot);
         self.free_sequence(&mut temporary)?;
         let fresh = self.alloc_sequence()?;

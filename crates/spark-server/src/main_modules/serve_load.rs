@@ -477,6 +477,9 @@ pub(crate) fn load_model(
         config.vision = None;
     }
 
+    if config.model_type == "hy_v4_flash" {
+        serve_phases::validate_hy4_speculation(&args)?;
+    }
     // Resolve dflash γ first — the dflash num_drafts default derives from it.
     // Explicit --dflash-gamma → MODEL.toml [dflash].gamma → engine default.
     // After this call `args.resolved_dflash_gamma()` is valid on dflash runs.

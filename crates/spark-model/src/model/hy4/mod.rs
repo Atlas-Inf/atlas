@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Eager accepted-token Hy4 backend. No graph/speculative/prefix-cache ABI.
+//! Eager Hy4 text backend with transactional single-sequence verification.
 
 use crate::layers::hy4::{
     Hy4FfnScratch,
@@ -24,6 +24,8 @@ mod benchmark;
 mod collectives;
 mod compute;
 mod model_trait;
+mod rollback_benchmark;
+mod speculation;
 #[cfg(test)]
 mod tests;
 mod unsupported;
@@ -75,6 +77,7 @@ struct RequestData<'a> {
     layers: Vec<RequestLayer<'a>>,
     history: Vec<u32>,
     poisoned: bool,
+    checkpoint: Option<speculation::Checkpoint<'a>>,
 }
 self_cell::self_cell! {
     struct RequestCell {owner:RequestOwner,#[covariant] dependent:RequestData,}
@@ -340,6 +343,7 @@ impl Runtime<'_> {
                     layers,
                     history: Vec::new(),
                     poisoned: false,
+                    checkpoint: None,
                 })
             },
         )?;

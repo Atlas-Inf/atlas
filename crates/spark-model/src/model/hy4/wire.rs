@@ -53,6 +53,12 @@ impl Hy4Model {
         let slot = words[1] as usize;
         let stream = s.gpu.default_stream();
         match words[0] {
+            speculation::CHECKPOINT => {
+                r.checkpoint(slot, words[2] as usize, stream)?;
+            }
+            speculation::COMMIT => {
+                r.commit(s, slot, words[2] as usize, words[3] as usize, stream)?;
+            }
             ALLOC => {
                 let requests = r.requests.lock();
                 if let Some(request) = requests.get(&slot) {

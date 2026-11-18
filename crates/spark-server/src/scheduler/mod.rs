@@ -326,10 +326,20 @@ pub fn run(
     let mut ngram_proposer = if use_ngram_speculative {
         // Chains cap at the model's verify width (mHC highway has MoE arms
         // for K=2/3 only → flash-next verifies K=3 max) and at K=4 hard.
-        let chain_cap = num_drafts
-            .min(model.verify_max_drafts().unwrap_or(3))
-            .min(3);
-        Some(NgramProposer::new(4).with_chain_and_cache(chain_cap, ngram_cache_path))
+        let chain_cap = num_drafts.min(model.verify_max_drafts().unwrap_or(3)).min(
+            if model.eager_prompt_lookup() {
+                usize::MAX
+            } else {
+                3
+            },
+        );
+        Some(if model.eager_prompt_lookup() {
+            NgramProposer::new(4)
+                .with_chain_and_cache(chain_cap, None)
+                .prompt_lookup_only()
+        } else {
+            NgramProposer::new(4).with_chain_and_cache(chain_cap, ngram_cache_path)
+        })
     } else {
         None
     };

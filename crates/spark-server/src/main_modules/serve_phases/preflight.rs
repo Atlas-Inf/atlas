@@ -10,6 +10,8 @@ use crate::cli;
 
 mod glm_chain;
 mod gpu_init;
+mod hy4;
+pub(crate) use hy4::validate as validate_hy4_speculation;
 mod independent;
 mod native_mtp;
 mod ssm_h_fp16;

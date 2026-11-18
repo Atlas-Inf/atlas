@@ -42,7 +42,19 @@ extern "C" __global__ void hy4_model_head(
     if(threadIdx.x%32==0)logits[n]=sum;
 }
 extern "C" __global__ void hy4_model_argmax(const float* logits,unsigned* out,unsigned vocab) {
-    if(threadIdx.x || blockIdx.x)return;
-    unsigned best=0;for(unsigned i=1;i<vocab;i++)if(logits[i]>logits[best])best=i;
-    *out=best;
+    __shared__ float values[256];
+    __shared__ unsigned indices[256];
+    unsigned lane=threadIdx.x,best=0;float value=logits[0];
+    for(unsigned i=lane;i<vocab;i+=blockDim.x)if(logits[i]>value) {value=logits[i];best=i;}
+    values[lane]=value;indices[lane]=best;__syncthreads();
+    for(unsigned stride=blockDim.x/2;stride;stride/=2) {
+        if(lane<stride) {
+            float other=values[lane+stride];unsigned index=indices[lane+stride];
+            if(other>values[lane] || (other==values[lane] && index<indices[lane])) {
+                values[lane]=other;indices[lane]=index;
+            }
+        }
+        __syncthreads();
+    }
+    if(!lane)*out=indices[0];
 }

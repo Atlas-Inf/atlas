@@ -54,14 +54,48 @@ impl Model for Hy4Model {
         let ptr = self.forward_rows(tokens, seq, super::batch::VERIFY, stream)?;
         self.argmax_batch(ptr, tokens.len(), stream)
     }
-    fn checkpoint_ssm_states(&self, _s: &mut SequenceState) -> Result<()> {
-        Self::unavailable()
+    fn checkpoint_ssm_states(&self, seq: &mut SequenceState) -> Result<()> {
+        let stream = self.eager_stream(self.default_stream())?;
+        self.send([
+            super::speculation::CHECKPOINT,
+            u32::try_from(seq.slot_idx)?,
+            u32::try_from(seq.seq_len)?,
+            0,
+        ])?;
+        self.borrow_dependent()
+            .checkpoint(seq.slot_idx, seq.seq_len, stream)
+    }
+    fn commit_accepted_prefix(
+        &self,
+        seq: &mut SequenceState,
+        accepted: usize,
+        rows: usize,
+    ) -> Result<()> {
+        let r = self.borrow_dependent();
+        r.validate_commit(seq.slot_idx, accepted, rows, Some(seq))?;
+        let stream = self.eager_stream(self.default_stream())?;
+        self.send([
+            super::speculation::COMMIT,
+            u32::try_from(seq.slot_idx)?,
+            u32::try_from(accepted)?,
+            u32::try_from(rows)?,
+        ])?;
+        r.commit(self.borrow_owner(), seq.slot_idx, accepted, rows, stream)
     }
     fn rollback_ssm_states(&self, _s: &mut SequenceState, _n: usize) -> Result<()> {
         Self::unavailable()
     }
     fn has_proposer(&self) -> bool {
         false
+    }
+    fn eager_prompt_lookup(&self) -> bool {
+        true
+    }
+    fn verify_max_drafts(&self) -> Option<usize> {
+        Some(5)
+    }
+    fn verify_context_limit(&self) -> Option<usize> {
+        Some(self.borrow_owner().max_seq)
     }
     fn has_self_speculative(&self) -> bool {
         false
@@ -228,7 +262,7 @@ impl Model for Hy4Model {
         let r = self.borrow_dependent();
         KernelLaunch::new(s.gpu.as_ref(), r.kernels[3])
             .grid([1, 1, 1])
-            .block([1, 1, 1])
+            .block([256, 1, 1])
             .arg_ptr(ptr)
             .arg_ptr(r.post)
             .arg_u32(s.config.vocab_size as u32)

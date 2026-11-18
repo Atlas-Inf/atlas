@@ -39,6 +39,7 @@ pub struct NgramProposer {
     max_match: usize,
     /// Maximum chain length per proposal
     max_chain: usize,
+    lookup_only: bool,
     /// Dynamic table: hash(ngram) → [(next_token, count)] (top CANDS_PER_KEY).
     table: HashMap<u64, Vec<(u32, u32)>>,
     /// Position index: hash of the 2-gram ENDING at position i -> positions i.
@@ -79,6 +80,7 @@ impl NgramProposer {
             min_match: 2,
             max_match: 16,
             max_chain: 1,
+            lookup_only: false,
             table: HashMap::new(),
             pos_index: HashMap::new(),
             indexed_up_to: 0,
@@ -88,6 +90,14 @@ impl NgramProposer {
             accepts: 0,
             rejects: 0,
         }
+    }
+
+    pub fn prompt_lookup_only(mut self) -> Self {
+        self.lookup_only = true;
+        self.min_match = 4;
+        self.table.clear();
+        self.cache_path = None;
+        self
     }
 
     /// Configure chain drafting and (optionally) disk persistence.
@@ -149,7 +159,7 @@ impl NgramProposer {
         }
         // Dynamic-table extension: keep drafting while the tail has a learned
         // continuation. Operates on tokens + drafts-so-far.
-        while drafts.len() < k {
+        while !self.lookup_only && drafts.len() < k {
             match self.table_best(all_tokens, &drafts) {
                 Some(t) => drafts.push(t),
                 None => break,
@@ -164,6 +174,9 @@ impl NgramProposer {
     /// The same observation is what llama.cpp applies to its ngram_mod cache
     /// on every accepted token.
     pub fn observe(&mut self, history: &[u32], next: u32) {
+        if self.lookup_only {
+            return;
+        }
         let len = history.len();
         for n in self.min_match..=self.max_match.min(len) {
             let key = hash_ngram(&history[len - n..]);
@@ -360,6 +373,10 @@ impl NgramProposer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "ngram_prompt_tests.rs"]
+mod prompt_tests;
 
 impl Drop for NgramProposer {
     fn drop(&mut self) {

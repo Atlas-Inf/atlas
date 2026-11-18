@@ -76,7 +76,6 @@ pub fn build_model(
     if config.model_type == "hy_v4_flash" {
         anyhow::ensure!(
             !use_speculative
-                && !self_speculative
                 && dflash_args.is_none()
                 && lora_args.is_none()
                 && config.vision.is_none()
@@ -84,7 +83,7 @@ pub fn build_model(
                 && !config.lm_head_fp8
                 && kv_dtype == KvCacheDtype::Bf16
                 && layer_dtypes.iter().all(|d| *d == KvCacheDtype::Bf16),
-            "Hy4 requires eager text-only, BF16 latent cache and FP32-accumulating LM head; speculation/DFly/vision/LoRA/mixed cache dtypes/head overrides unsupported"
+            "Hy4 requires eager text-only, BF16 latent cache and FP32-accumulating LM head; native MTP/DFly/vision/LoRA/mixed cache dtypes/head overrides unsupported"
         );
         return Ok(Box::new(crate::model::hy4::Hy4Model::new(
             config,
