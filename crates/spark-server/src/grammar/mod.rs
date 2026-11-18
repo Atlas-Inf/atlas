@@ -12,6 +12,7 @@ mod branch;
 mod compile_misc;
 mod compile_tools;
 mod engine;
+mod poolside_tags;
 mod poolside_values;
 mod schema;
 mod state;
@@ -20,6 +21,7 @@ mod state;
 pub(crate) mod tests;
 
 pub use engine::{GrammarEngine, GrammarError};
+pub use poolside_tags::{HY4_TAGS, POOLSIDE_V1_TAGS, PoolsideTags};
 pub use schema::augment_schema_with_tafc_think;
 pub use state::{GrammarState, grammar_blocks_stop};
 

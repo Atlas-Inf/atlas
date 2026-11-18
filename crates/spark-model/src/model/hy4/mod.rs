@@ -156,7 +156,7 @@ impl Hy4Model {
                 "Hy4 communicator rank/world mismatch"
             );
         }
-        collectives::register(gpu.as_ref(), comm.as_deref());
+        collectives::register(gpu.as_ref(), comm.as_deref())?;
         let owner = Arc::new(Shared {
             gpu,
             store,

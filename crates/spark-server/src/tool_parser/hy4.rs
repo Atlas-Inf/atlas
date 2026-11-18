@@ -9,6 +9,28 @@ impl ToolCallParser for Hy4Parser {
     fn system_prompt(&self, _t: &[ToolDefinition], _c: &ToolChoice, _l: &PromptLevers) -> String {
         String::new()
     }
+    fn compile_tool_grammar(
+        &self,
+        engine: &mut GrammarEngine,
+        tools: &[ToolDefinition],
+        use_triggers: bool,
+    ) -> Option<Result<CompiledGrammar, GrammarError>> {
+        let value_close = self
+            .param_value_close_delim()
+            .expect("hy4 declares a parameter-value close delimiter");
+        Some(engine.compile_poolside_family_tool_grammar(
+            tools,
+            use_triggers,
+            &crate::grammar::HY4_TAGS,
+            value_close,
+        ))
+    }
+    fn has_tool_grammar(&self) -> bool {
+        true
+    }
+    fn param_value_close_delim(&self) -> Option<&'static str> {
+        Some("</arg_value:opensource>")
+    }
     fn format_tool_calls(&self, calls: &[IncomingToolCall]) -> String {
         let mut text = PoolsideV1Parser.format_tool_calls(calls);
         for tag in ["tool_call", "arg_key", "arg_value"] {
@@ -40,7 +62,7 @@ mod tests {
     use crate::tokenizer::hy4::canonical;
     #[test]
     fn native_tools_parse_complete_empty_and_malformed_argument_blocks() {
-        assert!(!Hy4Parser.has_tool_grammar());
+        assert!(Hy4Parser.has_tool_grammar());
         for (body, count) in [
             ("ping", 1),
             (

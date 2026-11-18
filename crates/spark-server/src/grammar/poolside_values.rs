@@ -16,11 +16,12 @@
 use serde_json::Value;
 
 /// `pair_body` rules for a forced call, or `None` when no named property is
-/// closed. `pair_body` covers one `NAME</arg_key><arg_value>VALUE{value_close}`;
+/// closed. `pair_body` covers one `NAME{key_to_value}VALUE{value_close}`;
 /// an open property refers to the caller's `value` rule.
 pub(super) fn closed_pair_rules(
     schema: &Value,
     param_names: &[String],
+    key_to_value: &str,
     value_close: &str,
 ) -> Option<String> {
     let properties = schema.get("properties")?;
@@ -41,8 +42,9 @@ pub(super) fn closed_pair_rules(
     for (i, (name, value)) in param_names.iter().zip(values).enumerate() {
         let value = value.map_or_else(|| "value".to_string(), |arms| format!("({arms})"));
         rules.push(format!(
-            "key_{i} ::= {} \"</arg_key><arg_value>\" {value} \"{value_close}\"",
-            literal(name)
+            "key_{i} ::= {} {} {value} \"{value_close}\"",
+            literal(name),
+            literal(key_to_value)
         ));
     }
     rules.push("ws ::= [ ]?".to_string());
