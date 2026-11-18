@@ -201,11 +201,19 @@ pub(crate) fn prepare_chat_prompt(
     }
     // A template that owns its effort vocabulary gets the client's effort
     // whatever thinking resolved to, as vLLM passes it.
-    let reasoning_effort = effective_reasoning_effort(
+    let mut reasoning_effort = effective_reasoning_effort(
         req.reasoning_effort,
         state.default_reasoning_effort,
         enable_thinking || state.behavior.verbatim_reasoning_effort,
     );
+    // `--thinking-off-budget`: thinking that resolved off is served as
+    // capped low effort (see `thinking::low_effort_when_off`).
+    let off =
+        thinking::low_effort_when_off(state.thinking_off_budget, enable_thinking, gen_max as u32);
+    let enable_thinking = enable_thinking || off.is_some();
+    if off.is_some() {
+        (thinking_budget, reasoning_effort) = (off, Some(crate::ir::ReasoningEffort::Low));
+    }
     let us_thinking = _t_phase.elapsed().as_micros() - us_msg_entry;
 
     // ── Phase 5: render Jinja template + image-pad expansion ────

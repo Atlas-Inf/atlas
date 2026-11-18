@@ -378,3 +378,14 @@ fn no_server_budget_leaves_only_an_explicit_client_budget() {
         (false, None)
     );
 }
+
+#[test]
+fn thinking_off_budget_applies_only_to_a_request_that_resolved_off() {
+    // Unset, or thinking on: nothing changes.
+    assert_eq!(low_effort_when_off(None, false, 4096), None);
+    assert_eq!(low_effort_when_off(Some(256), true, 4096), None);
+    // Off: the cap, which always leaves half of max_tokens for the answer.
+    assert_eq!(low_effort_when_off(Some(256), false, 4096), Some(256));
+    assert_eq!(low_effort_when_off(Some(256), false, 16), Some(8));
+    assert_eq!(low_effort_when_off(Some(256), false, 1), Some(1));
+}

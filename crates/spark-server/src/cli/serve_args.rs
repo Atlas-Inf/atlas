@@ -460,6 +460,15 @@ pub struct ServeArgs {
     #[arg(long, visible_alias = "stupify", default_value_t = false)]
     pub disable_thinking: bool,
 
+    /// Serve a request whose thinking resolved off at the template's low
+    /// reasoning effort, capped at this many tokens (and at half the
+    /// request's `max_tokens`). For a model whose chat template opens a
+    /// reasoning block whatever the request says (GLM-5.3): without this
+    /// flag such a request reasons at the template's default effort with no
+    /// limit, as the reference server does.
+    #[arg(long)]
+    pub thinking_off_budget: Option<u32>,
+
     /// Serve exactly what the client asked for: the client's sampling
     /// parameters and nothing else, rendered through the checkpoint's own
     /// chat template. For benchmark runs whose rules lock sampling and

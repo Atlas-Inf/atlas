@@ -294,3 +294,57 @@ fn identical_tool_rounds_get_a_repeat_notice_unless_the_prompt_is_verbatim() {
         assert_eq!(prompt.contains("<REPEAT NOTICE>"), on, "{prompt}");
     }
 }
+
+/// `--thinking-off-budget`: a thinking-off request renders as the same
+/// request at low effort and is capped; a request that reasons is untouched.
+#[test]
+fn thinking_off_budget_serves_off_requests_as_capped_low_effort() {
+    let (dir, plain) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let reference = glm_state(plain.path());
+    let capped = Arc::new(AppState {
+        thinking_off_budget: Some(256),
+        ..Arc::into_inner(glm_state(dir.path())).unwrap()
+    });
+    let request = |extra: serde_json::Value, max_tokens: u32| {
+        let mut request = serde_json::json!({
+            "model": "glm", "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        request
+    };
+    let low = serde_json::json!({"reasoning_effort": "low"});
+    let (low_prompt, ..) = render(&reference, "low", &request(low.clone(), 4096));
+    assert!(low_prompt.contains("Reasoning Effort: Low") && low_prompt.ends_with("<think>"));
+    let off = [
+        serde_json::json!({"chat_template_kwargs": {"enable_thinking": false}}),
+        serde_json::json!({"reasoning_effort": "none"}),
+    ];
+    for extra in off {
+        let name = extra.to_string();
+        let got = render(&capped, &name, &request(extra.clone(), 4096));
+        assert_eq!(got, (low_prompt.clone(), true, Some(256)), "{name}");
+        let (_, _, tight) = render(&capped, &name, &request(extra, 16));
+        assert_eq!(
+            tight,
+            Some(8),
+            "{name}: half of max_tokens stays for the answer"
+        );
+    }
+    for extra in [
+        serde_json::json!({}),
+        low,
+        serde_json::json!({"reasoning_effort": "high"}),
+    ] {
+        let name = extra.to_string();
+        let request = request(extra, 4096);
+        assert_eq!(
+            render(&capped, &name, &request),
+            render(&reference, &name, &request),
+            "{name}"
+        );
+    }
+}

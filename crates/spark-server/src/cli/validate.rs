@@ -279,6 +279,16 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
             "drop --disable-thinking (the client decides thinking in reference mode).",
         ));
     }
+    if args.thinking_off_budget == Some(0)
+        || (args.reference_mode && args.thinking_off_budget.is_some())
+    {
+        v.push(Violation::new(
+            "--thinking-off-budget is 0, or is set together with --reference-mode.",
+            "the flag turns a thinking-off request into capped low-effort reasoning; \
+             reference mode serves the client's thinking flags unchanged.",
+            "give --thinking-off-budget at least 1 token, and drop it in reference mode.",
+        ));
+    }
     if args.reference_mode && args.max_thinking_budget.is_some() {
         v.push(Violation::new(
             "--reference-mode is set together with --max-thinking-budget.",

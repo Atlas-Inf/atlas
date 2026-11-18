@@ -318,6 +318,9 @@ pub(crate) fn log_behavior_audit(args: &cli::ServeArgs, ptx_set: &atlas_kernels:
     if args.disable_thinking {
         tracing::info!("--disable-thinking set: thinking is forced OFF for every request");
     }
+    if let Some(cap) = args.thinking_off_budget {
+        tracing::info!("--thinking-off-budget {cap}: a thinking-off request reasons at low effort");
+    }
     if let Some(threshold) = args.auto_compact {
         tracing::info!(
             "Auto-compact enabled: threshold={:.0}% of max_seq_len ({})",

@@ -1489,6 +1489,7 @@ pub(crate) fn load_model(
             b
         },
         disable_thinking: args.disable_thinking,
+        thinking_off_budget: args.thinking_off_budget,
         reference_mode: args.reference_mode,
         default_thinking: default_kwargs.thinking,
         default_reasoning_effort: match default_kwargs.reasoning_effort {
