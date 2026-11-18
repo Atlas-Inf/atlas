@@ -2,7 +2,7 @@
 
 #pragma once
 
-template<unsigned KIND>
+template<unsigned KIND,bool ALIGNED>
 __device__ __forceinline__ void hy4_batch_linear_impl(
     const __nv_bfloat16* x,const void* weights,const float* scales,void* out,
     unsigned n,unsigned k,unsigned rows,unsigned heads,unsigned xh,unsigned yh,
@@ -16,7 +16,7 @@ __device__ __forceinline__ void hy4_batch_linear_impl(
     for(unsigned col=lane*width;col<k;col+=32*width) {
         unsigned packed[8]={};
         const char* base=(const char*)weights+wi*(KIND==1?1:KIND==2?4:2);
-        bool vector=col+width<=k && ((uintptr_t)(base+col*(KIND==1?1:KIND==2?4:2))%16)==0;
+        bool vector=ALIGNED || (col+width<=k && ((uintptr_t)(base+col*(KIND==1?1:KIND==2?4:2))%16)==0);
         if(vector) {
             const uint4 a=*(const uint4*)(base+col*(KIND==1?1:KIND==2?4:2));
             packed[0]=a.x;packed[1]=a.y;packed[2]=a.z;packed[3]=a.w;
@@ -46,7 +46,7 @@ __device__ __forceinline__ void hy4_batch_linear_impl(
         #pragma unroll
         for(unsigned r=0;r<8;r++)if(first+r<rows) {
             const __nv_bfloat16* input=x+(size_t)(first+r)*xr+(size_t)head*xh+col;
-            bool xv=col+width<=k && (uintptr_t)input%16==0;
+            bool xv=ALIGNED || (col+width<=k && (uintptr_t)input%16==0);
             unsigned data[8]={};
             if(xv) {
                 uint4 a=*(const uint4*)input;
@@ -57,7 +57,7 @@ __device__ __forceinline__ void hy4_batch_linear_impl(
                 }
             }
             #pragma unroll
-            for(unsigned j=0;j<width;j++)if(col+j<k) {
+            for(unsigned j=0;j<width;j++)if(ALIGNED || col+j<k) {
                 unsigned short bits=(data[j/2]>>(16*(j%2)))&65535;
                 float value=xv?(float)*(const __nv_bfloat16*)&bits:(float)input[j];
                 sums[r]+=value*values[j];
@@ -79,9 +79,15 @@ extern "C" __global__ void hy4_batch_linear(
     const __nv_bfloat16* x,const void* weights,const float* scales,void* out,
     unsigned n,unsigned k,unsigned rows,unsigned heads,unsigned xh,unsigned yh,
     unsigned xr,unsigned yr,unsigned wr,unsigned kind,unsigned float_out) {
-    if(kind==1)hy4_batch_linear_impl<1>(x,weights,scales,out,n,k,rows,heads,xh,yh,xr,yr,wr,kind,float_out);
-    else if(kind==2)hy4_batch_linear_impl<2>(x,weights,scales,out,n,k,rows,heads,xh,yh,xr,yr,wr,kind,float_out);
-    else hy4_batch_linear_impl<0>(x,weights,scales,out,n,k,rows,heads,xh,yh,xr,yr,wr,kind,float_out);
+    if(k%16==0 && wr%16==0 && xr%8==0 && xh%8==0 && (uintptr_t)x%16==0 && (uintptr_t)weights%16==0) {
+        if(kind==1)hy4_batch_linear_impl<1,true>(x,weights,scales,out,n,k,rows,heads,xh,yh,xr,yr,wr,kind,float_out);
+        else if(kind==2)hy4_batch_linear_impl<2,true>(x,weights,scales,out,n,k,rows,heads,xh,yh,xr,yr,wr,kind,float_out);
+        else hy4_batch_linear_impl<0,true>(x,weights,scales,out,n,k,rows,heads,xh,yh,xr,yr,wr,kind,float_out);
+    } else {
+        if(kind==1)hy4_batch_linear_impl<1,false>(x,weights,scales,out,n,k,rows,heads,xh,yh,xr,yr,wr,kind,float_out);
+        else if(kind==2)hy4_batch_linear_impl<2,false>(x,weights,scales,out,n,k,rows,heads,xh,yh,xr,yr,wr,kind,float_out);
+        else hy4_batch_linear_impl<0,false>(x,weights,scales,out,n,k,rows,heads,xh,yh,xr,yr,wr,kind,float_out);
+    }
 }
 
 extern "C" __global__ void hy4_group_init(unsigned* groups,unsigned rows,unsigned experts) {
@@ -158,7 +164,7 @@ __device__ __forceinline__ void hy4_qdots(const __nv_bfloat16* x,Hy4Q4 q,unsigne
     for(unsigned r=0;r<8;r++)sums[r]=hy4_warp_sum(sums[r]);
 }
 
-extern "C" __global__ void hy4_batch_expert(const __nv_bfloat16* x,
+extern "C" __global__ __launch_bounds__(256,4) void hy4_batch_expert(const __nv_bfloat16* x,
     const Hy4Q4* table,const unsigned* groups,__nv_bfloat16* out,
     unsigned n,unsigned k,unsigned rows,unsigned slots,unsigned group,
     unsigned down,float limit,unsigned experts) {
@@ -170,6 +176,11 @@ extern "C" __global__ void hy4_batch_expert(const __nv_bfloat16* x,
     __syncthreads();
     const unsigned* list=groups+(size_t)e*(rows+1);
     if(o>=n)return;
+    if(!table[(e+group)*3+(down?2:0)].w) {
+        for(unsigned r=0;r<list[0];r++)if(threadIdx.x%32==0)
+            out[(size_t)list[1+r]*n+o]=__float2bfloat16_rn(0.f);
+        return;
+    }
     for(unsigned first=0;first<list[0];first+=8) {
     unsigned count=min(8u,list[0]-first);
     const unsigned* entries=list+1+first;
