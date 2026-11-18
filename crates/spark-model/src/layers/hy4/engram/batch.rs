@@ -138,7 +138,10 @@ impl<'a> Hy4Engram<'a> {
                 .launch(stream)?;
         }
         if let Some(comm) = comm.filter(|_| self.topology[1] > 1) {
-            comm.all_reduce_async(b.keys.0, rows * 4 * self.h * 2, stream)?;
+            let bytes = rows * self.h * 2;
+            for part in 0..4 {
+                comm.all_reduce_async(b.keys.offset(part * bytes).0, bytes, stream)?;
+            }
             comm.all_reduce_async(b.value.0, rows * self.h * 2, stream)?;
         }
         for row in 0..rows {

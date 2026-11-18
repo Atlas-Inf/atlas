@@ -79,6 +79,7 @@ fn fixture(gpu: &MockGpuBackend, rank: usize, world: usize) -> (ModelConfig, Wei
 struct Comm {
     rank: usize,
     calls: AtomicUsize,
+    bytes: usize,
 }
 impl spark_comm::CommBackend for Comm {
     fn rank(&self) -> usize {
@@ -91,7 +92,7 @@ impl spark_comm::CommBackend for Comm {
         anyhow::bail!("must use stream-ordered reduction")
     }
     fn all_reduce_async(&self, _p: u64, b: usize, _s: u64) -> Result<()> {
-        assert_eq!(b, 3072 * 2);
+        assert_eq!(b, self.bytes);
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -129,6 +130,7 @@ fn tp2_dispatch_owns_whole_heads_and_reduces_each_key_and_value_once() {
         let comm = Comm {
             rank: 1,
             calls: AtomicUsize::new(0),
+            bytes: 3072 * 2,
         };
         assert!(
             block
@@ -158,4 +160,42 @@ fn missing_or_malformed_table_contract_is_rejected_without_derived_leaks() {
     assert!(Hy4Engram::load(&c, &store, 0, &gpu).is_err());
     assert!(Hy4Engram::load(&c, &WeightStore::empty(), 1, &gpu).is_err());
     assert_eq!(gpu.alloc_count(), before);
+}
+
+#[test]
+fn batched_keys_respect_n_by_h_collective_capacity_and_reject_empty_batches() {
+    let gpu = MockGpuBackend::new();
+    let (c, store) = fixture(&gpu, 0, 2);
+    let block = Hy4Engram::load(&c, &store, 1, &gpu).unwrap();
+    let mut scratch = block.scratch().unwrap();
+    let history = vec![1; 57];
+    let hidden = gpu.alloc(history.len() * c.hidden_size * 4 * 2).unwrap();
+    let comm = Comm {
+        rank: 0,
+        calls: AtomicUsize::new(0),
+        bytes: history.len() * c.hidden_size * 2,
+    };
+    assert!(
+        block
+            .forward_batch(hidden, &[], 0, &mut scratch, Some(&comm), 0)
+            .is_err()
+    );
+    assert!(
+        block
+            .forward_batch(hidden, &history, 58, &mut scratch, Some(&comm), 0)
+            .is_err()
+    );
+    assert_eq!(gpu.launch_count(), 0);
+    block
+        .forward_batch(hidden, &history, 0, &mut scratch, Some(&comm), 0)
+        .unwrap();
+    assert_eq!(comm.calls.load(Ordering::Relaxed), 5);
+    let launches = gpu.launch_count();
+    assert!(
+        block
+            .forward_batch(hidden, &vec![1; 129], 0, &mut scratch, Some(&comm), 0)
+            .is_err()
+    );
+    assert_eq!(gpu.launch_count(), launches);
+    gpu.free(hidden).unwrap();
 }
