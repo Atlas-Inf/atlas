@@ -13,9 +13,10 @@ configuration.
   and all indexed shards. The script mounts the checkpoint read-only.
   `HY4_MODEL_DIR` and `HY4_IMAGE` can override those paths/tags.
 * The local index contains all 253640 tensor names required by the text
-  loader. The retained header fixture covers 208/213 representative tensors;
-  the five final norm/head tensors remain source-contract expectations,
-  not newly observed headers. Their shape/dtype is checked at real load.
+  loader. Cutover header reads on both Sparks verified all 14 shard lengths
+  and the five previously unobserved final norm/head tensors. This NVFP4
+  checkpoint stores the LM head and HC-head parameters as FP32; final norm
+  is BF16. Their shape/dtype is checked at real load.
 * `.75` is rank 0, direct-link `192.168.200.1`; `.74` is rank 1,
   direct-link `192.168.200.2`. Confirm the interface/HCA names with the
   operator before launching. The names and RDMA/NCCL settings come from
@@ -46,7 +47,8 @@ docker build --no-cache -f docker/gb10/hy4-flash.Dockerfile \
 
 This model-specific Dockerfile compiles only `gb10/hy4-flash/nvfp4` and
 installs NCCL development files in the build stage as well as runtime NCCL
-(>=2.28). No image build or container launch was run as part of this round.
+(2.28.9 for CUDA 13.0). The builder and runtime upgrade the base image's held
+NCCL packages together to the same pinned version. Host packages are unchanged.
 
 ## Launch commands
 
@@ -95,7 +97,7 @@ without changing the other.
   Engram shards complete hash heads and reduces key/value projections; MoE
   owns complete experts. Business logic uses `spark_comm::CommBackend`.
 * BF16 KV cache only, unquantized checkpoint LM head with FP32 accumulation
-  (the HF head weight itself is BF16), unquantized BF16 attention projections.
+  (this NVFP4 checkpoint stores FP32 weights), unquantized BF16 attention projections.
   Do not copy GLM's FP8-cache or head-quantization flags.
 * No prefix-cache reuse or NVMe swapping in this launch. Per-request token
   history carries bigram/trigram lookback across chunked prefill and decode;
