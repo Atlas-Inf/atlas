@@ -54,6 +54,9 @@ pub(crate) fn keeps_raw_f16(name: &str) -> bool {
 ///   - Qwen's `ngram_embedding.weight_scale` (one BF16 scalar)
 ///   - Qwen's `ngram_heads_offsets` / `ngram_heads_vocab_sizes` (I64, 16 each)
 pub fn is_ngram_table(name: &str) -> bool {
+    if name.contains(".engram_layer.multi_head_embedding.embedding.") {
+        return name.ends_with(".weight") || name.ends_with(".weight_scale_inv");
+    }
     if name.contains("ngram_embeddings.embedders.") || name.contains("ngram_embedding.shard_") {
         return name.ends_with(".weight")
             || (name.contains("ngram_embedding.shard_") && name.ends_with(".weight_scale"))
@@ -103,6 +106,24 @@ mod ngram_defer_tests {
         assert!(!is_ngram_table(
             "model.layers.0.mlp.experts.3.gate_proj.weight"
         ));
+    }
+
+    #[test]
+    fn hy4_engram_tables_and_row_scales_are_deferred() {
+        let base = "model.layers.1.engram_layer";
+        for suffix in ["weight", "weight_scale_inv"] {
+            assert!(is_ngram_table(&format!(
+                "{base}.multi_head_embedding.embedding.{suffix}"
+            )));
+        }
+        for name in [
+            String::new(),
+            format!("{base}.key_projs.0.weight"),
+            format!("{base}.lookup_per_head_norms.0.weight"),
+            format!("{base}.multi_head_embedding.embedding.bias"),
+        ] {
+            assert!(!is_ngram_table(&name), "{name}");
+        }
     }
 
     /// Qwen3.8-Flash-Next stores ONE logical table as 128 `shard_{i}` tensors

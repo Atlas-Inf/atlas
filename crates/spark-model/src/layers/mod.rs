@@ -17,6 +17,7 @@ pub mod glm_sp;
 pub mod glm_sp_moe_seam;
 pub mod glm_sp_overlap;
 pub mod glm_sp_uneven;
+pub mod hy4;
 pub mod moe;
 mod moe_grouped_decode;
 pub mod mtp_head;

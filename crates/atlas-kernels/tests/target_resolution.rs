@@ -131,6 +131,9 @@ fn resolve_name(model_type: &str, hidden: usize, refs: &[&str]) -> Option<&'stat
 
 // ── The dense-27B family ──
 
+#[path = "target_resolution/hy4.rs"]
+mod hy4;
+
 #[test]
 fn qwen38_checkpoint_resolves_to_its_own_target() {
     assert_eq!(

@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+use super::loader::Hy4Attention;
+use anyhow::Result;
+use spark_runtime::{
+    gpu::{DevicePtr, GpuBackend, KernelHandle},
+    kernel_args::KernelLaunch,
+};
+
+pub(super) struct Kernels {
+    pub linear: KernelHandle,
+    pub norm: KernelHandle,
+    pub gemv: KernelHandle,
+    pub rotary: KernelHandle,
+    pub cache: KernelHandle,
+    pub gate: KernelHandle,
+    pub attention: KernelHandle,
+    pub tail: KernelHandle,
+    pub pool: KernelHandle,
+    pub fwht: KernelHandle,
+    pub score: KernelHandle,
+    pub select: KernelHandle,
+}
+impl Kernels {
+    pub fn load(gpu: &dyn GpuBackend) -> Result<Self> {
+        Ok(Self {
+            linear: gpu.kernel("hy4_ffn", "hy4_linear")?,
+            norm: gpu.kernel("hy4_ffn", "hy4_norm_add")?,
+            gemv: gpu.kernel("hy4_mla", "mla_batched_gemv")?,
+            rotary: gpu.kernel("hy4_mla", "hy4_rotary")?,
+            cache: gpu.kernel("hy4_mla", "hy4_cache_latent")?,
+            gate: gpu.kernel("hy4_mla", "hy4_gate")?,
+            attention: gpu.kernel("hy4_mla", "hy4_paged_mla")?,
+            tail: gpu.kernel("hy4_indexpool", "hy4_tail_write")?,
+            pool: gpu.kernel("hy4_indexpool", "hy4_pool")?,
+            fwht: gpu.kernel("hy4_indexpool", "hy4_fwht")?,
+            score: gpu.kernel("hy4_indexpool", "hy4_index_scores")?,
+            select: gpu.kernel("hy4_indexpool", "hy4_index_select")?,
+        })
+    }
+}
+impl Hy4Attention<'_> {
+    pub(super) fn linear(
+        &self,
+        x: DevicePtr,
+        w: DevicePtr,
+        y: DevicePtr,
+        n: usize,
+        k: usize,
+        stream: u64,
+    ) -> Result<()> {
+        KernelLaunch::new(self.memory.gpu, self.kernels.linear)
+            .grid([n.div_ceil(128) as u32, 1, 1])
+            .block([128, 1, 1])
+            .arg_ptr(x)
+            .arg_ptr(w)
+            .arg_ptr(y)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .arg_u32(0)
+            .arg_u32(0)
+            .launch(stream)
+    }
+    pub(super) fn norm(
+        &self,
+        x: DevicePtr,
+        w: DevicePtr,
+        out: DevicePtr,
+        n: usize,
+        stream: u64,
+    ) -> Result<()> {
+        KernelLaunch::new(self.memory.gpu, self.kernels.norm)
+            .grid([1, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(DevicePtr::NULL)
+            .arg_ptr(x)
+            .arg_ptr(w)
+            .arg_ptr(out)
+            .arg_u32(n as u32)
+            .arg_f32(self.eps)
+            .launch(stream)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn rotary(
+        &self,
+        x: DevicePtr,
+        y: DevicePtr,
+        heads: usize,
+        layout: [usize; 4],
+        position: [i64; 3],
+        split: bool,
+        stream: u64,
+    ) -> Result<()> {
+        let [input_stride, output_stride, input_offset, output_offset] = layout;
+        KernelLaunch::new(self.memory.gpu, self.kernels.rotary)
+            .grid([heads as u32, 1, 1])
+            .block([32, 1, 1])
+            .arg_ptr(x)
+            .arg_ptr(y)
+            .arg_u32(input_stride as u32)
+            .arg_u32(output_stride as u32)
+            .arg_u32(input_offset as u32)
+            .arg_u32(output_offset as u32)
+            .arg_u64(position[0] as u64)
+            .arg_u64(position[1] as u64)
+            .arg_u64(position[2] as u64)
+            .arg_f32(self.rope.rope_theta as f32)
+            .arg_u32(self.rope.mrope_section[1] as u32)
+            .arg_u32(self.rope.mrope_section[2] as u32)
+            .arg_u32(u32::from(self.rope.mrope_interleaved))
+            .arg_u32(u32::from(split))
+            .launch(stream)
+    }
+    pub(super) fn gemv(
+        &self,
+        x: DevicePtr,
+        w: DevicePtr,
+        y: DevicePtr,
+        dimensions: [usize; 4],
+        stream: u64,
+    ) -> Result<()> {
+        let [n, k, input_stride, output_stride] = dimensions;
+        KernelLaunch::new(self.memory.gpu, self.kernels.gemv)
+            .grid([n.div_ceil(8) as u32, self.heads as u32, 1])
+            .block([256, 1, 1])
+            .arg_ptr(x)
+            .arg_ptr(w)
+            .arg_ptr(y)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .arg_u32(input_stride as u32)
+            .arg_u32(output_stride as u32)
+            .launch(stream)
+    }
+}

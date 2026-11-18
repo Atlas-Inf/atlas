@@ -38,6 +38,37 @@ impl Drop for Dir {
 
 type T = (String, &'static str, Vec<usize>, Vec<u8>);
 
+#[test]
+fn hy4_engram_load_preserves_deferred_locations_under_ep() {
+    let dir = Dir::new("hy4-engram");
+    let base = "model.layers.1.engram_layer";
+    let table = format!("{base}.multi_head_embedding.embedding.weight");
+    let scales = format!("{base}.multi_head_embedding.embedding.weight_scale_inv");
+    let projection = format!("{base}.key_projs.0.weight");
+    let tensors = vec![
+        (table.clone(), "F8_E4M3", vec![2, 96], vec![0x38; 192]),
+        (scales.clone(), "BF16", vec![2], vec![0x80, 0x3f, 0, 0x40]),
+        (projection.clone(), "BF16", vec![1, 1], vec![0x80, 0x3f]),
+    ];
+    checkpoint(&dir.0, std::slice::from_ref(&tensors));
+    for (rank, world) in [(0, 1), (0, 2), (1, 2)] {
+        let gpu = MockGpuBackend::new();
+        let mut loader = FastSafetensorsLoader::with_ep(rank, world, 512);
+        loader.demand_paged_patterns =
+            vec![".engram_layer.multi_head_embedding.embedding.weight".into()];
+        let store = loader.load(&dir.0, &gpu, 0).unwrap();
+        for (name, _, shape, bytes) in &tensors[..2] {
+            assert!(store.get(name).is_err());
+            let deferred = store.deferred(name).unwrap();
+            assert_eq!(&deferred.shape, shape);
+            assert_eq!(&deferred.read_bytes().unwrap(), bytes);
+        }
+        assert_eq!(store.deferred(&table).unwrap().dtype, WeightDtype::FP8E4M3);
+        assert_eq!(store.deferred(&scales).unwrap().dtype, WeightDtype::BF16);
+        assert!(store.get(&projection).is_ok());
+    }
+}
+
 fn write_shard(path: &Path, tensors: &[T]) {
     let mut header = serde_json::Map::new();
     let mut off = 0usize;

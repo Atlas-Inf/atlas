@@ -135,6 +135,7 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         // DeepSeek-V4 family (Flash) — MLA + MoE + CSA/HCA hybrid attention + mHC.
         "deepseek_v4" => Ok(Box::new(DeepSeekV4WeightLoader)),
         "glm5_next" => Ok(Box::new(Glm5WeightLoader)),
+        "hy_v4_flash" => Ok(Box::new(crate::weight_loader::hy4::Hy4WeightLoader)),
         _ => bail!(
             "Unsupported model type: '{}' (normalized: '{}'). \
              Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, holo3_1_moe, qwen3_vl_moe, qwen4_exp, nemotron_h, nemotron_h_puzzle, nemotron_h_omni, gemma4, mistral, minimax_m2, step3p7, laguna, deepseek_v4, m2m_100",
@@ -149,6 +150,8 @@ pub(crate) mod glm_dense_cache;
 mod glm_hc_prewarm;
 mod glm_shared_cache;
 mod glm_sparse_decode;
+#[cfg(test)]
+mod hy4_tests;
 mod lm_head_setup;
 mod m2_setup;
 

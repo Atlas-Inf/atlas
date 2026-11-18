@@ -59,6 +59,7 @@ base64 = "0.22"
 # pipeline can be proven before committing to an H.264 decoder.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico"] }
 parking_lot = { workspace = true }
+self_cell = "1.2.2"
 
 # Used by the `metal_qwen35_inference` example only — gated by
 # `required-features = ["metal-example"]` on the `[[example]]` block

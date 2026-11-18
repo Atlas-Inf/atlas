@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Eager text-only target. DFly, vision and graphs are unsupported.
+[model]
+name = "hy4-flash"
+hf_id = "atakans/Hy4-flash-NVFP4"
+architecture = "MLA + compressed DSA/SWA + latent MoE + iHC + Engram"
+layers_total = 42
+layers_full_attention = 12
+hidden_dim = 3072
+head_dim = 256
+q_heads = 32
+kv_heads = 32
+intermediate_size = 13824
+vocab_size = 120832
+max_position_embeddings = 1048576
+kv_lora_rank = 512
+q_lora_rank = 1024
+qk_rope_head_dim = 64
+qk_nope_head_dim = 192
+v_head_dim = 256
+num_experts = 512
+num_shared_experts = 1
+moe_intermediate_size = 1536
+top_k = 16
+hc_mult = 4
+hc_eps = 1e-6
+
+[[model_types]]
+model_type = "hy_v4_flash"
+hidden_size = 3072
+
+# Tencent generation_config.json: top_k=-1 means disabled (Atlas uses 0).
+[sampling.thinking_text]
+temperature = 0.9
+top_p = 1.0
+top_k = 0
+min_p = 0.0
+
+[sampling.thinking_coding]
+temperature = 0.9
+top_p = 1.0
+top_k = 0
+min_p = 0.0
+
+[sampling.non_thinking]
+temperature = 0.9
+top_p = 1.0
+top_k = 0
+min_p = 0.0
+
+[sampling.tools]
+temperature = 0.9
+top_p = 1.0
+top_k = 0
+min_p = 0.0
+
+[behavior]
+thinking_default = true
+verbatim_prompt = true
+jinja_template = "hy_v4_flash"
+tool_call_parser = "hy4"
+default_num_drafts = 0
+default_kv_dtype = "bf16"

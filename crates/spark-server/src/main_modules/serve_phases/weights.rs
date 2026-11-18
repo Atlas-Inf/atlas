@@ -100,6 +100,9 @@ pub(crate) fn load_weight_store(
     /// Keyed on `ple_layer_ids` rather than on `model_type`, because it is the
     /// presence of the tower that decides this, not the family name.
     fn demand_paged_patterns(config: &ModelConfig) -> Vec<String> {
+        if config.model_type == "hy_v4_flash" {
+            return vec![".engram_layer.multi_head_embedding.embedding.weight".to_string()];
+        }
         if config.ple_layer_ids.is_empty() {
             return Vec::new();
         }
@@ -189,6 +192,10 @@ pub(crate) fn load_weight_store(
             anyhow::bail!("--fast-load requires a Unix host (needs O_DIRECT / posix_fadvise)");
         }
     } else {
+        anyhow::ensure!(
+            config.model_type != "hy_v4_flash",
+            "Hy4 requires fast loading to read only TP-local Engram table rows"
+        );
         anyhow::ensure!(
             !config.expert_tp,
             "ATLAS_GLM_EXPERT_TP=1 needs the fast weight loader (ATLAS_FAST_LOAD)"

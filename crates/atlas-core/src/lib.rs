@@ -9,6 +9,7 @@ pub mod config;
 pub mod dtype;
 pub mod error;
 pub mod fault;
+pub mod hy4_reference;
 pub mod modelopt_codec;
 pub mod ngram_table;
 pub mod numeric;
