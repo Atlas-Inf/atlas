@@ -73,6 +73,10 @@ pub(crate) struct SsmSnapshotPool {
     /// aux state DECLINES restoring a slot without it (graceful miss beats
     /// silently serving another request's lexical state).
     pub(super) aux_blobs: Mutex<std::collections::HashMap<usize, Vec<(u32, Vec<u8>)>>>,
+    /// The aux of each spilled snapshot key, in the tier beside its state
+    /// (`ssm_snapshot_aux_spill`).
+    pub(super) spilled_aux:
+        Mutex<std::collections::HashMap<u64, super::ssm_snapshot_aux_spill::AuxRecord>>,
     /// Decode-rollback region: `h_snapshots` for the Phase-C ring.
     /// Layout per layer: `[max_batch_size * decode_ring_slots * h_bytes]`.
     /// Empty when `decode_ring_slots == 0`.
@@ -156,6 +160,7 @@ impl SsmSnapshotPool {
                 num_ssm_layers,
                 session_tags: Mutex::new(std::collections::HashMap::new()),
                 aux_blobs: Mutex::new(std::collections::HashMap::new()),
+                spilled_aux: Mutex::new(std::collections::HashMap::new()),
                 decode_h_snapshots: Vec::new(),
                 decode_conv_snapshots: Vec::new(),
                 decode_ring_slots: 0,
@@ -247,6 +252,7 @@ impl SsmSnapshotPool {
             num_ssm_layers,
             session_tags: Mutex::new(std::collections::HashMap::new()),
             aux_blobs: Mutex::new(std::collections::HashMap::new()),
+            spilled_aux: Mutex::new(std::collections::HashMap::new()),
             decode_h_snapshots,
             decode_conv_snapshots,
             decode_ring_slots: if decode_enabled { decode_ring_slots } else { 0 },

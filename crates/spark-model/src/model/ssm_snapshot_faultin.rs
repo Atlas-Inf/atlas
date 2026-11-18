@@ -51,7 +51,8 @@ impl SsmSnapshotPool {
         let mut guard = self.spill_staging.acquire(gpu, bytes)?;
         let kind = guard.kind();
         let blob = guard.as_mut_slice();
-        let hit = store.get(key, blob)?;
+        // Aux first: a missing chunk is a miss before any GPU work.
+        let hit = self.fault_in_aux(snap_slot, key, store, blob)? && store.get(key, blob)?;
         let get_us = t0.elapsed().as_micros();
         if !hit {
             return Ok(false);
@@ -113,7 +114,7 @@ impl SsmSnapshotPool {
                             // holding no bytes — a stale tier key manufactured
                             // eagerly — so retire it here instead of leaving the
                             // next warm turn to rediscover it the expensive way.
-                            retire_refused_spill(prefix_cache, store, key);
+                            self.retire_refused_spill(prefix_cache, store, key);
                         }
                         Err(e) => {
                             // Key RETAINED on purpose: an error is not evidence
@@ -152,18 +153,21 @@ impl SsmSnapshotPool {
 /// would leak it. `Err` at spill time deliberately KEEPS the key (an error is
 /// not evidence of absence); the fault-in miss arm retires it after exactly one
 /// doomed cycle.
-pub(super) fn retire_refused_spill(
-    prefix_cache: &dyn spark_runtime::prefix_cache::PrefixCache,
-    store: &dyn super::ssm_tier::SnapshotBlobStore,
-    key: u64,
-) {
-    if prefix_cache.forget_snapshot_tier_key(key) {
-        store.remove(key);
-        tracing::warn!(
-            "SSM spill tier refused a blob for key {key}; retired the entry rather than \
-             leaving it findable-but-empty — a dead tier key costs one live-snapshot spill \
-             per warm turn to rediscover"
-        );
+impl SsmSnapshotPool {
+    pub(super) fn retire_refused_spill(
+        &self,
+        prefix_cache: &dyn spark_runtime::prefix_cache::PrefixCache,
+        store: &dyn super::ssm_tier::SnapshotBlobStore,
+        key: u64,
+    ) {
+        if prefix_cache.forget_snapshot_tier_key(key) {
+            self.remove_spilled(store, key);
+            tracing::warn!(
+                "SSM spill tier refused a blob for key {key}; retired the entry rather than \
+                 leaving it findable-but-empty — a dead tier key costs one live-snapshot spill \
+                 per warm turn to rediscover"
+            );
+        }
     }
 }
 
