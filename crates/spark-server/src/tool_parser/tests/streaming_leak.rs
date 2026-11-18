@@ -18,10 +18,19 @@ use super::streaming_frag::write_and_bash_tools;
 /// is the concatenation of every post-sanitizer content chunk — i.e.
 /// exactly what the client would see in `choices[].delta.content`.
 fn stream_through_pipeline(chunks: &[&str]) -> (Vec<(String, String)>, String) {
-    use crate::tool_parser::LeakMarkers;
-    let markers: LeakMarkers = Qwen3CoderParser.leak_markers();
-    let mut det = StreamingToolDetector::new_with_tools(write_and_bash_tools());
+    stream_through_pipeline_with(
+        Qwen3CoderParser.leak_markers(),
+        StreamingToolDetector::new_with_tools(write_and_bash_tools()),
+        chunks,
+    )
+}
 
+/// Same pipeline with a caller-chosen parser vocabulary and detector.
+pub(super) fn stream_through_pipeline_with(
+    markers: LeakMarkers,
+    mut det: StreamingToolDetector,
+    chunks: &[&str],
+) -> (Vec<(String, String)>, String) {
     // Sanitizer state (mirrors the per-request fields on `StreamState`).
     let mut tag_scan_buf = String::new();
     let mut suppressing = false;
