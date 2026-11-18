@@ -23,7 +23,7 @@ impl DenseFfnLayer {
             return Ok(None);
         }
         let h = ctx.config.hidden_size as u32;
-        let inter = ctx.config.intermediate_size as u32;
+        let inter = self.inter(ctx);
         let quantized = ctx.buffers.ffn_act_a();
         let scales = ctx.buffers.ffn_act_scale();
         if quantized.is_null() || scales.is_null() {
@@ -109,7 +109,7 @@ impl DenseFfnLayer {
             return Ok(false);
         }
         let h = ctx.config.hidden_size as u32;
-        let inter = ctx.config.intermediate_size as u32;
+        let inter = self.inter(ctx);
         let quantized = ctx.buffers.ffn_act_a();
         let scales = ctx.buffers.ffn_act_scale();
         if quantized.is_null() || scales.is_null() {

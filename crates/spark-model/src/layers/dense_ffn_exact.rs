@@ -56,10 +56,7 @@ impl DenseFfnLayer {
     /// lever's `BATCH_MAX_ROWS` across sequences), serial decode on the plain
     /// NVFP4 arm, and a row-exact tier for both projection widths.
     pub(crate) fn rows_exact_serves(&self, m: u32, ctx: &ForwardContext) -> bool {
-        let (h, inter) = (
-            ctx.config.hidden_size as u32,
-            ctx.config.intermediate_size as u32,
-        );
+        let (h, inter) = (ctx.config.hidden_size as u32, self.inter(ctx));
         ctx.levers.dense_exact_verify()
             && ((2..=8).contains(&m) || ctx.levers.dense_exact_rows(m as usize))
             && self.serial_is_plain_nvfp4(ctx)
@@ -81,7 +78,7 @@ impl DenseFfnLayer {
             return Ok(false);
         }
         let h = ctx.config.hidden_size as u32;
-        let inter = ctx.config.intermediate_size as u32;
+        let inter = self.inter(ctx);
         let (gate, up, out) = (
             ctx.buffers.expert_gate_out(),
             ctx.buffers.expert_up_out(),

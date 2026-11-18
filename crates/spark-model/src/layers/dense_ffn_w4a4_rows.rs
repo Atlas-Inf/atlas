@@ -140,11 +140,7 @@ impl DenseFfnLayer {
         } = cfg;
         let gpu: &dyn GpuBackend = ctx.gpu;
         let w = &self.weights;
-        let (m, h, inter) = (
-            rows as u32,
-            ctx.config.hidden_size as u32,
-            ctx.config.intermediate_size as u32,
-        );
+        let (m, h, inter) = (rows as u32, ctx.config.hidden_size as u32, self.inter(ctx));
         let (a, a_sf) = (ctx.buffers.ffn_act_a(), ctx.buffers.ffn_act_scale());
         let (gate, up) = (ctx.buffers.expert_gate_out(), ctx.buffers.expert_up_out());
         let q = self.quantize_nvfp4_k;
@@ -183,11 +179,7 @@ impl DenseFfnLayer {
     ) -> Result<()> {
         use spark_runtime::cutlass::{Nvfp4Act, nvfp4_gemm_prequant as gemm};
         use spark_runtime::cutlass::{nvfp4_quant_act_scaled, nvfp4_quant_swiglu_clamp};
-        let (m, h, inter) = (
-            rows as u32,
-            ctx.config.hidden_size as u32,
-            ctx.config.intermediate_size as u32,
-        );
+        let (m, h, inter) = (rows as u32, ctx.config.hidden_size as u32, self.inter(ctx));
         let a = Nvfp4Act {
             packed: ctx.buffers.ffn_act_a().0,
             sf: ctx.buffers.ffn_act_scale().0,

@@ -101,7 +101,7 @@ impl DenseFfnLayer {
         let Some(native) = self.native else {
             return Ok(false);
         };
-        let (h, inter) = (ctx.config.hidden_size, ctx.config.intermediate_size);
+        let (h, inter) = (ctx.config.hidden_size, self.inter(ctx) as usize);
         let (gate, up, out) = (
             ctx.buffers.expert_gate_out(),
             ctx.buffers.expert_up_out(),

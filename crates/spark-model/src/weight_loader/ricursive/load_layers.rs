@@ -10,6 +10,7 @@ use crate::layer::TransformerLayer;
 use crate::layers::dense_ffn::{DenseFfnWeights, W4a4InputScales};
 use crate::layers::qwen3_attention::value_residual::{ValueResidual, value_residual_blend};
 use crate::layers::{DenseFfnLayer, FfnActivation, FfnComponent, Qwen3AttentionLayer};
+use crate::tp_shard::{TpShardKind, shard_dense_bf16, shard_quantized_nvfp4};
 use crate::weight_map::{
     AttentionWeights, DenseWeight, QuantizeCtx, QuantizedWeight, dense, detect_nvfp4_variant,
     load_kv_scales, quantized_any,
@@ -75,12 +76,58 @@ fn load_ffn(
     qctx: QuantizeCtx,
 ) -> Result<FfnComponent> {
     let (h, inter) = (config.hidden_size, config.intermediate_size);
-    let q = |name: &str, n, k| {
-        quantized_any(store, &format!("{lp}.mlp.{name}"), n, k, gpu, variant, qctx)
+    let (tp_rank, tp) = (config.tp_rank, config.tp_world_size.max(1));
+    ensure!(
+        inter.is_multiple_of(tp),
+        "ricursive intermediate_size {inter} not divisible by tp_size {tp}"
+    );
+    let local_inter = inter / tp;
+    // Gate/up column-parallel on inter, down row-parallel on inter: each
+    // rank's SwiGLU and down-GEMV run on its local slice and the partial
+    // output is all-reduced by the layer's TP seam. `n`/`k` stay the FULL
+    // dims — the shard helpers slice from them.
+    let q = |name: &str, n: usize, k: usize, kind: TpShardKind| -> Result<QuantizedWeight> {
+        let w = quantized_any(store, &format!("{lp}.mlp.{name}"), n, k, gpu, variant, qctx)?;
+        if tp > 1 && kind == TpShardKind::ColumnParallel {
+            ensure!(
+                !w.has_per_row_scale2(),
+                "{lp}.mlp.{name}: per-row scale2 does not shard column-parallel"
+            );
+        }
+        let s = shard_quantized_nvfp4(&w, n, k, kind, tp_rank, tp, 16, gpu)?;
+        // The shard copies the packed weight + per-group scales; release the
+        // full tensors. Store-backed sources are reclaimed by key;
+        // runtime-quantized sources (Bf16Raw, EXL3, FP8 fallback) are fresh
+        // allocs and are freed directly. The per-tensor `weight_scale_2` /
+        // `input_scale` stay resident — the shard replicates them.
+        if tp > 1 {
+            let store_backed = |ptr: DevicePtr| {
+                !ptr.is_null()
+                    && ["weight", "weight_packed", "weight_scale"].iter().any(|s| {
+                        store
+                            .get(&format!("{lp}.mlp.{name}.{s}"))
+                            .map(|t| t.ptr == ptr)
+                            .unwrap_or(false)
+                    })
+            };
+            if !store_backed(w.weight) {
+                gpu.free(w.weight)?;
+            }
+            if !store_backed(w.weight_scale) {
+                gpu.free(w.weight_scale)?;
+            }
+            for suffix in ["weight", "weight_packed", "weight_scale", "trellis"] {
+                let key = format!("{lp}.mlp.{name}.{suffix}");
+                if store.contains(&key) {
+                    store.reclaim(gpu, &key)?;
+                }
+            }
+        }
+        Ok(s)
     };
-    let gate_proj = q("gate_proj", inter, h)?;
-    let up_proj = q("up_proj", inter, h)?;
-    let down_proj = q("down_proj", h, inter)?;
+    let gate_proj = q("gate_proj", inter, h, TpShardKind::ColumnParallel)?;
+    let up_proj = q("up_proj", inter, h, TpShardKind::ColumnParallel)?;
+    let down_proj = q("down_proj", h, inter, TpShardKind::RowParallel)?;
     let input_scales = W4a4InputScales {
         gate_up: f32_scalar(gpu, gate_proj.input_scale)?.max(f32_scalar(gpu, up_proj.input_scale)?),
         down: f32_scalar(gpu, down_proj.input_scale)?,
@@ -96,9 +143,9 @@ fn load_ffn(
         })
     };
     let weights = DenseFfnWeights {
-        gate_proj_t: twin(&gate_proj, inter, h)?,
-        up_proj_t: twin(&up_proj, inter, h)?,
-        down_proj_t: twin(&down_proj, h, inter)?,
+        gate_proj_t: twin(&gate_proj, local_inter, h)?,
+        up_proj_t: twin(&up_proj, local_inter, h)?,
+        down_proj_t: twin(&down_proj, h, local_inter)?,
         gate_proj,
         up_proj,
         down_proj,
@@ -107,9 +154,12 @@ fn load_ffn(
         DenseFfnLayer::new_with_activation(weights, FfnActivation::SiLU, gpu, "ricursive")?;
     // Target-only clamped SwiGLU; the drafter keeps the unclamped common kernel.
     layer.set_act_mul(gpu.kernel("ricursive_swiglu", "silu_mul_clamp20")?);
+    if tp > 1 {
+        layer.set_tp_sharded(local_inter);
+    }
     if !hip {
         let limit = atlas_core::config::RICURSIVE_FFN_CLAMP as f32;
-        layer.enable_w4a4_rows(gpu, input_scales, limit, [h, inter])?;
+        layer.enable_w4a4_rows(gpu, input_scales, limit, [h, local_inter])?;
     }
     Ok(FfnComponent::Dense(layer))
 }
@@ -125,18 +175,55 @@ fn load_attention(
 ) -> Result<Qwen3AttentionLayer> {
     let p = format!("{lp}.self_attn");
     let (h, hd) = (config.hidden_size, config.head_dim);
+    let (tp_rank, tp) = (config.tp_rank, config.tp_world_size.max(1));
+    // Head counts in `config` are already TP-local (topology divided them);
+    // the checkpoint dims are the full counts.
     let nq = config.num_attention_heads;
-    let kv_width = config.num_key_value_heads * hd;
-    let q = bf16_matrix(store, &format!("{p}.q_proj.weight"), nq * hd, h)?;
-    let g = bf16_matrix(store, &format!("{p}.g_proj.weight"), nq * hd, h)?;
+    let kv = config.num_key_value_heads;
+    let (nq_full, kv_full) = (nq * tp, kv * tp);
+    // Column-parallel slice of a `[rows, h]` projection: rank `tp_rank`
+    // keeps its contiguous row block; the full checkpoint tensor is
+    // reclaimed once the shard is copied out.
+    let shard_col = |key: &str, full_rows: usize| -> Result<DevicePtr> {
+        let src = bf16_matrix(store, key, full_rows, h)?;
+        let (local, _, _) = shard_dense_bf16(
+            src,
+            full_rows,
+            h,
+            TpShardKind::ColumnParallel,
+            tp_rank,
+            tp,
+            gpu,
+        )?;
+        if tp > 1 {
+            store.reclaim(gpu, key)?;
+        }
+        Ok(local)
+    };
+    // Q and the attention gate are separate tensors (unlike Qwen3-Next's
+    // fused q_proj): shard each column-parallel, then interleave this
+    // rank's head block into the `[Q_i | G_i]` layout the layer expects.
+    let q = shard_col(&format!("{p}.q_proj.weight"), nq_full * hd)?;
+    let g = shard_col(&format!("{p}.g_proj.weight"), nq_full * hd)?;
     let qg = interleave_q_gate(gpu, q, g, nq, hd, h)?;
-    store.reclaim(gpu, &format!("{p}.q_proj.weight"))?;
-    store.reclaim(gpu, &format!("{p}.g_proj.weight"))?;
+    if tp > 1 {
+        // The interleave consumed the fresh shards; the store tensors were
+        // already reclaimed inside `shard_col`.
+        gpu.free(q)?;
+        gpu.free(g)?;
+    } else {
+        store.reclaim(gpu, &format!("{p}.q_proj.weight"))?;
+        store.reclaim(gpu, &format!("{p}.g_proj.weight"))?;
+    }
     let (k_scale, v_scale) = load_kv_scales(store, &p, gpu);
     let attn = AttentionWeights {
         q_proj: DenseWeight { weight: qg },
-        k_proj: bf16_dense(store, &format!("{p}.k_proj.weight"), kv_width, h)?,
-        v_proj: bf16_dense(store, &format!("{p}.v_proj.weight"), kv_width, h)?,
+        k_proj: DenseWeight {
+            weight: shard_col(&format!("{p}.k_proj.weight"), kv_full * hd)?,
+        },
+        v_proj: DenseWeight {
+            weight: shard_col(&format!("{p}.v_proj.weight"), kv_full * hd)?,
+        },
         o_proj: QuantizedWeight::null(),
         q_norm: dense(store, &format!("{p}.q_norm.weight"))?,
         k_norm: dense(store, &format!("{p}.k_norm.weight"))?,
@@ -159,12 +246,24 @@ fn load_attention(
         config.fp8_kv_calibration_tokens,
         config,
     )?;
-    layer.set_o_dense_bf16(bf16_dense(
-        store,
-        &format!("{p}.o_proj.weight"),
+    // O projection is row-parallel: each rank keeps the input columns of
+    // its local heads, and the layer's TP all-reduce sums the partial
+    // attention output across ranks.
+    let o_key = format!("{p}.o_proj.weight");
+    let o_src = bf16_matrix(store, &o_key, h, nq_full * hd)?;
+    let (o_w, _, _) = shard_dense_bf16(
+        o_src,
         h,
-        nq * hd,
-    )?);
+        nq_full * hd,
+        TpShardKind::RowParallel,
+        tp_rank,
+        tp,
+        gpu,
+    )?;
+    if tp > 1 {
+        store.reclaim(gpu, &o_key)?;
+    }
+    layer.set_o_dense_bf16(DenseWeight { weight: o_w });
     layer.set_post_sublayer_norms(
         dense(store, &format!("{lp}.post_attention_layernorm.weight"))?,
         dense(store, &format!("{lp}.post_feedforward_layernorm.weight"))?,
@@ -193,12 +292,6 @@ fn bf16_matrix(store: &WeightStore, key: &str, rows: usize, cols: usize) -> Resu
         t.shape
     );
     Ok(t.ptr)
-}
-
-fn bf16_dense(store: &WeightStore, key: &str, rows: usize, cols: usize) -> Result<DenseWeight> {
-    Ok(DenseWeight {
-        weight: bf16_matrix(store, key, rows, cols)?,
-    })
 }
 
 /// `[Q_0 | G_0 | Q_1 | G_1 | ...]` per head, the layout Atlas's gated

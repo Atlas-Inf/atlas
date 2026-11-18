@@ -133,7 +133,7 @@ impl DenseFfnLayer {
             return Ok(true);
         }
         let h = ctx.config.hidden_size as u32;
-        let inter = ctx.config.intermediate_size as u32;
+        let inter = self.inter(ctx);
         let (gate, up) = (ctx.buffers.expert_gate_out(), ctx.buffers.expert_up_out());
         ops::w4a16_gemv_batchm(
             ctx.gpu,
@@ -190,7 +190,7 @@ impl DenseFfnLayer {
         );
         let m = u32::try_from(rows)?;
         let h = ctx.config.hidden_size as u32;
-        let inter = ctx.config.intermediate_size as u32;
+        let inter = self.inter(ctx);
         let gate = ctx.buffers.expert_gate_out();
         let up = ctx.buffers.expert_up_out();
         // Cached BF16 weight `i` (gate, up, down), or the NVFP4 weight
