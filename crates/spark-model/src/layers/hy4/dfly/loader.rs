@@ -9,7 +9,12 @@ struct Loader<'a, 's> {
 }
 impl Loader<'_, '_> {
     fn source(&self, name: &str, shape: &[usize]) -> Result<DevicePtr> {
-        let t = self.store.get(&format!("model.dfly_layers.{name}"))?;
+        let key = format!("model.dfly_layers.{name}");
+        ensure!(
+            !self.store.was_reclaimed(&key),
+            "DFly {name} already consumed"
+        );
+        let t = self.store.get(&key)?;
         ensure!(
             t.shape == shape && t.dtype == WeightDtype::BF16,
             "DFly {name}: expected BF16 {shape:?}, got {:?} {:?}",
@@ -25,7 +30,13 @@ impl Loader<'_, '_> {
     }
     fn full(&mut self, name: &str, shape: &[usize]) -> Result<DevicePtr> {
         let src = self.source(name, shape)?;
-        self.copy(src, shape.iter().product::<usize>() * 2)
+        let out = self.copy(src, shape.iter().product::<usize>() * 2)?;
+        self.reclaim(name)?;
+        Ok(out)
+    }
+    fn reclaim(&self, name: &str) -> Result<()> {
+        self.store
+            .reclaim(self.memory.gpu, &format!("model.dfly_layers.{name}"))
     }
     fn rows(
         &mut self,
@@ -36,7 +47,9 @@ impl Loader<'_, '_> {
         world: usize,
     ) -> Result<DevicePtr> {
         let src = self.source(name, &[n, k])?;
-        self.copy(src.offset(rank * (n / world) * k * 2), n / world * k * 2)
+        let out = self.copy(src.offset(rank * (n / world) * k * 2), n / world * k * 2)?;
+        self.reclaim(name)?;
+        Ok(out)
     }
     fn columns(
         &mut self,
@@ -48,13 +61,18 @@ impl Loader<'_, '_> {
     ) -> Result<DevicePtr> {
         let src = self.source(name, &[n, k])?;
         let out = self.memory.alloc(n * (k / world) * 2)?;
-        for row in 0..n {
-            self.memory.gpu.copy_d2d(
-                src.offset((row * k + rank * (k / world)) * 2),
-                out.offset(row * (k / world) * 2),
-                k / world * 2,
-            )?;
-        }
+        let stream = self.memory.gpu.default_stream();
+        self.memory.gpu.copy_d2d_2d_async(
+            src.offset(rank * (k / world) * 2),
+            k * 2,
+            out,
+            (k / world) * 2,
+            (k / world) * 2,
+            n,
+            stream,
+        )?;
+        self.memory.gpu.synchronize(stream)?;
+        self.reclaim(name)?;
         Ok(out)
     }
 }
@@ -76,6 +94,7 @@ pub(super) fn load<'a>(
         let src = l.source(&format!("{a}kv_b_proj.weight"), &[14336, 512])?;
         let mut kv = vec![0u8; heads * 448 * 512 * 2];
         gpu.copy_d2h(src.offset(c.rank * kv.len()), &mut kv)?;
+        l.reclaim(&format!("{a}kv_b_proj.weight"))?;
         let mut key = vec![0u8; heads * 512 * 192 * 2];
         let mut value = Vec::with_capacity(heads * 256 * 512 * 2);
         for h in 0..heads {
@@ -103,7 +122,9 @@ pub(super) fn load<'a>(
             out: l.columns(&format!("{a}o_proj.weight"), H, 8192, c.rank, c.world)?,
             sink: {
                 let src = l.source(&format!("{a}learnable_sink_param"), &[32])?;
-                l.copy(src.offset(c.rank * heads * 2), heads * 2)?
+                let out = l.copy(src.offset(c.rank * heads * 2), heads * 2)?;
+                l.reclaim(&format!("{a}learnable_sink_param"))?;
+                out
             },
             attn_norm: l.full(&format!("{a}post_proj_norm.weight"), &[H])?,
             mg: l.rows(
@@ -175,4 +196,54 @@ pub(super) fn load<'a>(
         ops,
         _memory: l.memory,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spark_runtime::{gpu::mock::MockGpuBackend, weights::WeightTensor};
+    use std::collections::HashMap;
+
+    #[test]
+    fn shards_copy_owned_rows_and_columns_and_reject_reusing_consumed_sources() {
+        for rank in 0..2 {
+            for columns in [false, true] {
+                let gpu = MockGpuBackend::new();
+                let bytes: Vec<u8> = (0..32u16).flat_map(u16::to_le_bytes).collect();
+                let src = gpu.alloc(bytes.len()).unwrap();
+                gpu.copy_h2d(&bytes, src).unwrap();
+                let store = WeightStore::from_map(HashMap::from([(
+                    "model.dfly_layers.test".into(),
+                    WeightTensor {
+                        ptr: src,
+                        shape: vec![4, 8],
+                        dtype: WeightDtype::BF16,
+                    },
+                )]));
+                let mut l = Loader {
+                    memory: Owned::new(&gpu),
+                    store: &store,
+                };
+                let out = if columns {
+                    l.columns("test", 4, 8, rank, 2)
+                } else {
+                    l.rows("test", 4, 8, rank, 2)
+                }
+                .unwrap();
+                assert!(store.was_reclaimed("model.dfly_layers.test"));
+                assert!(l.rows("test", 4, 8, rank, 2).is_err());
+                let mut actual = vec![0u8; 32];
+                gpu.copy_d2h(out, &mut actual).unwrap();
+                let expected = if columns {
+                    bytes
+                        .chunks_exact(16)
+                        .flat_map(|r| r[rank * 8..rank * 8 + 8].iter().copied())
+                        .collect()
+                } else {
+                    bytes[rank * 32..rank * 32 + 32].to_vec()
+                };
+                assert_eq!(actual, expected);
+            }
+        }
+    }
 }

@@ -87,6 +87,11 @@ spark-runtime = { path = "../spark-runtime", default-features = false, features 
 # GPU parity test against SparkGLM's own FlashKDA library (glm5_kda).
 libloading = "0.8"
 
+[[example]]
+name = "hy4_dfly_offline"
+path = "examples/hy4_dfly_offline/main.rs"
+required-features = ["cuda", "gpu-examples", "nccl"]
+
 [lints]
 workspace = true
 

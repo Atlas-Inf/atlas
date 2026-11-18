@@ -167,6 +167,7 @@ pub struct Dfly<'a> {
     _memory: Owned<'a>,
 }
 impl<'a> Dfly<'a> {
+    /// Loads owned TP weights and reclaims consumed auxiliary source tensors.
     pub fn load(store: &WeightStore, gpu: &'a dyn GpuBackend, config: Config) -> Result<Self> {
         config.validate()?;
         loader::load(store, gpu, config)
