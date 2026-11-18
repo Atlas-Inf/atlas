@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::{EngramScratch, Hy4Engram};
+use crate::layers::hy4::timing;
 use anyhow::{Context, Result, ensure};
 use spark_comm::CommBackend;
 use spark_runtime::{gpu::DevicePtr, kernel_args::KernelLaunch};
@@ -87,6 +88,7 @@ impl Hy4Engram<'_> {
                 .arg_u32(u32::from(self.topology[0] == 0))
                 .launch(stream)?;
             if let Some(c) = comm {
+                let _reduce = timing::span("all_reduce", stream)?;
                 c.all_reduce_async(out.0, self.h * 2, stream)?;
             }
         }

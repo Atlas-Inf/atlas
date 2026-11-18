@@ -105,12 +105,20 @@ impl Hy4Model {
                 "Hy4 sequence position/token mismatch"
             );
         }
+        let control = crate::layers::hy4::timing::enabled().then(std::time::Instant::now);
         self.send([
             ROW,
             u32::try_from(seq.slot_idx)?,
             token,
             u32::try_from(seq.seq_len)?,
         ])?;
+        if let Some(start) = control {
+            tracing::info!(
+                "HY4_CONTROL position={} broadcasts_ms={:.6}",
+                seq.seq_len,
+                start.elapsed().as_secs_f64() * 1000.,
+            );
+        }
         let ptr = r.row(s, seq.slot_idx, token, stream)?;
         seq.tokens.push(token);
         seq.seq_len += 1;

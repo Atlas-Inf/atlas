@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use super::timing;
 use super::{Hy4FfnScratch, ffn::Hy4Ffn};
 use anyhow::{Context, Result, ensure};
 use spark_comm::CommBackend;
@@ -55,6 +56,7 @@ impl Hy4Ffn<'_> {
             shared,
         ] = scratch.ptrs;
         if self.dense {
+            let _dense = timing::span("ffn_shared_dense", stream)?;
             self.mlp(
                 x,
                 activated,
@@ -67,6 +69,7 @@ impl Hy4Ffn<'_> {
                 stream,
             )?;
         } else {
+            let router = timing::span("ffn_router_topk", stream)?;
             // BF16 checkpoint router, FP32 dot products/logits.
             self.linear(
                 x,
@@ -89,6 +92,8 @@ impl Hy4Ffn<'_> {
                 .arg_u32(u32::from(self.routing.renormalize))
                 .arg_f32(self.routing.scaling)
                 .launch(stream)?;
+            drop(router);
+            let routed_span = timing::span("ffn_routed", stream)?;
             self.linear(
                 x,
                 self.down,
@@ -118,9 +123,12 @@ impl Hy4Ffn<'_> {
                 rows,
                 stream,
             )?;
+            drop(routed_span);
             if let Some(comm) = comm {
+                let _reduce = timing::span("all_reduce", stream)?;
                 comm.all_reduce_async(routed.0, rows as usize * self.h * 2, stream)?;
             }
+            let _shared = timing::span("ffn_shared_dense", stream)?;
             self.mlp(
                 x,
                 activated,
@@ -133,6 +141,7 @@ impl Hy4Ffn<'_> {
                 stream,
             )?;
         }
+        let _norm = timing::span("ihc_norms", stream)?;
         KernelLaunch::new(self.gpu, self.kernels[4])
             .grid([rows, 1, 1])
             .block([256, 1, 1])

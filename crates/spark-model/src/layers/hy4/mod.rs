@@ -10,6 +10,7 @@ pub mod ffn;
 mod ffn_forward;
 mod ffn_scratch;
 pub mod hc;
+pub mod timing;
 mod weights;
 pub use ffn_scratch::Hy4FfnScratch;
 

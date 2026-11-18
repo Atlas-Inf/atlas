@@ -201,7 +201,7 @@ impl SchedLevers {
             ),
 
             // Presence-gated, not value-gated.
-            decode_timing: present("ATLAS_DECODE_TIMING"),
+            decode_timing: present("ATLAS_DECODE_TIMING") || opt_in("ATLAS_HY4_TIMING"),
             mtp_timing: opt_in("ATLAS_MTP_TIMING"),
             // `--mtp-gate force` is the configured spelling; the env var is
             // the fallback for scripts that predate the flag.

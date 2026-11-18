@@ -336,6 +336,11 @@ impl RdmaPair {
             )?;
             land(dst + off as u64, recv + off as u64, len)?;
         }
+        if seq == 1 || seq.is_multiple_of(10_000) {
+            tracing::info!(
+                "RDMA pair exchange engaged: enqueued={seq} bytes={bytes} stream={stream}"
+            );
+        }
         Ok(true)
     }
 }

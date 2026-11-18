@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
+use crate::layers::hy4::timing;
 use spark_runtime::kernel_args::KernelLaunch;
 
 impl Runtime<'_> {
@@ -26,6 +27,8 @@ impl Runtime<'_> {
                 let gpu = s.gpu.as_ref();
                 let c = &s.config;
                 let h = c.hidden_size;
+                let timer = timing::Token::begin(gpu, stream, c.tp_rank, data.history.len());
+                let row_span = timing::span("other", stream)?;
                 KernelLaunch::new(gpu, self.kernels[0])
                     .grid([((4 * h) as u32).div_ceil(256), 1, 1])
                     .block([256, 1, 1])
@@ -37,6 +40,7 @@ impl Runtime<'_> {
                 for (cell, state) in owner.layers.iter().zip(&mut data.layers) {
                     let b = cell.borrow_dependent();
                     if let Some(e) = &b.engram {
+                        let _engram = timing::span("engram", stream)?;
                         e.forward(
                             self.highway,
                             &data.history,
@@ -46,10 +50,13 @@ impl Runtime<'_> {
                             stream,
                         )?;
                     }
+                    let hc = timing::span("ihc_norms", stream)?;
                     b.hc_attn
                         .collapse(gpu, self.highway, self.collapsed, self.post, 1, stream)?;
                     self.norm(s, self.collapsed, b.input_norm, self.normed, stream)?;
+                    drop(hc);
                     let p = data.history.len() as i64;
+                    let attention = timing::span("attention", stream)?;
                     state.attn.forward(
                         self.normed,
                         self.output,
@@ -57,6 +64,8 @@ impl Runtime<'_> {
                         s.comm.as_deref(),
                         stream,
                     )?;
+                    drop(attention);
+                    let hc = timing::span("ihc_norms", stream)?;
                     b.hc_attn.scatter(
                         gpu,
                         [self.output, self.highway, self.post, self.highway],
@@ -66,6 +75,7 @@ impl Runtime<'_> {
                     b.hc_mlp
                         .collapse(gpu, self.highway, self.collapsed, self.post, 1, stream)?;
                     self.norm(s, self.collapsed, b.mlp_norm, self.normed, stream)?;
+                    drop(hc);
                     b.ffn.forward(
                         self.normed,
                         self.output,
@@ -74,6 +84,7 @@ impl Runtime<'_> {
                         s.comm.as_deref(),
                         stream,
                     )?;
+                    let _hc = timing::span("ihc_norms", stream)?;
                     b.hc_mlp.scatter(
                         gpu,
                         [self.output, self.highway, self.post, self.highway],
@@ -81,6 +92,7 @@ impl Runtime<'_> {
                         stream,
                     )?;
                 }
+                let hc = timing::span("ihc_norms", stream)?;
                 self.head.collapse(
                     gpu,
                     self.highway,
@@ -90,6 +102,8 @@ impl Runtime<'_> {
                     stream,
                 )?;
                 self.norm(s, self.collapsed, self.final_norm, self.normed, stream)?;
+                drop(hc);
+                let head = timing::span("lm_head", stream)?;
                 KernelLaunch::new(gpu, self.kernels[2])
                     .grid([(c.vocab_size as u32).div_ceil(8), 1, 1])
                     .block([256, 1, 1])
@@ -100,7 +114,10 @@ impl Runtime<'_> {
                     .arg_u32(h as u32)
                     .arg_u32(u32::from(self.lm_head_f32))
                     .launch(stream)?;
+                drop(head);
+                drop(row_span);
                 gpu.synchronize(stream)?;
+                timer.finish()?;
                 Ok(self.logits)
             })();
             if result.is_ok() {
