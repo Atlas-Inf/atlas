@@ -121,6 +121,8 @@ impl Hy4Model {
         page_size: usize,
         max_batch: usize,
     ) -> Result<Self> {
+        let timing = crate::layers::hy4::timing::enabled();
+        tracing::info!("HY4 CUDA-event timing enabled={timing}");
         ensure!(
             max_seq > 0
                 && max_seq <= config.max_position_embeddings

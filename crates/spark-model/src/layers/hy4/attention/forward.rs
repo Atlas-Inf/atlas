@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::cache::AttentionCache;
+use crate::layers::hy4::timing;
 use anyhow::{Context, Result, ensure};
 use spark_comm::CommBackend;
 use spark_runtime::{gpu::DevicePtr, kernel_args::KernelLaunch};
@@ -107,6 +108,7 @@ impl AttentionCache<'_, '_> {
             .launch(stream)?;
         a.rotary(s.kv, row, 1, [576, 576, 512, 512], position, false, stream)?;
         if a.index.is_some() {
+            let _index = timing::span("dsa_index", stream)?;
             self.run_index(x, position, stream)?;
         }
         let s = &self.scratch;
@@ -147,6 +149,7 @@ impl AttentionCache<'_, '_> {
             stream,
         )?;
         if let Some(comm) = comm {
+            let _reduce = timing::span("all_reduce", stream)?;
             comm.all_reduce_async(s.partial.0, a.hidden * 2, stream)?;
         }
         a.norm(s.partial, a.norm, out, a.hidden, stream)

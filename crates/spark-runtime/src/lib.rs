@@ -47,6 +47,7 @@ pub mod progress;
 pub mod radix_tree;
 pub mod run_metrics;
 pub mod sampler;
+pub mod timing;
 pub mod weights;
 
 /// Last paged-KV block boundary strictly below `total_tokens`.
