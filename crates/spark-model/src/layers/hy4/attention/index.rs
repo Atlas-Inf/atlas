@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::cache::AttentionCache;
+use crate::layers::hy4::timing;
 use anyhow::{Context, Result};
 use spark_runtime::{gpu::DevicePtr, kernel_args::KernelLaunch};
 
@@ -18,8 +19,11 @@ impl AttentionCache<'_, '_> {
         if self.len.is_multiple_of(4) {
             self.first_group_position = Some(position);
         }
+        let phase = timing::span("dsa_key_projection", stream)?;
         a.linear(x, ix.key, s.key, 128, a.hidden, stream)?;
+        drop(phase);
         a.norm(s.key, ix.key_norm, s.key, 128, stream)?;
+        let phase = timing::span("dsa_tail_write", stream)?;
         KernelLaunch::new(gpu, a.kernels.tail)
             .grid([1, 1, 1])
             .block([128, 1, 1])
@@ -27,7 +31,9 @@ impl AttentionCache<'_, '_> {
             .arg_ptr(self.tail)
             .arg_u32((self.len % 4) as u32)
             .launch(stream)?;
+        drop(phase);
         if self.len % 4 == 3 {
+            let phase = timing::span("dsa_pool", stream)?;
             KernelLaunch::new(gpu, a.kernels.pool)
                 .grid([1, 1, 1])
                 .block([128, 1, 1])
@@ -39,6 +45,7 @@ impl AttentionCache<'_, '_> {
                 .arg_ptr(s.pooled)
                 .arg_f32(a.eps)
                 .launch(stream)?;
+            drop(phase);
             a.rotary(
                 s.pooled,
                 s.pooled,
@@ -52,6 +59,7 @@ impl AttentionCache<'_, '_> {
             let group = self.len / 4;
             let page = group / 64;
             let row = group % 64;
+            let phase = timing::span("dsa_pool_fwht", stream)?;
             KernelLaunch::new(gpu, a.kernels.fwht)
                 .grid([1, 1, 1])
                 .block([128, 1, 1])
@@ -59,8 +67,11 @@ impl AttentionCache<'_, '_> {
                 .arg_ptr(self.pool.offset(page * 8448 + row * 128))
                 .arg_ptr(self.pool.offset(page * 8448 + 8192 + row * 4))
                 .launch(stream)?;
+            drop(phase);
         }
+        let phase = timing::span("dsa_query_projection", stream)?;
         a.linear(s.qc, ix.query, s.query, ix.heads * 128, a.qrank, stream)?;
+        drop(phase);
         a.rotary(
             s.query,
             s.query,
@@ -70,6 +81,7 @@ impl AttentionCache<'_, '_> {
             true,
             stream,
         )?;
+        let phase = timing::span("dsa_query_fwht", stream)?;
         KernelLaunch::new(gpu, a.kernels.fwht)
             .grid([ix.heads as u32, 1, 1])
             .block([128, 1, 1])
@@ -77,9 +89,13 @@ impl AttentionCache<'_, '_> {
             .arg_ptr(s.quant)
             .arg_ptr(s.scales)
             .launch(stream)?;
+        drop(phase);
+        let phase = timing::span("dsa_head_projection", stream)?;
         a.linear(x, ix.head, s.hw, ix.heads, a.hidden, stream)?;
+        drop(phase);
         let groups = self.len / 4;
         if groups > 0 {
+            let _phase = timing::span("dsa_score", stream)?;
             KernelLaunch::new(gpu, a.kernels.score)
                 .grid([groups.div_ceil(128) as u32, 1, 1])
                 .block([128, 1, 1])
@@ -93,6 +109,7 @@ impl AttentionCache<'_, '_> {
                 .arg_u32(ix.heads as u32)
                 .launch(stream)?;
         }
+        let _phase = timing::span("dsa_select", stream)?;
         KernelLaunch::new(gpu, a.kernels.select)
             .grid([1, 1, 1])
             .block([1, 1, 1])

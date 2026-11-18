@@ -69,6 +69,7 @@ impl Hy4Attention<'_> {
         n: usize,
         stream: u64,
     ) -> Result<()> {
+        let _phase = crate::layers::hy4::timing::span("attn_norm", stream)?;
         KernelLaunch::new(self.memory.gpu, self.kernels.norm)
             .grid([1, 1, 1])
             .block([256, 1, 1])
@@ -91,6 +92,7 @@ impl Hy4Attention<'_> {
         split: bool,
         stream: u64,
     ) -> Result<()> {
+        let _phase = crate::layers::hy4::timing::span("attn_rope", stream)?;
         let [input_stride, output_stride, input_offset, output_offset] = layout;
         KernelLaunch::new(self.memory.gpu, self.kernels.rotary)
             .grid([heads as u32, 1, 1])

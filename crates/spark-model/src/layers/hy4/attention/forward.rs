@@ -84,12 +84,20 @@ impl AttentionCache<'_, '_> {
         let a = self.layer;
         let s = &self.scratch;
         let gpu = a.memory.gpu;
+        let phase = timing::span("attn_q_a", stream)?;
         a.linear(x, a.qa, s.qc, a.qrank, a.hidden, stream)?;
+        drop(phase);
         a.norm(s.qc, a.qan, s.qc, a.qrank, stream)?;
+        let phase = timing::span("attn_q_b", stream)?;
         a.linear(s.qc, a.qb, s.q, a.heads * 256, a.qrank, stream)?;
+        drop(phase);
+        let phase = timing::span("attn_kv_a", stream)?;
         a.linear(x, a.kva, s.kv, 576, a.hidden, stream)?;
+        drop(phase);
         a.norm(s.kv, a.kvn, s.kv_norm, 512, stream)?;
+        let phase = timing::span("attn_q_absorb", stream)?;
         a.gemv(s.q, a.wk, s.absorbed, [512, 192, 256, 576], stream)?;
+        drop(phase);
         a.rotary(
             s.q,
             s.absorbed,
@@ -100,12 +108,14 @@ impl AttentionCache<'_, '_> {
             stream,
         )?;
         let row = self.latent.offset(self.layout.slot(self.len)? * 576 * 2);
+        let phase = timing::span("attn_cache_write", stream)?;
         KernelLaunch::new(gpu, a.kernels.cache)
             .grid([1, 1, 1])
             .block([256, 1, 1])
             .arg_ptr(s.kv_norm)
             .arg_ptr(row)
             .launch(stream)?;
+        drop(phase);
         a.rotary(s.kv, row, 1, [576, 576, 512, 512], position, false, stream)?;
         if a.index.is_some() {
             let _index = timing::span("dsa_index", stream)?;
@@ -116,6 +126,7 @@ impl AttentionCache<'_, '_> {
             Some(window) => (DevicePtr::NULL, (self.len + 1).min(window)),
             None => (s.indices, 2048),
         };
+        let phase = timing::span("attn_latent", stream)?;
         KernelLaunch::new(gpu, a.kernels.attention)
             .grid([a.heads as u32, 1, 1])
             .block([256, 1, 1])
@@ -131,8 +142,14 @@ impl AttentionCache<'_, '_> {
             .arg_u32(a.window.unwrap_or(0) as u32)
             .arg_u32(count as u32)
             .launch(stream)?;
+        drop(phase);
+        let phase = timing::span("attn_value_extract", stream)?;
         a.gemv(s.latent_out, a.wv, s.values, [256, 512, 512, 256], stream)?;
+        drop(phase);
+        let phase = timing::span("attn_gate_projection", stream)?;
         a.linear(x, a.gate, s.gates, a.heads * 256, a.hidden, stream)?;
+        drop(phase);
+        let phase = timing::span("attn_gate", stream)?;
         KernelLaunch::new(gpu, a.kernels.gate)
             .grid([(a.heads * 256).div_ceil(256) as u32, 1, 1])
             .block([256, 1, 1])
@@ -140,6 +157,8 @@ impl AttentionCache<'_, '_> {
             .arg_ptr(s.gates)
             .arg_u32((a.heads * 256) as u32)
             .launch(stream)?;
+        drop(phase);
+        let phase = timing::span("attn_output_projection", stream)?;
         a.linear(
             s.values,
             a.output,
@@ -148,6 +167,7 @@ impl AttentionCache<'_, '_> {
             a.heads * 256,
             stream,
         )?;
+        drop(phase);
         if let Some(comm) = comm {
             let _reduce = timing::span("all_reduce", stream)?;
             comm.all_reduce_async(s.partial.0, a.hidden * 2, stream)?;
