@@ -25,6 +25,7 @@ mod model_trait;
 #[cfg(test)]
 mod tests;
 mod unsupported;
+mod vocab;
 mod wire;
 
 struct Shared {
@@ -91,8 +92,7 @@ struct Runtime<'a> {
     command: DevicePtr,
     embed: DevicePtr,
     final_norm: DevicePtr,
-    lm_head: DevicePtr,
-    lm_head_f32: bool,
+    vocab: vocab::VocabHead,
     kernels: [KernelHandle; 4],
     max_batch: usize,
 }
@@ -225,14 +225,8 @@ impl Hy4Model {
                     }
                 }
             }
-            let head = store.get("lm_head.weight")?;
-            use spark_runtime::weights::WeightDtype;
-            ensure!(
-                head.shape == [c.vocab_size, c.hidden_size]
-                    && matches!(head.dtype, WeightDtype::BF16 | WeightDtype::FP32),
-                "Hy4 LM head requires unquantized BF16/FP32 checkpoint weight"
-            );
             let mut mem = Owned::new(gpu);
+            let vocab = vocab::VocabHead::load(c, store, gpu, &mut mem)?;
             let h = c.hidden_size;
             let highway = mem.alloc(4 * h * 2)?;
             let collapsed = mem.alloc(h * 2)?;
@@ -253,8 +247,7 @@ impl Hy4Model {
                     false,
                 )?,
                 final_norm: weight(store, "model.norm.weight", &[h], false)?,
-                lm_head: head.ptr,
-                lm_head_f32: head.dtype == WeightDtype::FP32,
+                vocab,
                 kernels: [
                     gpu.kernel("hy4_model", "hy4_model_embed")?,
                     gpu.kernel("hy4_model", "hy4_model_norm")?,

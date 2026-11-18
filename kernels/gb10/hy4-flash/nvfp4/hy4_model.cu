@@ -5,6 +5,13 @@
 #include <stdint.h>
 #include "hy4_gemv.cuh"
 
+extern "C" __global__ void hy4_head_bf16(const void* input,__nv_bfloat16* output,
+    unsigned count,unsigned f32) {
+    unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
+    if (i<count) output[i]=f32?__float2bfloat16_rn(((const float*)input)[i]):
+        ((const __nv_bfloat16*)input)[i];
+}
+
 extern "C" __global__ void hy4_model_embed(
     const __nv_bfloat16* table,__nv_bfloat16* out,unsigned token,unsigned h) {
     unsigned d=blockIdx.x*blockDim.x+threadIdx.x;
