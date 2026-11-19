@@ -34,6 +34,11 @@ metal-example = ["metal", "dep:tokenizers", "dep:memmap2", "dep:safetensors"]
 gpu-examples = ["dep:safetensors"]
 # The NCCL and RDMA CommBackend, for the `comm_pair_bench` example (pair or chain).
 nccl = ["cuda", "spark-comm/nccl"]
+# Decode /v1/score JPEGs with libjpeg-turbo, PIL's decoder, so a scoring
+# model sees the pixels its Python reference server does. Off by default (the
+# build needs cmake and nasm); without it JPEGs decode through `image`, whose
+# pixels need not match libjpeg-turbo's.
+pil-jpeg = ["dep:turbojpeg"]
 
 [dependencies]
 atlas-core = { workspace = true }
@@ -58,6 +63,9 @@ base64 = "0.22"
 # decodable in pure Rust with no system dependency, so the whole temporal
 # pipeline can be proven before committing to an H.264 decoder.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico"] }
+# libjpeg-turbo for /v1/score JPEGs, behind `pil-jpeg` (its build script
+# compiles the C library with cmake and nasm).
+turbojpeg = { version = "1.5.1", optional = true }
 parking_lot = { workspace = true }
 
 # Used by the `metal_qwen35_inference` example only — gated by

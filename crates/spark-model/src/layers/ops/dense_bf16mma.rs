@@ -74,6 +74,8 @@ pub struct DenseBf16mma {
     /// W8A8 on the transposed `[K, N]` prefill copy.
     w8a8_t: KernelHandle,
     quant_nvfp4: KernelHandle,
+    /// `dl_quant_nvfp4` into the K-tiled layout the `w4a4ws` twins read.
+    quant_nvfp4_kt: KernelHandle,
     quant_fp8: KernelHandle,
     lowp: LowpMix,
     /// GDN in_proj_ba + gates (`gdn_ba_gates_prefill.cu`).
@@ -101,6 +103,7 @@ impl Default for DenseBf16mma {
             w8a8: KernelHandle(0),
             w8a8_t: KernelHandle(0),
             quant_nvfp4: KernelHandle(0),
+            quant_nvfp4_kt: KernelHandle(0),
             quant_fp8: KernelHandle(0),
             lowp: LowpMix(0),
             ba: KernelHandle(0),
@@ -189,6 +192,7 @@ impl DenseBf16mma {
             w8a8: k("dense_w8a8_fp8"),
             w8a8_t: k("dense_w8a8_fp8t"),
             quant_nvfp4: k("dl_quant_nvfp4"),
+            quant_nvfp4_kt: k("dl_quant_nvfp4_kt"),
             quant_fp8: k("dl_quant_fp8"),
             lowp,
             gate_up: crate::layers::try_kernel(gpu, MODULE, "dense_bf16mma_gate_up_silu"),
@@ -228,16 +232,17 @@ impl DenseBf16mma {
                 self.slots,
             ),
             Some((nvfp4, kernel, smem)) => {
-                let token_scales = self.quantize(gpu, nvfp4, input, lowp, [m, k], stream)?;
                 // A bit-identical persistent twin where it is faster: one
-                // CTA per SM over 144-row chunks.
-                let (kernel, smem) = match self.lowp_twin(kernel, m) {
+                // CTA per SM over 144-row chunks. The W4A4 twins read their
+                // tokens K-tiled.
+                let (kernel, smem, tiled) = match self.lowp_twin(kernel, m) {
                     Some(twin) => {
                         (threads, persistent) = (twin.threads, Some(twin.fixed));
-                        (twin.kernel, twin.smem)
+                        (twin.kernel, twin.smem, twin.tiled)
                     }
-                    None => (kernel, smem),
+                    None => (kernel, smem, false),
                 };
+                let token_scales = self.quantize(gpu, nvfp4, tiled, input, lowp, [m, k], stream)?;
                 let launch = KernelLaunch::new(gpu, kernel)
                     .shared_mem(smem)
                     .arg_ptr(lowp.codes);

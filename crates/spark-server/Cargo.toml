@@ -22,6 +22,8 @@ cuda = [
 # single-GPU builds use `--no-default-features --features cuda` to skip
 # linking libnccl.
 nccl = ["cuda", "spark-comm/nccl"]
+# /v1/score JPEGs through libjpeg-turbo (see spark-model's `pil-jpeg`).
+pil-jpeg = ["spark-model/pil-jpeg"]
 metal = [
     "atlas-core/metal",
     "spark-runtime/metal",

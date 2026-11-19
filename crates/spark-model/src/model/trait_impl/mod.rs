@@ -322,7 +322,7 @@ impl Model for TransformerModel {
         &self,
         reqs: &[crate::traits::ScoreInput<'_>],
         stream: u64,
-    ) -> Result<Vec<Vec<Vec<f32>>>> {
+    ) -> Result<Vec<Vec<crate::traits::ScoreBranchProbs>>> {
         self.score_requests_impl(reqs, stream)
     }
     fn score_capacity(&self) -> (usize, usize) {
@@ -331,11 +331,35 @@ impl Model for TransformerModel {
     fn score_pack(
         &self,
         tokens: &[u32],
+        images: &[crate::VisionItem],
         prefix_bidir: bool,
         limit: usize,
         stream: u64,
     ) -> Result<crate::traits::ScorePackInfo> {
-        self.score_pack_impl(tokens, prefix_bidir, limit, stream)
+        let spec = crate::traits::ScorePackSpec {
+            tokens,
+            images,
+            prefix_bidir,
+        };
+        let mut out = self.score_packs_impl(&[spec], limit, stream);
+        out.pop().expect("one pack")
+    }
+    fn score_packs(
+        &self,
+        specs: &[crate::traits::ScorePackSpec<'_>],
+        limit: usize,
+        stream: u64,
+    ) -> Vec<Result<crate::traits::ScorePackInfo>> {
+        self.score_packs_impl(specs, limit, stream)
+    }
+    fn score_pack_by_id(&self, id: u64, limit: usize, stream: u64) -> Result<bool> {
+        self.score_pack_by_id_impl(id, limit, stream)
+    }
+    fn score_packs_prefetch(&self, packs: &[crate::traits::ScorePackKey<'_>]) -> (Vec<bool>, bool) {
+        self.score_packs_prefetch_impl(packs)
+    }
+    fn score_packs_wait(&self, timeout: std::time::Duration) {
+        self.store_wait(timeout)
     }
     fn supports_prefill_multi(&self) -> bool {
         self.prefill_multi_supported()

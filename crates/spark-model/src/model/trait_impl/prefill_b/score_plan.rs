@@ -27,8 +27,13 @@
 /// One request: a shared prefix, its branches, whether the prefix is a
 /// bidirectional state block (`prefix_bidir`), and the knowledge pack it
 /// continues, if any (index into the pass's packs, and the pack's tokens).
-pub(in crate::model) type ScoreRequest<'a> =
-    (&'a [u32], &'a [Vec<u32>], bool, Option<(usize, &'a [u32])>);
+pub(in crate::model) type ScoreRequest<'a> = (
+    &'a [u32],
+    &'a [Vec<u32>],
+    bool,
+    Option<(usize, &'a [u32])>,
+    Option<&'a [Vec<usize>]>,
+);
 
 pub(super) struct ScorePlan {
     /// Full token list per stream.
@@ -54,6 +59,9 @@ pub(super) struct ScorePlan {
     pub kv_len: Vec<usize>,
     /// Per head stream: the branch stream whose tail block it reads, if any.
     pub tail_from: Vec<Option<usize>>,
+    /// Per branch stream: processed-row offsets for requested readouts.
+    /// `None` means the legacy last row.
+    pub readout_rows: Vec<Option<Vec<usize>>>,
 }
 
 impl ScorePlan {
@@ -69,6 +77,7 @@ impl ScorePlan {
             state_end: Vec::new(),
             kv_len: Vec::new(),
             tail_from: Vec::new(),
+            readout_rows: Vec::new(),
         };
         // Per request: (pack tokens, its index, state end S, head end F).
         fn geometry<'a>(
@@ -96,7 +105,7 @@ impl ScorePlan {
             head_idx.push((f > p0).then_some(p.tokens.len()));
             if f > p0 {
                 let t = joined(base, &prefix[..f - p0], &[]);
-                p.push(t, p0, None, p0 / bs, k, s_end(end, bidir));
+                p.push(t, p0, None, p0 / bs, k, s_end(end, bidir), None);
             }
         }
         p.heads = p.tokens.len();
@@ -115,7 +124,14 @@ impl ScorePlan {
                 Some(_) => (f, f / bs),
                 None => (base.len(), base.len() / bs),
             };
-            for b in branches.iter() {
+            for (branch_idx, b) in branches.iter().enumerate() {
+                let readout_rows = r.4.map(|offsets| {
+                    let branch_end = base.len() + prefix.len() + b.len();
+                    offsets[branch_idx]
+                        .iter()
+                        .map(|&offset| branch_end - 1 - offset - start)
+                        .collect()
+                });
                 p.push(
                     joined(base, prefix, b),
                     start,
@@ -123,6 +139,7 @@ impl ScorePlan {
                     shared,
                     k,
                     s_end(end, bidir),
+                    readout_rows,
                 );
             }
             p.branch_counts.push(branches.len());
@@ -130,21 +147,26 @@ impl ScorePlan {
         p
     }
 
-    /// A pack build (`score_pack.rs`): one stream over all of `tokens` from
-    /// position 0, no branches; under `bidir` every row reads every key.
-    pub(super) fn pack(tokens: &[u32], bidir: bool) -> Self {
-        let p = tokens.len();
+    /// Pack builds (`score_pack_build.rs`): per pack one stream over all of
+    /// its tokens from position 0, no branches; under `bidir` every row reads
+    /// every key of its pack.
+    pub(super) fn packs(packs: &[(&[u32], bool)]) -> Self {
+        let n = packs.len();
         Self {
-            tokens: vec![tokens.to_vec()],
-            starts: vec![0],
-            heads: 1,
-            head_of: vec![None],
-            shared_blocks: vec![0],
-            pack_of: vec![None],
+            tokens: packs.iter().map(|(t, _)| t.to_vec()).collect(),
+            starts: vec![0; n],
+            heads: n,
+            head_of: vec![None; n],
+            shared_blocks: vec![0; n],
+            pack_of: vec![None; n],
             branch_counts: Vec::new(),
-            state_end: vec![if bidir { p as i32 } else { -1 }],
-            kv_len: vec![p],
-            tail_from: vec![None],
+            state_end: packs
+                .iter()
+                .map(|&(t, bidir)| if bidir { t.len() as i32 } else { -1 })
+                .collect(),
+            kv_len: packs.iter().map(|(t, _)| t.len()).collect(),
+            tail_from: vec![None; n],
+            readout_rows: vec![None; n],
         }
     }
 
@@ -156,6 +178,7 @@ impl ScorePlan {
         shared: usize,
         pack: Option<usize>,
         s: i32,
+        readout_rows: Option<Vec<usize>>,
     ) {
         self.kv_len.push(tokens.len());
         self.tokens.push(tokens);
@@ -164,6 +187,7 @@ impl ScorePlan {
         self.shared_blocks.push(shared);
         self.pack_of.push(pack);
         self.state_end.push(s);
+        self.readout_rows.push(readout_rows);
     }
 
     /// Whether stream `i` reads its pack directly (its K/V blocks, entry SSM
@@ -205,7 +229,7 @@ mod tests {
     fn one_request_shares_whole_blocks_and_replays_the_tail() {
         let prefix: Vec<u32> = (0..37).collect();
         let branches = [vec![100, 101], vec![200]];
-        let plan = ScorePlan::new(&[(&prefix, &branches, false, None)], 16);
+        let plan = ScorePlan::new(&[(&prefix, &branches, false, None, None)], 16);
         assert_eq!(plan.heads, 1);
         assert_eq!(plan.starts, vec![0, 32, 32]);
         assert_eq!(plan.head_of, vec![None, Some(0), Some(0)]);
@@ -217,10 +241,25 @@ mod tests {
     }
 
     #[test]
+    fn readouts_map_back_from_each_branch_end_into_processed_rows() {
+        let prefix: Vec<u32> = (0..37).collect();
+        let branches = [vec![100, 101, 102]];
+        let readouts = [vec![0, 2]];
+        let plan = ScorePlan::new(
+            &[(&prefix, &branches, false, None, Some(&readouts[..]))],
+            16,
+        );
+        assert_eq!(plan.readout_rows, vec![None, Some(vec![7, 5])]);
+    }
+
+    #[test]
     fn heads_come_first_and_branches_keep_request_order() {
         let (p1, p2): (Vec<u32>, Vec<u32>) = ((0..20).collect(), vec![7, 8, 9]);
         let (b1, b2) = ([vec![1], vec![2]], [vec![3]]);
-        let plan = ScorePlan::new(&[(&p1, &b1, false, None), (&p2, &b2, false, None)], 16);
+        let plan = ScorePlan::new(
+            &[(&p1, &b1, false, None, None), (&p2, &b2, false, None, None)],
+            16,
+        );
         // Request 2's prefix is under a block: no head, its branch starts at 0.
         assert_eq!(plan.heads, 1);
         assert_eq!(plan.head_of, vec![None, Some(0), Some(0), None]);
@@ -235,7 +274,10 @@ mod tests {
         let (b1, b2) = ([vec![100, 101], vec![200]], [vec![300]]);
         let short = vec![5, 6];
         let plan = ScorePlan::new(
-            &[(&prefix, &b1, true, None), (&short, &b2, false, None)],
+            &[
+                (&prefix, &b1, true, None, None),
+                (&short, &b2, false, None, None),
+            ],
             16,
         );
         assert_eq!(plan.heads, 1);
@@ -252,7 +294,10 @@ mod tests {
         let pack: Vec<u32> = (1000..1040).collect();
         let prefix: Vec<u32> = (0..30).collect();
         let branches = [vec![100, 101], vec![200]];
-        let plan = ScorePlan::new(&[(&prefix, &branches, true, Some((0, &pack[..])))], 16);
+        let plan = ScorePlan::new(
+            &[(&prefix, &branches, true, Some((0, &pack[..])), None)],
+            16,
+        );
         assert_eq!(plan.heads, 1);
         assert_eq!(plan.starts, vec![40, 64, 64]);
         assert_eq!(plan.shared_blocks, vec![2, 4, 4]);
@@ -281,8 +326,8 @@ mod tests {
         let branches = [vec![7], vec![8]];
         let plain: Vec<u32> = (0..20).collect();
         let reqs = [
-            (&prefix[..], &branches[..], true, Some((0, &pack[..]))),
-            (&plain[..], &branches[..], false, None),
+            (&prefix[..], &branches[..], true, Some((0, &pack[..])), None),
+            (&plain[..], &branches[..], false, None, None),
         ];
         let plan = ScorePlan::new(&reqs, 16);
         // Only the plain request has a head.
@@ -297,9 +342,9 @@ mod tests {
     }
 
     #[test]
-    fn a_pack_build_is_one_whole_stream() {
+    fn a_pack_build_is_one_whole_stream_a_pack() {
         let tokens: Vec<u32> = (0..40).collect();
-        let plan = ScorePlan::pack(&tokens, true);
+        let plan = ScorePlan::packs(&[(&tokens, true)]);
         assert_eq!((plan.heads, plan.streams(), plan.total_rows()), (1, 1, 40));
         assert_eq!(
             (plan.state_end.clone(), plan.kv_len.clone()),
@@ -307,7 +352,12 @@ mod tests {
         );
         assert_eq!(plan.own_blocks(16), 3);
         assert!(plan.branch_counts.is_empty());
-        assert_eq!(ScorePlan::pack(&tokens, false).state_end, vec![-1]);
+        assert_eq!(ScorePlan::packs(&[(&tokens, false)]).state_end, vec![-1]);
+        let short: Vec<u32> = (0..20).collect();
+        let two = ScorePlan::packs(&[(&tokens, true), (&short, false)]);
+        assert_eq!((two.heads, two.streams(), two.total_rows()), (2, 2, 60));
+        assert_eq!(two.own_blocks(16), 5);
+        assert_eq!((two.state_end, two.starts), (vec![40, -1], vec![0, 0]));
     }
 
     #[test]
@@ -315,7 +365,10 @@ mod tests {
         let pack: Vec<u32> = (1000..1032).collect();
         let prefix: Vec<u32> = (0..20).collect();
         let branches = [vec![7]];
-        let plan = ScorePlan::new(&[(&prefix, &branches, true, Some((0, &pack[..])))], 16);
+        let plan = ScorePlan::new(
+            &[(&prefix, &branches, true, Some((0, &pack[..])), None)],
+            16,
+        );
         assert_eq!(plan.starts, vec![32, 48]);
         assert_eq!(plan.shared_blocks, vec![2, 3]);
         assert_eq!(plan.own_blocks(16), 1 + 1);

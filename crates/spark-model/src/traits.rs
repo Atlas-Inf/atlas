@@ -489,6 +489,9 @@ mod model_defaults;
 mod seq_vision;
 pub use eos_ban::EosBan;
 pub use logprobs::*;
-pub use model::{BeamReq, Model, ScoreInput, ScorePackInfo, UnknownScorePack, padded_batch_n};
+pub use model::{
+    BeamReq, Model, ScoreBranchProbs, ScoreInput, ScorePackInfo, ScorePackKey, ScorePackSpec,
+    UnknownScorePack, padded_batch_n,
+};
 pub use model_defaults::{EP_CMD_PC_PLANT, EP_CMD_PREFILL_SLICE};
 pub use seq_vision::SeqVision;

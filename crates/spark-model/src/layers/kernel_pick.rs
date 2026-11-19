@@ -213,6 +213,17 @@ pub(crate) fn try_kernel_gated(
     }
 }
 
+/// `try_kernel` for a kernel only some targets ship (a fast twin added to one
+/// family's kernel file): looked up only where the loaded kernels define it,
+/// so a target without it falls back without an unresolved lookup.
+#[track_caller]
+pub fn try_shipped_kernel(gpu: &dyn GpuBackend, module: &str, func: &str) -> KernelHandle {
+    match gpu.ships_kernel(module, func) {
+        true => try_kernel(gpu, module, func),
+        false => KernelHandle(0),
+    }
+}
+
 #[track_caller]
 pub fn try_kernel(gpu: &dyn GpuBackend, module: &str, func: &str) -> KernelHandle {
     match gpu.kernel(module, func) {

@@ -126,12 +126,15 @@ pub struct VisionEncoder {
     k_gemm_pipelined: KernelHandle, // dense_gemm_bf16_pipelined (tensor-core, ~40×; no bias)
     k_add_bias: KernelHandle, // vision_add_bias: C += bias[n] (fuses bias for the TC path)
     k_norm: KernelHandle, // vision_layer_norm (biased, in-place)
+    k_norm_to: KernelHandle, // vision_layer_norm_to (same bits, src → dst, 256 threads)
     k_add: KernelHandle,  // vision_add_inplace
     k_gelu: KernelHandle, // vision_gelu (in-place)
     k_attn: KernelHandle, // vision_attention_rope (legacy SDPA — ATLAS_VISION_ATTN_LEGACY=1)
     k_rope_deint: KernelHandle, // vit_rope_deinterleave (rope + head-contig Qr/Kr + V transpose)
     k_softmax: KernelHandle, // vit_softmax_rows (parallel row softmax)
     k_scatter_head: KernelHandle, // vit_scatter_head (contig → interleaved O slot)
+    k_flash72: KernelHandle, // vit_flash_attention_d72 (fused all-head attention, head_dim 72)
+    k_gemm_epi: KernelHandle, // dense_gemm_bf16_pipelined_epi (bias [+GELU] [+residual] epilogue)
     k_gemm_f32: KernelHandle, // dense_gemm_bf16_f32out (raw QKᵀ scores, f32 out)
     k_merge: KernelHandle, // vision_spatial_merge (2×2)
     k_f32_bf16: KernelHandle, // vision_f32_to_bf16
@@ -184,6 +187,12 @@ mod glm_oracle_tests;
 #[cfg(all(test, feature = "cuda"))]
 #[path = "vision_encoder/glm_attention_gpu_tests.rs"]
 mod glm_attention_gpu_tests;
+#[cfg(all(test, feature = "cuda"))]
+#[path = "vision_encoder/vit_flash72_gpu_tests.rs"]
+mod vit_flash72_gpu_tests;
+#[cfg(all(test, feature = "cuda"))]
+#[path = "vision_encoder/vit_layer_norm_gpu_tests.rs"]
+mod vit_layer_norm_gpu_tests;
 
 #[cfg(test)]
 mod receive_only_tests {

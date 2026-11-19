@@ -137,6 +137,82 @@ void vision_layer_norm(
     }
 }
 
+// ── LayerNorm src → dst (may alias), bit-identical to vision_layer_norm ──
+// vision_layer_norm runs one 1024-thread CTA per row: three passes over global
+// memory behind 1024-thread barriers, one CTA an SM. This replays that launch's
+// 32 warps on 8 (real warp r takes the warps r, r+8, r+16, r+24): every thread
+// sums the same elements in the same order and the same shuffle trees combine
+// them, so the mean, the inverse deviation and every output are the original's
+// bits. Valid for D >= 1024 with D % 32 == 0 (the original's 1024 threads, all
+// 32 warps full); the caller keeps vision_layer_norm otherwise.
+// Grid: (N, 1, 1)  Block: (256, 1, 1)
+extern "C" __global__ void __launch_bounds__(256) vision_layer_norm_to(
+    const __nv_bfloat16* src,            // [N, D]
+    __nv_bfloat16* dst,                  // [N, D]; may be src
+    const __nv_bfloat16* __restrict__ w, // [D]
+    const __nv_bfloat16* __restrict__ b, // [D]
+    unsigned int N, unsigned int D,
+    float eps
+) {
+    unsigned int row = blockIdx.x;
+    if (row >= N) return;
+    const __nv_bfloat16* s = src + (size_t)row * D;
+    __nv_bfloat16* d = dst + (size_t)row * D;
+    const unsigned int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    __shared__ float red[32];
+    __shared__ float stat;
+
+    // Mean: the original thread t = v*32 + lane sums s[t], s[t+1024], ...
+    for (unsigned int v = warp; v < 32; v += 8) {
+        float sum = 0.0f;
+        for (unsigned int i = v * 32 + lane; i < D; i += 1024) {
+            sum += bf16_to_f32(s[i]);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        if (lane == 0) red[v] = sum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float sum = red[lane];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        if (lane == 0) stat = sum / D;
+    }
+    __syncthreads();
+    const float mean_val = stat;
+    __syncthreads();  // red and stat are reused below
+
+    // Variance, the same way.
+    for (unsigned int v = warp; v < 32; v += 8) {
+        float var = 0.0f;
+        for (unsigned int i = v * 32 + lane; i < D; i += 1024) {
+            float diff = bf16_to_f32(s[i]) - mean_val;
+            var += diff * diff;
+        }
+        for (int offset = 16; offset > 0; offset >>= 1)
+            var += __shfl_down_sync(0xffffffff, var, offset);
+        if (lane == 0) red[v] = var;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float var = red[lane];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            var += __shfl_down_sync(0xffffffff, var, offset);
+        if (lane == 0) stat = rsqrtf(var / D + eps);
+    }
+    __syncthreads();
+    const float inv_std = stat;
+
+    // Normalize and scale: each element is read before the same thread
+    // writes it, so dst may alias src.
+    for (unsigned int i = threadIdx.x; i < D; i += blockDim.x) {
+        float val = (bf16_to_f32(s[i]) - mean_val) * inv_std;
+        val = val * bf16_to_f32(w[i]) + bf16_to_f32(b[i]);
+        d[i] = f32_to_bf16(val);
+    }
+}
+
 // ── Add residual in-place: dst[i] += src[i] ──
 // Grid: (ceil(n/256), 1, 1)  Block: (256, 1, 1)
 extern "C" __global__
@@ -325,14 +401,13 @@ void vit_rope_deinterleave(
     float krot  = (d < half_D) ? -kpart : kpart;
     float k_r   = kv * cos_v + krot * sin_v;
 
-    // V un-rotated
-    float v_v   = bf16_to_f32(V_row[d]);
-
     size_t hc = (size_t)h * seq * D + (size_t)tok * D + d;   // Qr/Kr [H,seq,D]
     Qr[hc] = f32_to_bf16(q_r);
     Kr[hc] = f32_to_bf16(k_r);
-    // Vt [H,D,seq]: index h*D*seq + d*seq + tok  (d,tok swapped = transpose)
-    Vt[(size_t)h * D * seq + (size_t)d * seq + (size_t)tok] = f32_to_bf16(v_v);
+    // Vt [H,D,seq]: index h*D*seq + d*seq + tok  (d,tok swapped = transpose).
+    // Null for vit_flash_attention_d72, which reads V from QKV: these strided
+    // 2-byte stores were most of this kernel's time.
+    if (Vt) Vt[(size_t)h * D * seq + (size_t)d * seq + (size_t)tok] = V_row[d];
 }
 
 // (B) Row softmax over raw scores S[seq,seq] (f32) → probs P[seq,seq] (bf16).
@@ -459,4 +534,172 @@ void vision_bf16_copy(
 ) {
     unsigned int i = blockIdx.x * 256 + threadIdx.x;
     if (i < n) dst[i] = src[i];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (E) Fused tensor-core attention for one image (head_dim 72): replaces the
+//     per-head GEMM1 → softmax → GEMM2 → scatter loop with one launch over all
+//     heads. Reads the rotated Qr/Kr [H,seq,72] of vit_rope_deinterleave and V
+//     straight from the interleaved QKV; writes O[seq,H*72] in its head slots.
+//     Same semantics: non-causal, scale rsqrt(72), max-subtracted softmax, f32
+//     accumulation; P is rounded to BF16 for P·V as in the GEMM path.
+//     grid = ( ceil(seq/64), H, 1 ), block = (128,1,1); seq ≥ 1.
+// ─────────────────────────────────────────────────────────────────────────────
+#define VIT_FA_D 72
+#define VIT_FA_DP 80                   // head dim padded to 5 k16 steps
+#define VIT_FA_BM 64
+#define VIT_FA_BN 64
+#define VIT_FA_KSTRIDE (VIT_FA_DP + 8)
+#define VIT_FA_VSTRIDE (VIT_FA_BN + 8)
+
+__device__ __forceinline__ void vit_mma_bf16(float c[4], const unsigned int a[4],
+                                             unsigned int b0, unsigned int b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ unsigned int vit_pack_bf16(float lo, float hi) {
+    __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<unsigned int*>(&v);
+}
+
+extern "C" __global__ void __launch_bounds__(128) vit_flash_attention_d72(
+    const __nv_bfloat16* __restrict__ Qr,   // [H, seq, 72] rotated
+    const __nv_bfloat16* __restrict__ Kr,   // [H, seq, 72] rotated
+    const __nv_bfloat16* __restrict__ QKV,  // [seq, 3*H*72] (V read from here)
+    __nv_bfloat16* __restrict__ O,          // [seq, H*72]
+    unsigned int seq, unsigned int H) {
+    __shared__ __align__(16) __nv_bfloat16 s_k[VIT_FA_BN][VIT_FA_KSTRIDE];
+    __shared__ __align__(16) __nv_bfloat16 s_vt[VIT_FA_D][VIT_FA_VSTRIDE];
+    const unsigned int head = blockIdx.y;
+    const unsigned int hidden = H * VIT_FA_D;
+    const size_t qkv_stride = 3 * (size_t)hidden;
+    const __nv_bfloat16* q_base = Qr + (size_t)head * seq * VIT_FA_D;
+    const __nv_bfloat16* k_base = Kr + (size_t)head * seq * VIT_FA_D;
+    const __nv_bfloat16* v_base = QKV + 2 * (size_t)hidden + head * VIT_FA_D;
+    const unsigned int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const unsigned int group = lane >> 2, quad = lane & 3;
+    const unsigned int r0 = blockIdx.x * VIT_FA_BM + warp * 16 + group, r1 = r0 + 8;
+
+    // Q A-fragments for the five k16 steps; columns 72..79 are zero.
+    unsigned int qa[5][4];
+    #pragma unroll
+    for (int ks = 0; ks < 5; ++ks) {
+        unsigned int c0 = ks * 16 + quad * 2, c1 = c0 + 8;
+        bool v0 = c0 < VIT_FA_D, v1 = c1 < VIT_FA_D;
+        qa[ks][0] = (r0 < seq && v0) ? *(const unsigned int*)(q_base + (size_t)r0 * VIT_FA_D + c0) : 0u;
+        qa[ks][1] = (r1 < seq && v0) ? *(const unsigned int*)(q_base + (size_t)r1 * VIT_FA_D + c0) : 0u;
+        qa[ks][2] = (r0 < seq && v1) ? *(const unsigned int*)(q_base + (size_t)r0 * VIT_FA_D + c1) : 0u;
+        qa[ks][3] = (r1 < seq && v1) ? *(const unsigned int*)(q_base + (size_t)r1 * VIT_FA_D + c1) : 0u;
+    }
+    // The pad columns of s_k stay zero for the whole kernel.
+    for (unsigned int key = threadIdx.x; key < VIT_FA_BN; key += 128)
+        *(uint4*)&s_k[key][VIT_FA_D] = make_uint4(0, 0, 0, 0);
+
+    const float scale_log2 = rsqrtf((float)VIT_FA_D) * 1.4426950408889634f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+    float o[9][4];
+    #pragma unroll
+    for (int i = 0; i < 9; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+
+    for (unsigned int kv0 = 0; kv0 < seq; kv0 += VIT_FA_BN) {
+        __syncthreads();  // the previous tile is no longer being read
+        for (unsigned int c = threadIdx.x; c < VIT_FA_BN * (VIT_FA_D / 8); c += 128) {
+            unsigned int key = c / (VIT_FA_D / 8), d = (c % (VIT_FA_D / 8)) * 8;
+            uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
+            if (kv0 + key < seq) {
+                kv = *(const uint4*)(k_base + (size_t)(kv0 + key) * VIT_FA_D + d);
+                vv = *(const uint4*)(v_base + (size_t)(kv0 + key) * qkv_stride + d);
+            }
+            *(uint4*)&s_k[key][d] = kv;
+            const __nv_bfloat16* v8 = reinterpret_cast<const __nv_bfloat16*>(&vv);
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) s_vt[d + e][key] = v8[e];
+        }
+        __syncthreads();
+
+        float s[8][4];
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.0f;
+            const __nv_bfloat16* krow = s_k[nt * 8 + group];
+            #pragma unroll
+            for (int ks = 0; ks < 5; ++ks)
+                vit_mma_bf16(s[nt], qa[ks], *(const unsigned int*)(krow + ks * 16 + quad * 2),
+                             *(const unsigned int*)(krow + ks * 16 + 8 + quad * 2));
+        }
+
+        float t0 = m0, t1 = m1;
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            unsigned int key = kv0 + nt * 8 + quad * 2;
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                bool valid = key + j < seq;
+                s[nt][j] = valid ? s[nt][j] * scale_log2 : -INFINITY;
+                s[nt][2 + j] = valid ? s[nt][2 + j] * scale_log2 : -INFINITY;
+                t0 = fmaxf(t0, s[nt][j]);
+                t1 = fmaxf(t1, s[nt][2 + j]);
+            }
+        }
+        #pragma unroll
+        for (int offset = 1; offset < 4; offset <<= 1) {
+            t0 = fmaxf(t0, __shfl_xor_sync(0xffffffffu, t0, offset));
+            t1 = fmaxf(t1, __shfl_xor_sync(0xffffffffu, t1, offset));
+        }
+        // Every tile holds at least one valid key, so the new maxima are finite.
+        float alpha0 = exp2f(m0 - t0), alpha1 = exp2f(m1 - t1);
+        m0 = t0;
+        m1 = t1;
+        l0 *= alpha0;
+        l1 *= alpha1;
+        #pragma unroll
+        for (int dt = 0; dt < 9; ++dt) {
+            o[dt][0] *= alpha0; o[dt][1] *= alpha0;
+            o[dt][2] *= alpha1; o[dt][3] *= alpha1;
+        }
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            s[nt][0] = exp2f(s[nt][0] - m0); s[nt][1] = exp2f(s[nt][1] - m0);
+            s[nt][2] = exp2f(s[nt][2] - m1); s[nt][3] = exp2f(s[nt][3] - m1);
+            l0 += s[nt][0] + s[nt][1];
+            l1 += s[nt][2] + s[nt][3];
+        }
+        // Score tiles (2j, 2j+1) are exactly the A fragment of P's j-th k16 step.
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            unsigned int pa[4] = {
+                vit_pack_bf16(s[2 * j][0], s[2 * j][1]),
+                vit_pack_bf16(s[2 * j][2], s[2 * j][3]),
+                vit_pack_bf16(s[2 * j + 1][0], s[2 * j + 1][1]),
+                vit_pack_bf16(s[2 * j + 1][2], s[2 * j + 1][3]),
+            };
+            #pragma unroll
+            for (int dt = 0; dt < 9; ++dt) {
+                const __nv_bfloat16* vrow = s_vt[dt * 8 + group];
+                vit_mma_bf16(o[dt], pa, *(const unsigned int*)(vrow + j * 16 + quad * 2),
+                             *(const unsigned int*)(vrow + j * 16 + 8 + quad * 2));
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 1; offset < 4; offset <<= 1) {
+        l0 += __shfl_xor_sync(0xffffffffu, l0, offset);
+        l1 += __shfl_xor_sync(0xffffffffu, l1, offset);
+    }
+    const float inv0 = 1.0f / l0, inv1 = 1.0f / l1;
+    #pragma unroll
+    for (int dt = 0; dt < 9; ++dt) {
+        unsigned int col = head * VIT_FA_D + dt * 8 + quad * 2;
+        if (r0 < seq)
+            *(__nv_bfloat162*)(O + (size_t)r0 * hidden + col) =
+                __floats2bfloat162_rn(o[dt][0] * inv0, o[dt][1] * inv0);
+        if (r1 < seq)
+            *(__nv_bfloat162*)(O + (size_t)r1 * hidden + col) =
+                __floats2bfloat162_rn(o[dt][2] * inv1, o[dt][3] * inv1);
+    }
 }

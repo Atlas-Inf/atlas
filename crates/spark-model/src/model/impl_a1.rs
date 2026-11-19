@@ -720,6 +720,7 @@ impl TransformerModel {
             lm_head_fp8,
             score_head_rows: Default::default(),
             score_packs: Default::default(),
+            score_store: Default::default(),
             layers,
             buffers,
             prefill_pipe: None,

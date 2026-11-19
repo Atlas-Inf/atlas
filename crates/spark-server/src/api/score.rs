@@ -6,8 +6,12 @@
 //! {"prefix": [ids], "branches": [[ids], ...], "options": [ids] | [[ids], ...]}
 //! ```
 //! returns `{"probs": [[p, ...], ...], "engine_us": n}`: per branch, the
-//! softmax over its option tokens at the branch's last position. `prefix` is
-//! read once and every branch continues it, all in one forward pass
+//! softmax over its option tokens at the branch's last position. Optional
+//! `"readouts": [[offset, ...], ...]` selects 1..=4 rows per branch (0 is the
+//! last token); then each `probs` branch contains one distribution per row.
+//! Without `readouts`, the response shape is unchanged. Optional `"images"`
+//! supplies ordered base64 PNG/JPEG/WebP payloads for image-pad runs in the
+//! prefix. `prefix` is read once and every branch continues it, all in one forward pass
 //! (`spark_model::traits::Model::score_branches`). A flat `options` list
 //! applies to every branch. `"attention": "prefix_bidir"` reads the prefix
 //! as a bidirectional state block and each branch as a bidirectional
@@ -23,7 +27,10 @@
 //! the state reads and that never reads the state. The response carries
 //! `"pack_id"` (and `"pack": "built" | "held"`), which a later request can
 //! send instead of the tokens; an id the model no longer holds answers 404,
-//! and the client sends the tokens again.
+//! and the client sends the tokens again. `"images"` with `"pack"` tokens are
+//! the pack's (every image pad in the pack, none in the prefix or branches):
+//! an image pack, e.g. a photo asked many questions, whose images are encoded
+//! once with it. Images with `"pack_id"` are refused.
 //!
 //! Scheduling: a score pass shares the prefill arena, KV pool and SSM slots
 //! with chat requests, so it runs only when the scheduler is quiescent (no
@@ -39,8 +46,11 @@ use axum::response::{IntoResponse, Json, Response};
 use serde::{Deserialize, Serialize};
 
 use super::compact::openai_error_response;
+#[path = "score_images.rs"]
+mod score_images;
 use crate::main_modules::model_host::CurrentModel;
 use crate::scheduler::score::{PackRef, ScoreError, ScoreJob};
+use score_images::ScoreImageInput;
 
 /// Upper bounds per request (branches and options per branch).
 pub const MAX_BRANCHES: usize = 256;
@@ -68,21 +78,43 @@ pub struct ScoreRequest {
     /// A pack id from an earlier response (instead of `pack`).
     #[serde(default)]
     pub pack_id: Option<String>,
+    /// Images in the order of their runs in `prefix`.
+    #[serde(default)]
+    images: Option<Vec<ScoreImageInput>>,
+    /// Per branch, offsets back from its last token to score.
+    #[serde(default)]
+    pub readouts: Option<Vec<Vec<usize>>>,
 }
 
-/// A validated request: prefix, branches, per-branch options, prefix_bidir,
-/// and the pack it continues.
-pub type Validated = (
-    Vec<u32>,
-    Vec<Vec<u32>>,
-    Vec<Vec<u32>>,
-    bool,
-    Option<PackRef>,
-);
+struct Validated {
+    prefix: Vec<u32>,
+    branches: Vec<Vec<u32>>,
+    options: Vec<Vec<u32>>,
+    prefix_bidir: bool,
+    pack: Option<PackRef>,
+    images: Option<Vec<ScoreImageInput>>,
+    readouts: Option<Vec<Vec<usize>>>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum BranchProbabilities {
+    Last(Vec<f32>),
+    Readouts(Vec<Vec<f32>>),
+}
+
+impl From<spark_model::traits::ScoreBranchProbs> for BranchProbabilities {
+    fn from(value: spark_model::traits::ScoreBranchProbs) -> Self {
+        match value {
+            spark_model::traits::ScoreBranchProbs::Last(probs) => Self::Last(probs),
+            spark_model::traits::ScoreBranchProbs::Readouts(probs) => Self::Readouts(probs),
+        }
+    }
+}
 
 #[derive(Serialize)]
 struct ScoreResponse {
-    probs: Vec<Vec<f32>>,
+    probs: Vec<BranchProbabilities>,
     engine_us: u64,
     queue_us: u64,
     /// Requests that shared this one's forward pass (1 = ran alone).
@@ -95,8 +127,8 @@ struct ScoreResponse {
     pack: Option<&'static str>,
 }
 
-/// Validate and expand a request into (prefix, branches, per-branch options).
-pub fn validate(req: ScoreRequest, vocab_size: u32) -> Result<Validated, String> {
+/// Validate and expand the text fields of a score request.
+fn validate(req: ScoreRequest, vocab_size: u32) -> Result<Validated, String> {
     let ScoreRequest {
         prefix,
         branches,
@@ -104,6 +136,8 @@ pub fn validate(req: ScoreRequest, vocab_size: u32) -> Result<Validated, String>
         attention,
         pack,
         pack_id,
+        images,
+        readouts,
     } = req;
     let prefix_bidir = match attention.as_deref() {
         None | Some("causal") => false,
@@ -140,6 +174,22 @@ pub fn validate(req: ScoreRequest, vocab_size: u32) -> Result<Validated, String>
     if options.len() != branches.len() {
         return Err("options: one option list per branch".into());
     }
+    if let Some(readouts) = &readouts {
+        if readouts.len() != branches.len() {
+            return Err("readouts: one readout list per branch".into());
+        }
+        for (branch, offsets) in branches.iter().zip(readouts) {
+            if !(1..=4).contains(&offsets.len()) {
+                return Err("readouts: need 1..=4 offsets per branch".into());
+            }
+            if offsets.iter().any(|&offset| offset >= branch.len()) {
+                return Err("readouts: every offset must be inside its branch".into());
+            }
+            if (1..offsets.len()).any(|i| offsets[..i].contains(&offsets[i])) {
+                return Err("readouts: offsets of a branch must be distinct".into());
+            }
+        }
+    }
     if options
         .iter()
         .any(|o| o.is_empty() || o.len() > MAX_OPTIONS)
@@ -160,7 +210,15 @@ pub fn validate(req: ScoreRequest, vocab_size: u32) -> Result<Validated, String>
             "token id {bad} out of range: vocab_size is {vocab_size}"
         ));
     }
-    Ok((prefix, branches, options, prefix_bidir, pack))
+    Ok(Validated {
+        prefix,
+        branches,
+        options,
+        prefix_bidir,
+        pack,
+        images,
+        readouts,
+    })
 }
 
 pub async fn score(
@@ -176,11 +234,68 @@ pub async fn score(
             );
         }
     };
-    let (prefix, branches, options, prefix_bidir, pack) =
-        match validate(req, state.tokenizer.vocab_size()) {
-            Ok(v) => v,
-            Err(msg) => return openai_error_response(StatusCode::BAD_REQUEST, msg),
+    if score_images::images_with_pack_id(req.images.as_deref(), req.pack_id.is_some()) {
+        return openai_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "score: images cannot be combined with pack_id (send the pack's tokens with them)"
+                .into(),
+        );
+    }
+    let Validated {
+        prefix,
+        branches,
+        options,
+        prefix_bidir,
+        pack,
+        images,
+        readouts,
+    } = match validate(req, state.tokenizer.vocab_size()) {
+        Ok(v) => v,
+        Err(msg) => return openai_error_response(StatusCode::BAD_REQUEST, msg),
+    };
+    let image_count = images.as_ref().map_or(0, Vec::len);
+    if score_images::vision_tower_missing(image_count, state.vision_config.is_some()) {
+        return openai_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "score: this model has no vision tower".into(),
+        );
+    }
+    if image_count > spark_model::vision_limits::MAX_VISION_ITEMS {
+        return openai_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "score: {image_count} images, over the {} one request may carry",
+                spark_model::vision_limits::MAX_VISION_ITEMS
+            ),
+        );
+    }
+    // Text-only requests skip the image-marker checks entirely (their
+    // behaviour is unchanged by the image path).
+    let pad_counts = if image_count == 0 {
+        Vec::new()
+    } else {
+        let marker_ids =
+            match score_images::image_token_ids(&state.tokenizer, state.vision_config.as_ref()) {
+                Ok(ids) => ids,
+                Err(msg) => return openai_error_response(StatusCode::UNPROCESSABLE_ENTITY, msg),
+            };
+        // With pack tokens the images are the pack's: their pads must all be
+        // in the pack, none in the prefix or a branch.
+        let checked = match &pack {
+            Some(PackRef::Tokens(pack_tokens)) => {
+                let rest: Vec<Vec<u32>> = std::iter::once(prefix.clone())
+                    .chain(branches.iter().cloned())
+                    .collect();
+                score_images::validate_image_tokens(pack_tokens, &rest, image_count, marker_ids)
+            }
+            _ => score_images::validate_image_tokens(&prefix, &branches, image_count, marker_ids),
         };
+        match checked {
+            Ok(counts) => counts,
+            Err(msg) => return openai_error_response(StatusCode::UNPROCESSABLE_ENTITY, msg),
+        }
+    };
+    let vision_rows: usize = pad_counts.iter().sum();
     let Some(queue) = state.score_tx.clone() else {
         return openai_error_response(
             StatusCode::NOT_IMPLEMENTED,
@@ -196,6 +311,40 @@ pub async fn score(
             "pack: knowledge packs are off on this server (start it with --score-packs N)".into(),
         );
     }
+    let vision_items = if let Some(images) = images.filter(|items| !items.is_empty()) {
+        let config = state
+            .vision_config
+            .as_ref()
+            .expect("images require a vision config")
+            .clone();
+        let max_pixels = state.vision_max_pixels;
+        // Refuse before decoding when the queue is full, and bound concurrent
+        // decodes: each holds up to a few images' RGB buffers on the host.
+        if queue.tx.capacity() == 0 {
+            return busy();
+        }
+        let Ok(_decode_permit) = score_images::DECODE_PERMITS.acquire().await else {
+            return busy();
+        };
+        match tokio::task::spawn_blocking(move || {
+            score_images::preprocess_images(images, &pad_counts, &config, max_pixels)
+        })
+        .await
+        {
+            Ok(Ok(items)) => items,
+            Ok(Err(msg)) => {
+                return openai_error_response(StatusCode::UNPROCESSABLE_ENTITY, msg);
+            }
+            Err(e) => {
+                return openai_error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("score: image preprocessing failed: {e}"),
+                );
+            }
+        }
+    } else {
+        Vec::new()
+    };
     let (reply, rx) = tokio::sync::oneshot::channel();
     let job = ScoreJob {
         prefix,
@@ -203,6 +352,9 @@ pub async fn score(
         options,
         prefix_bidir,
         pack,
+        images: vision_items,
+        vision_rows,
+        readouts,
         pack_limit: queue.packs,
         enqueued: std::time::Instant::now(),
         reply,
@@ -237,7 +389,7 @@ pub async fn score(
     };
     match reply {
         Ok(Ok(out)) => Json(ScoreResponse {
-            probs: out.probs,
+            probs: out.probs.into_iter().map(Into::into).collect(),
             engine_us: out.engine_us,
             queue_us: out.queue_us,
             batched: out.batched,
@@ -271,74 +423,5 @@ fn busy() -> Response {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn req(json: &str) -> ScoreRequest {
-        serde_json::from_str(json).unwrap()
-    }
-
-    #[test]
-    fn shared_options_expand_per_branch() {
-        let (p, b, o, bidir, pack) = validate(
-            req(r#"{"prefix":[1,2],"branches":[[3],[4,5]],"options":[7,8]}"#),
-            10,
-        )
-        .unwrap();
-        assert!(!bidir);
-        assert!(pack.is_none());
-        assert_eq!(p, vec![1, 2]);
-        assert_eq!(b.len(), 2);
-        assert_eq!(o, vec![vec![7, 8], vec![7, 8]]);
-    }
-
-    #[test]
-    fn per_branch_options_must_match_branches() {
-        let r = req(r#"{"branches":[[3],[4]],"options":[[7]]}"#);
-        assert!(validate(r, 10).is_err());
-        let r = req(r#"{"branches":[[3],[4]],"options":[[7],[8,9]]}"#);
-        assert!(validate(r, 10).is_ok());
-    }
-
-    #[test]
-    fn rejects_empty_and_out_of_vocab() {
-        assert!(validate(req(r#"{"branches":[],"options":[1]}"#), 10).is_err());
-        assert!(validate(req(r#"{"branches":[[]],"options":[1]}"#), 10).is_err());
-        assert!(validate(req(r#"{"branches":[[1]],"options":[]}"#), 10).is_err());
-        assert!(validate(req(r#"{"branches":[[1]],"options":[10]}"#), 10).is_err());
-        assert!(validate(req(r#"{"prefix":[11],"branches":[[1]],"options":[2]}"#), 10).is_err());
-    }
-
-    #[test]
-    fn attention_mode_is_validated() {
-        let ok = req(r#"{"prefix":[1],"branches":[[3]],"options":[7],"attention":"prefix_bidir"}"#);
-        assert!(validate(ok, 10).unwrap().3);
-        let empty = req(r#"{"branches":[[3]],"options":[7],"attention":"prefix_bidir"}"#);
-        assert!(validate(empty, 10).is_err());
-        let bad = req(r#"{"prefix":[1],"branches":[[3]],"options":[7],"attention":"full"}"#);
-        assert!(validate(bad, 10).is_err());
-    }
-
-    #[test]
-    fn a_pack_is_tokens_or_an_id_never_both() {
-        let t = req(r#"{"prefix":[1],"branches":[[3]],"options":[7],"pack":[4,5]}"#);
-        assert_eq!(
-            validate(t, 10).unwrap().4,
-            Some(PackRef::Tokens(vec![4, 5]))
-        );
-        let id =
-            req(r#"{"prefix":[1],"branches":[[3]],"options":[7],"pack_id":"00000000000000ff"}"#);
-        assert_eq!(validate(id, 10).unwrap().4, Some(PackRef::Id(255)));
-        let both = req(r#"{"branches":[[3]],"options":[7],"pack":[4],"pack_id":"ff"}"#);
-        assert!(validate(both, 10).is_err());
-        let state_is_pack =
-            req(r#"{"branches":[[3]],"options":[7],"pack":[4],"attention":"prefix_bidir"}"#);
-        assert!(validate(state_is_pack, 10).is_ok());
-        let empty = req(r#"{"branches":[[3]],"options":[7],"pack":[]}"#);
-        assert!(validate(empty, 10).is_err());
-        let not_hex = req(r#"{"branches":[[3]],"options":[7],"pack_id":"zz"}"#);
-        assert!(validate(not_hex, 10).is_err());
-        let out_of_vocab = req(r#"{"branches":[[3]],"options":[7],"pack":[10]}"#);
-        assert!(validate(out_of_vocab, 10).is_err());
-    }
-}
+#[path = "score_tests.rs"]
+mod tests;

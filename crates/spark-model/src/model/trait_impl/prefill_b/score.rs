@@ -17,6 +17,8 @@
 //! A request may continue a knowledge pack (`score_pack.rs`): its positions
 //! start at the pack's length and the streams that read the pack directly take
 //! its blocks and SSM state; the pack's rows are never recomputed.
+//! Image requests encode their prefix images once and share those rows across
+//! the request's head and branches. Optional readouts score selected branch rows.
 //!
 //! Per layer every weight-bound step (norms, projections, MoE) runs ONCE over
 //! all rows. Attention needs no ordering: every row's K/V is written before
@@ -35,7 +37,7 @@ use super::score_plan::{ScorePlan, ScoreRequest};
 use super::score_profile::{Phase, ScoreProfile};
 use super::stage_batched::PerStreamStageInfo;
 use crate::layer::{ForwardContext, GdnPrefillBuffers};
-use crate::traits::{Model, SequenceState};
+use crate::traits::{Model, ScoreBranchProbs, SequenceState};
 
 impl TransformerModel {
     /// See the module docs. Per request, `options[i]` are branch i's single
@@ -45,8 +47,20 @@ impl TransformerModel {
         &self,
         reqs: &[crate::traits::ScoreInput<'_>],
         stream: u64,
-    ) -> Result<Vec<Vec<Vec<f32>>>> {
+    ) -> Result<Vec<Vec<ScoreBranchProbs>>> {
         ensure!(!reqs.is_empty(), "score: no requests");
+        super::score_head::validate_readouts(reqs)?;
+        super::score_vision::validate_score_vision(
+            reqs,
+            self.vision_encoder.as_ref().map(|enc| {
+                let merge = self
+                    .config
+                    .vision
+                    .as_ref()
+                    .map_or(1, |v| v.spatial_merge_size.max(1));
+                (enc.output_rows(), merge)
+            }),
+        )?;
         let v = self.config.vocab_size as u32;
         for r in reqs {
             ensure!(!r.branches.is_empty(), "score: no branches");
@@ -86,12 +100,16 @@ impl TransformerModel {
         let (req_pack, ids) = super::score_pack::resolve(&mut held, reqs)?;
         let packs: Vec<&SequenceState> = ids.iter().map(|id| &held.0[id].seq).collect();
         let pack_tokens: Vec<&[u32]> = ids.iter().map(|id| &held.0[id].tokens[..]).collect();
+        let pack_vision: Vec<super::score_vision::PackVision<'_>> = ids
+            .iter()
+            .map(|id| (&held.0[id].grids[..], &held.0[id].hashes[..]))
+            .collect();
         let plan_reqs: Vec<ScoreRequest<'_>> = reqs
             .iter()
             .zip(&req_pack)
             .map(|(r, k)| {
                 let pack = k.map(|k| (k, pack_tokens[k]));
-                (r.prefix, r.branches, r.prefix_bidir, pack)
+                (r.prefix, r.branches, r.prefix_bidir, pack, r.readouts)
             })
             .collect();
         let plan = ScorePlan::new(&plan_reqs, bs);
@@ -129,7 +147,7 @@ impl TransformerModel {
         let t0 = std::time::Instant::now();
         let mut marks = [0u128; 3];
         let mut seqs: Vec<SequenceState> = Vec::with_capacity(plan.tokens.len());
-        let run = (|| -> Result<Vec<Vec<f32>>> {
+        let run = (|| -> Result<Vec<ScoreBranchProbs>> {
             // Only a stream that starts from the zero state needs one: a
             // branch with a head enters from the head's conv window and state,
             // a stream on a pack from the pack's (`score_ssm.rs`), and MTP
@@ -141,6 +159,7 @@ impl TransformerModel {
                     self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream)?;
                 }
             }
+            self.prepare_score_vision(reqs, &plan, &mut seqs, &pack_vision, stream)?;
             marks[0] = t0.elapsed().as_micros();
             self.score_forward(&plan, &mut seqs, &packs, stream)?;
             if trace {
@@ -444,44 +463,5 @@ impl TransformerModel {
         }
         prof.report(plan.total_rows(), n);
         Ok(())
-    }
-}
-
-impl TransformerModel {
-    /// `prefix_bidir`: upload each stream's state end and the heads' widened
-    /// KV extents (a head with a partial tail reads up to S, not F). Returns
-    /// the scratch cursor past the staged array.
-    fn score_stage_bidir(
-        &self,
-        plan: &ScorePlan,
-        meta: &mut crate::layer::BatchedAttnMetadata,
-        cursor: usize,
-        stream: u64,
-    ) -> Result<usize> {
-        let n = plan.streams();
-        let off = (cursor + 63) & !63;
-        ensure!(
-            off + n * 4 <= self.buffers.scratch_bytes(),
-            "score: state-end staging exceeds scratch ({n} streams)"
-        );
-        let as_bytes = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
-        let dst = self.buffers.scratch().offset(off);
-        self.gpu
-            .copy_h2d_async_retained(&as_bytes(&plan.state_end), dst, stream)?;
-        meta.state_end = dst;
-        let mut changed = false;
-        for i in 0..n {
-            let want = plan.kv_len[i] as i32;
-            if meta.kv_lens_host[i] != want {
-                meta.kv_lens_host[i] = want;
-                changed = true;
-            }
-        }
-        if changed {
-            let bytes = as_bytes(&meta.kv_lens_host);
-            self.gpu
-                .copy_h2d_async_retained(&bytes, meta.kv_lens, stream)?;
-        }
-        Ok(off + ((n * 4 + 63) & !63))
     }
 }

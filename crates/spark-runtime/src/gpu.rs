@@ -254,6 +254,14 @@ pub trait GpuBackend: Send + Sync {
     #[track_caller]
     fn kernel(&self, module: &str, func_name: &str) -> Result<KernelHandle>;
 
+    /// Whether the loaded kernels define `module::func_name`, asked without a
+    /// lookup (no audit row): for a kernel only some targets ship, checked
+    /// before `try_kernel` so a target without it never records a miss its
+    /// boot gate would refuse. Default: false (the optional path is not taken).
+    fn ships_kernel(&self, _module: &str, _func_name: &str) -> bool {
+        false
+    }
+
     /// This backend's memoized kernel handles and scratch allocations.
     ///
     /// Required rather than defaulted: an op that memoizes a `KernelHandle`

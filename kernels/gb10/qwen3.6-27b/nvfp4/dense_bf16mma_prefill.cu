@@ -1043,11 +1043,15 @@ __device__ __forceinline__ float dl_load_row(const __nv_bfloat16* __restrict__ x
     return am;
 }
 
-extern "C" __global__ void __launch_bounds__(256)
-dl_quant_nvfp4(const __nv_bfloat16* __restrict__ x, unsigned char* __restrict__ q, unsigned char* __restrict__ s,
-               float* __restrict__ ag, unsigned int K)
+// KT: tokens K-tiled for dz_body: the 32 code bytes and 4 scale bytes of a
+// 64-K stage st of row r at q[(st * M + r) * 32] and s[(st * M + r) * 4],
+// the row-major bytes in the same order (K % 64 == 0). A stage of a token tile
+// is then whole 128-byte lines, not a 32-byte and a 4-byte read a row.
+template <bool KT>
+__device__ __forceinline__ void dl_quant_nvfp4_body(const __nv_bfloat16* __restrict__ x, unsigned char* __restrict__ q,
+                                                    unsigned char* __restrict__ s, float* __restrict__ ag,
+                                                    unsigned int K, unsigned int M)
 {
-    atlas_pdl_enter();
     const unsigned long long r = blockIdx.x;
     uint4 v[DL_QB][2];
     float bmax[DL_QB];
@@ -1060,15 +1064,34 @@ dl_quant_nvfp4(const __nv_bfloat16* __restrict__ x, unsigned char* __restrict__ 
         if (b >= K / 16) break;
         const unsigned int* w = (const unsigned int*)&v[i][0];
         Nvfp4qGrid grid;
-        s[r * (K / 16) + b] = (unsigned char)nvfp4q_block_scale(bmax[i], gl, &grid);
+        const unsigned long long sb = KT ? ((unsigned long long)(b >> 2) * M + r) * 4 + (b & 3) : r * (K / 16) + b;
+        s[sb] = (unsigned char)nvfp4q_block_scale(bmax[i], gl, &grid);
         unsigned int o[2] = {0, 0};
         #pragma unroll
         for (int j = 0; j < 8; j++) {
             const float2 f = __bfloat1622float2(*(const __nv_bfloat162*)&w[j]);
             o[j >> 2] |= nvfp4q_pack2(f.x, f.y, grid) << (8 * (j & 3));
         }
-        *(uint2*)&q[r * (K / 2) + 8 * b] = make_uint2(o[0], o[1]);
+        const unsigned long long qb = KT ? ((unsigned long long)(b >> 2) * M + r) * 32 + 8 * (b & 3) : r * (K / 2) + 8 * b;
+        *(uint2*)&q[qb] = make_uint2(o[0], o[1]);
     }
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+dl_quant_nvfp4(const __nv_bfloat16* __restrict__ x, unsigned char* __restrict__ q, unsigned char* __restrict__ s,
+               float* __restrict__ ag, unsigned int K)
+{
+    atlas_pdl_enter();
+    dl_quant_nvfp4_body<false>(x, q, s, ag, K, 0);
+}
+
+// dl_quant_nvfp4 into the K-tiled layout of dz_body (M rows, K % 64 == 0).
+extern "C" __global__ void __launch_bounds__(256)
+dl_quant_nvfp4_kt(const __nv_bfloat16* __restrict__ x, unsigned char* __restrict__ q, unsigned char* __restrict__ s,
+                  float* __restrict__ ag, unsigned int K, unsigned int M)
+{
+    atlas_pdl_enter();
+    dl_quant_nvfp4_body<true>(x, q, s, ag, K, M);
 }
 
 extern "C" __global__ void __launch_bounds__(256)
@@ -1525,7 +1548,9 @@ dense_w4a8ws_nvfp4(const unsigned char* __restrict__ aq, const float* __restrict
 // stage's NVFP4 weights, block scales, tokens and token scales into
 // db_body's layouts, and the 8 MMA warps gather their operands and issue its
 // MMAs in its order, so results are bit-identical. No re-encode, so the
-// stages are small and many are in flight. Two token layouts:
+// stages are small and many are in flight. Tokens come K-tiled
+// (dl_quant_nvfp4_kt), so a stage's rows are contiguous lines. Two smem
+// token layouts:
 //  LANE (short passes, 4 stages): per (row, lane t) the MMA's b0, b1 and the
 //  row's group scales, copied 4 bytes at a time, so a token tile is one
 //  16-byte shared load per lane.
@@ -1610,39 +1635,36 @@ __device__ __forceinline__ void dz_body(
             if (G >= DZ_R) dl_mbar_wait(&empty[G % DZ_R], ((G - DZ_R) / DZ_R) & 1);
             const unsigned int kb = c.s * DB_KS, live = c.tl.ttv * 8;
             Tok& tb = tk[G % DZ_R];
+            // K-tiled tokens (dl_quant_nvfp4_kt): row r's stage codes and scales.
+            const unsigned long long st = (unsigned long long)c.s * M;
+            auto tq = [&](unsigned int r) { return Aq + (st + c.tl.r0 + (r < c.tl.rows ? r : 0)) * 32; };
+            auto ts = [&](unsigned int r) { return As + (st + c.tl.r0 + (r < c.tl.rows ? r : 0)) * 4; };
             if constexpr (LANE) {
             // Word w of a row's 32 code bytes is b(w / 4) of lane w % 4.
             #pragma unroll
             for (unsigned int i = 0; i < (8 * DW_ROWS + 127) / 128; i++) {
                 const unsigned int x = lt + 128 * i, r = x >> 3, w = x & 7;
                 if (r < DW_ROWS && r < live)
-                    dl_cp4((unsigned char*)&tb.f[r][w & 3] + 4 * (w >> 2),
-                           Aq + (unsigned long long)(c.tl.r0 + (r < c.tl.rows ? r : 0)) * (K / 2) + kb / 2 + 4 * w,
-                           r < c.tl.rows);
+                    dl_cp4((unsigned char*)&tb.f[r][w & 3] + 4 * (w >> 2), tq(r) + 4 * w, r < c.tl.rows);
             }
             #pragma unroll
             for (unsigned int i = 0; i < (4 * DW_ROWS + 127) / 128; i++) {
                 const unsigned int x = lt + 128 * i, r = x >> 2;
                 if (r < DW_ROWS && r < live)
-                    dl_cp4((unsigned char*)&tb.f[r][x & 3] + 8,
-                           As + (unsigned long long)(c.tl.r0 + (r < c.tl.rows ? r : 0)) * (K / 16) + kb / 16,
-                           r < c.tl.rows);
+                    dl_cp4((unsigned char*)&tb.f[r][x & 3] + 8, ts(r), r < c.tl.rows);
             }
             } else {
             #pragma unroll
             for (unsigned int i = 0; i < (2 * DW_ROWS + 127) / 128; i++) {
                 const unsigned int x = lt + 128 * i, r = x >> 1, qc = x & 1;
                 if (r < DW_ROWS && r < live)
-                    bm_cp16(&tb.q[r][dl_tok4(r, qc)],
-                            Aq + (unsigned long long)(c.tl.r0 + (r < c.tl.rows ? r : 0)) * (K / 2) + qc * 16 + kb / 2,
-                            r < c.tl.rows);
+                    bm_cp16(&tb.q[r][dl_tok4(r, qc)], tq(r) + qc * 16, r < c.tl.rows);
             }
             #pragma unroll
             for (unsigned int i = 0; i < (DW_ROWS + 127) / 128; i++) {
                 const unsigned int r = lt + 128 * i;
                 if (r < DW_ROWS && r < live)
-                    dl_cp4(&tb.s[r], As + (unsigned long long)(c.tl.r0 + (r < c.tl.rows ? r : 0)) * (K / 16) + kb / 16,
-                           r < c.tl.rows);
+                    dl_cp4(&tb.s[r], ts(r), r < c.tl.rows);
             }
             }
             DbW<DB_NVFP4, HV>& sw = wt[G % DZ_R];

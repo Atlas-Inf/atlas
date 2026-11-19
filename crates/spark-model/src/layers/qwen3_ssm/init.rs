@@ -22,6 +22,9 @@ impl Qwen3SsmLayer {
 
         // conv_dim = Q_flat + K_flat + V_flat = 2*key_dim + value_dim = 8192
         let conv_dim = nk * kd * 2 + nv * vd;
+        // Whether the residual norms may run small blocks (their kernels'
+        // capability, resolved here at load, before the boot audit seals).
+        crate::layers::ops::resolve_row_norm_any_block(gpu);
 
         Ok(Self {
             // mHC is attached later by the loader, and only for models that
@@ -206,6 +209,11 @@ impl Qwen3SsmLayer {
                 "norm",
                 &super::kernel_select::gated_norm_kernel(config, "gated_rms_norm_prefill")?,
             )?,
+            gated_rms_norm_prefill_warp_k: crate::layers::try_shipped_kernel(
+                gpu,
+                "norm",
+                &super::kernel_select::gated_norm_kernel(config, "gated_rms_norm_prefill_warp")?,
+            ),
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_k: crate::layers::tgemm_kernel(gpu),
             w4a16_gemm_t_k64_k: crate::layers::k64_kernel(gpu)?,
