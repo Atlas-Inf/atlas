@@ -31,7 +31,6 @@ use super::serve::{
 use crate::api::InferenceRequest;
 use crate::main_modules::AppState;
 use crate::main_modules::serve_phases;
-use crate::tokenizer::ChatTokenizer;
 use crate::{
     cli, conversation_store, rate_limiter, response_store, scheduler, scheduling_policy,
     session_manager,
@@ -559,6 +558,26 @@ pub(crate) fn load_model(
     // is the real one. Validated ≥ 1.0 in `validate_serve_args`.
     config.fp8_kv_headroom = args.fp8_kv_headroom;
 
+    // Tokenizer parses are CPU work that read none of what follows: run them
+    // under the weight read. The vocab size is taken before the KV config, the
+    // tokenizer phase at phase 8 if its inputs still hold. Only rank 0 reaches
+    // phase 8; EP workers enter their command loop before it.
+    let tokenizer_vocab = {
+        let dir = model_dir.clone();
+        std::thread::spawn(move || serve_phases::tokenizer_vocab_size(&dir))
+    };
+    let tokenizer_prep = (args.rank == 0)
+        .then(|| {
+            serve_phases::TokenizerPrep::spawn(
+                &model_dir,
+                &args,
+                &config,
+                ptx_set.behavior.jinja_template,
+                ptx_set.behavior.verbatim_prompt,
+            )
+        })
+        .flatten();
+
     // 3. Load model weights
     spark_runtime::progress::phase(5, "weight load");
     let oom_reserve_bytes = args.oom_guard_mb * 1024 * 1024;
@@ -700,7 +719,10 @@ pub(crate) fn load_model(
     // listener, the TUI thread, the OOM watchdog), and a concurrent getenv
     // during setenv is UB.
     config.profile = args.profile;
-    serve_phases::cap_vocab_size_to_tokenizer(&model_dir, &mut config);
+    let tokenizer_vocab = tokenizer_vocab
+        .join()
+        .unwrap_or_else(|_| serve_phases::tokenizer_vocab_size(&model_dir));
+    serve_phases::cap_vocab_size_to_tokenizer(tokenizer_vocab, &mut config);
     let serve_phases::KvCacheConfig {
         effective_kv_dtype_str: _,
         kv_dtype,
@@ -896,11 +918,6 @@ pub(crate) fn load_model(
 
     // 6. Load tokenizer
     spark_runtime::progress::phase(8, "tokenizer");
-    // Thinking support is derived from model capabilities, not hardcoded model names.
-    // Models with SSM layers or Qwen3.5-style architecture support <think> tokens.
-    // The --enable-thinking flag controls OPEN-ENDED vs CLOSED thinking.
-    let caps = config.capabilities();
-    let supports_thinking = caps.supports_thinking;
     // `--reference-mode`: one neutralized copy of `[behavior]`, read below by
     // the watchdogs, the chat levers and AppState alike.
     let behavior = {
@@ -921,24 +938,27 @@ pub(crate) fn load_model(
         }
         b
     };
-    let tokenizer = ChatTokenizer::from_model_dir(
-        &model_dir,
-        eos_tokens[0],
-        supports_thinking,
-        &config.model_type,
-        ptx_set.behavior.jinja_template,
-        Some(std::path::Path::new(".")), // repo root for override templates
-        args.disable_template_overrides || args.reference_mode,
-        ptx_set.behavior.verbatim_prompt,
-    )?;
-
     // (AM1 attractor-mask registration removed 2026-06-03 — see
     // decode_logits_seq.rs / compile_tools.rs; `lean` was an Atlas-only
     // decode artifact, now fixed at the grammar `first_char` rule.)
 
-    // Tokenizer-derived runtime: vocab cap, reasoning parser, think tokens,
-    // im_start hard-stop, tool-call open/close tokens, and the XGrammar
-    // engine.
+    // Chat tokenizer and its runtime: vocab cap, reasoning parser, think
+    // tokens, im_start hard-stop, tool-call open/close tokens, and the
+    // XGrammar engine. Prepared under the weight read when its inputs held.
+    let tokenizer_inputs = serve_phases::TokenizerInputs::new(
+        &args,
+        &config,
+        &eos_tokens,
+        ptx_set.behavior.jinja_template,
+        ptx_set.behavior.verbatim_prompt,
+    );
+    let tokenizer_phase = match tokenizer_prep.and_then(|p| p.take(&tokenizer_inputs)) {
+        Some(phase) => phase,
+        None => serve_phases::run_tokenizer_phase(&model_dir, &tokenizer_inputs, &mut config)?,
+    };
+    config.vocab_size = tokenizer_phase.vocab_size;
+    eos_tokens = tokenizer_phase.eos_tokens;
+    let tokenizer = tokenizer_phase.tokenizer;
     let serve_phases::TokenizerRuntime {
         vocab_masks,
         limits: tokenizer_limits,
@@ -948,13 +968,7 @@ pub(crate) fn load_model(
         tool_call_start_token,
         tool_call_end_token,
         grammar_engine,
-    } = serve_phases::resolve_tokenizer_runtime(
-        &args,
-        &mut config,
-        &tokenizer,
-        &mut eos_tokens,
-        supports_thinking,
-    );
+    } = tokenizer_phase.runtime;
 
     ensure_glm_tool_boundary(
         &config,
