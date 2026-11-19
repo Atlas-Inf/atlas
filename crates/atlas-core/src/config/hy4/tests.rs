@@ -81,7 +81,6 @@ fn dfly_mask_is_checkpoint_metadata_without_a_fallback() {
     let c = parse_config(&raw.to_string()).unwrap();
     assert!(c.hy4.unwrap().dfly_mask_token_id().is_err());
     for mask in [
-        json!(null),
         json!(-1),
         json!(120832),
         json!(4294967296u64),
@@ -91,6 +90,16 @@ fn dfly_mask_is_checkpoint_metadata_without_a_fallback() {
         raw["dfly_mask_token_id"] = mask;
         assert!(parse_config(&raw.to_string()).is_err());
     }
+}
+
+#[test]
+fn null_dfly_mask_is_absent_until_dfly_is_enabled() {
+    let mut raw: Value = serde_json::from_str(CONFIG).unwrap();
+    raw["dfly_mask_token_id"] = Value::Null;
+    let config = parse_config(&raw.to_string()).unwrap();
+    let hy = config.hy4.unwrap();
+    assert_eq!(hy.dfly_mask_token_id, None);
+    assert!(hy.dfly_mask_token_id().is_err());
 }
 
 #[test]
