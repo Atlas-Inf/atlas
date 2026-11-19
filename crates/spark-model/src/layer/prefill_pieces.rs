@@ -8,8 +8,12 @@
 /// their token-parallel work (projections, MoE) whole and run attention per
 /// sub-chunk; chunk metadata then carries each sub-chunk's causal extent.
 pub const PREFILL_ATTENTION_ROWS: usize = 4096;
-/// Sub-chunk extents a chunk's `seq_len` buffer holds after its total.
-pub const PREFILL_MAX_SUB_CHUNKS: usize = 8;
+/// Widest prefill chunk the extent buffer covers: a native-context pass, such
+/// as a knowledge pack encoded in one piece.
+pub const PREFILL_MAX_ROWS: usize = 262_144;
+/// Sub-chunk extents a chunk's `seq_len` buffer holds after its total: every
+/// [`PREFILL_ATTENTION_ROWS`] piece of the widest chunk, plus the top-k split.
+pub const PREFILL_MAX_SUB_CHUNKS: usize = PREFILL_MAX_ROWS / PREFILL_ATTENTION_ROWS + 1;
 
 /// Attention pieces `(row0, rows)` of a prefill chunk starting at sequence
 /// position `seq_start`. A chunk that crosses the semantic top-k boundary
@@ -55,5 +59,16 @@ mod prefill_piece_tests {
         assert_eq!(pieces(0, 1500, 2048), [(0, 1500)]);
         assert_eq!(pieces(0, 2048, 2048), [(0, 2048)]);
         assert_eq!(pieces(0, 4096, 0), [(0, 4096)]);
+    }
+
+    #[test]
+    fn a_native_context_chunk_fits_the_extent_buffer() {
+        use super::{PREFILL_MAX_ROWS, PREFILL_MAX_SUB_CHUNKS};
+        // A full-width chunk, aligned or crossing the top-k boundary.
+        for (start, topk) in [(0, 0), (0, 2048), (1000, 2048)] {
+            assert!(pieces(start, PREFILL_MAX_ROWS, topk).len() <= PREFILL_MAX_SUB_CHUNKS);
+        }
+        // A 36K-row knowledge pack (9 pieces) no longer exceeds it.
+        assert_eq!(pieces(0, 35_963, 0).len(), 9);
     }
 }
