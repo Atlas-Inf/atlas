@@ -35,3 +35,34 @@ Separate CUDA timing and live-input reference replay were not collected before
 the no-restarts instruction. No new measurement restart, optimization or serving
 change. No substantiated two-change50-tok/s claim.
 Full evidence: `/home/robert/hy4-dfly-20261118/analysis/numbers.json`.
+
+## Follow-up: reference acceptance blocked by the reserve
+
+Read-only CUDA memory probe, Nov18 Toronto, serving unchanged:
+
+| Rank0 memory | Bytes |
+|---|---:|
+| Free |7405494272 |
+| Required reserve (12 GiB) |12884901888 |
+| Above reserve |−5479407616 |
+
+No reference weights or target replica were loaded. Historical production logs
+contain acceptance and output IDs, not the live normalized hidden/KV/index inputs.
+The same-continuation reference result remains unavailable; no integration bug
+has been established. No serving restart, cache eviction or reserve reduction.
+
+Upstream vLLM's `vllm/v1/spec_decode/metrics.py` defines mean acceptance length
+as `1 + num_accepted_tokens / num_drafts`, including the bonus token:
+https://github.com/vllm-project/vllm/blob/main/vllm/v1/spec_decode/metrics.py .
+The publisher README does not define whether its column uses that statistic;
+the linked recipe source returned404, so this link is unverified.
+
+| Counting convention | Atlas | Publisher code |
+|---|---:|---:|
+| Draft tokens only, measured Atlas |2.298701 |Unknown |
+| Including bonus, measured Atlas |3.298701 |Unknown |
+| If publisher3.80 includes bonus: draft tokens only |2.298701 |2.80 |
+| If publisher3.80 excludes bonus: draft tokens only |2.298701 |3.80 |
+
+Even a normalized publisher comparison is a different prompt/FP8-KV workload,
+not evidence of a same-continuation acceptance gap.
