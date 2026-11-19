@@ -190,6 +190,9 @@ mod glm_attention_gpu_tests;
 #[cfg(all(test, feature = "cuda"))]
 #[path = "vision_encoder/vit_flash72_gpu_tests.rs"]
 mod vit_flash72_gpu_tests;
+#[cfg(all(test, feature = "cuda"))]
+#[path = "vision_encoder/vit_layer_norm_gpu_tests.rs"]
+mod vit_layer_norm_gpu_tests;
 
 #[cfg(test)]
 mod receive_only_tests {

@@ -183,10 +183,9 @@ impl VisionEncoder {
             .launch(stream)
     }
 
-    /// Whether the fused-epilogue kernels serve the ViT (`ATLAS_VISION_UNFUSED`
-    /// keeps the separate bias / GELU / residual passes for A/B checks).
+    /// Whether the fused-epilogue kernels serve the ViT ([`vit_fused_opt_in`]).
     fn vit_fused(&self) -> bool {
-        self.k_gemm_epi.0 != 0 && std::env::var("ATLAS_VISION_UNFUSED").is_err()
+        self.k_gemm_epi.0 != 0 && vit_fused_opt_in()
     }
 
     /// Steps 5-13 of a block with the fused epilogue. The residual stream stays
@@ -323,11 +322,9 @@ impl VisionEncoder {
         let d = self.head_dim as u32; // 72
         let hd = self.hidden_size as u32; // H*D = 1152
 
-        // One fused launch over every head (head_dim 72; ATLAS_VISION_ATTN_GEMM
-        // keeps the per-head GEMM loop below for A/B checks). It reads V from
-        // the QKV rows, so it needs no transposed copy.
-        let flash =
-            self.k_flash72.0 != 0 && d == 72 && std::env::var("ATLAS_VISION_ATTN_GEMM").is_err();
+        // One fused launch over every head (head_dim 72, [`vit_fused_opt_in`]).
+        // It reads V from the QKV rows, so it needs no transposed copy.
+        let flash = self.k_flash72.0 != 0 && d == 72 && vit_fused_opt_in();
 
         // (1) rope + deinterleave [+ V-transpose] → buf_qr/buf_kr[/buf_vt] (all heads)
         KernelLaunch::new(gpu, self.k_rope_deint)
@@ -777,7 +774,18 @@ impl VisionEncoder {
     }
 }
 
-/// Whether the ViT's fused-epilogue GEMMs go to cuBLASLt (`ATLAS_VISION_LT=1`).
+/// Whether the ViT runs its fused kernels (`ATLAS_VISION_FUSED=1`): the
+/// all-head flash attention and the bias / GELU / residual GEMM epilogues. They
+/// round differently from the separate passes (one BF16 rounding per output,
+/// a different softmax accumulation order), so vision outputs change; off by
+/// default, which keeps every target's vision tower on its existing kernels.
+fn vit_fused_opt_in() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_VISION_FUSED").is_ok_and(|v| v == "1"))
+}
+
+/// Whether the ViT's fused-epilogue GEMMs go to cuBLASLt (`ATLAS_VISION_LT=1`,
+/// with `ATLAS_VISION_FUSED=1`).
 fn vit_lt() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_VISION_LT").is_ok_and(|v| v == "1"))

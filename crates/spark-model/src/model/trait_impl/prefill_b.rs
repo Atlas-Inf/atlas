@@ -60,6 +60,7 @@ mod score_ssm;
 pub(in crate::model) mod score_store;
 mod score_store_ahead;
 mod score_store_disk;
+mod score_store_parts;
 mod score_vision;
 mod stage_batched;
 mod upload_meta;
