@@ -86,6 +86,7 @@ impl AttentionCache<'_, '_> {
                 return Err(e);
             }
             self.len += 1;
+            self.record_prefix(stream)?;
         }
         Ok(())
     }

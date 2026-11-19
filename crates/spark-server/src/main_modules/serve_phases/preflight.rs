@@ -99,7 +99,7 @@ pub(crate) fn preflight_reserve(
             spark_model::layers::qwen3_attention::glm_multi_seq_sparse_enabled(&config.model_type);
         anyhow::ensure!(
             !sparse_decode
-                || !(args.speculative || args.self_speculative || args.ngram_speculative),
+                || !(args.speculative || args.self_speculative || args.uses_lookup_verifier()),
             "ATLAS_GLM_MULTI_SEQ_SPARSE=1 supports non-speculative decode only"
         );
         anyhow::ensure!(
@@ -134,7 +134,7 @@ pub(crate) fn preflight_reserve(
                 ep_v2,
                 !(args.speculative
                     || args.self_speculative
-                    || args.ngram_speculative
+                    || args.uses_lookup_verifier()
                     || args.dflash),
             )
             .validate()?;
@@ -166,7 +166,7 @@ pub(crate) fn preflight_reserve(
             config.index_topk,
         );
         anyhow::ensure!(
-            !(args.self_speculative || args.ngram_speculative)
+            !(args.self_speculative || args.uses_lookup_verifier())
                 && (!args.speculative || native_mtp::admitted(args, ep_v2)),
             "GLM-5 speculative decoding is served through --dflash, or explicit strict native MTP \
              at TP2/EP2 or TP4/EP4 and C1..C4 with equal active/admitted limits; self/n-gram \
@@ -178,7 +178,7 @@ pub(crate) fn preflight_reserve(
     // `--dflash` allocates the same verify pools, sized by its γ-derived
     // draft count (see `build_model`), not the MTP `--num-drafts`.
     let spec_on_pool =
-        args.speculative || args.dflash || args.self_speculative || args.ngram_speculative;
+        args.speculative || args.dflash || args.self_speculative || args.uses_lookup_verifier();
     let pool_drafts = if args.dflash {
         super::build::checked_dflash_num_drafts(args.resolved_dflash_gamma())?
     } else {
@@ -234,11 +234,12 @@ pub(crate) fn preflight_reserve(
     );
     // The replay-mode verify-window input ring is likewise allocated inside
     // `SsmStatePool::new` (pre-snapshot) — no reserve term.
-    let spec_tokens_pre = if args.speculative || args.self_speculative || args.ngram_speculative {
-        args.resolved_num_drafts() + 2
-    } else {
-        1
-    };
+    let spec_tokens_pre =
+        if args.speculative || args.self_speculative || args.uses_lookup_verifier() {
+            args.resolved_num_drafts() + 2
+        } else {
+            1
+        };
     // B4 (chunked-prefill BF16 KV cliff): the prior `.min(8192)` cap forced
     // every prompt > 8 k to chunk, which compounds K-side BF16 rounding noise
     // at chunk boundaries (per the 4-agent audit 2026-05-27). When the user
@@ -332,7 +333,7 @@ pub(crate) fn preflight_reserve(
     let native_preallocated = native_mtp::preallocated(args, config, long_context)?;
     let cuda_headroom: usize = if (args.speculative && !native_preallocated)
         || args.self_speculative
-        || args.ngram_speculative
+        || args.uses_lookup_verifier()
     {
         4 * 1024 * 1024 * 1024
     } else {

@@ -102,6 +102,7 @@ impl Runtime<'_> {
                     stream,
                 )?;
                 self.norm(s, self.collapsed, self.final_norm, self.normed, stream)?;
+                self.capture_draft(data, self.normed, stream)?;
                 drop(hc);
                 let head = timing::span("lm_head", stream)?;
                 KernelLaunch::new(gpu, self.kernels[2])

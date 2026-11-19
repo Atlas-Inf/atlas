@@ -41,8 +41,20 @@ pub(crate) fn parse_hy4(raw: &Value) -> Result<ModelConfig> {
         text["model_type"] == "hy_v4_flash",
         "hy_v4_flash text model_type mismatch"
     );
-    let hy: Hy4Config =
+    let mut hy: Hy4Config =
         serde_json::from_value(text.clone()).context("Invalid hy_v4_flash text configuration")?;
+    hy.dfly_mask_token_id = raw
+        .get("dfly_mask_token_id")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .context("hy_v4_flash invalid dfly_mask_token_id")?;
+    if let Some(mask) = hy.dfly_mask_token_id {
+        ensure!(
+            (mask as usize) < positive(text, "vocab_size")?,
+            "hy_v4_flash dfly_mask_token_id exceeds vocabulary"
+        );
+    }
     let layers = positive(text, "num_hidden_layers")?;
     ensure!(
         hy.layer_types.len() == layers

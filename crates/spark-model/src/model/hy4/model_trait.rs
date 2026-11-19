@@ -91,6 +91,32 @@ impl Model for Hy4Model {
     fn eager_prompt_lookup(&self) -> bool {
         true
     }
+    fn eager_draft(
+        &self,
+        bonus: u32,
+        count: usize,
+        seq: &mut SequenceState,
+        stream: u64,
+    ) -> Result<Option<Vec<u32>>> {
+        if self.borrow_dependent().drafter.is_none() {
+            return Ok(None);
+        }
+        ensure!(
+            (1..=5).contains(&count) && (bonus as usize) < self.vocab_size(),
+            "Hy4 DFly invalid count/bonus"
+        );
+        let stream = self.eager_stream(stream)?;
+        self.checkpoint_ssm_states(seq)?;
+        self.send([
+            draft::PROPOSE,
+            u32::try_from(seq.slot_idx)?,
+            bonus,
+            u32::try_from(count)?,
+        ])?;
+        self.borrow_dependent()
+            .propose(self.borrow_owner(), seq.slot_idx, bonus, count, stream)
+            .map(Some)
+    }
     fn verify_max_drafts(&self) -> Option<usize> {
         Some(5)
     }

@@ -23,6 +23,7 @@ mod batch;
 mod benchmark;
 mod collectives;
 mod compute;
+mod draft;
 mod model_trait;
 mod rollback_benchmark;
 mod speculation;
@@ -78,11 +79,13 @@ struct RequestData<'a> {
     history: Vec<u32>,
     poisoned: bool,
     checkpoint: Option<speculation::Checkpoint<'a>>,
+    draft: Option<draft::State<'a>>,
 }
 self_cell::self_cell! {
     struct RequestCell {owner:RequestOwner,#[covariant] dependent:RequestData,}
 }
 struct Runtime<'a> {
+    drafter: Option<Mutex<draft::DraftCell>>,
     layers: Vec<Arc<LayerCell>>,
     requests: Mutex<HashMap<usize, RequestCell>>,
     head: IndependentHc<'a>,
@@ -247,6 +250,7 @@ impl Hy4Model {
             let batch_logits = mem.alloc(c.vocab_size * 4 * max_batch)?;
             let command = mem.alloc(4 * 4)?;
             Ok(Runtime {
+                drafter: None,
                 layers,
                 requests: Mutex::new(HashMap::new()),
                 head: IndependentHc::load(store, "model.hc_head", true, c, gpu)?,
@@ -340,6 +344,14 @@ impl Runtime<'_> {
                     });
                 }
                 Ok::<_, anyhow::Error>(RequestData {
+                    draft: if self.drafter.is_some() {
+                        Some(draft::State::new(
+                            owner.shared.gpu.as_ref(),
+                            owner.shared.config.hidden_size,
+                        )?)
+                    } else {
+                        None
+                    },
                     layers,
                     history: Vec::new(),
                     poisoned: false,

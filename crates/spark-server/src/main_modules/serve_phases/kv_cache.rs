@@ -18,7 +18,7 @@ pub(crate) fn resolve_prefill_budget(
     args: &cli::ServeArgs,
     ssm_prefill_chunk: usize,
 ) -> PrefillBudget {
-    let spec_tokens = if args.speculative || args.self_speculative || args.ngram_speculative {
+    let spec_tokens = if args.speculative || args.self_speculative || args.uses_lookup_verifier() {
         args.resolved_num_drafts() + 2
     } else {
         1

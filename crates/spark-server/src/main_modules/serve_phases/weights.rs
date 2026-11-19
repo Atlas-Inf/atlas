@@ -10,35 +10,9 @@ use atlas_core::config::ModelConfig;
 
 use crate::cli;
 
-pub(crate) fn quant_multiplier(config: &ModelConfig) -> Option<f64> {
-    // Both Qwen3.8-Flash-Next NVFP4 packs measure device-after-load / on-disk
-    // at ~1.15: nvidia pack 84.0 GB / 73.33 GB (2026-09-15 serve log,
-    // docs/porting/QWEN38_NVIDIA_PORT_LOG_2026-09-15.md §B.2), RadixArk pack
-    // ~90.4 GB peak / 78.19 GB on-disk (gb10 flash-next MODEL.toml memory
-    // note). The generic 1.3 over-projects by ~10 GB — that is what refused
-    // util >=0.85 + MTP on GB10 (§B.2 rows 014/015) and every boot on a 96 GB
-    // Strix pool. 1.2 keeps ~4.5% margin over the measured ratio.
-    if config.model_type == "qwen4_exp" {
-        Some(1.2)
-    } else if config.model_type == "glm5_next" {
-        // The EP loader has already removed the remote half of the routed
-        // experts. ModelOpt tensors are kept packed/zero-copy and the GLM
-        // loader deliberately omits transposed MoE copies, so the generic
-        // 1.30x NVFP4 estimate is not representative. Keep 5% for CUDA
-        // metadata and the few BF16 dense/shared weights quantized at load.
-        Some(1.05)
-    } else if config.model_type == "minimax_m2" || config.model_type == "step3p7" {
-        Some(1.02)
-    } else if config
-        .quantization_config
-        .as_ref()
-        .is_some_and(|qc| qc.quant_method == "fp8")
-    {
-        Some(1.05)
-    } else {
-        None
-    }
-}
+#[path = "weights_policy.rs"]
+mod policy;
+pub(crate) use policy::quant_multiplier;
 
 pub(crate) fn load_weight_store(
     args: &cli::ServeArgs,
@@ -90,33 +64,7 @@ pub(crate) fn load_weight_store(
         return Ok(store);
     }
 
-    /// Tensors this model reads from disk at use time rather than holding.
-    ///
-    /// Only the `qwen4_exp` PLE n-gram table so far. It is 51.2 B parameters —
-    /// 41% of that checkpoint — and is gathered by row (~2.5 KB per token), so
-    /// making it resident is both unnecessary and, on a 119 GB GB10, impossible:
-    /// the pre-flight lands at 163 GB with it and ~96 GB without.
-    ///
-    /// Keyed on `ple_layer_ids` rather than on `model_type`, because it is the
-    /// presence of the tower that decides this, not the family name.
-    fn demand_paged_patterns(config: &ModelConfig) -> Vec<String> {
-        if config.model_type == "hy_v4_flash" {
-            return vec![".engram_layer.multi_head_embedding.embedding.weight".to_string()];
-        }
-        if config.ple_layer_ids.is_empty() {
-            return Vec::new();
-        }
-        vec![".ple.ple_embedding.ngram_embedding.shard_".to_string()]
-    }
-
-    // Loader-owned load policies (dead-weight namespaces, slab packing) —
-    // the loader that knows which tensors it reads is the SSOT for both.
-    let weight_policy =
-        spark_model::factory::loader_for_config(config).context("weight-load policy lookup")?;
-    let dead_ns = weight_policy.dead_namespaces(config);
-    let slab_pack = weight_policy.slab_pack_weights(config)
-        && config.tp_world_size <= 1
-        && config.ep_world_size <= 1;
+    let (dead_ns, slab_pack) = policy::load_policy(args, config)?;
 
     let store = if use_fast_load(args) {
         #[cfg(unix)]
@@ -147,7 +95,7 @@ pub(crate) fn load_weight_store(
             }
             loader.peak_memory_multiplier = mult;
             loader.expert_tp = config.expert_tp;
-            loader.demand_paged_patterns = demand_paged_patterns(config);
+            loader.demand_paged_patterns = policy::demand_paged_patterns(config);
             if !loader.demand_paged_patterns.is_empty() {
                 tracing::info!(
                     "Demand-paged (never resident, read by row at use time): {:?}",

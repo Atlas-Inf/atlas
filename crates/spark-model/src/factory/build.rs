@@ -75,17 +75,16 @@ pub fn build_model(
 ) -> Result<Box<dyn Model>> {
     if config.model_type == "hy_v4_flash" {
         anyhow::ensure!(
-            !use_speculative
-                && dflash_args.is_none()
+            dflash_args.is_none()
                 && lora_args.is_none()
                 && config.vision.is_none()
                 && config.lm_head_bf16_override.is_none()
                 && !config.lm_head_fp8
                 && kv_dtype == KvCacheDtype::Bf16
                 && layer_dtypes.iter().all(|d| *d == KvCacheDtype::Bf16),
-            "Hy4 requires eager text-only, BF16 latent cache and FP32-accumulating LM head; native MTP/DFly/vision/LoRA/mixed cache dtypes/head overrides unsupported"
+            "Hy4 requires eager text-only, BF16 latent cache and FP32-accumulating LM head; vision/LoRA/mixed cache dtypes/head overrides unsupported"
         );
-        return Ok(Box::new(crate::model::hy4::Hy4Model::new(
+        let mut model = crate::model::hy4::Hy4Model::new(
             config,
             store,
             gpu,
@@ -93,7 +92,11 @@ pub fn build_model(
             max_seq_len,
             kv_block_size,
             max_batch_size,
-        )?));
+        )?;
+        if use_speculative {
+            model.enable_dfly()?;
+        }
+        return Ok(Box::new(model));
     }
     crate::weight_loader::qwen4_exp::mode::validate(
         &config,

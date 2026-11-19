@@ -25,6 +25,7 @@ pub struct AttentionCache<'layer, 'gpu> {
     pub(super) poisoned: bool,
     pub(super) scratch: Scratch,
     pub(super) batch: Option<super::batch::BatchScratch<'gpu>>,
+    pub(super) prefix: Option<super::prefix::Prefix<'gpu>>,
 }
 pub(super) struct Scratch {
     pub qkv: DevicePtr,
@@ -173,6 +174,7 @@ impl<'layer, 'gpu> AttentionCache<'layer, 'gpu> {
             poisoned: false,
             scratch,
             batch: None,
+            prefix: None,
         })
     }
     pub fn committed_len(&self) -> usize {
@@ -182,6 +184,7 @@ impl<'layer, 'gpu> AttentionCache<'layer, 'gpu> {
     pub fn release(&mut self) -> Result<()> {
         self.poisoned = true;
         self.batch = None;
+        self.prefix = None;
         self._memory.release()
     }
 

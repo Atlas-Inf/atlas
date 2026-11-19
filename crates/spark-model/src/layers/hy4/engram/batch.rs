@@ -123,21 +123,25 @@ impl<'a> Hy4Engram<'a> {
             } else {
                 (b.keys.offset(i * self.h * 2), 4 * self.h)
             };
-            KernelLaunch::new(gpu, gpu.kernel("hy4_engram", "hy4_engram_batch_project")?)
-                .grid([self.h.div_ceil(128) as u32, rows.div_ceil(8) as u32, 1])
-                .block([128, 1, 1])
-                .arg_ptr(b.lookup)
-                .arg_ptr(self.projections[i])
-                .arg_ptr(self.biases[i])
-                .arg_ptr(out)
-                .arg_u32(self.h as u32)
-                .arg_u32((heads * self.dim) as u32)
-                .arg_u32((self.heads.start * self.dim) as u32)
-                .arg_u32(local as u32)
-                .arg_u32(u32::from(self.topology[0] == 0))
-                .arg_u32(rows as u32)
-                .arg_u32(stride as u32)
-                .launch(stream)?;
+            KernelLaunch::new(
+                gpu,
+                gpu.op_cache()
+                    .kernel(gpu, "hy4_engram", "hy4_engram_batch_project")?,
+            )
+            .grid([self.h.div_ceil(128) as u32, rows.div_ceil(8) as u32, 1])
+            .block([128, 1, 1])
+            .arg_ptr(b.lookup)
+            .arg_ptr(self.projections[i])
+            .arg_ptr(self.biases[i])
+            .arg_ptr(out)
+            .arg_u32(self.h as u32)
+            .arg_u32((heads * self.dim) as u32)
+            .arg_u32((self.heads.start * self.dim) as u32)
+            .arg_u32(local as u32)
+            .arg_u32(u32::from(self.topology[0] == 0))
+            .arg_u32(rows as u32)
+            .arg_u32(stride as u32)
+            .launch(stream)?;
         }
         if let Some(comm) = comm.filter(|_| self.topology[1] > 1) {
             let _reduce = super::super::timing::span("all_reduce", stream)?;

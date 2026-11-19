@@ -153,11 +153,11 @@ pub(crate) fn build_model(
         args.max_seq_len,
         args.max_batch_size,
         mtp_quant,
-        args.speculative || args.dflash,
+        args.speculative || args.dflash || args.dfly_speculative,
         prefix_cache,
         args.mtp_vocab,
         comm,
-        args.self_speculative || args.ngram_speculative,
+        args.self_speculative || args.uses_lookup_verifier(),
         if args.dflash {
             checked_dflash_num_drafts(args.resolved_dflash_gamma())?
         } else {
@@ -254,7 +254,10 @@ pub(crate) fn maybe_run_ep_worker(
     let rank = args.rank;
     let model_owned = model.take().expect("EP worker requires owned model");
     let model_has_proposer = model_owned.has_proposer();
-    if !args.speculative && !args.self_speculative && !args.ngram_speculative && model_has_proposer
+    if !args.speculative
+        && !args.self_speculative
+        && !args.uses_lookup_verifier()
+        && model_has_proposer
     {
         let override_set = matches!(
             std::env::var("ATLAS_ALLOW_SPEC_MISMATCH").as_deref(),
@@ -276,7 +279,7 @@ pub(crate) fn maybe_run_ep_worker(
     } else if !model_has_proposer
         && !args.speculative
         && !args.self_speculative
-        && !args.ngram_speculative
+        && !args.uses_lookup_verifier()
     {
         tracing::info!(
             "EP worker (rank {rank}): checkpoint has no MTP weights; \

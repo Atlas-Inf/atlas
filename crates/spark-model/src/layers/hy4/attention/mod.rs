@@ -6,11 +6,13 @@
 
 mod batch;
 mod cache;
+mod dfly;
 mod forward;
 mod index;
 mod kernels;
 mod loader;
 pub(crate) mod memory;
+mod prefix;
 mod projections;
 #[cfg(test)]
 mod tests;

@@ -53,6 +53,9 @@ impl Hy4Model {
         let slot = words[1] as usize;
         let stream = s.gpu.default_stream();
         match words[0] {
+            draft::PROPOSE => {
+                r.propose(s, slot, words[2], words[3] as usize, stream)?;
+            }
             speculation::CHECKPOINT => {
                 r.checkpoint(slot, words[2] as usize, stream)?;
             }
