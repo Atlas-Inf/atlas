@@ -195,9 +195,9 @@ fn rank_settings(
     prefill_budget: usize,
     max_batch_tokens: usize,
     vision_max_pixels: Option<usize>,
-) -> [spark_model::model::startup_parity::Setting; 17] {
+) -> [spark_model::model::startup_parity::Setting; 18] {
     // Off the speculative lanes no pool is sized by the draft depth.
-    let num_drafts = if args.speculative || args.self_speculative || args.ngram_speculative {
+    let num_drafts = if args.speculative || args.self_speculative || args.uses_lookup_verifier() {
         args.num_drafts.unwrap_or(0)
     } else {
         0
@@ -242,6 +242,7 @@ fn rank_settings(
         // environment. The head clamps a step's drafts to its own pool, so a
         // worker with a narrower one rolls back from state it never kept.
         ("--num-drafts", num_drafts as u64),
+        ("--dfly-speculative", args.dfly_speculative as u64),
         (
             "MTP verify pool (ATLAS_MTP_MAX_SEQS, _K_LADDER, _POOL_FULL_WIDTH)",
             mtp_verify_pool_word(args.max_batch_size, num_drafts),
@@ -467,6 +468,17 @@ mod tests {
         assert_eq!(
             differing((&["--speculative"], 8192, 8196), (&[], 8192, 8196)),
             ["--speculative or --dflash"]
+        );
+    }
+
+    #[test]
+    fn dfly_and_lookup_are_distinct_even_at_the_same_draft_depth() {
+        assert_eq!(
+            differing(
+                (&["--dfly-speculative", "--num-drafts=5"], 8192, 8196),
+                (&["--ngram-speculative", "--num-drafts=5"], 8192, 8196)
+            ),
+            ["--dfly-speculative"]
         );
     }
 

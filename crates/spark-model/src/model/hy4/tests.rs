@@ -10,7 +10,7 @@ use spark_runtime::{
 #[path = "batch_tests.rs"]
 mod batch_tests;
 
-fn config() -> ModelConfig {
+pub(super) fn config() -> ModelConfig {
     use atlas_core::config::{Hy4Attention as A, Hy4Mlp};
     let mut c = atlas_core::config::parse_config(include_str!(
         "../../../../atlas-core/src/config/fixtures/hy4/config.json"
@@ -61,7 +61,7 @@ fn add(
         },
     );
 }
-fn store(gpu: &MockGpuBackend) -> WeightStore {
+pub(super) fn store(gpu: &MockGpuBackend) -> WeightStore {
     let mut m = HashMap::new();
     for (name, shape) in [
         ("q_a_proj.weight", vec![16, 32]),

@@ -206,6 +206,23 @@ impl Runtime<'_> {
                         w.logits
                     }
                 };
+                if data.draft.is_some() {
+                    if mode == BATCH {
+                        self.head.collapse(
+                            gpu,
+                            w.highway.offset((n - 1) * 4 * h * 2),
+                            w.collapsed,
+                            DevicePtr::NULL,
+                            1,
+                            stream,
+                        )?;
+                        self.batch_norm(s, w.collapsed, self.final_norm, w.normed, 1, stream)?;
+                    }
+                    let hidden = w
+                        .normed
+                        .offset(if mode == VERIFY { (n - 1) * h * 2 } else { 0 });
+                    self.capture_draft(data, hidden, stream)?;
+                }
                 drop(row_span);
                 gpu.synchronize(stream)?;
                 if let Some(timer) = timer {

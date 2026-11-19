@@ -223,7 +223,7 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
     // against MODEL.toml later, and a model default is inert without a
     // speculative method rather than a user error.
     let any_spec =
-        args.speculative || args.self_speculative || args.ngram_speculative || args.dflash;
+        args.speculative || args.self_speculative || args.uses_lookup_verifier() || args.dflash;
     if let Some(num_drafts) = args.num_drafts
         && num_drafts > 1
         && !any_spec

@@ -709,6 +709,17 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// Optional native eager drafter. Checkpoint target state before alias writes.
+    fn eager_draft(
+        &self,
+        _bonus: u32,
+        _count: usize,
+        _seq: &mut SequenceState,
+        _stream: u64,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
     /// True when every row of a single-sequence verify (K = 2..=num_drafts+1,
     /// within `verify_max_drafts`) is bitwise the serial decode step at its
     /// position, so a T=0 speculative run commits exactly the tokens and

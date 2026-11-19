@@ -578,6 +578,12 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub ngram_speculative: bool,
 
+    /// Enable HY4's TP2 DFly drafter with native greedy verification.
+    /// Requires --max-batch-size=1 and --max-num-seqs=1.
+    #[arg(long, default_value_t = false, requires = "num_drafts",
+        conflicts_with_all = ["speculative", "self_speculative", "ngram_speculative", "dflash"])]
+    pub dfly_speculative: bool,
+
     /// Enable DFlash block-diffusion speculative decoding (Z Lab,
     /// arXiv 2602.06036). Pairs the target with a small Qwen3-architecture
     /// drafter (e.g. `z-lab/Qwen3.6-35B-A3B-DFlash`) that emits γ tokens
@@ -1198,6 +1204,9 @@ pub struct ServeArgs {
 }
 
 impl ServeArgs {
+    pub fn uses_lookup_verifier(&self) -> bool {
+        self.ngram_speculative || self.dfly_speculative
+    }
     /// Effective speculative draft count. Valid only AFTER
     /// `serve_phases::apply_model_default_num_drafts` has resolved the
     /// CLI → MODEL.toml → engine-default precedence into `num_drafts` (it

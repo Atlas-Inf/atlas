@@ -75,6 +75,9 @@ pub(crate) fn hash_tokens(tokens: impl IntoIterator<Item = u32>) -> u64 {
 }
 
 impl NgramProposer {
+    pub fn max_chain(&self) -> usize {
+        self.max_chain
+    }
     pub fn new(_order: usize) -> Self {
         Self {
             min_match: 2,

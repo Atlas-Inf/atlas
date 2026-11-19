@@ -18,6 +18,13 @@ pub(crate) fn prepare_reserve<B>(
 }
 
 fn prepare_topology(args: &cli::ServeArgs, config: &mut ModelConfig) -> Result<Option<Topology>> {
+    anyhow::ensure!(
+        !args.dfly_speculative || config.model_type == "hy_v4_flash",
+        "--dfly-speculative is supported only for HY4"
+    );
+    if args.dfly_speculative {
+        super::hy4::validate(args)?;
+    }
     // GLM Strict/Spark: refuse a launch outside the mode contract before CUDA.
     spark_model::weight_loader::glm5_mode::validate(
         config,

@@ -7,7 +7,8 @@ pub(super) const COMMIT: u32 = 8;
 
 pub(super) struct Checkpoint<'a> {
     caches: Vec<AttentionCache<'a, 'a>>,
-    history: Vec<u32>,
+    pub(super) history: Vec<u32>,
+    pub(super) draft: Option<draft::State<'a>>,
 }
 
 impl Runtime<'_> {
@@ -22,10 +23,16 @@ impl Runtime<'_> {
                 "Hy4 checkpoint position/state mismatch"
             );
             if let Some(checkpoint) = &mut data.checkpoint {
+                if data.draft.is_some() && checkpoint.history == data.history {
+                    return Ok(());
+                }
                 for (cache, layer) in checkpoint.caches.iter_mut().zip(&data.layers) {
                     cache.copy_state_from(&layer.attn, stream)?;
                 }
                 checkpoint.history.clone_from(&data.history);
+                if let (Some(saved), Some(current)) = (&mut checkpoint.draft, &data.draft) {
+                    saved.copy_from(current, stream)?;
+                }
             } else {
                 let caches = data
                     .layers
@@ -35,6 +42,7 @@ impl Runtime<'_> {
                 data.checkpoint = Some(Checkpoint {
                     caches,
                     history: data.history.clone(),
+                    draft: data.draft.as_ref().map(|d| d.fork(stream)).transpose()?,
                 });
             }
             Ok(())
@@ -100,6 +108,9 @@ impl Runtime<'_> {
                     layer.attn.copy_state_from(cache, stream)?;
                 }
                 data.history.clone_from(&checkpoint.history);
+                if let (Some(current), Some(saved)) = (&mut data.draft, &checkpoint.draft) {
+                    current.copy_from(saved, stream)?;
+                }
                 data.poisoned = false;
                 Ok::<_, anyhow::Error>(replay)
             })?

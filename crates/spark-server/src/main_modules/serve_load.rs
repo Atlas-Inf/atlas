@@ -1046,7 +1046,7 @@ pub(crate) fn load_model(
         scheduler_model.has_self_speculative(),
         scheduler_model.requires_aux_state(),
     )?;
-    let use_ngram_spec = args.ngram_speculative;
+    let use_ngram_spec = args.uses_lookup_verifier();
     // For DFlash, force `num_drafts = γ - 1` so the scheduler asks the
     // proposer for γ tokens (DraftProposer::propose semantics: "up to
     // num_drafts" → drafts.len() = γ → routes to step_verify_dflash).

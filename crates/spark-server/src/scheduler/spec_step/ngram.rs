@@ -13,6 +13,60 @@
 
 use super::*;
 
+fn draft_count(max: usize, limit: Option<usize>, position: usize) -> usize {
+    limit.map_or(max, |limit| {
+        max.min(limit.saturating_sub(position.saturating_add(1)))
+    })
+}
+
+fn finish_proposal(
+    count: usize,
+    native: anyhow::Result<Option<Vec<u32>>>,
+    fallback: impl FnOnce() -> Vec<u32>,
+) -> anyhow::Result<Vec<u32>> {
+    if let Some(tokens) = native? {
+        anyhow::ensure!(tokens.len() == count, "native eager draft count mismatch");
+        return Ok(tokens);
+    }
+    let mut chain = fallback();
+    chain.truncate(count);
+    Ok(chain)
+}
+
+fn propose(
+    model: &dyn Model,
+    a: &mut ActiveSeq,
+    proposer: &mut NgramProposer,
+) -> anyhow::Result<Vec<u32>> {
+    if model.eager_prompt_lookup()
+        && !super::admission::ngram(a, true, model.verify_context_limit())
+    {
+        return Ok(Vec::new());
+    }
+    let count = draft_count(
+        proposer.max_chain(),
+        model.verify_context_limit(),
+        a.seq.seq_len,
+    );
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let native = if model.eager_prompt_lookup() {
+        model.eager_draft(a.last_token, count, &mut a.seq, 0)
+    } else {
+        Ok(None)
+    };
+    finish_proposal(count, native, || {
+        let mut context = a.seq.tokens.clone();
+        context.push(a.last_token);
+        proposer.propose_chain(&context)
+    })
+}
+
+#[cfg(test)]
+#[path = "ngram_tests.rs"]
+mod tests;
+
 /// N-gram speculative step: CPU proposer + CUDA-graphed K=2 verify.
 ///
 /// Two-phase pipeline (same as MTP but with N-gram proposer instead):
@@ -94,14 +148,14 @@ pub fn step_ngram(
         // the graphed verifies top out at K=4.
         // `a.last_token` is sampled-but-not-pushed (verify_b comment): the
         // searchable context ends at the emitted token, not tokens.last().
-        let mut ngram_ctx = a.seq.tokens.clone();
-        ngram_ctx.push(a.last_token);
-        let mut chain = proposer.propose_chain(&ngram_ctx);
-        if model.eager_prompt_lookup()
-            && let Some(limit) = model.verify_context_limit()
-        {
-            chain.truncate(limit.saturating_sub(a.seq.seq_len + 1));
-        }
+        let chain = match propose(model, a, proposer) {
+            Ok(chain) => chain,
+            Err(error) => {
+                a.engine_error = Some(format!("{error:#}"));
+                a.finished = true;
+                return;
+            }
+        };
         if !chain.is_empty() {
             a.pending_drafts = chain;
 
@@ -314,14 +368,14 @@ pub fn step_ngram_verify(
 
     // Propose next chain — same off-by-one: last_token is emitted but not
     // yet pushed to seq.tokens.
-    let mut ngram_ctx = a.seq.tokens.clone();
-    ngram_ctx.push(a.last_token);
-    let mut chain = proposer.propose_chain(&ngram_ctx);
-    if model.eager_prompt_lookup()
-        && let Some(limit) = model.verify_context_limit()
-    {
-        chain.truncate(limit.saturating_sub(a.seq.seq_len + 1));
-    }
+    let chain = match propose(model, a, proposer) {
+        Ok(chain) => chain,
+        Err(error) => {
+            a.engine_error = Some(format!("{error:#}"));
+            a.finished = true;
+            return;
+        }
+    };
     if !chain.is_empty() {
         a.pending_drafts = chain;
     }
