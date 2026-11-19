@@ -83,3 +83,60 @@ The3-prompt/20-prompt greedy corpus and native rollback qualification have NOT
 been rerun for this revision because free CUDA memory is below the reserve.
 No candidate image/deployment or measured new commit latency/throughput.
 The earlier47.205ms saving remains an upper bound, not a measured improvement.
+
+## Approved window qualification: Nov18
+
+Production source `2b6d6ea54e05b4782f554b71e705e33636ad5896`,
+image `atlas-hy4-flash:dfly-2b6d6ea54`. Full no-cache production build,
+208 CUDA modules, identical image/binary on both ranks. No system package
+installs; memwatch inactive; reserve unchanged at12288 MiB.
+
+### Same-continuation acceptance
+
+Live code continuation256 IDs equals independently generated serial prefix.
+On77 speculative steps, native Atlas, Torch on live inputs, and Torch on
+independently recomputed scalar-target inputs EACH accept177/385 drafts:
+**45.974%,2.298701 drafts/step,3.298701 including bonus**. Acceptance matches
+on every step. Normalized target hidden and all five accepted DSA latent/index
+views are byte-identical to scalar at every captured anchor.
+
+Full five-draft vectors match the reference on76/77 steps; two IDs differ
+after an already-rejected position on the remaining step, without changing
+acceptance. That suffix difference was not diagnosed. No acceptance-gap bug.
+Publisher3.80's exact convention remains unverified; vLLM's standard mean
+includes bonus, which would make the comparable publisher draft count2.80.
+Different publisher prompts/FP8 KV remain non-comparable to this continuation.
+
+### Fresh sequential n=3, timing off
+
+| Configuration | Code tok/s | Change | Repetitive tok/s | Change | Code draft acceptance | Repeat draft acceptance |
+|---|---:|---:|---:|---:|---:|---:|
+| spec-37057536a lookup baseline |20.708573 |— |28.063079 |— |6/15,40.00% |990/1470,67.35% |
+| New exact-prefix lookup |20.953282 |+1.18% |34.739208 |+23.79% |6/15,40.00% |990/1470,67.35% |
+| New exact-prefix DFly |**27.157910** |**+31.14%** |**41.549020** |**+48.06%** |531/1155,45.97% |1248/1425,87.58% |
+
+All benchmark response texts match across configurations and all three runs.
+DFly code rates:27.051575,27.236321,27.185835 tok/s.
+Actual verifier N=6. DFly code host verify mean98.404ms, commit host enqueue
+mean0.564ms. Commit enqueue timing does not measure asynchronous GPU copy time.
+Code50 tok/s is NOT achieved.
+
+Both new modes:3/3 parity and20/20 corpus token IDs/text match fresh serial;
+native TP2 verifier N=1..6 (21 row comparisons) and12 rollback cases
+(prefixes57/515, accepted1..6) pass; four forced tool cases pass, Beijing JSON,
+finish_reason=tool_calls, both streaming content channels empty.
+Rollback checks compare continuation IDs, not full GPU-buffer hashes.
+Native comparisons are logged by the leader; the worker executes RPC/NCCL
+operations. A harness assertion incorrectly expected duplicate comparison
+logs on the worker; corrected without changing model code or rerunning passed
+DFly parity/rollback/tool requests.
+
+Diagnostic capture was removed in separate commit `2b6d6ea54` after data
+collection. Local patch and diagnostics branch retained, not in the PR diff.
+Final source has47 HY4 CPU tests passing, workspace clippy, fmt, license,
+typos and diff checks passing. PR32:1 passed,0 failed,0 pending.
+
+Selected configuration: DFly, `--dfly-speculative --num-drafts=5`.
+The unconditional23:15 Toronto restore-spec watchdog remains armed as
+requested, pending clarification about retaining a fully qualified winner.
+Full evidence: `/home/robert/hy4-dfly-20261118/window/summary.json`.
