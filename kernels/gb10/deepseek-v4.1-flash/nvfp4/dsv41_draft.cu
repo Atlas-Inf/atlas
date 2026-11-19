@@ -49,21 +49,44 @@ extern "C" __global__ void dsv41_parts_rows(
 }
 
 #define DSV41_MARKOV_THREADS 256
+#define DSV41_MARKOV_WARPS (DSV41_MARKOV_THREADS / 32)
 
-// The block's best of the candidates its threads hold, in entry 0 of
-// `values` and `tokens` (shared, a thread an entry).
-__device__ __forceinline__ void dsv41_markov_best(float* values, unsigned int* tokens) {
-    for (unsigned int step = DSV41_MARKOV_THREADS / 2; step > 0; step /= 2) {
-        if (threadIdx.x < step) {
-            const float other = values[threadIdx.x + step];
-            const unsigned int other_token = tokens[threadIdx.x + step];
-            if (dsv41_candidate_before(other, other_token, values[threadIdx.x], tokens[threadIdx.x])) {
-                values[threadIdx.x] = other;
-                tokens[threadIdx.x] = other_token;
-            }
+// The warp's best of the candidates its lanes hold, in every lane.
+__device__ __forceinline__ void dsv41_markov_warp_best(float& value, unsigned int& token) {
+    #pragma unroll
+    for (unsigned int o = 16; o > 0; o >>= 1) {
+        const float other = __shfl_xor_sync(0xffffffffu, value, o);
+        const unsigned int other_token = __shfl_xor_sync(0xffffffffu, token, o);
+        if (dsv41_candidate_before(other, other_token, value, token)) {
+            value = other;
+            token = other_token;
         }
-        __syncthreads();
     }
+}
+
+// The block's best of the candidates its warps hold, each the same in all
+// of a warp's lanes: in every thread. `values` and `tokens` are shared, an
+// entry a warp.
+__device__ __forceinline__ void dsv41_markov_block_best(
+    float& value, unsigned int& token, float* values, unsigned int* tokens) {
+    const unsigned int lane = threadIdx.x & 31u;
+    if (lane == 0) {
+        values[threadIdx.x >> 5] = value;
+        tokens[threadIdx.x >> 5] = token;
+    }
+    __syncthreads();
+    value = lane < DSV41_MARKOV_WARPS ? values[lane] : 0.0f;
+    token = lane < DSV41_MARKOV_WARPS ? tokens[lane] : DSV41_NO_TOKEN;
+    dsv41_markov_warp_best(value, token);
+}
+
+// Eight BF16 values of a row, as a lane holds them.
+__device__ __forceinline__ void dsv41_markov_eight(const __nv_bfloat16* at, float* v) {
+    const uint4 w = *reinterpret_cast<const uint4*>(at);
+    dsv41_unpack2(w.x, v[0], v[1]);
+    dsv41_unpack2(w.y, v[2], v[3]);
+    dsv41_unpack2(w.z, v[4], v[5]);
+    dsv41_unpack2(w.w, v[6], v[7]);
 }
 
 // One row of a draft block through the Markov head, on a rank's share of the
@@ -79,8 +102,13 @@ __device__ __forceinline__ void dsv41_markov_best(float* values, unsigned int* t
 // closes the chain.
 //
 // logits [n] FP32, head [n, rank] BF16 (this rank's rows, the first of them
-// token `first`), embed [vocab, rank] BF16. Grid ceil(n / 256), block 256,
-// a thread a token; rank at most 256.
+// token `first`), embed [vocab, rank] BF16; rank a multiple of 8, at most
+// 256. Grid ceil(n / 256), block 256: a block takes 256 tokens, a warp 32 of
+// them one after another, and a lane eight values of each one's row, so a
+// warp reads a row in one load of whole cache lines and the row before's
+// eight values stay in a lane's registers. (A thread a token read 32 rows a
+// load, a value each: 97 us a round of the release's head against this
+// form's time, with the head in the cache.)
 extern "C" __global__ void __launch_bounds__(DSV41_MARKOV_THREADS) dsv41_markov_round(
     const float* __restrict__ logits,
     const __nv_bfloat16* __restrict__ head,
@@ -95,10 +123,9 @@ extern "C" __global__ void __launch_bounds__(DSV41_MARKOV_THREADS) dsv41_markov_
     unsigned int token,
     unsigned int vocab) {
     atlas_pdl_enter();
-    __shared__ float values[DSV41_MARKOV_THREADS];
-    __shared__ unsigned int tokens[DSV41_MARKOV_THREADS];
-    __shared__ float from[DSV41_MARKOV_THREADS];
-    const unsigned int t = threadIdx.x;
+    __shared__ float was[DSV41_MARKOV_WARPS], values[DSV41_MARKOV_WARPS];
+    __shared__ unsigned int was_tokens[DSV41_MARKOV_WARPS], tokens[DSV41_MARKOV_WARPS];
+    const unsigned int t = threadIdx.x, lane = t & 31u;
     unsigned int last = token;
     if (before) {
         float best = 0.0f;
@@ -110,37 +137,40 @@ extern "C" __global__ void __launch_bounds__(DSV41_MARKOV_THREADS) dsv41_markov_
                 best_token = before[2 * i + 1];
             }
         }
-        values[t] = best;
-        tokens[t] = best_token;
-        __syncthreads();
-        dsv41_markov_best(values, tokens);
-        last = tokens[0];
-        __syncthreads();
+        dsv41_markov_warp_best(best, best_token);
+        dsv41_markov_block_best(best, best_token, was, was_tokens);
+        last = best_token;
     }
     if (chosen && blockIdx.x == 0 && t == 0) *chosen = last;
     if (!logits) return;
     // A row that found no token ends the chain for the host; the rows after
     // it still run, from any token.
-    const __nv_bfloat16* row = embed + (size_t)(last < vocab ? last : 0u) * rank;
-    for (unsigned int k = t; k < rank; k += DSV41_MARKOV_THREADS) from[k] = __bfloat162float(row[k]);
-    __syncthreads();
-    const unsigned int v = blockIdx.x * DSV41_MARKOV_THREADS + t;
+    const bool live = 8u * lane < rank;
+    float from[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    if (live) dsv41_markov_eight(embed + (size_t)(last < vocab ? last : 0u) * rank + 8u * lane, from);
     float value = 0.0f;
     unsigned int mine_token = DSV41_NO_TOKEN;
-    if (v < n) {
-        const __nv_bfloat16* to = head + (size_t)v * rank;
+    const unsigned int base = blockIdx.x * DSV41_MARKOV_THREADS + (t & ~31u);
+    for (unsigned int v = base; v < base + 32u && v < n; ++v) {
         float gain = 0.0f;
-        for (unsigned int k = 0; k < rank; ++k) gain += from[k] * __bfloat162float(to[k]);
-        value = logits[v] + gain;
+        if (live) {
+            float to[8];
+            dsv41_markov_eight(head + (size_t)v * rank + 8u * lane, to);
+            #pragma unroll
+            for (unsigned int k = 0; k < 8; ++k) gain += from[k] * to[k];
+        }
+        #pragma unroll
+        for (unsigned int o = 16; o > 0; o >>= 1) gain += __shfl_xor_sync(0xffffffffu, gain, o);
+        const float now = logits[v] + gain;
         // A logit that is not a number is no candidate.
-        if (value == value) mine_token = first + v;
+        if (now == now && dsv41_candidate_before(now, first + v, value, mine_token)) {
+            value = now;
+            mine_token = first + v;
+        }
     }
-    values[t] = value;
-    tokens[t] = mine_token;
-    __syncthreads();
-    dsv41_markov_best(values, tokens);
+    dsv41_markov_block_best(value, mine_token, values, tokens);
     if (t == 0) {
-        mine[2 * blockIdx.x] = __float_as_uint(values[0]);
-        mine[2 * blockIdx.x + 1] = tokens[0];
+        mine[2 * blockIdx.x] = __float_as_uint(value);
+        mine[2 * blockIdx.x + 1] = mine_token;
     }
 }

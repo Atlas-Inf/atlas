@@ -130,8 +130,9 @@ impl Draft {
                 );
                 tensor(store, &name, WeightDtype::BF16)
             };
+            // What `dsv41_markov_round` takes: a lane reads eight values.
             ensure!(
-                (1..=256).contains(&rank),
+                (1..=256).contains(&rank) && rank.is_multiple_of(8),
                 "deepseek_v41: a Markov head of rank {rank}"
             );
             Markov {
