@@ -434,7 +434,7 @@ impl Qwen4ExpMtpHead {
 
 #[cfg(test)]
 #[path = "qwen4exp_mtp_batch_tests.rs"]
-mod tests;
+pub(super) mod tests;
 
 #[cfg(all(test, feature = "cuda"))]
 #[path = "qwen4exp_mtp_batch_gpu_tests.rs"]

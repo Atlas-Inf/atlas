@@ -159,6 +159,9 @@ pub struct Qwen4ExpMtpHead {
     /// `ATLAS_QWEN4EXP_MTP_DRAFT_TP`: the worker projects half of the draft
     /// head of each batched propose the model announces (`draft_tp`).
     tp: Option<draft_tp::DraftTp>,
+    /// `ATLAS_QWEN4EXP_MTP_DRAFT_TP_ONE`: a lone sequence's propose is
+    /// announced and split too.
+    tp_one: bool,
     /// `ATLAS_QWEN4EXP_MTP_ABSORB` (`qwen4exp_mtp_absorb.rs`).
     absorb: qwen4exp_mtp_absorb::AbsorbBufs,
 }
@@ -215,6 +218,15 @@ impl DraftProposer for Qwen4ExpMtpHead {
             .downcast_mut::<Qwen4ExpMtpProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid qwen4_exp MTP proposer state"))?;
 
+        // An announced one-row draft-TP propose (`draft_tp`): from here on
+        // every exit issues the swaps the worker walks.
+        let tp = self.draft_tp_one_run(
+            ctx.comm,
+            ctx.gpu,
+            num_drafts,
+            grammar_bitmask.is_some(),
+            stream,
+        )?;
         qwen4exp_mtp_kv::settle_unverified(st);
         self.absorb_before_propose(&mut [&mut *st], &[position], 1, ctx, stream)?;
         crate::layers::qsa::draft_share_set(st.body_state.as_mut(), true); // MTP_INDEX_SHARE
@@ -234,6 +246,7 @@ impl DraftProposer for Qwen4ExpMtpHead {
                 stream,
                 grammar_bitmask,
                 want_conf,
+                tp.as_ref(),
             )?;
             // Confidence stop: the first draft is always kept; a later one
             // whose draft-head probability is below the threshold ends the
@@ -260,6 +273,7 @@ impl DraftProposer for Qwen4ExpMtpHead {
         crate::layers::qsa::draft_share_set(st.body_state.as_mut(), false);
         st.last_num_drafted = drafts.len();
         st.awaiting_verdict = true;
+        tp.map_or(Ok(()), draft_tp::TpRun::finish)?;
         Ok(drafts)
     }
 

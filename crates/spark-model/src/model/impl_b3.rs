@@ -253,8 +253,17 @@ impl TransformerModel {
             let ctx_rows = proposer.rank_split_ctx(comm, seqs);
             self.announce_draft_split(ctx_rows)?;
         }
+        // ATLAS_QWEN4EXP_MTP_DRAFT_TP_ONE: a lone qwen4_exp sequence's propose
+        // whose draft head the worker shares, announced as a one-row plan.
+        let tp_comm = match split_comm {
+            Some(_) => None,
+            None => {
+                let grammar = grammar_bitmask.is_some();
+                self.announce_draft_tp(proposer, 1, num_drafts, grammar, &ctx)?
+            }
+        };
         let ctx = ForwardContext {
-            comm: split_comm,
+            comm: split_comm.or(tp_comm),
             ..ctx
         };
         let drafts = proposer.propose(

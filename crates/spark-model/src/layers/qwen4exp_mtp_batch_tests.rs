@@ -107,7 +107,7 @@ impl TransformerLayer for StubBody {
     }
 }
 
-fn config() -> ModelConfig {
+pub(crate) fn config() -> ModelConfig {
     let mut c = ModelConfig::qwen3_next_80b_nvfp4();
     c.hidden_size = 256;
     c.hc_mult = 4;
@@ -117,9 +117,9 @@ fn config() -> ModelConfig {
     c
 }
 
-type Calls = Arc<Mutex<Vec<usize>>>;
+pub(crate) type Calls = Arc<Mutex<Vec<usize>>>;
 
-fn head(gpu: &MockGpuBackend, c: &ModelConfig) -> (Qwen4ExpMtpHead, Calls) {
+pub(crate) fn head(gpu: &MockGpuBackend, c: &ModelConfig) -> (Qwen4ExpMtpHead, Calls) {
     let h = c.hidden_size;
     let dw = |bytes: usize| DenseWeight {
         weight: gpu.alloc(bytes).unwrap(),
