@@ -128,6 +128,28 @@ impl Hy4Model {
     }
 }
 impl Runtime<'_> {
+    pub(super) fn capture_teacher(
+        &self,
+        shared: &Shared,
+        data: &mut RequestData<'_>,
+        hidden: DevicePtr,
+        tokens: &[u32],
+        stream: u64,
+    ) -> Result<()> {
+        if !super::draft_capture::teacher_enabled(shared.config.tp_rank) {
+            return Ok(());
+        }
+        let mut history = data.history.clone();
+        history.extend_from_slice(tokens);
+        let result = Self::targets(data, stream).and_then(|caches| {
+            super::draft_capture::teacher(shared, hidden, caches, &history, stream)
+        });
+        if let Err(error) = result {
+            tracing::warn!(%error, "HY4 diagnostic teacher capture failed");
+        }
+        Ok(())
+    }
+
     pub(super) fn capture_draft_prefix(
         &self,
         data: &mut RequestData<'_>,
@@ -236,7 +258,13 @@ impl Runtime<'_> {
                     bonus,
                     count,
                 };
-                let capture = super::draft_capture::begin(s, &input, &data.history, stream)?;
+                let capture = match super::draft_capture::begin(s, &input, &data.history, stream) {
+                    Ok(capture) => capture,
+                    Err(error) => {
+                        tracing::warn!(%error, "HY4 diagnostic capture failed");
+                        None
+                    }
+                };
                 let result = drafter.lock().with_dependent_mut(|_, draft| {
                     draft.draft(
                         &input,
@@ -252,7 +280,9 @@ impl Runtime<'_> {
                     data.poisoned = true;
                 }
                 if let (Some(capture), Ok(tokens)) = (capture, &result) {
-                    capture.finish(tokens)?;
+                    if let Err(error) = capture.finish(tokens) {
+                        tracing::warn!(%error, "HY4 diagnostic capture finish failed");
+                    }
                 }
                 result
             })

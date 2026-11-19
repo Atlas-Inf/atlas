@@ -5,11 +5,24 @@ use crate::layers::hy4::dfly;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
+    io::Write,
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 static STEPS: AtomicUsize = AtomicUsize::new(0);
+
+fn write_private(path: impl AsRef<std::path::Path>, bytes: &[u8]) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)?;
+    Ok(())
+}
 
 pub(super) struct Capture {
     path: PathBuf,
@@ -45,6 +58,17 @@ pub(super) fn begin(
     if step >= limit {
         return Ok(None);
     }
+    capture(shared, input, history, stream, PathBuf::from(path), step).map(Some)
+}
+
+fn capture(
+    shared: &Shared,
+    input: &dfly::Input,
+    history: &[u32],
+    stream: u64,
+    directory: PathBuf,
+    step: usize,
+) -> Result<Capture> {
     let anchor = history.len();
     let [hidden_bytes, cache_bytes, index_bytes] =
         sizes(shared.config.hidden_size, anchor, input.count)?;
@@ -52,14 +76,20 @@ pub(super) fn begin(
         input.caches.iter().all(|cache| cache.len == anchor),
         "Hy4 DFly capture history/cache mismatch"
     );
-    let path = PathBuf::from(path).join(format!("step-{step:05}"));
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    std::fs::create_dir(&path)?;
+    let path = directory.join(format!("step-{step:05}"));
+    let mut directory = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directory.mode(0o700);
+    }
+    directory.recursive(true).create(path.parent().unwrap())?;
+    directory.recursive(false).create(&path)?;
     shared.gpu.synchronize(stream)?;
     let write = |name: &str, pointer, len| -> Result<()> {
         let mut bytes = vec![0; len];
         shared.gpu.copy_d2h(pointer, &mut bytes)?;
-        std::fs::write(path.join(name), bytes)?;
+        write_private(path.join(name), &bytes)?;
         Ok(())
     };
     write("hidden.bf16", input.target_hidden, hidden_bytes)?;
@@ -67,7 +97,7 @@ pub(super) fn begin(
         write(&format!("cache-{i}.bf16"), cache.latent, cache_bytes)?;
         write(&format!("indices-{i}.i32"), cache.indices, index_bytes)?;
     }
-    Ok(Some(Capture {
+    Ok(Capture {
         path,
         metadata: json!({
             "history": history,
@@ -78,7 +108,45 @@ pub(super) fn begin(
             "world": shared.config.tp_world_size,
             "target_layers": dfly::TARGET_LAYERS,
         }),
-    }))
+    })
+}
+
+pub(super) fn teacher_enabled(rank: usize) -> bool {
+    rank == 0 && std::env::var_os("ATLAS_HY4_DFLY_TEACHER_DIR").is_some()
+}
+
+#[derive(serde::Deserialize)]
+struct Plan {
+    anchor: usize,
+    bonus: u32,
+    count: usize,
+}
+
+pub(super) fn teacher(
+    shared: &Shared,
+    hidden: spark_runtime::gpu::DevicePtr,
+    caches: [dfly::TargetCache; 5],
+    history: &[u32],
+    stream: u64,
+) -> Result<()> {
+    let directory = PathBuf::from(std::env::var_os("ATLAS_HY4_DFLY_TEACHER_DIR").unwrap());
+    let plans: Vec<Plan> = serde_json::from_slice(&std::fs::read(directory.join("plans.json"))?)?;
+    let Some((step, plan)) = plans
+        .iter()
+        .enumerate()
+        .find(|(_, p)| p.anchor == history.len())
+    else {
+        return Ok(());
+    };
+    let input = dfly::Input {
+        target_hidden: hidden,
+        caches,
+        bonus: plan.bonus,
+        count: plan.count,
+    };
+    let mut frame = capture(shared, &input, history, stream, directory, step)?;
+    frame.metadata["kind"] = json!("serial_teacher");
+    frame.save()
 }
 
 impl Capture {
@@ -88,9 +156,13 @@ impl Capture {
             "Hy4 DFly capture output count"
         );
         self.metadata["atlas"] = json!(tokens);
-        std::fs::write(
+        self.save()
+    }
+
+    fn save(&self) -> Result<()> {
+        write_private(
             self.path.join("metadata.json"),
-            serde_json::to_vec_pretty(&self.metadata)?,
+            &serde_json::to_vec_pretty(&self.metadata)?,
         )?;
         Ok(())
     }
