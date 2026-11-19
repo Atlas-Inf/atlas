@@ -236,6 +236,7 @@ impl Runtime<'_> {
                     bonus,
                     count,
                 };
+                let capture = super::draft_capture::begin(s, &input, &data.history, stream)?;
                 let result = drafter.lock().with_dependent_mut(|_, draft| {
                     draft.draft(
                         &input,
@@ -249,6 +250,9 @@ impl Runtime<'_> {
                 });
                 if result.is_err() {
                     data.poisoned = true;
+                }
+                if let (Some(capture), Ok(tokens)) = (capture, &result) {
+                    capture.finish(tokens)?;
                 }
                 result
             })
