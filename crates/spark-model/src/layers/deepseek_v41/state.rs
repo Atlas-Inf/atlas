@@ -80,6 +80,10 @@ pub struct SeqState {
     /// first position and rows, while it can still be taken back.
     pub(super) kept_window: DevicePtr,
     pub(super) kept: Option<(usize, usize)>,
+    /// A batch whose refused rows' keys the ring has yet to get back
+    /// ([`SeqState::restore_window`]): its first position, the rows
+    /// accepted, and its rows.
+    pub(super) taken_back: Option<(usize, usize, usize)>,
     /// On an Engram layer: the compressed id of the token at every position
     /// so far, which the n-grams ending at the next ones are hashed from.
     pub history: Vec<u32>,
@@ -116,6 +120,7 @@ impl SeqState {
             compressed,
             kept_window: gpu.alloc(KEPT_ROWS * HEAD_DIM * 2)?,
             kept: None,
+            taken_back: None,
             history: Vec::new(),
             draft: None,
         })
@@ -123,7 +128,8 @@ impl SeqState {
 
     /// Take back all but the first `accepted` of the `rows` tokens the last
     /// batch ran: a verify whose later drafts were refused. The ring gets
-    /// back the keys those rows displaced, a compressor the group that was
+    /// back the keys those rows displaced when the layer next runs
+    /// ([`SeqState::restore_window`]), a compressor the group that was
     /// open at the last accepted token, and an Engram's history ends there.
     /// Keys of groups the refused rows completed stay where they are: no
     /// query sees them before the tokens that complete those groups again
@@ -131,7 +137,6 @@ impl SeqState {
     pub fn roll_back(
         &mut self,
         gpu: &dyn GpuBackend,
-        restore: KernelHandle,
         ratio: usize,
         accepted: usize,
         rows: usize,
@@ -149,22 +154,7 @@ impl SeqState {
             kept == rows,
             "deepseek_v41: a verify of {rows} rows after a batch of {kept}"
         );
-        // In stream order, behind the batch and ahead of the next: a wait
-        // for the stream and a copy a row, in every layer, was 1.6 ms of a
-        // verify step with nothing on the GPU.
-        KernelLaunch::new(gpu, restore)
-            .grid([
-                div_ceil(((rows - accepted) * HEAD_DIM / 8) as u32, 256),
-                1,
-                1,
-            ])
-            .block([256, 1, 1])
-            .arg_ptr(self.kept_window)
-            .arg_ptr(self.window)
-            .arg_u32(first as u32)
-            .arg_u32(accepted as u32)
-            .arg_u32(rows as u32)
-            .launch(stream)?;
+        self.taken_back = Some((first, accepted, rows));
         let end = first + accepted;
         if let Some(c) = self.compressed.as_ref().filter(|_| ratio > 1) {
             // The pools start at the group that was open before the batch.
@@ -178,6 +168,36 @@ impl SeqState {
         self.history.truncate(end);
         self.kept = None;
         Ok(())
+    }
+
+    /// The ring gets back the keys a taken-back batch's refused rows
+    /// displaced (`dsv41_window_restore`), ahead of whatever next reads or
+    /// writes it: the layer's next run. A launch in each of forty layers
+    /// between a verify and the draft pass behind it was 90 us with nothing
+    /// else on the GPU; among a layer's own launches it is 3 to 6 us beside
+    /// the layer's first projection, which waits for the site before it.
+    pub fn restore_window(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        restore: KernelHandle,
+        stream: u64,
+    ) -> Result<()> {
+        let Some((first, accepted, rows)) = self.taken_back.take() else {
+            return Ok(());
+        };
+        KernelLaunch::new(gpu, restore)
+            .grid([
+                div_ceil(((rows - accepted) * HEAD_DIM / 8) as u32, 256),
+                1,
+                1,
+            ])
+            .block([256, 1, 1])
+            .arg_ptr(self.kept_window)
+            .arg_ptr(self.window)
+            .arg_u32(first as u32)
+            .arg_u32(accepted as u32)
+            .arg_u32(rows as u32)
+            .launch(stream)
     }
 
     pub fn free(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
@@ -316,3 +336,7 @@ impl Handoff {
         grown(gpu, flags, held, rows, cols, stream)
     }
 }
+
+#[cfg(test)]
+#[path = "state_test_gpu.rs"]
+mod test_gpu;

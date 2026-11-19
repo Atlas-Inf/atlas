@@ -216,8 +216,7 @@ impl TransformerLayer for Layer {
             .as_any_mut()
             .downcast_mut::<SeqState>()
             .context("deepseek_v41: a layer state that is not this layer's")?;
-        let restore = self.block.shared.kernels.cache.window_restore;
-        state.roll_back(gpu, restore, self.compresses, num_accepted, k, stream)
+        state.roll_back(gpu, self.compresses, num_accepted, k, stream)
     }
 
     /// A chunk of a prompt, a batch of rows at a time: the bytes of a

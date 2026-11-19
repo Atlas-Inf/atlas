@@ -82,6 +82,9 @@ impl Block {
             &self.weights.attn,
         );
         let began = profile::begin(gpu, stream)?;
+        // Before the ring is written or read: the keys a verify's refused
+        // rows displaced.
+        state.restore_window(gpu, k.cache.window_restore, stream)?;
         // The low-rank query and the window key, both from the input's FP8
         // form; then the query normed, and the key normed, turned to the
         // token's position and rounded into the window.
