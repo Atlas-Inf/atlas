@@ -780,6 +780,7 @@ impl TransformerModel {
             proposer,
             native_glm_mtp,
             draft_assist: None,
+            head_pick: None,
             lightning_dspark_identity: Default::default(),
             mtp_hidden_save,
             verify_hidden_stash,

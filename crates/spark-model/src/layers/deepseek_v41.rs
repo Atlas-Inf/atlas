@@ -23,6 +23,8 @@ pub mod engram;
 pub mod engram_table;
 pub mod gemm;
 pub mod hc;
+pub mod head;
+pub mod head_bound;
 pub mod index;
 pub mod index_recipe;
 pub mod layer;

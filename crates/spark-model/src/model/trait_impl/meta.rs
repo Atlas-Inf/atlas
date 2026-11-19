@@ -420,6 +420,8 @@ impl TransformerModel {
         logits_ptr: DevicePtr,
         dst: &mut [u8],
     ) -> Result<()> {
+        // A row a step picked from without computing is computed first.
+        self.head_whole_for_read(logits_ptr)?;
         self.gpu.copy_d2h(logits_ptr, dst)
     }
 
@@ -436,6 +438,10 @@ impl TransformerModel {
         logits_ptr: DevicePtr,
         _stream: u64,
     ) -> Result<u32> {
+        // A row a step picked from without computing says its argmax.
+        if let Some(picked) = self.head_picked(logits_ptr, 1)? {
+            return Ok(picked[0]);
+        }
         // Use backend's default stream (same as decode) to avoid implicit
         // sync overhead from legacy default stream (handle 0).
         let stream = self.gpu.default_stream();

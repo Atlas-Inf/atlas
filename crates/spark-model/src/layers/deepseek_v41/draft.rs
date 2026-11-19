@@ -105,6 +105,13 @@ pub struct Draft {
 }
 
 impl Draft {
+    /// The parts this rank holds, and the FP8 copy of its rows of the
+    /// model's head, which the pick of a step's largest logit reads too
+    /// (`head.rs`).
+    pub fn head_copy(&self) -> (Held, Mxfp8Weight) {
+        (self.held, self.head)
+    }
+
     /// Whether `token` is one of the model's.
     pub(super) fn holds(&self, token: u32) -> bool {
         (token as usize) < self.markov.vocab

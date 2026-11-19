@@ -47,6 +47,18 @@ __device__ __forceinline__ float dsv41_bf16(float v) {
     return __bfloat162float(__float2bfloat16(v));
 }
 
+// No candidate, where a token is expected.
+#define DSV41_NO_TOKEN 0xffffffffu
+
+// Whether candidate (value, token) comes before (best, best_token): the
+// larger value, and among equals the lower token, which is the order of the
+// engine's argmax. Every rank orders the same candidates the same way.
+__device__ __forceinline__ bool dsv41_candidate_before(
+    float value, unsigned int token, float best, unsigned int best_token) {
+    return token != DSV41_NO_TOKEN &&
+           (best_token == DSV41_NO_TOKEN || value > best || (value == best && token < best_token));
+}
+
 // 2^ceil(log2(ratio)), read off the float's exponent.
 __device__ __forceinline__ float dsv41_pow2_ceil(float ratio) {
     const unsigned int bits = __float_as_uint(ratio);

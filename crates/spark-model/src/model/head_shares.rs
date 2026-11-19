@@ -75,11 +75,30 @@ impl TransformerModel {
         Ok(true)
     }
 
-    /// The head of one row in shares, into `self.buffers.logits()`.
-    /// `Ok(false)`, nothing launched: the caller runs the full head.
+    /// In place of the head of the first `rows` rows, the tokens of their
+    /// largest logits (`head_pick`: `[rows]` u32 on the device), where the
+    /// head goes in shares and the ranks pick. `None`, nothing launched.
+    pub(in crate::model) fn head_picks_in_shares(
+        &self,
+        normed: DevicePtr,
+        rows: usize,
+        stream: u64,
+    ) -> Result<Option<DevicePtr>> {
+        if self.head_share().is_none() {
+            return Ok(None);
+        }
+        self.head_pick_rows(normed, rows, stream)
+    }
+
+    /// The head of one row in shares, into `self.buffers.logits()`, or the
+    /// row marked with its pick. `Ok(false)`, nothing launched: the caller
+    /// runs the full head.
     pub(in crate::model) fn head_in_shares(&self, normed: DevicePtr, stream: u64) -> Result<bool> {
         if self.head_share().is_none() {
             return Ok(false);
+        }
+        if self.head_pick_rows(normed, 1, stream)?.is_some() {
+            return Ok(true);
         }
         if !self.head_rows_in_shares(normed, 1, stream)? {
             // The transport would not take it after all: the row whole, here.

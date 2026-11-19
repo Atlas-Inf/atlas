@@ -537,6 +537,19 @@ pub fn build_model(
     } else {
         None
     };
+    // The pick of a step's largest logit (unless `ATLAS_DSV41_HEAD_PICK=0`)
+    // reads the draft head's FP8 copy of this rank's rows of the head, and the
+    // rows: so wherever the draft head is served.
+    let dsv41_head_pick = match &dsv41_draft {
+        Some(draft) if crate::model::head_pick_allowed() => {
+            use crate::layers::deepseek_v41::{head::HeadPick, parts::PARTS};
+            let (held, copy) = draft.head_copy();
+            let (n, hidden) = (config.vocab_size / PARTS, config.hidden_size);
+            let rows = lm_head.weight.offset(held.first * n * hidden * 2);
+            Some(HeadPick::load(gpu.as_ref(), rows, copy, held, n, hidden)?)
+        }
+        _ => None,
+    };
     // ── Step 3b: Post-load MoE prefill transpose (MiniMax EP=2 TTFT fix) ──
     //
     // MiniMax M2.7-NVFP4 EP=2 has ~46 GB free at layer-0 load time but
@@ -1396,6 +1409,10 @@ pub fn build_model(
             _ => model.set_draft_assist(draft),
         }
         tracing::info!("DeepSeek-V4.1 draft head: ENABLED, a part on every rank");
+    }
+    if let Some(pick) = dsv41_head_pick {
+        model.set_head_pick(pick);
+        tracing::info!("DeepSeek-V4.1 head: a greedy step picks its largest logit");
     }
 
     // ── Step 6c: Qwen3.8-Flash-Next MTP proposer (optional) ──

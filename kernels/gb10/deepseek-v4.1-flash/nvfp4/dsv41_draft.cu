@@ -49,16 +49,6 @@ extern "C" __global__ void dsv41_parts_rows(
 }
 
 #define DSV41_MARKOV_THREADS 256
-#define DSV41_MARKOV_NONE 0xffffffffu
-
-// Whether candidate (value, token) comes before (best, best_token): the
-// larger value, and among equals the lower token. Every rank orders the same
-// candidates the same way.
-__device__ __forceinline__ bool dsv41_markov_before(
-    float value, unsigned int token, float best, unsigned int best_token) {
-    return token != DSV41_MARKOV_NONE &&
-           (best_token == DSV41_MARKOV_NONE || value > best || (value == best && token < best_token));
-}
 
 // The block's best of the candidates its threads hold, in entry 0 of
 // `values` and `tokens` (shared, a thread an entry).
@@ -67,7 +57,7 @@ __device__ __forceinline__ void dsv41_markov_best(float* values, unsigned int* t
         if (threadIdx.x < step) {
             const float other = values[threadIdx.x + step];
             const unsigned int other_token = tokens[threadIdx.x + step];
-            if (dsv41_markov_before(other, other_token, values[threadIdx.x], tokens[threadIdx.x])) {
+            if (dsv41_candidate_before(other, other_token, values[threadIdx.x], tokens[threadIdx.x])) {
                 values[threadIdx.x] = other;
                 tokens[threadIdx.x] = other_token;
             }
@@ -112,10 +102,10 @@ extern "C" __global__ void __launch_bounds__(DSV41_MARKOV_THREADS) dsv41_markov_
     unsigned int last = token;
     if (before) {
         float best = 0.0f;
-        unsigned int best_token = DSV41_MARKOV_NONE;
+        unsigned int best_token = DSV41_NO_TOKEN;
         for (unsigned int i = t; i < count; i += DSV41_MARKOV_THREADS) {
             const float value = __uint_as_float(before[2 * i]);
-            if (dsv41_markov_before(value, before[2 * i + 1], best, best_token)) {
+            if (dsv41_candidate_before(value, before[2 * i + 1], best, best_token)) {
                 best = value;
                 best_token = before[2 * i + 1];
             }
@@ -136,7 +126,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_MARKOV_THREADS) dsv41_markov_
     __syncthreads();
     const unsigned int v = blockIdx.x * DSV41_MARKOV_THREADS + t;
     float value = 0.0f;
-    unsigned int mine_token = DSV41_MARKOV_NONE;
+    unsigned int mine_token = DSV41_NO_TOKEN;
     if (v < n) {
         const __nv_bfloat16* to = head + (size_t)v * rank;
         float gain = 0.0f;
