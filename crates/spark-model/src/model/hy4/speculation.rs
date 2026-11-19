@@ -9,6 +9,7 @@ pub(super) struct Checkpoint<'a> {
     caches: Vec<AttentionCache<'a, 'a>>,
     pub(super) history: Vec<u32>,
     pub(super) draft: Option<draft::State<'a>>,
+    pub(super) draft_prefix: Vec<draft::State<'a>>,
 }
 
 impl Runtime<'_> {
@@ -43,6 +44,7 @@ impl Runtime<'_> {
                     caches,
                     history: data.history.clone(),
                     draft: data.draft.as_ref().map(|d| d.fork(stream)).transpose()?,
+                    draft_prefix: Vec::new(),
                 });
             }
             Ok(())
@@ -83,7 +85,7 @@ impl Runtime<'_> {
 
     pub(super) fn commit(
         &self,
-        s: &Shared,
+        _s: &Shared,
         slot: usize,
         accepted: usize,
         rows: usize,
@@ -93,7 +95,7 @@ impl Runtime<'_> {
         if accepted == rows {
             return Ok(());
         }
-        let replay = {
+        let position = {
             let mut requests = self.requests.lock();
             let cell = requests.get_mut(&slot).context("Hy4 commit slot missing")?;
             cell.with_dependent_mut(|_, data| {
@@ -102,25 +104,22 @@ impl Runtime<'_> {
                     .as_ref()
                     .context("Hy4 verify checkpoint missing")?;
                 let base = checkpoint.history.len();
-                let replay = data.history[base..base + accepted].to_vec();
                 data.poisoned = true;
                 for (layer, cache) in data.layers.iter_mut().zip(&checkpoint.caches) {
-                    layer.attn.copy_state_from(cache, stream)?;
+                    layer.attn.commit_prefix(cache, accepted, rows, stream)?;
                 }
-                data.history.clone_from(&checkpoint.history);
-                if let (Some(current), Some(saved)) = (&mut data.draft, &checkpoint.draft) {
+                data.history.truncate(base + accepted);
+                if let Some(current) = &mut data.draft {
+                    let saved = checkpoint
+                        .draft_prefix
+                        .get(accepted - 1)
+                        .context("Hy4 accepted draft prefix missing")?;
                     current.copy_from(saved, stream)?;
                 }
                 data.poisoned = false;
-                Ok::<_, anyhow::Error>(replay)
+                Ok::<_, anyhow::Error>(data.history.len())
             })?
         };
-        if replay.len() == 1 {
-            self.row(s, slot, replay[0], stream)?;
-        } else {
-            self.rows(s, slot, &replay, batch::BATCH, stream)?;
-        }
-        let position = self.requests.lock()[&slot].borrow_dependent().history.len();
         self.checkpoint(slot, position, stream)
     }
 }

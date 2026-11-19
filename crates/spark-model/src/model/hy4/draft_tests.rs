@@ -5,6 +5,62 @@ use crate::traits::Model;
 use spark_runtime::gpu::mock::MockGpuBackend;
 
 #[test]
+fn prefix_commit_selects_captured_hidden_and_indices_without_running_a_forward() {
+    for accepted in 1..=6 {
+        let gpu = Box::new(MockGpuBackend::new());
+        let weights = super::super::tests::store(&gpu);
+        let model =
+            Hy4Model::new(super::super::tests::config(), weights, gpu, None, 16, 4, 1).unwrap();
+        let mut seq = model.alloc_sequence().unwrap();
+        let stream = model.default_stream();
+        model.prefill(&[1], &mut seq, stream).unwrap();
+        model.checkpoint_ssm_states(&mut seq).unwrap();
+        model
+            .decode_verify(&[2, 3, 4, 5, 6, 7], &mut seq, stream)
+            .unwrap();
+        let runtime = model.borrow_dependent();
+        let owner = model.borrow_owner();
+        runtime
+            .requests
+            .lock()
+            .get_mut(&seq.slot_idx)
+            .unwrap()
+            .with_dependent_mut(|cell_owner, data| {
+                let checkpoint = data.checkpoint.as_mut().unwrap();
+                for row in 0..6 {
+                    let mut state = State::new(cell_owner.shared.gpu.as_ref(), 32).unwrap();
+                    owner
+                        .gpu
+                        .copy_h2d(&vec![70 + row as u8; 64 + 5 * 8192], state.hidden)
+                        .unwrap();
+                    state.len = row + 2;
+                    state.ready = true;
+                    checkpoint.draft_prefix.push(state);
+                }
+                data.draft = Some(checkpoint.draft_prefix[5].fork(stream).unwrap());
+                checkpoint.draft = data.draft.as_ref().map(|s| s.fork(stream).unwrap());
+            });
+        seq.tokens.truncate(1 + accepted);
+        seq.seq_len = 1 + accepted;
+        model.commit_accepted_prefix(&mut seq, accepted, 6).unwrap();
+        assert_eq!(
+            runtime.head_rows.load(std::sync::atomic::Ordering::Relaxed),
+            6
+        );
+        let requests = runtime.requests.lock();
+        let data = requests[&seq.slot_idx].borrow_dependent();
+        assert_eq!(data.history, seq.tokens);
+        assert_eq!(data.layers[0].attn.committed_len(), 1 + accepted);
+        let state = data.draft.as_ref().unwrap();
+        assert!(state.ready);
+        assert_eq!(state.len, 1 + accepted);
+        let mut bytes = vec![0; 64 + 5 * 8192];
+        owner.gpu.copy_d2h(state.hidden, &mut bytes).unwrap();
+        assert_eq!(bytes, vec![69 + accepted as u8; bytes.len()]);
+    }
+}
+
+#[test]
 fn duplicate_checkpoint_preserves_pre_draft_state_but_new_history_refreshes_it() {
     let gpu = Box::new(MockGpuBackend::new());
     let weights = super::super::tests::store(&gpu);

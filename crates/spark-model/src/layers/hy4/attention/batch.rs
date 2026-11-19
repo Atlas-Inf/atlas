@@ -272,6 +272,7 @@ impl AttentionCache<'_, '_> {
                     )?;
                 }
                 self.len += 1;
+                self.record_prefix(stream)?;
             }
             let count = a.window.map_or_else(
                 || ((self.len - 1) / 4).min(INDEX_KEYS / 4 - 1) * 4 + (self.len - 1) % 4 + 1,

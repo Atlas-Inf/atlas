@@ -13,6 +13,9 @@ use std::{collections::HashMap, sync::Mutex};
 #[path = "snapshot_tests.rs"]
 mod snapshots;
 
+#[path = "prefix_tests.rs"]
+mod prefix;
+
 fn config(rank: usize, world: usize) -> ModelConfig {
     let mut c = parse_config(include_str!(
         "../../../../../atlas-core/src/config/fixtures/hy4/config.json"

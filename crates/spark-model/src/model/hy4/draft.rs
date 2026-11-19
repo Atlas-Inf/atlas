@@ -128,6 +128,44 @@ impl Hy4Model {
     }
 }
 impl Runtime<'_> {
+    pub(super) fn capture_draft_prefix(
+        &self,
+        data: &mut RequestData<'_>,
+        hidden: DevicePtr,
+        start: usize,
+        rows: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if data.draft.is_none() {
+            return Ok(());
+        }
+        let mut targets = Self::targets(data, stream)?;
+        let checkpoint = data
+            .checkpoint
+            .as_mut()
+            .context("Hy4 draft prefix checkpoint missing")?;
+        let state = data.draft.as_ref().unwrap();
+        while checkpoint.draft_prefix.len() < rows {
+            checkpoint
+                .draft_prefix
+                .push(State::new(state.memory.gpu, state.width)?);
+        }
+        for row in 0..rows {
+            for (i, target) in targets.iter_mut().enumerate() {
+                target.indices = data.layers[dfly::TARGET_LAYERS[i]]
+                    .attn
+                    .prefix_indices(row)?;
+                target.len = start + row + 1;
+            }
+            checkpoint.draft_prefix[row].capture(
+                hidden.offset(row * state.width * 2),
+                &targets,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
     fn targets(data: &mut RequestData<'_>, stream: u64) -> Result<[TargetCache; 5]> {
         dfly::TARGET_LAYERS
             .iter()

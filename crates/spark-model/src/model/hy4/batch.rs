@@ -110,6 +110,9 @@ impl Runtime<'_> {
                     self.batch_norm(s, w.collapsed, b.input_norm, w.normed, n, stream)?;
                     drop(hc);
                     let attn = timing::span("attention", stream)?;
+                    if mode == VERIFY && data.checkpoint.is_some() {
+                        state.attn.begin_prefix(n, stream)?;
+                    }
                     state.attn.forward(
                         w.normed,
                         w.output,
@@ -222,6 +225,9 @@ impl Runtime<'_> {
                         .normed
                         .offset(if mode == VERIFY { (n - 1) * h * 2 } else { 0 });
                     self.capture_draft(data, hidden, stream)?;
+                    if mode == VERIFY && data.checkpoint.is_some() {
+                        self.capture_draft_prefix(data, w.normed, start, n, stream)?;
+                    }
                 }
                 drop(row_span);
                 gpu.synchronize(stream)?;

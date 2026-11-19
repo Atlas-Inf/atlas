@@ -33,7 +33,7 @@ HY3/AngelSpec results are a different checkpoint/block size/temperature.
 
 Separate CUDA timing and live-input reference replay were not collected before
 the no-restarts instruction. No new measurement restart, optimization or serving
-change. No substantiated two-change50-tok/s claim.
+change during that analysis. No substantiated two-change50-tok/s claim.
 Full evidence: `/home/robert/hy4-dfly-20261118/analysis/numbers.json`.
 
 ## Follow-up: reference acceptance blocked by the reserve
@@ -66,3 +66,20 @@ the linked recipe source returned404, so this link is unverified.
 
 Even a normalized publisher comparison is a different prompt/FP8-KV workload,
 not evidence of a same-continuation acceptance gap.
+
+## Exact prefix commit: CPU-tested, not serving-qualified
+
+The HY4 speculative transaction now retains accepted KV rows, restores only
+rejected physical KV rows and pooled-index cells, and selects captured per-row
+DSA tail, first-group position, indices and normalized target hidden state.
+History is truncated and the checkpoint refreshed without target forward replay.
+The shared path covers both DFly and prompt lookup. Prefix tracking is enabled
+only when a verify checkpoint exists.
+
+CPU/mock checks cover36 cache cases (SWA/DSA, bases57/255/515, accepted1..6),
+including full persistent-buffer byte equality, and6 model-level hidden/index
+selection cases. These are not full-model GPU numerical parity checks.
+The3-prompt/20-prompt greedy corpus and native rollback qualification have NOT
+been rerun for this revision because free CUDA memory is below the reserve.
+No candidate image/deployment or measured new commit latency/throughput.
+The earlier47.205ms saving remains an upper bound, not a measured improvement.
