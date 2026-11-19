@@ -289,7 +289,7 @@ fn runs_of(experts: &[(u32, usize)]) -> Runs {
 }
 
 #[test]
-fn a_launchs_tiles_are_cut_where_a_pairs_scales_start_a_word() {
+fn a_launch_cuts_its_tiles_where_a_pairs_scales_start_a_word() {
     // Tiles start at pairs 0, 128, 256, 300, 364 and 492: the first three
     // on a multiple of eight.
     let runs = runs_of(&[(3, 300), (7, 64), (9, 200)]);

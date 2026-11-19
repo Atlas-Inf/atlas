@@ -65,7 +65,7 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v41_keeps_what_it_reads_and_no_other_familys_scratch() {
+    fn deepseek_v41_keeps_what_it_reads_and_no_scratch_of_another_family() {
         let rows = 8200;
         let of =
             |model_type: &str| BufferSizes::from_config(&shaped(model_type), rows, 34_000, 16, 1);
