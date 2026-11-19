@@ -191,15 +191,19 @@ impl AttentionCache<'_, '_> {
                 rows * stride * 2,
                 stream,
             )?;
-            KernelLaunch::new(gpu, gpu.kernel("hy4_mla", "hy4_batch_join_qkv")?)
-                .grid([rows as u32, 1, 1])
-                .block([256, 1, 1])
-                .arg_ptr(b.shares)
-                .arg_ptr(b.qc)
-                .arg_ptr(b.kv)
-                .arg_u32(a.qrank as u32)
-                .arg_u32(rows as u32)
-                .launch(stream)?;
+            KernelLaunch::new(
+                gpu,
+                gpu.op_cache()
+                    .kernel(gpu, "hy4_mla", "hy4_batch_join_qkv")?,
+            )
+            .grid([rows as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(b.shares)
+            .arg_ptr(b.qc)
+            .arg_ptr(b.kv)
+            .arg_u32(a.qrank as u32)
+            .arg_u32(rows as u32)
+            .launch(stream)?;
             drop(exchange);
         } else {
             linear(input, a.qa, b.qc, a.qrank, a.hidden)?;
@@ -280,36 +284,44 @@ impl AttentionCache<'_, '_> {
             );
             let splits = count.div_ceil(128);
             let mla = timing::span("latent_attention", stream)?;
-            KernelLaunch::new(gpu, gpu.kernel("hy4_mla", "hy4_mla_batch_partial")?)
-                .grid([a.heads as u32, splits as u32, (end - first) as u32])
-                .block([256, 1, 1])
-                .arg_ptr(b.absorbed.offset(first * a.heads * 576 * 2))
-                .arg_ptr(self.latent)
-                .arg_ptr(self.table)
-                .arg_ptr(if a.window.is_some() {
-                    DevicePtr::NULL
-                } else {
-                    b.indices
-                })
-                .arg_ptr(b.softmax_parts)
-                .arg_u32(start_position as u32)
-                .arg_u32(self.layout.page_size as u32)
-                .arg_u32(self.layout.table.len() as u32)
-                .arg_u32(a.window.unwrap_or(0) as u32)
-                .arg_u32(count as u32)
-                .arg_u32(splits as u32)
-                .arg_u32(a.heads as u32)
-                .arg_u32(INDEX_KEYS as u32)
-                .launch(stream)?;
-            KernelLaunch::new(gpu, gpu.kernel("hy4_mla", "hy4_mla_batch_merge")?)
-                .grid([a.heads as u32, (end - first) as u32, 1])
-                .block([256, 1, 1])
-                .arg_ptr(b.softmax_parts)
-                .arg_ptr(a.sink)
-                .arg_ptr(b.latent.offset(first * a.heads * 512 * 2))
-                .arg_u32(splits as u32)
-                .arg_u32(a.heads as u32)
-                .launch(stream)?;
+            KernelLaunch::new(
+                gpu,
+                gpu.op_cache()
+                    .kernel(gpu, "hy4_mla", "hy4_mla_batch_partial")?,
+            )
+            .grid([a.heads as u32, splits as u32, (end - first) as u32])
+            .block([256, 1, 1])
+            .arg_ptr(b.absorbed.offset(first * a.heads * 576 * 2))
+            .arg_ptr(self.latent)
+            .arg_ptr(self.table)
+            .arg_ptr(if a.window.is_some() {
+                DevicePtr::NULL
+            } else {
+                b.indices
+            })
+            .arg_ptr(b.softmax_parts)
+            .arg_u32(start_position as u32)
+            .arg_u32(self.layout.page_size as u32)
+            .arg_u32(self.layout.table.len() as u32)
+            .arg_u32(a.window.unwrap_or(0) as u32)
+            .arg_u32(count as u32)
+            .arg_u32(splits as u32)
+            .arg_u32(a.heads as u32)
+            .arg_u32(INDEX_KEYS as u32)
+            .launch(stream)?;
+            KernelLaunch::new(
+                gpu,
+                gpu.op_cache()
+                    .kernel(gpu, "hy4_mla", "hy4_mla_batch_merge")?,
+            )
+            .grid([a.heads as u32, (end - first) as u32, 1])
+            .block([256, 1, 1])
+            .arg_ptr(b.softmax_parts)
+            .arg_ptr(a.sink)
+            .arg_ptr(b.latent.offset(first * a.heads * 512 * 2))
+            .arg_u32(splits as u32)
+            .arg_u32(a.heads as u32)
+            .launch(stream)?;
             drop(mla);
         }
         a.batch_linear(

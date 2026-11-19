@@ -38,17 +38,20 @@ impl VocabHead {
         ensure!(elements <= u32::MAX as usize, "Hy4 head shard too large");
         let weight = memory.alloc(elements * 2)?;
         let stream = gpu.default_stream();
-        KernelLaunch::new(gpu, gpu.kernel("hy4_model", "hy4_head_bf16")?)
-            .grid([(elements as u32).div_ceil(256), 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(
-                src.ptr
-                    .offset(start * c.hidden_size * src.dtype.byte_size()),
-            )
-            .arg_ptr(weight)
-            .arg_u32(elements as u32)
-            .arg_u32(u32::from(src.dtype == WeightDtype::FP32))
-            .launch(stream)?;
+        KernelLaunch::new(
+            gpu,
+            gpu.op_cache().kernel(gpu, "hy4_model", "hy4_head_bf16")?,
+        )
+        .grid([(elements as u32).div_ceil(256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(
+            src.ptr
+                .offset(start * c.hidden_size * src.dtype.byte_size()),
+        )
+        .arg_ptr(weight)
+        .arg_u32(elements as u32)
+        .arg_u32(u32::from(src.dtype == WeightDtype::FP32))
+        .launch(stream)?;
         gpu.synchronize(stream)?;
         if store.get("model.embed_tokens.weight")?.ptr != src.ptr {
             store.reclaim(gpu, "lm_head.weight")?;

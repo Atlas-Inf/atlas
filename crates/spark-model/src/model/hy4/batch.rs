@@ -83,14 +83,18 @@ impl Runtime<'_> {
                 let positions = (start..start + n)
                     .map(|p| [p as i64; 3])
                     .collect::<Vec<_>>();
-                KernelLaunch::new(gpu, gpu.kernel("hy4_model", "hy4_model_batch_embed")?)
-                    .grid([(4 * h).div_ceil(256) as u32, n as u32, 1])
-                    .block([256, 1, 1])
-                    .arg_ptr(self.embed)
-                    .arg_ptr(w.tokens)
-                    .arg_ptr(w.highway)
-                    .arg_u32(h as u32)
-                    .launch(stream)?;
+                KernelLaunch::new(
+                    gpu,
+                    gpu.op_cache()
+                        .kernel(gpu, "hy4_model", "hy4_model_batch_embed")?,
+                )
+                .grid([(4 * h).div_ceil(256) as u32, n as u32, 1])
+                .block([256, 1, 1])
+                .arg_ptr(self.embed)
+                .arg_ptr(w.tokens)
+                .arg_ptr(w.highway)
+                .arg_u32(h as u32)
+                .launch(stream)?;
                 for (cell, state) in owner.layers.iter().zip(&mut data.layers) {
                     let b = cell.borrow_dependent();
                     if let Some(e) = &b.engram {
