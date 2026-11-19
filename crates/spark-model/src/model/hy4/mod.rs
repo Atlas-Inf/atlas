@@ -24,7 +24,6 @@ mod benchmark;
 mod collectives;
 mod compute;
 mod draft;
-mod draft_capture;
 mod model_trait;
 mod rollback_benchmark;
 mod speculation;

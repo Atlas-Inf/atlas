@@ -225,7 +225,6 @@ impl Runtime<'_> {
                         .normed
                         .offset(if mode == VERIFY { (n - 1) * h * 2 } else { 0 });
                     self.capture_draft(data, hidden, stream)?;
-                    self.capture_teacher(s, data, hidden, tokens, stream)?;
                     if mode == VERIFY && data.checkpoint.is_some() {
                         self.capture_draft_prefix(data, w.normed, start, n, stream)?;
                     }
