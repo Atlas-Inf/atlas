@@ -11,6 +11,7 @@ mod kernel_gate;
 mod kv_cache;
 mod preflight;
 mod runtime;
+mod tokenizer_prep;
 mod tokenizer_runtime;
 mod topology;
 mod weights;
@@ -21,7 +22,7 @@ pub(super) use build::{
 };
 pub(super) use config::{
     apply_model_default_dflash_gamma, apply_model_default_num_drafts, cap_vocab_size_to_tokenizer,
-    load_model_config, merge_sidecar_quant_config, resolve_model_dir,
+    load_model_config, merge_sidecar_quant_config, resolve_model_dir, tokenizer_vocab_size,
 };
 pub(super) use fp4_local_precision::warn_if_native_precision_unset;
 pub(super) use kernel_gate::audit_and_gate;
@@ -36,6 +37,7 @@ pub(super) use runtime::{
     log_response_store_audit, open_dump_writer, resolve_model_name, resolve_tool_call_parser,
     server_default_preset,
 };
+pub(super) use tokenizer_prep::{TokenizerInputs, TokenizerPrep, run_tokenizer_phase};
 pub(super) use tokenizer_runtime::{TokenizerRuntime, resolve_tokenizer_runtime};
 pub(super) use topology::{Topology, init_nccl_comm, resolve_topology};
 pub(super) use weights::{
