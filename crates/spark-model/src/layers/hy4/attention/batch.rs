@@ -272,7 +272,7 @@ impl AttentionCache<'_, '_> {
                 .grid([a.heads as u32, batched as u32, 1])
                 .block([32, 1, 1])
                 .arg_ptr(b.q.offset(first * a.heads * 256 * 2))
-                .arg_ptr(b.absorbed)
+                .arg_ptr(b.absorbed.offset(first * a.heads * 576 * 2))
                 .arg_u32(256)
                 .arg_u32(576)
                 .arg_u32(192)
