@@ -6,7 +6,8 @@ impl Dfly<'_> {
     pub(super) fn forward(
         &self,
         input: &Input,
-        head: Head,
+        weight: DevicePtr,
+        lookup: &mut EmbeddingLookup<'_>,
         comm: Option<&dyn CommBackend>,
         stream: u64,
     ) -> Result<Vec<u32>> {
@@ -15,12 +16,10 @@ impl Dfly<'_> {
         let o = &self.ops;
         let rows = input.count + 1;
         let heads = 32 / c.world;
-        let ids: Vec<u8> = std::iter::once(input.bonus)
+        let ids: Vec<u32> = std::iter::once(input.bonus)
             .chain(std::iter::repeat_n(120009, input.count))
-            .flat_map(u32::to_le_bytes)
             .collect();
-        o.gpu.copy_h2d_async_retained(&ids, s.ids, stream)?;
-        o.embed(head.embedding, s.ids, s.hidden, rows, stream)?;
+        lookup(&ids, s.hidden, stream)?;
         o.norm(s.hidden, self.fusion.en, s.concat, [1, H, H, H], stream)?;
         o.norm(
             input.target_hidden,
@@ -94,9 +93,7 @@ impl Dfly<'_> {
         let mut previous = input.bonus;
         let mut tokens = Vec::with_capacity(input.count);
         for step in 0..input.count {
-            o.gpu
-                .copy_h2d_async_retained(&previous.to_le_bytes(), s.ids, stream)?;
-            o.embed(head.embedding, s.ids, s.embedding, 1, stream)?;
+            lookup(&[previous], s.embedding, stream)?;
             let hidden = s.final_hidden.offset((step + 1) * H * 2);
             o.norm(hidden, b.hn, s.concat, [1, H, H, H], stream)?;
             o.norm(
@@ -111,7 +108,7 @@ impl Dfly<'_> {
             o.element(Op::Silu, s.cg, s.cu, s.ca, H, stream)?;
             o.linear(s.ca, b.down, s.delta, [1, H, H], stream)?;
             o.element(Op::Add, hidden, s.delta, s.corrected, H, stream)?;
-            previous = o.head(s.corrected, head, s.logits, s.id, comm, stream)?;
+            previous = o.head(s.corrected, weight, s.logits, s.id, comm, stream)?;
             tokens.push(previous);
         }
         Ok(tokens)

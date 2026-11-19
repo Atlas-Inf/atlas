@@ -227,7 +227,7 @@ impl<'a> Ops<'a> {
     pub fn head(
         &self,
         x: DevicePtr,
-        head: Head,
+        weight: DevicePtr,
         logits: DevicePtr,
         id: DevicePtr,
         comm: Option<&dyn CommBackend>,
@@ -240,7 +240,7 @@ impl<'a> Ops<'a> {
             .grid([(local as u32).div_ceil(8), 1, 1])
             .block([256, 1, 1])
             .arg_ptr(x)
-            .arg_ptr(head.weight)
+            .arg_ptr(weight)
             .arg_ptr(logits.offset(start * 4))
             .arg_u32(local as u32)
             .arg_u32(H as u32)

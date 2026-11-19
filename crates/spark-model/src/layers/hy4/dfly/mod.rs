@@ -98,6 +98,8 @@ pub struct Head {
     pub weight: DevicePtr,
 }
 
+pub type EmbeddingLookup<'a> = dyn FnMut(&[u32], DevicePtr, u64) -> Result<()> + 'a;
+
 struct Layer {
     input_norm: DevicePtr,
     post_norm: DevicePtr,
@@ -179,11 +181,50 @@ impl<'a> Dfly<'a> {
         comm: Option<&dyn CommBackend>,
         stream: u64,
     ) -> Result<Vec<u32>> {
+        ensure!(!head.embedding.is_null(), "DFly shared embedding missing");
+        self.validate_draft(input, head.weight, comm)?;
+        self.forward(
+            input,
+            head.weight,
+            &mut |tokens, output, stream| {
+                let bytes: Vec<_> = tokens.iter().flat_map(|id| id.to_le_bytes()).collect();
+                self.ops
+                    .gpu
+                    .copy_h2d_async_retained(&bytes, self.scratch.ids, stream)?;
+                self.ops.embed(
+                    head.embedding,
+                    self.scratch.ids,
+                    output,
+                    tokens.len(),
+                    stream,
+                )
+            },
+            comm,
+            stream,
+        )
+    }
+
+    /// The lookup writes the requested BF16 rows to output on the supplied stream.
+    pub fn draft_with_embedding_lookup(
+        &mut self,
+        input: &Input,
+        weight: DevicePtr,
+        lookup: &mut EmbeddingLookup<'_>,
+        comm: Option<&dyn CommBackend>,
+        stream: u64,
+    ) -> Result<Vec<u32>> {
+        self.validate_draft(input, weight, comm)?;
+        self.forward(input, weight, lookup, comm, stream)
+    }
+
+    fn validate_draft(
+        &self,
+        input: &Input,
+        weight: DevicePtr,
+        comm: Option<&dyn CommBackend>,
+    ) -> Result<()> {
         input.validate(self.config)?;
-        ensure!(
-            !head.embedding.is_null() && !head.weight.is_null(),
-            "DFly shared head missing"
-        );
+        ensure!(!weight.is_null(), "DFly shared head missing");
         if self.config.world > 1 {
             let comm = comm.ok_or_else(|| anyhow::anyhow!("DFly TP communicator missing"))?;
             ensure!(
@@ -196,6 +237,6 @@ impl<'a> Dfly<'a> {
                 "DFly unexpected communicator"
             );
         }
-        self.forward(input, head, comm, stream)
+        Ok(())
     }
 }

@@ -69,6 +69,20 @@ impl CheckpointIo {
         rows: usize,
         buffers: &mut Buffers<'_>,
     ) -> Result<DevicePtr> {
+        let out = buffers.alloc(rows * shape[1] * 2)?;
+        self.copy_rows(name, shape, start, rows, |offset, bytes| {
+            buffers.gpu.copy_h2d(bytes, out.offset(offset))
+        })?;
+        Ok(out)
+    }
+    pub fn copy_rows(
+        &self,
+        name: &str,
+        shape: [usize; 2],
+        start: usize,
+        rows: usize,
+        mut copy: impl FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<()> {
         ensure!(
             rows > 0 && start.checked_add(rows).is_some_and(|n| n <= shape[0]),
             "invalid checkpoint row slice"
@@ -92,7 +106,6 @@ impl CheckpointIo {
             8 + header_len + ((tensor.data_offsets[0] + start * shape[1] * stride) as u64),
         ))?;
         let elements = rows * shape[1];
-        let out = buffers.alloc(elements * 2)?;
         let mut offset = 0;
         while offset < elements {
             let count = (elements - offset).min(1024 * 1024);
@@ -111,10 +124,10 @@ impl CheckpointIo {
             } else {
                 &raw
             };
-            buffers.gpu.copy_h2d(source, out.offset(offset * 2))?;
+            copy(offset * 2, source)?;
             offset += count;
         }
-        Ok(out)
+        Ok(())
     }
     fn header(&self, name: &str) -> Result<(File, u64, Tensor)> {
         let filename = self
@@ -174,7 +187,7 @@ impl CheckpointIo {
                 .checked_add(bytes / if sharded { world } else { 1 })
                 .context("local sum overflow")?;
         }
-        let shared = vocab * 3072 * 2 + vocab / world * 3072 * 2;
+        let shared = vocab / world * 3072 * 2;
         let scratch = 64 * 1024 * 1024;
         let runtime_margin = 1024 * 1024 * 1024;
         let peak = (raw + largest).max(local + shared + scratch) + runtime_margin;

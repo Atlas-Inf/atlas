@@ -6,7 +6,7 @@
 use anyhow::{Context, Result, ensure};
 use atlas_core::scope::ModelResource;
 use spark_comm::{CommBackend, nccl_backend::NcclBackend};
-use spark_model::layers::hy4::dfly::{Config, Dfly, Head, Input, TargetCache};
+use spark_model::layers::hy4::dfly::{Config, Dfly, Input, TargetCache};
 use spark_runtime::{
     cuda_backend::AtlasCudaBackend,
     gpu::GpuBackend,
@@ -15,6 +15,8 @@ use spark_runtime::{
 use std::{collections::HashMap, path::Path};
 
 mod io;
+#[cfg(test)]
+mod tests;
 
 fn main() -> Result<()> {
     let mut args = arguments()?;
@@ -91,21 +93,28 @@ fn main() -> Result<()> {
     store.release(g)?;
     io::guard(g, reserve, 0)?;
     let mut buffers = io::Buffers::new(g, reserve);
-    let head = Head {
-        embedding: checkpoint.rows(
-            "model.embed_tokens.weight",
-            [config.vocab, 3072],
-            0,
-            config.vocab,
-            &mut buffers,
-        )?,
-        weight: checkpoint.rows(
-            "lm_head.weight",
-            [config.vocab, 3072],
-            rank * (config.vocab / world),
-            config.vocab / world,
-            &mut buffers,
-        )?,
+    let weight = checkpoint.rows(
+        "lm_head.weight",
+        [config.vocab, 3072],
+        rank * (config.vocab / world),
+        config.vocab / world,
+        &mut buffers,
+    )?;
+    let mut lookup = |ids: &[u32], output: spark_runtime::gpu::DevicePtr, stream| {
+        ensure!(!ids.is_empty(), "empty embedding lookup");
+        io::guard(g, reserve, 0)?;
+        for (row, id) in ids.iter().enumerate() {
+            checkpoint.copy_rows(
+                "model.embed_tokens.weight",
+                [config.vocab, 3072],
+                *id as usize,
+                1,
+                |offset, bytes| {
+                    g.copy_h2d_async_retained(bytes, output.offset(row * 3072 * 2 + offset), stream)
+                },
+            )?;
+        }
+        Ok(())
     };
     println!("DFLY_MEMORY_PHASE before_communicator");
     io::guard(g, reserve, 0)?;
@@ -163,7 +172,7 @@ fn main() -> Result<()> {
             bonus: case.bonus,
             count: case.count,
         };
-        let actual = dfly.draft(&input, head, comm, stream)?;
+        let actual = dfly.draft_with_embedding_lookup(&input, weight, &mut lookup, comm, stream)?;
         for (i, cache) in input.caches.iter().enumerate() {
             let mut prefix = vec![0u8; case.anchor * 576 * 2];
             if !prefix.is_empty() {
