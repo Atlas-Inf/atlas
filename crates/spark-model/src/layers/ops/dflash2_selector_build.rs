@@ -10,7 +10,10 @@
 
 use anyhow::{Result, ensure};
 
-use super::{DFLASH2_SELECTOR_MAX_TOP_K, DFLASH2_SELECTOR_SYMBOL, DFLASH2_SELECTOR_THREADS};
+use super::{
+    DFLASH2_SELECTOR_MAX_SPLITS, DFLASH2_SELECTOR_MAX_TOP_K, DFLASH2_SELECTOR_SYMBOL,
+    DFLASH2_SELECTOR_THREADS,
+};
 
 /// Mirrors `DF2_SEL_MAX_TOP_K` / `DF2_SEL_THREADS` of the 32-candidate twin.
 pub const DFLASH2_SELECTOR_WIDE_MAX_TOP_K: usize = 32;
@@ -67,6 +70,25 @@ pub(super) fn ensure_base_selector(top_k: u32, entry: &str) -> Result<()> {
         "{entry} supports selector top_k 1..={DFLASH2_SELECTOR_MAX_TOP_K}, found {top_k}"
     );
     Ok(())
+}
+
+/// Bytes of `dflash2_candidate_selector` (or `dflash2_selector_topk`)
+/// scratch for up to `gamma` rows: a u32 ticket (padded to 16 bytes), f32
+/// values and u32 ids of every slice's top-K, a u32 ticket per row and the
+/// rows' merged lists, sized for the widest selector's K (each kernel lays it
+/// out by its own). It must start zeroed (the kernel leaves every ticket at
+/// zero), and launches sharing it must be stream-ordered.
+pub fn dflash2_selector_scratch_bytes(gamma: usize) -> usize {
+    let k = super::DFLASH2_SELECTOR_WIDE_MAX_TOP_K;
+    dflash2_selector_lists_offset(gamma, k) + 2 * 4 * gamma * k
+}
+
+/// Byte offset of the rows' merged lists (f32 values `[gamma, max_top_k]`,
+/// then u32 ids) in the scratch of a selector built for `max_top_k`
+/// candidates: past its ticket, its slice lists and the row tickets, as the
+/// kernel's `df2_sel_scratch` lays them out by its own `DF2_SEL_MAX_TOP_K`.
+pub fn dflash2_selector_lists_offset(gamma: usize, max_top_k: usize) -> usize {
+    16 + 2 * 4 * gamma * DFLASH2_SELECTOR_MAX_SPLITS * max_top_k + 4 * gamma
 }
 
 #[cfg(test)]
