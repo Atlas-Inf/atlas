@@ -51,6 +51,7 @@ fn main() -> Result<()> {
         rank,
         world,
         vocab: model.vocab_size,
+        mask_token_id: hy.dfly_mask_token_id()?,
         eps: model.rms_norm_eps as f32,
         theta: hy.rope_parameters.deepseek_sparse_attention.rope_theta as f32,
     };

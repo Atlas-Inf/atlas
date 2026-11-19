@@ -27,6 +27,7 @@ pub struct Config {
     pub rank: usize,
     pub world: usize,
     pub vocab: usize,
+    pub mask_token_id: u32,
     pub eps: f32,
     pub theta: f32,
 }
@@ -35,7 +36,8 @@ impl Config {
         ensure!(
             matches!(self.world, 1 | 2)
                 && self.rank < self.world
-                && self.vocab > 120009
+                && self.vocab > 0
+                && (self.mask_token_id as usize) < self.vocab
                 && self.vocab <= u32::MAX as usize
                 && self.vocab.is_multiple_of(self.world)
                 && self.eps.is_finite()
@@ -62,6 +64,12 @@ pub struct Input {
     pub count: usize,
 }
 impl Input {
+    fn query_ids(&self, c: Config) -> Vec<u32> {
+        std::iter::once(self.bonus)
+            .chain(std::iter::repeat_n(c.mask_token_id, self.count))
+            .collect()
+    }
+
     fn validate(&self, c: Config) -> Result<()> {
         ensure!(
             (1..=5).contains(&self.count),

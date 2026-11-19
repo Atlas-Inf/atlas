@@ -106,6 +106,11 @@ impl Hy4Model {
                             rank: c.tp_rank,
                             world: c.tp_world_size,
                             vocab: c.vocab_size,
+                            mask_token_id: c
+                                .hy4
+                                .as_ref()
+                                .context("Hy4 metadata missing")?
+                                .dfly_mask_token_id()?,
                             eps: c.rms_norm_eps as f32,
                             theta: c
                                 .hy4

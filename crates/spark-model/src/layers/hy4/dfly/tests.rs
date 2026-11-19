@@ -7,6 +7,7 @@ fn config() -> Config {
         rank: 0,
         world: 2,
         vocab: 120832,
+        mask_token_id: 120009,
         eps: 1e-5,
         theta: 1e7,
     }
@@ -52,8 +53,29 @@ fn validates_tp_and_explicit_numerics() {
             theta: 0.,
             ..config()
         },
+        Config {
+            mask_token_id: 120832,
+            ..config()
+        },
     ] {
         assert!(c.validate().is_err());
+    }
+}
+
+#[test]
+fn query_rows_use_the_configured_mask_without_replacing_the_bonus() {
+    for mask_token_id in [0, 17, 120009] {
+        let c = Config {
+            mask_token_id,
+            ..config()
+        };
+        assert!(c.validate().is_ok());
+        for count in 1..=5 {
+            let i = Input { count, ..input() };
+            let ids = i.query_ids(c);
+            assert_eq!(ids[0], i.bonus);
+            assert_eq!(&ids[1..], vec![mask_token_id; count]);
+        }
     }
 }
 #[test]

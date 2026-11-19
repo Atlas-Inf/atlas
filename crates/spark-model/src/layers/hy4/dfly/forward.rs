@@ -16,9 +16,7 @@ impl Dfly<'_> {
         let o = &self.ops;
         let rows = input.count + 1;
         let heads = 32 / c.world;
-        let ids: Vec<u32> = std::iter::once(input.bonus)
-            .chain(std::iter::repeat_n(120009, input.count))
-            .collect();
+        let ids = input.query_ids(c);
         lookup(&ids, s.hidden, stream)?;
         o.norm(s.hidden, self.fusion.en, s.concat, [1, H, H, H], stream)?;
         o.norm(

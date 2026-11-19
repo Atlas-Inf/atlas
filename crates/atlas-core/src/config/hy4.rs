@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -38,6 +39,8 @@ pub struct Hy4Ropes {
 pub struct Hy4Config {
     #[serde(skip)]
     pub attention_projection_fp8: bool,
+    #[serde(skip)]
+    pub dfly_mask_token_id: Option<u32>,
     pub layer_types: Vec<Hy4Attention>,
     pub swa_pattern: Vec<u8>,
     pub mlp_layer_types: Vec<Hy4Mlp>,
@@ -74,6 +77,13 @@ pub struct Hy4Config {
     pub compressed_indexer_key_pooling: String,
     pub compressed_indexer_skip_fine_select: bool,
     pub rope_parameters: Hy4Ropes,
+}
+
+impl Hy4Config {
+    pub fn dfly_mask_token_id(&self) -> Result<u32> {
+        self.dfly_mask_token_id
+            .context("HY4 DFly requires checkpoint dfly_mask_token_id")
+    }
 }
 
 #[cfg(test)]

@@ -24,6 +24,11 @@ fn prepare_topology(args: &cli::ServeArgs, config: &mut ModelConfig) -> Result<O
     );
     if args.dfly_speculative {
         super::hy4::validate(args)?;
+        config
+            .hy4
+            .as_ref()
+            .context("HY4 DFly metadata missing")?
+            .dfly_mask_token_id()?;
     }
     // GLM Strict/Spark: refuse a launch outside the mode contract before CUDA.
     spark_model::weight_loader::glm5_mode::validate(

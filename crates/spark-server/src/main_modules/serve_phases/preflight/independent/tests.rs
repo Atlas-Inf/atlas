@@ -8,6 +8,39 @@ use clap::Parser;
 #[path = "long_context_tests.rs"]
 mod long_context;
 
+#[test]
+fn dfly_missing_mask_fails_before_backend_initialization() {
+    let cli::Command::Serve(args) = cli::Cli::try_parse_from([
+        "spark",
+        "serve",
+        "unused",
+        "--dfly-speculative",
+        "--num-drafts=5",
+        "--max-batch-size=1",
+        "--max-num-seqs=1",
+        "--world-size=2",
+        "--tp-size=2",
+    ])
+    .unwrap()
+    .command
+    else {
+        panic!("serve args")
+    };
+    let mut config = atlas_core::config::parse_config(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../atlas-core/src/config/fixtures/hy4/config.json"
+    )))
+    .unwrap();
+    config.hy4.as_mut().unwrap().dfly_mask_token_id = None;
+    let error = super::prepare_reserve(&args, &mut config, || -> Result<((), usize)> {
+        panic!("missing DFly mask reached backend initialization")
+    })
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(error.contains("dfly_mask_token_id"), "{error}");
+}
+
 // Supply only the I/O boundary; all topology/admission/accounting is production.
 fn prepare_reserve(
     args: &cli::ServeArgs,
