@@ -16,6 +16,8 @@ const THREADS: u32 = 256;
 /// it start only as it ends: the experts' then have no time to read their
 /// weights ahead.
 const SCORED_BY_A_BLOCK: u32 = 4;
+/// The rows of a batch such a block scores at once (`DSV41_SCORED_ROWS`).
+const SCORED_ROWS: u32 = 3;
 /// The widest activation a kernel here stages in shared memory.
 const MAX_K: usize = 5120;
 
@@ -153,10 +155,9 @@ pub fn route_fast(
                 .launch(stream)?;
         }
         false => KernelLaunch::new(gpu, kernels.scores)
-            // Up to three tokens a block, one after another: see the kernel.
             .grid([
                 div_ceil(experts as u32, SCORED_BY_A_BLOCK),
-                div_ceil(tokens as u32, 3),
+                div_ceil(tokens as u32, SCORED_ROWS),
                 1,
             ])
             .block([THREADS, 1, 1])

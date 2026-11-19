@@ -84,16 +84,74 @@ extern "C" __global__ void __launch_bounds__(DSV41_MOE_THREADS) dsv41_moe_route(
     }
 }
 
+// Rows of a batch that a block of `dsv41_moe_scores` scores at once.
+#define DSV41_SCORED_ROWS 3u
+
 // Routing in two launches, for when one token must not take a millisecond:
 // an expert's score is a block's work here, so a thread adds 20 products
 // where `dsv41_moe_route`'s adds 5,120. The scores are the same FP32 sums in
-// another order.
+// another order, which is `dsv41_dot_wide`'s: a thread adds every 256th
+// product, and the threads' sums meet in a tree.
 //
 // score[t, e] = sqrt(softplus(x[t] . gate[e])). Grid (blocks, g): a block
-// takes ceil(experts / blocks) experts of every g-th of the T tokens, one
-// after another. Few enough blocks that the GPU holds them all at once let
-// the kernels after this one start beside it, and the experts' read their
-// weights ahead while it runs.
+// takes ceil(experts / blocks) experts, one after another, of the g-th
+// three of the T tokens, the three at once: a thread reads a gate value
+// once and adds its product with each token's, and the tokens' sums go
+// through one tree side by side. Measured alone with the pick behind it,
+// us for 1 / 3 / 6 tokens: a token at a time 27 / 37 / 44, three at once
+// 26 / 31 / 35, and all of a batch's in one block 27 / 33 / 53, which the
+// tokens' own values bound and not the gate's. Few enough blocks that the
+// GPU holds them all at once let the kernels after this one start beside
+// it, and the experts' read their weights ahead while it runs.
+//
+// The scores of R tokens, R known where it is compiled: `acc` and the
+// tree's rows are then registers and straight code.
+template <unsigned int R>
+__device__ __forceinline__ void dsv41_moe_scores_of(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ gate,
+    float* __restrict__ score,
+    float (*red)[DSV41_MOE_THREADS],
+    unsigned int H,
+    unsigned int experts,
+    unsigned int first) {
+    const unsigned int tid = threadIdx.x;
+    const unsigned int each = (experts + gridDim.x - 1u) / gridDim.x;
+    const __nv_bfloat16* mine = x + (size_t)first * H;
+    for (unsigned int e = blockIdx.x * each; e < experts && e < (blockIdx.x + 1u) * each; ++e) {
+        const __nv_bfloat16* row = gate + (size_t)e * H;
+        float acc[R];
+        #pragma unroll
+        for (unsigned int r = 0; r < R; ++r) acc[r] = 0.0f;
+        for (unsigned int d = tid; d < H; d += DSV41_MOE_THREADS) {
+            const float w = __bfloat162float(row[d]);
+            #pragma unroll
+            for (unsigned int r = 0; r < R; ++r)
+                acc[r] += __bfloat162float(mine[(size_t)r * H + d]) * w;
+        }
+        #pragma unroll
+        for (unsigned int r = 0; r < R; ++r) red[r][tid] = acc[r];
+        __syncthreads();
+        for (unsigned int width = DSV41_MOE_THREADS / 2; width > 0; width >>= 1) {
+            if (tid < width) {
+                #pragma unroll
+                for (unsigned int r = 0; r < R; ++r) red[r][tid] += red[r][tid + width];
+            }
+            __syncthreads();
+        }
+        // Thread 0 keeps the sums: the next expert's are written over them.
+        float logit[R];
+        #pragma unroll
+        for (unsigned int r = 0; r < R; ++r) logit[r] = red[r][0];
+        if (tid == 0) {
+            #pragma unroll
+            for (unsigned int r = 0; r < R; ++r)
+                score[(size_t)(first + r) * experts + e] =
+                    sqrtf(logit[r] > 20.0f ? logit[r] : log1pf(expf(logit[r])));
+        }
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(DSV41_MOE_THREADS) dsv41_moe_scores(
     const __nv_bfloat16* __restrict__ x,
     const unsigned char* __restrict__ gate_bytes,
@@ -103,15 +161,14 @@ extern "C" __global__ void __launch_bounds__(DSV41_MOE_THREADS) dsv41_moe_scores
     unsigned int T) {
     atlas_pdl_enter_touch({gate_bytes, 2u * H, 2ull * H}, {gate_bytes, 0u, 0ull}, experts,
                           blockIdx.y * gridDim.x + blockIdx.x, dsv41_touchers(gridDim.x));
+    __shared__ float red[DSV41_SCORED_ROWS][DSV41_MOE_THREADS];
     const __nv_bfloat16* gate = (const __nv_bfloat16*)gate_bytes;
-    const unsigned int each = (experts + gridDim.x - 1u) / gridDim.x;
-    for (unsigned int t = blockIdx.y; t < T; t += gridDim.y) {
-        for (unsigned int e = blockIdx.x * each; e < experts && e < (blockIdx.x + 1u) * each; ++e) {
-            const float logit = dsv41_dot_wide(x + (size_t)t * H, gate + (size_t)e * H, H);
-            if (threadIdx.x == 0)
-                score[(size_t)t * experts + e] =
-                    sqrtf(logit > 20.0f ? logit : log1pf(expf(logit)));
-        }
+    const unsigned int first = blockIdx.y * DSV41_SCORED_ROWS;
+    if (first >= T) return;
+    switch (T - first < DSV41_SCORED_ROWS ? T - first : DSV41_SCORED_ROWS) {
+        case 1: return dsv41_moe_scores_of<1>(x, gate, score, red, H, experts, first);
+        case 2: return dsv41_moe_scores_of<2>(x, gate, score, red, H, experts, first);
+        default: return dsv41_moe_scores_of<3>(x, gate, score, red, H, experts, first);
     }
 }
 

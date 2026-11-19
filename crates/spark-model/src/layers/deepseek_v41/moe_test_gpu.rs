@@ -15,7 +15,8 @@ use super::*;
 use crate::layers::deepseek_v41::ops::{self, Kernels};
 use crate::layers::deepseek_v41::parts::{PartKernels, project};
 use crate::layers::deepseek_v41::test_support::{
-    Recording, backend, bf16s, checkpoint, closeness, download, load_fp8, picks, rows_of, upload,
+    Recording, Rng, activations, backend, bf16s, checkpoint, closeness, download, le_bytes,
+    load_fp8, picks, rows_of, upload,
 };
 use crate::weight_map::test_checkpoint::read_checkpoint_tensor;
 
@@ -330,6 +331,101 @@ fn the_moe_replays_the_reference() -> Result<()> {
             gpu.free(w.data)?;
             gpu.free(w.scales)?;
         }
+    }
+    Ok(())
+}
+
+/// The router's scores of `tokens` rows of `x` in one launch, as FP32 bits.
+fn scores_of(
+    gpu: &dyn GpuBackend,
+    k: &MoeKernels,
+    x: DevicePtr,
+    gate: DevicePtr,
+    bias: DevicePtr,
+    tokens: usize,
+    experts: usize,
+) -> Result<Vec<u32>> {
+    let scores = gpu.alloc(tokens * experts * 4)?;
+    let (chosen, weights) = (
+        gpu.alloc(tokens * TOP_K * 4)?,
+        gpu.alloc(tokens * TOP_K * 4)?,
+    );
+    let stream = gpu.default_stream();
+    route_fast(
+        gpu,
+        k,
+        x,
+        gate,
+        bias,
+        scores,
+        chosen,
+        weights,
+        tokens,
+        HIDDEN,
+        experts,
+        TOP_K,
+        ROUTE_SCALE,
+        true,
+        false,
+        stream,
+    )?;
+    gpu.synchronize(stream)?;
+    let mut bytes = vec![0u8; tokens * experts * 4];
+    gpu.copy_d2h(scores, &mut bytes)?;
+    for p in [scores, chosen, weights] {
+        gpu.free(p)?;
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+#[test]
+#[ignore = "needs a GB10 GPU and the deepseek-v4.1-flash target"]
+fn rows_scored_together_score_as_each_alone() -> Result<()> {
+    let gpu = backend()?;
+    let k = MoeKernels::load(gpu)?;
+    let mut rng = Rng(0x5c0_4e5);
+    // A count of experts the blocks do not divide, and more rows than a
+    // block takes at once.
+    let (experts, most) = (386usize, 13usize);
+    let x = activations(&mut rng, most * HIDDEN);
+    let gate = upload(
+        gpu,
+        &le_bytes(&activations(&mut rng, experts * HIDDEN), u16::to_le_bytes),
+    )?;
+    let bias = upload(gpu, &vec![0u8; experts * 4])?;
+    let rows = |first: usize, count: usize| -> Result<Vec<u32>> {
+        let at = &x[first * HIDDEN..(first + count) * HIDDEN];
+        let x = upload(gpu, &le_bytes(at, u16::to_le_bytes))?;
+        let scores = scores_of(gpu, &k, x, gate, bias, count, experts);
+        gpu.free(x)?;
+        scores
+    };
+    let alone: Vec<u32> = (0..most)
+        .map(|row| rows(row, 1))
+        .collect::<Result<Vec<_>>>()?
+        .concat();
+    for tokens in [2, 6, 8, 9, most] {
+        assert_eq!(
+            rows(0, tokens)?,
+            alone[..tokens * experts],
+            "{tokens} rows together"
+        );
+    }
+    // The sums' order is part of what a build's tokens are: the scores of
+    // one row, as every build since the routing went to two launches left
+    // them.
+    let digest = alone.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &v| {
+        (h ^ u64::from(v)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    assert_eq!(
+        digest, 0x498c_8fb8_9846_aeca,
+        "the router's scores of a row"
+    );
+    for p in [gate, bias] {
+        gpu.free(p)?;
     }
     Ok(())
 }
