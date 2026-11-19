@@ -152,3 +152,65 @@ extern "C" __global__ void hy4_mla_batch_merge(const float* partials,const float
     hy4_mla_merge_impl(partials+(size_t)row*heads*splits*514,sink,
         out+(size_t)row*heads*512,splits);
 }
+
+// ── Batched causal prologue (speculative verify / decode batching) ──────
+// Same math as hy4_norm_add (the a.norm call with H=512) and hy4_rotary,
+// one launch per layer instead of three launches per row. Outputs are
+// byte-identical: each row block replicates the single-row reduction and
+// rope arithmetic in the same order.
+extern "C" __global__ void hy4_batch_kv_norm(const __nv_bfloat16* kv,
+    const __nv_bfloat16* w, __nv_bfloat16* latent, const unsigned* table,
+    unsigned start, unsigned page_size, unsigned columns, unsigned circular,
+    float eps) {
+    unsigned row=blockIdx.x, tid=threadIdx.x;
+    unsigned pos=start+row, page=pos/page_size;
+    unsigned column=circular?page%columns:page;
+    size_t slot=(size_t)table[column]*page_size+pos%page_size;
+    const __nv_bfloat16* x=kv+(size_t)row*576;
+    __nv_bfloat16* out=latent+slot*576;
+    __shared__ float red[256], r;
+    float ss=0.f;
+    for (unsigned d=tid; d<512; d+=256) { float v=(float)x[d]; ss+=v*v; }
+    red[tid]=ss;
+    __syncthreads();
+    for (unsigned s=128;s;s>>=1) {
+        if (tid<s) red[tid]+=red[tid+s];
+        __syncthreads();
+    }
+    if (tid==0) r=rsqrtf(red[0]/512+eps);
+    __syncthreads();
+    for (unsigned d=tid; d<512; d+=256)
+        out[d]=__float2bfloat16_rn((float)x[d]*r*(float)w[d]);
+}
+
+// rows share one (in_stride,out_stride,in_offset,out_offset) layout via the
+// row_in/row_out element strides; paged=1 targets latent slot rows through
+// the page table instead of contiguous output rows.
+extern "C" __global__ void hy4_batch_rotary(const __nv_bfloat16* x, __nv_bfloat16* y,
+    unsigned in_stride, unsigned out_stride, unsigned in_offset, unsigned out_offset,
+    unsigned row_in, unsigned row_out, const unsigned* table,
+    unsigned start, unsigned page_size, unsigned columns, unsigned circular,
+    unsigned paged, unsigned long long pt, unsigned long long ph, unsigned long long pw,
+    float theta, unsigned sh, unsigned sw, unsigned interleaved, unsigned split) {
+    unsigned i=threadIdx.x, head=blockIdx.x, row=blockIdx.y;
+    if (i>=32) return;
+    unsigned axis=interleaved?((i%3==1 && i<sh*3)?1:((i%3==2 && i<sw*3)?2:0)):
+        (i<32-sh-sw?0:(i<32-sw?1:2));
+    float p=(float)(axis==0?pt+row:(axis==1?ph+row:pw+row));
+    float angle=p*powf(theta,-(float)i/32.f),s,c;
+    sincosf(angle,&s,&c);
+    const __nv_bfloat16* src=x+(size_t)row*row_in+(size_t)head*in_stride+in_offset;
+    float a=(float)src[i*2],b=(float)src[i*2+1];
+    __nv_bfloat16* dst;
+    if (paged) {
+        unsigned pos=start+row, page=pos/page_size;
+        unsigned column=circular?page%columns:page;
+        dst=y+((size_t)table[column]*page_size+pos%page_size)*576+out_offset;
+    } else {
+        dst=y+(size_t)row*row_out+(size_t)head*out_stride+out_offset;
+    }
+    // A separate barrier permits the indexer's in-place pair-to-half shuffle.
+    __syncthreads();
+    dst[split?i:i*2]=__float2bfloat16_rn(a*c-b*s);
+    dst[split?32+i:i*2+1]=__float2bfloat16_rn(a*s+b*c);
+}

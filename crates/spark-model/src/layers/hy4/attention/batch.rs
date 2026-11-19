@@ -238,22 +238,93 @@ impl AttentionCache<'_, '_> {
         for first in (0..rows).step_by(causal_rows) {
             let end = (first + causal_rows).min(rows);
             let start_position = self.len;
+            let _causal = timing::span("attn_causal_rows", stream)?;
+            let page_size = self.layout.page_size as u32;
+            let columns = self.layout.table.len() as u32;
+            let circular = u32::from(a.window.is_some());
+            let batched = end - first;
+            let base = positions.get(first).copied().unwrap_or([0; 3]);
+            {
+                let _rope = timing::span("attn_norm", stream)?;
+                KernelLaunch::new(
+                    gpu,
+                    gpu.op_cache().kernel(gpu, "hy4_mla", "hy4_batch_kv_norm")?,
+                )
+                .grid([batched as u32, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(b.kv.offset(first * 576 * 2))
+                .arg_ptr(a.kvn)
+                .arg_ptr(self.latent)
+                .arg_ptr(self.table)
+                .arg_u32(start_position as u32)
+                .arg_u32(page_size)
+                .arg_u32(columns)
+                .arg_u32(circular)
+                .arg_f32(a.eps)
+                .launch(stream)?;
+            }
+            {
+                let _rope = timing::span("attn_rope", stream)?;
+                KernelLaunch::new(
+                    gpu,
+                    gpu.op_cache().kernel(gpu, "hy4_mla", "hy4_batch_rotary")?,
+                )
+                .grid([a.heads as u32, batched as u32, 1])
+                .block([32, 1, 1])
+                .arg_ptr(b.q.offset(first * a.heads * 256 * 2))
+                .arg_ptr(b.absorbed)
+                .arg_u32(256)
+                .arg_u32(576)
+                .arg_u32(192)
+                .arg_u32(512)
+                .arg_u32(a.heads as u32 * 256)
+                .arg_u32(a.heads as u32 * 576)
+                .arg_ptr(DevicePtr::NULL)
+                .arg_u32(start_position as u32)
+                .arg_u32(page_size)
+                .arg_u32(columns)
+                .arg_u32(circular)
+                .arg_u32(0)
+                .arg_u64(base[0] as u64)
+                .arg_u64(base[1] as u64)
+                .arg_u64(base[2] as u64)
+                .arg_f32(a.rope.rope_theta as f32)
+                .arg_u32(a.rope.mrope_section[1] as u32)
+                .arg_u32(a.rope.mrope_section[2] as u32)
+                .arg_u32(u32::from(a.rope.mrope_interleaved))
+                .arg_u32(0)
+                .launch(stream)?;
+                KernelLaunch::new(
+                    gpu,
+                    gpu.op_cache().kernel(gpu, "hy4_mla", "hy4_batch_rotary")?,
+                )
+                .grid([1, batched as u32, 1])
+                .block([32, 1, 1])
+                .arg_ptr(b.kv.offset(first * 576 * 2))
+                .arg_ptr(self.latent)
+                .arg_u32(576)
+                .arg_u32(576)
+                .arg_u32(512)
+                .arg_u32(512)
+                .arg_u32(576)
+                .arg_u32(576)
+                .arg_ptr(self.table)
+                .arg_u32(start_position as u32)
+                .arg_u32(page_size)
+                .arg_u32(columns)
+                .arg_u32(circular)
+                .arg_u32(1)
+                .arg_u64(base[0] as u64)
+                .arg_u64(base[1] as u64)
+                .arg_u64(base[2] as u64)
+                .arg_f32(a.rope.rope_theta as f32)
+                .arg_u32(a.rope.mrope_section[1] as u32)
+                .arg_u32(a.rope.mrope_section[2] as u32)
+                .arg_u32(u32::from(a.rope.mrope_interleaved))
+                .arg_u32(0)
+                .launch(stream)?;
+            }
             for (row, &position) in positions.iter().enumerate().take(end).skip(first) {
-                let _causal = timing::span("attn_causal_rows", stream)?;
-                let kv = b.kv.offset(row * 576 * 2);
-                let latent = self.latent.offset(self.layout.slot(self.len)? * 576 * 2);
-                a.norm(kv, a.kvn, latent, 512, stream)?;
-                let absorbed = b.absorbed.offset(row * a.heads * 576 * 2);
-                a.rotary(
-                    b.q.offset(row * a.heads * 256 * 2),
-                    absorbed,
-                    a.heads,
-                    [256, 576, 192, 512],
-                    position,
-                    false,
-                    stream,
-                )?;
-                a.rotary(kv, latent, 1, [576, 576, 512, 512], position, false, stream)?;
                 if let Some(ix) = &a.index {
                     self.run_index_projected(
                         input.offset(row * a.hidden * 2),
@@ -278,6 +349,7 @@ impl AttentionCache<'_, '_> {
                 self.len += 1;
                 self.record_prefix(stream)?;
             }
+            drop(_causal);
             let count = a.window.map_or_else(
                 || ((self.len - 1) / 4).min(INDEX_KEYS / 4 - 1) * 4 + (self.len - 1) % 4 + 1,
                 |w| self.len.min(w),
