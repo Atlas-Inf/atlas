@@ -4,6 +4,10 @@ use super::{Result, cli};
 
 pub(crate) fn validate(args: &cli::ServeArgs) -> Result<()> {
     anyhow::ensure!(
+        !args.dfly_speculative || (args.tp_size == 2 && args.world_size == 2),
+        "HY4 DFly requires --tp-size=2 and --world-size=2"
+    );
+    anyhow::ensure!(
         !args.dfly_speculative || (args.max_batch_size == 1 && args.max_num_seqs == 1),
         "HY4 DFly requires --max-batch-size=1 and --max-num-seqs=1"
     );
@@ -37,6 +41,47 @@ mod tests {
         args
     }
 
+    fn dfly_args(flags: &[&str]) -> cli::ServeArgs {
+        args(
+            &["--world-size=2", "--tp-size=2"]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn dfly_requires_exactly_two_world_and_tensor_parallel_ranks() {
+        for (world, tp) in [("1", "1"), ("2", "1"), ("1", "2"), ("4", "2"), ("4", "4")] {
+            let a = args(&[
+                "--dfly-speculative",
+                "--num-drafts=5",
+                "--max-batch-size=1",
+                "--max-num-seqs=1",
+                "--world-size",
+                world,
+                "--tp-size",
+                tp,
+            ]);
+            let mut config = atlas_core::config::parse_config(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../atlas-core/src/config/fixtures/hy4/config.json"
+            )))
+            .unwrap();
+            let error = super::super::independent::prepare_reserve(
+                &a,
+                &mut config,
+                || -> Result<((), usize)> {
+                    panic!("invalid DFly topology reached backend initialization")
+                },
+            )
+            .err()
+            .unwrap()
+            .to_string();
+            assert!(error.contains("--tp-size=2 and --world-size=2"), "{error}");
+        }
+    }
+
     #[test]
     fn prompt_lookup_is_opt_in_and_requires_an_explicit_bounded_draft_length() {
         assert!(validate(&args(&[])).is_ok());
@@ -55,7 +100,7 @@ mod tests {
     #[test]
     fn dfly_requires_explicit_bounded_count_and_excludes_other_proposers() {
         for n in ["1", "5"] {
-            let a = args(&[
+            let a = dfly_args(&[
                 "--dfly-speculative",
                 "--num-drafts",
                 n,
@@ -67,7 +112,7 @@ mod tests {
         }
         for n in ["0", "6"] {
             assert!(
-                validate(&args(&[
+                validate(&dfly_args(&[
                     "--dfly-speculative",
                     "--num-drafts",
                     n,
@@ -77,9 +122,9 @@ mod tests {
                 .is_err()
             );
         }
-        assert!(validate(&args(&["--dfly-speculative", "--num-drafts=5"])).is_err());
+        assert!(validate(&dfly_args(&["--dfly-speculative", "--num-drafts=5"])).is_err());
         assert!(
-            validate(&args(&[
+            validate(&dfly_args(&[
                 "--dfly-speculative",
                 "--num-drafts=5",
                 "--max-batch-size=2",
@@ -88,7 +133,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            validate(&args(&[
+            validate(&dfly_args(&[
                 "--dfly-speculative",
                 "--num-drafts=5",
                 "--max-batch-size=1",
