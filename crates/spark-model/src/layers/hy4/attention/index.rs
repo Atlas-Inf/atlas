@@ -161,11 +161,14 @@ impl AttentionCache<'_, '_> {
         let gpu = a.memory.gpu;
         let ix = a.index.as_ref().context("Hy4 SWA has no IndexPool")?;
         let rows = positions.len();
-        ensure!(rows > 0 && rows <= crate::layers::hy4::batch::MAX_ROWS, "Hy4 index tile rows");
+        ensure!(
+            rows > 0 && rows <= crate::layers::hy4::batch::MAX_ROWS,
+            "Hy4 index tile rows"
+        );
         let len_base = self.len;
         for (r, &position) in positions.iter().enumerate() {
             let len = len_base + r;
-            if len % 4 == 0 {
+            if len.is_multiple_of(4) {
                 self.first_group_position = Some(position);
             }
             a.norm(
