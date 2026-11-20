@@ -16,11 +16,12 @@ use std::ffi::c_void;
 use anyhow::{Result, bail};
 
 use super::{
-    AtlasCudaBackend, cuCtxGetDevice, cuCtxSetCurrent, cuDeviceGetAttribute, cuEventCreate,
-    cuEventDestroy_v2, cuEventRecord, cuEventSynchronize, cuGraphDestroy, cuGraphExecDestroy,
-    cuGraphLaunch, cuMemAllocHost_v2, cuMemFreeHost, cuMemGetInfo_v2, cuMemsetD2D8Async,
-    cuMemsetD8Async, cuMemsetD32Async, cuStreamBeginCapture, cuStreamCreate, cuStreamDestroy_v2,
-    cuStreamEndCapture, cuStreamSynchronize, cuStreamWaitEvent,
+    AtlasCudaBackend, cuCtxGetDevice, cuCtxGetStreamPriorityRange, cuCtxSetCurrent,
+    cuDeviceGetAttribute, cuEventCreate, cuEventDestroy_v2, cuEventRecord, cuEventSynchronize,
+    cuGraphDestroy, cuGraphExecDestroy, cuGraphLaunch, cuMemAllocHost_v2, cuMemFreeHost,
+    cuMemGetInfo_v2, cuMemsetD2D8Async, cuMemsetD8Async, cuMemsetD32Async, cuStreamBeginCapture,
+    cuStreamCreate, cuStreamCreateWithPriority, cuStreamDestroy_v2, cuStreamEndCapture,
+    cuStreamSynchronize, cuStreamWaitEvent,
 };
 use crate::gpu::{DevicePtr, GraphHandle};
 
@@ -219,6 +220,21 @@ impl AtlasCudaBackend {
         let status = unsafe { cuStreamCreate(&mut stream, 1) };
         if status != 0 {
             bail!("cuStreamCreate failed: status {status}");
+        }
+        Ok(stream)
+    }
+
+    pub(super) fn create_stream_ahead_cu(&self) -> Result<u64> {
+        let (mut least, mut greatest) = (0i32, 0i32);
+        let status = unsafe { cuCtxGetStreamPriorityRange(&mut least, &mut greatest) };
+        if status != 0 {
+            bail!("cuCtxGetStreamPriorityRange failed: status {status}");
+        }
+        let mut stream: u64 = 0;
+        // CU_STREAM_NON_BLOCKING = 1, as `create_stream_cu`.
+        let status = unsafe { cuStreamCreateWithPriority(&mut stream, 1, greatest) };
+        if status != 0 {
+            bail!("cuStreamCreateWithPriority({greatest}) failed: status {status}");
         }
         Ok(stream)
     }

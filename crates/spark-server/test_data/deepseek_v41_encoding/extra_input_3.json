@@ -1,0 +1,125 @@
+{
+ "thinking_mode": "chat",
+ "tools": [
+  {
+   "type": "function",
+   "namespace": {
+    "name": "maps",
+    "description": "Mapping tools."
+   },
+   "function": {
+    "name": "route",
+    "description": "Plan a route",
+    "parameters": {
+     "type": "object",
+     "properties": {}
+    }
+   }
+  },
+  {
+   "type": "function",
+   "namespace": "files",
+   "function": {
+    "name": "read",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string"
+      }
+     }
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "web::search",
+    "description": "Search",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "q": {
+       "type": "string"
+      }
+     }
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "stat",
+    "namespace": "files",
+    "description": "Stat",
+    "parameters": {
+     "type": "object",
+     "properties": {}
+    }
+   }
+  }
+ ],
+ "messages": [
+  {
+   "role": "system",
+   "content": "Tools ahead."
+  },
+  {
+   "role": "user",
+   "content": "Go"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "a",
+     "type": "function",
+     "namespace": "files",
+     "function": {
+      "name": "read",
+      "arguments": "{\"path\": \"/tmp/x\", \"lines\": [1, 2], \"deep\": {\"k\": null}, \"ok\": true, \"n\": 1.5}"
+     }
+    },
+    {
+     "id": "b",
+     "type": "function",
+     "function": {
+      "name": "web::search",
+      "arguments": {
+       "q": "say \"hi\" <b>"
+      }
+     }
+    },
+    {
+     "id": "c",
+     "type": "function",
+     "function": {
+      "name": "route",
+      "namespace": "maps",
+      "arguments": "\"{\\\"to\\\": \\\"Paris\\\"}\""
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "c",
+   "content": "route ok"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "a",
+   "content": "file text"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b",
+   "content": "results"
+  },
+  {
+   "role": "user",
+   "content": "And then?"
+  }
+ ]
+}

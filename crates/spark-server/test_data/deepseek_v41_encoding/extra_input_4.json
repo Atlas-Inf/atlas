@@ -1,0 +1,107 @@
+{
+ "thinking_mode": "thinking",
+ "reasoning_effort": "max",
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "get_weather",
+    "description": "Weather for a city",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      },
+      "days": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  }
+ ],
+ "messages": [
+  {
+   "role": "system",
+   "content": "Vision."
+  },
+  {
+   "role": "user",
+   "content": [
+    {
+     "type": "text",
+     "text": "Look:"
+    },
+    {
+     "type": "image_url",
+     "image_url": {
+      "url": "file:///a.png"
+     }
+    },
+    {
+     "type": "text",
+     "text": "and"
+    },
+    {
+     "type": "image",
+     "source": {
+      "type": "base64",
+      "data": "AAAA"
+     }
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "reasoning_content": "need tools",
+   "content": "Checking.",
+   "tool_calls": [
+    {
+     "id": "t1",
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Oslo\"}"
+     }
+    },
+    {
+     "id": "t2",
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "arguments": "not json"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t2",
+   "content": [
+    {
+     "type": "text",
+     "text": "chart:"
+    },
+    {
+     "type": "image_url",
+     "image_url": {
+      "url": "file:///a.png"
+     }
+    },
+    {
+     "type": "audio",
+     "x": 1
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t1",
+   "content": "sunny"
+  }
+ ]
+}

@@ -4,7 +4,7 @@
 
 use super::harness::Stream;
 use crate::tool_parser::{
-    DeepseekV4DsmlParser, Gemma4Parser, LeakMarkers, MinimaxXmlParser, PoolsideV1Parser,
+    DeepseekDsmlParser, Gemma4Parser, LeakMarkers, MinimaxXmlParser, PoolsideV1Parser,
     Qwen3CoderParser, Qwen3XmlParser, ToolCallParser,
 };
 
@@ -14,7 +14,7 @@ fn marker_sets() -> [LeakMarkers; 6] {
         Qwen3CoderParser.leak_markers(),
         MinimaxXmlParser.leak_markers(),
         Gemma4Parser.leak_markers(),
-        DeepseekV4DsmlParser.leak_markers(),
+        DeepseekDsmlParser::V4.leak_markers(),
         Qwen3XmlParser.leak_markers(),
     ]
 }

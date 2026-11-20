@@ -63,7 +63,7 @@ fn is_prime(value: u64) -> bool {
 }
 
 /// The `count`-th prime strictly greater than `start`.
-fn nth_prime_after(start: u64, count: usize) -> u64 {
+pub(super) fn nth_prime_after(start: u64, count: usize) -> u64 {
     let mut prime = start;
     for _ in 0..count {
         prime += 1;

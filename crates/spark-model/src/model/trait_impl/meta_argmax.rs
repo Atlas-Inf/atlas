@@ -13,6 +13,10 @@ impl TransformerModel {
         n: usize,
         _stream: u64,
     ) -> Result<Vec<u32>> {
+        // Rows a step picked from without computing say their argmax.
+        if let Some(picked) = self.head_picked(logits_ptr, n)? {
+            return Ok(picked);
+        }
         let stream = self.gpu.default_stream();
         let v = self.config.vocab_size;
         let bf16 = 2usize;

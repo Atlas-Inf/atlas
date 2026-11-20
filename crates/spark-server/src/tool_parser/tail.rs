@@ -13,10 +13,11 @@ impl std::str::FromStr for ToolCallFormat {
             "mistral" => Ok(Self::Mistral),
             "minimax_xml" => Ok(Self::MinimaxXml),
             "deepseek_v4" | "dsml" => Ok(Self::DeepseekV4),
+            "deepseek_v41" => Ok(Self::DeepseekV41),
             "bare_json" => Ok(Self::BareJson),
             "poolside_v1" => Ok(Self::PoolsideV1),
             other => Err(format!(
-                "Unknown tool call parser '{other}'. Supported: hermes, qwen3_coder, qwen3_xml, gemma4, mistral, minimax_xml, deepseek_v4, bare_json, poolside_v1",
+                "Unknown tool call parser '{other}'. Supported: hermes, qwen3_coder, qwen3_xml, gemma4, mistral, minimax_xml, deepseek_v4, deepseek_v41, bare_json, poolside_v1",
             )),
         }
     }
@@ -32,7 +33,8 @@ impl ToolCallFormat {
             Self::Gemma4 => Box::new(Gemma4Parser),
             Self::Mistral => Box::new(MistralNativeParser),
             Self::MinimaxXml => Box::new(MinimaxXmlParser),
-            Self::DeepseekV4 => Box::new(DeepseekV4DsmlParser),
+            Self::DeepseekV4 => Box::new(DeepseekDsmlParser::V4),
+            Self::DeepseekV41 => Box::new(DeepseekDsmlParser::V41),
             Self::BareJson => Box::new(BareJsonParser),
             Self::PoolsideV1 => Box::new(PoolsideV1Parser),
         }
@@ -61,6 +63,7 @@ impl ToolCallFormat {
             Self::Mistral => "mistral",
             Self::MinimaxXml => "minimax_xml",
             Self::DeepseekV4 => "deepseek_v4",
+            Self::DeepseekV41 => "deepseek_v41",
             Self::BareJson => "bare_json",
             Self::PoolsideV1 => "poolside_v1",
         }

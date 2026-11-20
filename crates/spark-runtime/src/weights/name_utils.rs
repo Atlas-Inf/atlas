@@ -59,6 +59,11 @@ pub fn is_ngram_table(name: &str) -> bool {
             || (name.contains("ngram_embedding.shard_") && name.ends_with(".weight_scale"))
             || exl3_trellis_tail(name);
     }
+    // DeepSeek-V4.1's Engram tables: 384 million rows of FP8 a layer, and
+    // their E8M0 scales, read by row.
+    if name.contains(".engram.embed.") {
+        return name.ends_with(".weight") || name.ends_with(".scale");
+    }
     name.ends_with(".ngram_embedding.trellis")
 }
 

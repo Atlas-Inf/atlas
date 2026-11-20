@@ -19,6 +19,12 @@ use anyhow::{Context, Result};
 use super::super::{LayerType, ModelConfig, finalize_config, parse_quantization_config};
 
 pub fn parse_deepseek_v4(json: &str) -> Result<ModelConfig> {
+    parse_deepseek_family(json, "deepseek_v4")
+}
+
+/// The parse DeepSeek-V4 and V4.1 share, over a flat config. V4.1 unwraps
+/// its `text_config` first (see `deepseek_v41.rs`).
+pub(super) fn parse_deepseek_family(json: &str, model_type: &str) -> Result<ModelConfig> {
     let mut raw: serde_json::Value =
         serde_json::from_str(json).context("Invalid JSON in DeepSeek-V4 config.json")?;
 
@@ -138,7 +144,7 @@ pub fn parse_deepseek_v4(json: &str) -> Result<ModelConfig> {
     config.layer_types = vec![LayerType::FullAttention; config.num_hidden_layers];
 
     // Architecture flags
-    config.model_type = "deepseek_v4".to_string();
+    config.model_type = model_type.to_string();
     config.attn_gated = false; // DeepSeek-V4 uses ungated Q
     config.nested_config = false;
     config.weight_prefix = "model".to_string();

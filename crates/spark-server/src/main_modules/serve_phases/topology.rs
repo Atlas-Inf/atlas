@@ -72,11 +72,14 @@ pub(crate) fn resolve_topology(
     // Every rank must resolve the same value (`rank_settings`): with it each
     // rank holds a 1/ep slice of every routed expert, without it 1/ep of the
     // experts. The pair (EP2) and the chain (EP4) slice alike.
-    config.expert_tp = std::env::var("ATLAS_GLM_EXPERT_TP").as_deref() == Ok("1")
+    config.expert_tp = (std::env::var("ATLAS_GLM_EXPERT_TP").as_deref() == Ok("1")
         && config.model_type == "glm5_next"
         && matches!(ep_size, 2 | 4)
         && tp_size == ep_size
-        && world_size == ep_size;
+        && world_size == ep_size)
+        // DeepSeek-V4.1 always: its loader reads a rank's parts of each
+        // routed expert from disk, on one rank too.
+        || config.model_type == "deepseek_v41";
     // The arena sizes the mHC highway for the format the model keeps it in
     // (environment only, so the same before and after CUDA is up).
     config.hc_highway_bf16 = spark_model::layers::ops::hc_bf16_for(&config.model_type);

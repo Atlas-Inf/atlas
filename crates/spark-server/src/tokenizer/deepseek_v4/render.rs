@@ -3,23 +3,25 @@
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
+use super::preprocess::{last_user_index, opens_assistant_turn, role};
 use super::{
-    ASSISTANT, BOS, DSML, EOS, LATEST_REMINDER, ReasoningEffort, THINK_END, THINK_START, USER,
+    ASSISTANT, BOS, DSML, Dialect, EOS, LATEST_REMINDER, SYSTEM, THINK_END, THINK_START, USER,
+    dsml_tags, v41,
 };
 
 const TOOL_INSTRUCTIONS: &str = r##"## Tools
 
-You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<{dsml}tool_calls>" block like the following:
+You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<{dsml}{calls}>" block like the following:
 
-<{dsml}tool_calls>
-<{dsml}invoke name="$TOOL_NAME">
-<{dsml}parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</{dsml}parameter>
+<{dsml}{calls}>
+<{dsml}{invoke} name="$TOOL_NAME">
+<{dsml}{parameter} name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</{dsml}{parameter}>
 ...
-</{dsml}invoke>
-<{dsml}invoke name="$TOOL_NAME2">
+</{dsml}{invoke}>
+<{dsml}{invoke} name="$TOOL_NAME2">
 ...
-</{dsml}invoke>
-</{dsml}tool_calls>
+</{dsml}{invoke}>
+</{dsml}{calls}>
 
 String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
 
@@ -34,49 +36,64 @@ Otherwise, output directly after {think_end} with tool calls or final response.
 You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
 "##;
 
+/// `effort` is the reasoning-effort text that opens a thinking prompt, or "".
 pub(super) fn render_messages(
     messages: &[Value],
     thinking: bool,
     drop_thinking: bool,
-    effort: ReasoningEffort,
+    dialect: Dialect,
+    effort: &str,
 ) -> Result<String> {
-    let last_user = messages
-        .iter()
-        .rposition(|m| matches!(role(m), Some("user" | "developer")))
-        .unwrap_or(usize::MAX);
+    let turn = Turn {
+        thinking,
+        drop_thinking,
+        dialect,
+        // With no user message, every message counts as after the last one,
+        // as the reference's index of -1 makes it.
+        after_last_user: last_user_index(messages, dialect).map_or(0, |index| index + 1),
+    };
     let mut prompt = String::from(BOS);
     for index in 0..messages.len() {
-        prompt.push_str(&render_message(
-            index,
-            messages,
-            thinking,
-            drop_thinking,
-            effort,
-            last_user,
-        )?);
+        prompt.push_str(&render_message(index, messages, turn, effort)?);
     }
     Ok(prompt)
 }
 
-fn render_message(
-    index: usize,
-    messages: &[Value],
+#[derive(Clone, Copy)]
+struct Turn {
     thinking: bool,
     drop_thinking: bool,
-    effort: ReasoningEffort,
-    last_user: usize,
-) -> Result<String> {
+    dialect: Dialect,
+    /// The first index past the last message that starts a turn.
+    after_last_user: usize,
+}
+
+fn render_message(index: usize, messages: &[Value], turn: Turn, effort: &str) -> Result<String> {
+    let Turn {
+        thinking,
+        drop_thinking,
+        dialect,
+        after_last_user,
+    } = turn;
     let message = &messages[index];
+    let message_role =
+        role(message).with_context(|| format!("{} message is missing role", dialect.name()))?;
     let mut out = String::new();
-    if index == 0 && thinking {
-        out.push_str(effort.prefix());
+    if index == 0 {
+        if dialect == Dialect::V41 && (!effort.is_empty() || message_role == "system") {
+            out.push_str(SYSTEM);
+        }
+        out.push_str(effort);
     }
 
     let content = content_text(message.get("content"))?;
-    match role(message).context("DeepSeek-V4 message is missing role")? {
+    match message_role {
         "system" => {
+            if dialect == Dialect::V41 && index > 0 {
+                out.push_str(SYSTEM);
+            }
             out.push_str(&content);
-            append_tools_and_format(&mut out, message)?;
+            append_tools_and_format(&mut out, message, dialect)?;
         }
         "developer" => {
             if content.is_empty() {
@@ -84,11 +101,15 @@ fn render_message(
             }
             out.push_str(USER);
             out.push_str(&content);
-            append_tools_and_format(&mut out, message)?;
+            append_tools_and_format(&mut out, message, dialect)?;
         }
         "user" => {
             out.push_str(USER);
-            if let Some(blocks) = message.get("content_blocks").and_then(Value::as_array) {
+            if let Some(blocks) = message
+                .get("content_blocks")
+                .and_then(Value::as_array)
+                .filter(|blocks| dialect == Dialect::V4 || !blocks.is_empty())
+            {
                 let rendered = blocks
                     .iter()
                     .map(render_content_block)
@@ -105,7 +126,7 @@ fn render_message(
         "tool" => bail!("DeepSeek-V4 tool messages must be merged before rendering"),
         "assistant" => {
             let previous_has_task = index > 0 && messages[index - 1].get("task").is_some();
-            if thinking && !previous_has_task && (!drop_thinking || index > last_user) {
+            if thinking && !previous_has_task && (!drop_thinking || index >= after_last_user) {
                 out.push_str(
                     message
                         .get("reasoning_content")
@@ -119,7 +140,7 @@ fn render_message(
                 && !calls.is_empty()
             {
                 out.push_str("\n\n");
-                out.push_str(&render_tool_calls(calls)?);
+                out.push_str(&render_tool_calls(calls, dialect)?);
             }
             if !message
                 .get("wo_eos")
@@ -129,7 +150,7 @@ fn render_message(
                 out.push_str(EOS);
             }
         }
-        other => bail!("unsupported DeepSeek-V4 message role '{other}'"),
+        other => bail!("unsupported {} message role '{other}'", dialect.name()),
     }
 
     let next_role = messages.get(index + 1).and_then(role);
@@ -152,23 +173,25 @@ fn render_message(
             out.push_str(if thinking { THINK_START } else { THINK_END });
         }
         out.push_str(task_token);
-    } else if matches!(role(message), Some("user" | "developer")) {
+    } else if opens_assistant_turn(index, message, dialect) {
         out.push_str(ASSISTANT);
-        out.push_str(if thinking && (!drop_thinking || index >= last_user) {
-            THINK_START
-        } else {
-            THINK_END
-        });
+        out.push_str(
+            if thinking && (!drop_thinking || index + 1 >= after_last_user) {
+                THINK_START
+            } else {
+                THINK_END
+            },
+        );
     }
     Ok(out)
 }
 
-fn append_tools_and_format(out: &mut String, message: &Value) -> Result<()> {
+fn append_tools_and_format(out: &mut String, message: &Value, dialect: Dialect) -> Result<()> {
     if let Some(tools) = message.get("tools").and_then(Value::as_array)
         && !tools.is_empty()
     {
         out.push_str("\n\n");
-        out.push_str(&render_tools(tools)?);
+        out.push_str(&render_tools(tools, dialect)?);
     }
     if let Some(response_format) = message.get("response_format") {
         out.push_str("\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n");
@@ -177,42 +200,68 @@ fn append_tools_and_format(out: &mut String, message: &Value) -> Result<()> {
     Ok(())
 }
 
-fn render_tools(tools: &[Value]) -> Result<String> {
+fn render_tools(tools: &[Value], dialect: Dialect) -> Result<String> {
     let schemas = tools
         .iter()
-        .map(|tool| {
-            let function = tool
-                .get("function")
-                .context("DeepSeek-V4 tools must use OpenAI function format")?;
-            python_json(function)
+        .map(|tool| match dialect {
+            Dialect::V4 => python_json(
+                tool.get("function")
+                    .context("DeepSeek-V4 tools must use OpenAI function format")?,
+            ),
+            Dialect::V41 => python_json(&v41::tool_schema(tool)?),
         })
         .collect::<Result<Vec<_>>>()?
         .join("\n");
+    let (calls, invoke, parameter) = dsml_tags(dialect);
     Ok(TOOL_INSTRUCTIONS
+        .replace("{calls}", calls)
+        .replace("{invoke}", invoke)
+        .replace("{parameter}", parameter)
         .replace("{dsml}", DSML)
         .replace("{think_start}", THINK_START)
         .replace("{think_end}", THINK_END)
         .replace("{schemas}", &schemas))
 }
 
-fn render_tool_calls(calls: &[Value]) -> Result<String> {
+fn render_tool_calls(calls: &[Value], dialect: Dialect) -> Result<String> {
+    let (calls_tag, invoke, parameter) = dsml_tags(dialect);
     let mut invokes = Vec::with_capacity(calls.len());
     for call in calls {
         let function = call.get("function").unwrap_or(call);
         let name = function
             .get("name")
             .and_then(Value::as_str)
-            .context("DeepSeek-V4 tool call is missing function.name")?;
-        let arguments = function
+            .with_context(|| format!("{} tool call is missing function.name", dialect.name()))?;
+        let name = match dialect {
+            Dialect::V4 => name.to_string(),
+            Dialect::V41 => v41::qualified_tool_name(
+                name,
+                // The reference's `call namespace or function namespace`.
+                call.get("namespace")
+                    .filter(|namespace| v41::truthy(Some(namespace)))
+                    .or_else(|| function.get("namespace")),
+            )?,
+        };
+        let given = function
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| Value::Object(Default::default()));
-        let arguments = match arguments {
-            Value::String(raw) => {
-                serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({"arguments": raw}))
+        // Arguments may arrive as JSON text; V4.1 also accepts text encoded
+        // twice, and wraps whatever is still not an object.
+        let mut arguments = given.clone();
+        for _ in 0..(if dialect == Dialect::V41 { 2 } else { 1 }) {
+            let Value::String(raw) = &arguments else {
+                break;
+            };
+            match serde_json::from_str(raw) {
+                Ok(parsed) => arguments = parsed,
+                Err(_) => break,
             }
-            other => other,
-        };
+        }
+        let unparsed_text = given.is_string() && given == arguments;
+        if !arguments.is_object() && (dialect == Dialect::V41 || unparsed_text) {
+            arguments = serde_json::json!({"arguments": given});
+        }
         let object = arguments
             .as_object()
             .context("DeepSeek-V4 tool arguments must be a JSON object")?;
@@ -223,16 +272,16 @@ fn render_tool_calls(calls: &[Value]) -> Result<String> {
                 other => ("false", python_json(other)?),
             };
             params.push(format!(
-                "<{DSML}parameter name=\"{key}\" string=\"{is_string}\">{rendered}</{DSML}parameter>"
+                "<{DSML}{parameter} name=\"{key}\" string=\"{is_string}\">{rendered}</{DSML}{parameter}>"
             ));
         }
         invokes.push(format!(
-            "<{DSML}invoke name=\"{name}\">\n{}\n</{DSML}invoke>",
+            "<{DSML}{invoke} name=\"{name}\">\n{}\n</{DSML}{invoke}>",
             params.join("\n")
         ));
     }
     Ok(format!(
-        "<{DSML}tool_calls>\n{}\n</{DSML}tool_calls>",
+        "<{DSML}{calls_tag}>\n{}\n</{DSML}{calls_tag}>",
         invokes.join("\n")
     ))
 }
@@ -284,10 +333,6 @@ fn content_text(content: Option<&Value>) -> Result<String> {
             .map(|parts| parts.join("")),
         Some(_) => bail!("unexpected DeepSeek-V4 content type"),
     }
-}
-
-fn role(message: &Value) -> Option<&str> {
-    message.get("role").and_then(Value::as_str)
 }
 
 pub(super) fn python_json(value: &Value) -> Result<String> {

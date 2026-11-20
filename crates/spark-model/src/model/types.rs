@@ -253,6 +253,9 @@ pub struct TransformerModel {
     /// rank's copy of the drafter, which serves its part of a split propose
     /// (`draft_assist`). `None` on the head and when the split is off.
     pub(super) draft_assist: Option<Arc<dyn super::draft_assist::DraftAssist>>,
+    /// `ATLAS_DSV41_HEAD_PICK`: a greedy step's token without its logits
+    /// (`head_pick`). `None` when off or the model has no pick.
+    pub(super) head_pick: Option<super::head_pick::HeadPicks>,
     /// Immutable typed identity for the admitted official Lightning product.
     /// `None` for generic DFlash, MTP, and non-speculative models.
     pub(super) lightning_dspark_identity: LightningDsparkIdentityLatch,

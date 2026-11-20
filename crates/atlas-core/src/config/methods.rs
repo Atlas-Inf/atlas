@@ -437,9 +437,14 @@ impl ModelConfig {
 
     /// Whether the radix prefix cache captures every state needed to resume
     /// this model exactly. DeepSeek V4 compression also carries a prompt-built
-    /// pool and ring that are not represented by KV blocks today.
+    /// pool and ring that are not represented by KV blocks today, and
+    /// DeepSeek V4.1 keeps its whole attention cache outside the KV blocks.
     pub fn kv_only_prefix_cache_is_safe(&self) -> bool {
-        self.model_type != "deepseek_v4" || self.compress_ratios.iter().all(|&ratio| ratio == 0)
+        match self.model_type.as_str() {
+            "deepseek_v41" => false,
+            "deepseek_v4" => self.compress_ratios.iter().all(|&ratio| ratio == 0),
+            _ => true,
+        }
     }
 }
 

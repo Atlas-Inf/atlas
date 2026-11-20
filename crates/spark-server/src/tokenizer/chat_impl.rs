@@ -179,8 +179,9 @@ impl ChatTokenizer {
         reasoning_effort: Option<&str>,
         preserve_thinking: Option<bool>,
     ) -> Result<Vec<u32>> {
-        if self.chat_encoding == ChatEncoding::DeepseekV4 {
+        if let ChatEncoding::Deepseek(dialect) = self.chat_encoding {
             let rendered = super::deepseek_v4::encode_messages(
+                dialect,
                 messages,
                 tools,
                 enable_thinking,
@@ -246,7 +247,7 @@ impl ChatTokenizer {
         reasoning_effort: Option<&str>,
         preserve_thinking: Option<bool>,
     ) -> Result<Vec<u32>> {
-        if self.chat_encoding == ChatEncoding::DeepseekV4 {
+        if matches!(self.chat_encoding, ChatEncoding::Deepseek(_)) {
             return self.apply_chat_template_jinja_with_effort(
                 messages,
                 tools,
@@ -327,7 +328,7 @@ impl ChatTokenizer {
     }
 
     pub fn uses_deepseek_v4_encoding(&self) -> bool {
-        self.chat_encoding == ChatEncoding::DeepseekV4
+        matches!(self.chat_encoding, ChatEncoding::Deepseek(_))
     }
 
     /// Encode the `<|image_pad|>` placeholder token and return its ID.

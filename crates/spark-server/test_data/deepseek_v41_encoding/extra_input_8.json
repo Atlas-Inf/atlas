@@ -1,0 +1,68 @@
+{
+ "thinking_mode": "thinking",
+ "messages": [
+  {
+   "role": "system",
+   "content": "",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "role": "user",
+   "content": "w?"
+  },
+  {
+   "role": "assistant",
+   "reasoning_content": "call it",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "x",
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "arguments": {
+       "city": "Rome",
+       "days": 2
+      }
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "x",
+   "content": "{\"t\": 30}"
+  },
+  {
+   "role": "assistant",
+   "reasoning_content": "done",
+   "content": "Hot."
+  },
+  {
+   "role": "user",
+   "content": "thanks"
+  }
+ ]
+}

@@ -139,8 +139,8 @@ impl RdmaChain {
     }
 
     /// The four-rank all-to-all (`CommBackend::all_to_all_async`) on
-    /// `stream`: consecutive one-shot ops of an equal share of every plane's
-    /// rows, each capturable like one. `false` (nothing enqueued) when it does
+    /// `stream`: consecutive one-shot ops of a run of every plane's rows
+    /// (`a2a_split`), each capturable like one. `false` (nothing enqueued) when it does
     /// not apply (not four ranks, the kernel missing, more than two planes, a
     /// shape no split into ops of whole rows and 128-byte segments serves).
     pub(in crate::nccl_backend) fn all_to_all(
@@ -152,21 +152,13 @@ impl RdmaChain {
         if max == 0 || planes.is_empty() || planes.len() > 2 {
             return Ok(false);
         }
-        let seg = |n: usize| -> usize { planes.iter().map(|p| p.rows / n * p.row_bytes).sum() };
-        let fits = |n: usize| {
-            planes.iter().all(|p| p.rows.is_multiple_of(n))
-                && seg(n).is_multiple_of(128)
-                && MAX_RANKS * seg(n) <= max
-        };
-        let most = planes.iter().map(|p| p.rows).max().unwrap_or(0);
-        let first = (MAX_RANKS * seg(1)).div_ceil(max).max(1);
-        let Some(n) = (first..=most).find(|&n| fits(n)) else {
+        let shape: Vec<(usize, usize)> = planes.iter().map(|p| (p.rows, p.row_bytes)).collect();
+        let Some(ops) = a2a_split::ops(&shape, max) else {
             return Ok(false);
         };
-        for i in 0..n {
+        for (i, op) in ops.iter().enumerate() {
             let mut a2a = oneshot::A2a::default();
-            for (k, p) in planes.iter().enumerate() {
-                let rows = p.rows / n;
+            for (k, (p, &(at, rows))) in planes.iter().zip(op).enumerate() {
                 let (Ok(row_bytes), Ok(pitch), Ok(bytes)) = (
                     u32::try_from(p.row_bytes),
                     u32::try_from(p.pitch),
@@ -175,9 +167,9 @@ impl RdmaChain {
                     return Ok(false);
                 };
                 a2a.planes[k] = oneshot::A2aPlane {
-                    src: p.src + (i * rows * p.row_bytes) as u64,
+                    src: p.src + (at * p.row_bytes) as u64,
                     src_stride: p.src_stride,
-                    dst: p.dst + (i * rows * p.pitch) as u64,
+                    dst: p.dst + (at * p.pitch) as u64,
                     dst_stride: p.dst_stride,
                     row_bytes,
                     pitch,
@@ -186,7 +178,8 @@ impl RdmaChain {
                 };
             }
             if !self.oneshot().all_to_all(a2a, stream)? {
-                // Only the first op can decline (every op has the same shape).
+                // Only the first op can decline (every op is whole rows
+                // within the maximum).
                 ensure!(i == 0, "RDMA chain: all-to-all op refused mid-way");
                 return Ok(false);
             }

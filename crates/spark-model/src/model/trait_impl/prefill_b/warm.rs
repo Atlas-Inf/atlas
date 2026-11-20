@@ -77,7 +77,13 @@ impl TransformerModel {
             return Ok([Duration::ZERO; 2]);
         }
         let t0 = Instant::now();
-        if self.comm.is_some() {
+        // DeepSeek-V4.1's layers keep their own working buffers, and write
+        // what they read of the arena (a chunk's embeddings, its streams and
+        // their mix) before they read it, as its decode step does
+        // (`decode_a.rs`): the zero would be 3.2 GB of memsets a chunk of
+        // 8,192 rows, 17 ms with the GPU waiting.
+        if self.config.model_type == "deepseek_v41" {
+        } else if self.comm.is_some() {
             self.warm_zero_arena(stream)?;
         } else if chunk_start == 0 {
             self.buffers

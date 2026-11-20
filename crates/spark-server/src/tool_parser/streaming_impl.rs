@@ -20,7 +20,7 @@ impl StreamingToolDetector {
             buffer: String::new(),
             inside_tag: false,
             current_tag_open: None,
-            inside_dsml: false,
+            inside_dsml: None,
             promote_bare_names: false,
             complete_poolside_calls: false,
             call_counter: 0,
@@ -73,7 +73,7 @@ impl StreamingToolDetector {
         self.buffer.clear();
         self.inside_tag = false;
         self.current_tag_open = None;
-        self.inside_dsml = false;
+        self.inside_dsml = None;
         self.literal_xml_state = crate::literal_xml::LiteralXmlState::default();
         self.native_openers = 0;
         self.reset_call_state();
@@ -407,7 +407,9 @@ impl StreamingToolDetector {
                     let remainder = self.buffer[safe..].to_string();
                     let dsml_leading_whitespace = !remainder.is_empty()
                         && content.trim().is_empty()
-                        && DSML_OPEN.starts_with(&remainder);
+                        && DSML_DIALECTS
+                            .iter()
+                            .any(|dsml| dsml.open.starts_with(&remainder));
                     if dsml_leading_whitespace {
                         // A partial `<` may still become a different XML
                         // marker. Keep its preceding whitespace until the

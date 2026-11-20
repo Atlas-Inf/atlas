@@ -7,6 +7,7 @@
 #   gemma4      — Native: <|tool_call>call:fn{key:val,...}<tool_call|>
 #   mistral     — Native: [TOOL_CALLS]fn[ARGS]{"k":"v",...}
 #   deepseek_v4 — Native DSML: <｜DSML｜tool_calls>...<｜DSML｜invoke ...>
+#   deepseek_v41 — Native DSML: <｜DSML｜ calls>...<｜DSML｜ invoke ...>
 
 [model_type]
 qwen3_5_moe = "qwen3_coder"    # Qwen3.5-35B, Qwen3.5-122B — native XML format
@@ -22,6 +23,7 @@ gemma4      = "gemma4"        # Gemma-4 — native format: <|tool_call>call:name
 minimax_m2  = "minimax_xml"    # MiniMax M2 — <minimax:tool_call><invoke name=""><parameter name="">...
 laguna      = "poolside_v1"     # Poolside — <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>
 deepseek_v4 = "deepseek_v4"    # DeepSeek-V4-Flash — checkpoint-native typed DSML
+deepseek_v41 = "deepseek_v41"  # DeepSeek-V4.1-Flash — the same DSML with a space before each tag name
 
 # Default reasoning parser per model_type.
 # Override at runtime with --reasoning-parser <format>.
@@ -47,6 +49,7 @@ deepseek_v4 = "deepseek_r1"    # DeepSeek-V4-Flash — official <think>/</think>
                                # parser so think_end_token resolves and inside_thinking can engage on
                                # enable_thinking=true. supports_thinking (has_ssm||has_mamba2) is false
                                # for this pure-attention MLA model, so the parser MUST be set here.
+deepseek_v41 = "deepseek_r1"   # DeepSeek-V4.1-Flash — as deepseek_v4
 qwen3_next  = "qwen"
 qwen3_vl_moe = "qwen"
 mistral     = "mistral"

@@ -396,6 +396,7 @@ pub enum ToolCallFormat {
     Mistral,
     MinimaxXml,
     DeepseekV4,
+    DeepseekV41,
     BareJson,
     PoolsideV1,
 }

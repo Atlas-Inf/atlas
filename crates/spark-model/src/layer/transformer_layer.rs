@@ -375,6 +375,13 @@ pub trait TransformerLayer: Send + Sync {
         self.verify_context_limit()
     }
 
+    /// Whether [`Self::decode_batched`] is this layer's own K-token pass even
+    /// though it is an attention layer: the eager verify then hands it the
+    /// K rows at once instead of decoding them one by one. Default: no.
+    fn decode_batched_is_native(&self) -> bool {
+        false
+    }
+
     /// Deepest `num_drafts` this layer can serve in a BATCHED verify, if it
     /// is bounded at all. The verify runs `K = num_drafts + 1` rows.
     ///

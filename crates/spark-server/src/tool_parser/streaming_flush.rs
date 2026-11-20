@@ -165,7 +165,7 @@ impl StreamingToolDetector {
     /// `tool_describe`) being reassembled across token boundaries — dropping
     /// it truncates the streamed name by exactly `len("tool")` == 4 chars.
     pub fn inside_tool_call(&self) -> bool {
-        self.inside_tag || self.inside_dsml || self.has_partial_tool_opener()
+        self.inside_tag || self.inside_dsml.is_some() || self.has_partial_tool_opener()
     }
 
     /// Returns safe byte length to emit without splitting a partial tag.
@@ -188,7 +188,8 @@ impl StreamingToolDetector {
             b"<|tool_call>",
             b"<minimax:tool_call>",
             b"<minimax:_call>",
-            DSML_OPEN.as_bytes(),
+            DSML_V4.open.as_bytes(),
+            DSML_V41.open.as_bytes(),
             b"<function",
             b"call:",
             MISTRAL_TOOL_CALLS_TAG.as_bytes(),

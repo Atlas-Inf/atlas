@@ -57,6 +57,7 @@ impl TransformerModel {
                 if rows > 1
                     && self.dense_gemv_batchm_kernel.0 != 0
                     && (self.levers.exact_verify
+                        || self.config.model_type == "deepseek_v41"
                         || self.config.model_type == "qwen4_exp"
                             && (batchm_requested() || self.levers.qwen4exp_batch_fast))
                     && !self.levers.batch_bisect(ops::BISECT_HEAD) =>
@@ -221,9 +222,12 @@ impl TransformerModel {
         Ok(())
     }
 
-    /// `lm_head` (single-row decode), split when admitted.
+    /// `lm_head` (single-row decode), split over a pair or in a share a rank
+    /// (`head_shares`) when admitted.
     pub(in crate::model) fn lm_head_tp(&self, normed: DevicePtr, stream: u64) -> Result<()> {
-        if !self.qwen4exp_split_head(normed, 1, HeadArith::Gemv, stream)? {
+        if !self.qwen4exp_split_head(normed, 1, HeadArith::Gemv, stream)?
+            && !self.head_in_shares(normed, stream)?
+        {
             self.lm_head(normed, stream)?;
         }
         Ok(())

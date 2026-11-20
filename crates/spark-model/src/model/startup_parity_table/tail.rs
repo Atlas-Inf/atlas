@@ -186,4 +186,11 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
             rt::ssm_snap_ladder_base().unwrap_or(0) as u64
         })
     }),
+    // DeepSeek-V4.1: a pick and a head in shares are different collectives.
+    ("ATLAS_DSV41_HEAD_PICK", || {
+        Ok(crate::model::head_pick_allowed() as u64)
+    }),
+    ("ATLAS_DSV41_HEAD_PICK_CHECK", || {
+        Ok(crate::model::head_pick_check_requested() as u64)
+    }),
 ];

@@ -384,6 +384,68 @@ pub struct ModelConfig {
     #[serde(default)]
     pub num_hash_layers: usize,
 
+    // ── DeepSeek-V4.1 shared sparse attention + Engram ──
+    /// Layers that compress their own KV (and own the index keys); every later
+    /// compressing layer reads the most recent source's cache. Empty = each
+    /// compressing layer owns its KV, as in DeepSeek-V4.
+    #[serde(default)]
+    pub kv_source_layer_ids: Vec<usize>,
+    /// Layers that run the indexer; every later compressing layer reuses the
+    /// most recent source's top-k selection.
+    #[serde(default)]
+    pub index_source_layer_ids: Vec<usize>,
+    /// Index source whose scores pick candidate blocks that every later index
+    /// source must select from (the first level of a two-level top-k).
+    #[serde(default)]
+    pub candidate_source_layer_id: Option<usize>,
+    /// Blocks kept by the candidate pre-filter.
+    #[serde(default)]
+    pub candidate_topk_blocks: usize,
+    /// Compressed positions per candidate block.
+    #[serde(default)]
+    pub candidate_block_size: usize,
+    /// Decoder layers that add an Engram n-gram lookup into the residual
+    /// stream (see `config/engram_dsv41.rs`). Empty = no Engram.
+    #[serde(default)]
+    pub engram_layer_ids: Vec<usize>,
+    /// DeepSeek-V4.1: the compressed id of every token id, which the Engram
+    /// tables are hashed over. It is derived from the tokenizer, so the
+    /// server sets it before the model is built.
+    #[serde(skip)]
+    pub engram_token_map: Option<std::sync::Arc<Vec<u32>>>,
+    /// The compressed id of the Engram pad token, beside `engram_token_map`.
+    #[serde(skip)]
+    pub engram_pad_id: u32,
+    /// DeepSeek-V4.1: the rotary base of a layer that attends over its
+    /// window only (HF `rope_theta`). `rope_theta` holds the compressing
+    /// layers' base, HF `compress_rope_theta`.
+    #[serde(default)]
+    pub window_rope_theta: f64,
+    /// Rows of each Engram layer's table, as published.
+    #[serde(default)]
+    pub engram_num_embeddings: Vec<u64>,
+    #[serde(default)]
+    pub engram_max_ngram_size: usize,
+    /// Base the per-head prime search of the Engram tables starts above.
+    #[serde(default)]
+    pub engram_vocab_size: u64,
+    #[serde(default)]
+    pub engram_n_heads: usize,
+    #[serde(default)]
+    pub engram_head_dim: usize,
+    /// Raw token whose compressed id fills n-gram slots with no history.
+    #[serde(default)]
+    pub engram_pad_token_id: u32,
+    /// Size of the normalized token vocab the Engram hashes over.
+    #[serde(default)]
+    pub engram_compressed_vocab_size: u64,
+    /// Routed experts in each DSpark draft stage (0 = same as the target).
+    #[serde(default)]
+    pub dspark_n_routed_experts: usize,
+    /// Experts each draft token activates (0 = same as the target).
+    #[serde(default)]
+    pub dspark_num_experts_per_tok: usize,
+
     // ── YaRN RoPE scaling (Mistral Small 4) ──
     /// YaRN scaling factor (`yarn.factor`). 0.0 = YaRN disabled, use plain RoPE.
     #[serde(default)]
@@ -812,6 +874,7 @@ pub(crate) fn default_conv_kernel() -> usize {
 
 mod dispatch;
 mod dispatch_nemotron;
+mod engram_dsv41;
 mod factory;
 mod gguf;
 mod methods;
@@ -825,6 +888,7 @@ mod tests_glm5_next;
 mod vision;
 
 pub use dispatch::parse_config;
+pub use engram_dsv41::DeepseekV41Engram;
 pub use gguf::{GgufConfigInputs, GgufMeta, config_from_gguf};
 pub use ngram::{NgramDims, ngram_ids, shift_right_ignore_eos, shift_right_ignore_eos_fill};
 pub use ngram_qwen4exp::Qwen4ExpNgram;
@@ -833,9 +897,9 @@ pub use parsers::{
     parse_mistral_params, parse_peft_adapter_config, parse_quantization_config,
 };
 pub(crate) use parsers::{
-    parse_deepseek_v4, parse_gemma4_params, parse_glm5_next, parse_glm5_vision_config,
-    parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp, parse_ricursive,
-    parse_step3p7, parse_vision_config,
+    parse_deepseek_v4, parse_deepseek_v41, parse_gemma4_params, parse_glm5_next,
+    parse_glm5_vision_config, parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp,
+    parse_ricursive, parse_step3p7, parse_vision_config,
 };
 pub use vision::{OmniVisionConfig, PixelBounds, VisionConfig, VisionTokenBudgets};
 

@@ -37,6 +37,8 @@ int cuGetErrorName(int code, const char **out) { (void)code; (void)out; return 1
 int cuGetErrorString(int code, const char **out) { (void)code; (void)out; return 100; }
 /* Streams */
 int cuStreamCreate(void **a, unsigned int b) { (void)a; (void)b; return 100; }
+int cuStreamCreateWithPriority(void **a, unsigned int b, int c) { (void)a; (void)b; (void)c; return 100; }
+int cuCtxGetStreamPriorityRange(int *a, int *b) { (void)a; (void)b; return 100; }
 int cuStreamDestroy_v2(void *a) { (void)a; return 100; }
 int cuStreamSynchronize(void *a) { (void)a; return 100; }
 int cuStreamQuery(void *a) { (void)a; return 100; }

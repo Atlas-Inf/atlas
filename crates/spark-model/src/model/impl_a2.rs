@@ -362,6 +362,8 @@ impl TransformerModel {
         if !self.multi_rank_protocol_active() {
             return Ok(());
         }
+        // Every rank is between steps here, and nowhere else for certain.
+        self.head_pick_agree()?;
         if v2 {
             self.ep_broadcast_u32(seq_id)?;
         }

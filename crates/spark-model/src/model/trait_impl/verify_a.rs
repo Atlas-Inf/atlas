@@ -70,7 +70,9 @@ impl TransformerModel {
         for (i, layer) in self.layers.iter().enumerate() {
             let layer_type = self.config.layer_type(i);
 
-            if layer_type == atlas_core::config::LayerType::FullAttention {
+            if layer_type == atlas_core::config::LayerType::FullAttention
+                && !layer.decode_batched_is_native()
+            {
                 // Attention layers: sequential per-token (need per-token metadata)
                 for t in 0..k {
                     let pos = seq.seq_len + t;
@@ -220,12 +222,18 @@ impl TransformerModel {
         self.final_norm_rows(hidden, normed, k as u32, stream)?;
 
         // ── LM head for K tokens → logits[K, vocab] ──
-        self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
+        // In a share a rank where the ranks hold the head so (`head_shares`):
+        // serial decode's bytes, and a quarter of the head to read.
+        // Or, where the ranks pick (`head_pick`), each row's argmax alone.
+        let picked = self.head_picks_in_shares(normed, k, stream)?;
+        if picked.is_none() && !self.head_rows_in_shares(normed, k, stream)? {
+            self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
+        }
 
         // ── Argmax per token ──
         let vocab = self.config.vocab_size;
         let mut results = Vec::with_capacity(k);
-        for t in 0..k {
+        for t in (0..k).filter(|_| picked.is_none()) {
             let logits_t = self.buffers.logits().offset(t * vocab * bf16);
             let out_ptr = self.buffers.scratch().offset(t * 4);
             ops::argmax_bf16(
@@ -239,7 +247,8 @@ impl TransformerModel {
         }
         // D2H: copy all K argmax results at once
         let mut buf = vec![0u8; k * 4];
-        self.gpu.copy_d2h(self.buffers.scratch(), &mut buf)?;
+        self.gpu
+            .copy_d2h(picked.unwrap_or(self.buffers.scratch()), &mut buf)?;
         for t in 0..k {
             let tok =
                 u32::from_le_bytes([buf[t * 4], buf[t * 4 + 1], buf[t * 4 + 2], buf[t * 4 + 3]]);
