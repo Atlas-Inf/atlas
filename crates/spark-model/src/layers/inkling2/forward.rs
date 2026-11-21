@@ -15,7 +15,7 @@ use super::batch::Batch;
 use super::debug;
 use super::layer::Inkling2Layer;
 use super::ops::{self, DecodeAttn, HeadNorm};
-use super::weights::{InputNorms, KvConv};
+use super::weights::{InputNorms, KvConv, Linear};
 use crate::layer::ForwardContext;
 
 impl Inkling2Layer {
@@ -182,12 +182,30 @@ impl Inkling2Layer {
         gm.proj(gpu, n, av, w.wv, s.v_lin, d.kv_dim, h, stream)?;
         gm.proj(gpu, n, aq, w.wr, s.r, d.rel_dim, h, stream)?;
         gm.proj(gpu, n, aq, w.gate, s.gate, d.q_dim, h, stream)?;
-        gm.proj(gpu, n, aq, w.sink, s.sink, p.heads, h, stream)?;
+        gm.proj(gpu, n, aq, Linear::Bf16(w.sink), s.sink, p.heads, h, stream)?;
         if let KvConv::Dynamic { proj, .. } = w.k_conv {
-            gm.proj(gpu, n, ak, proj, s.dyn_k, d.dyn_dim, h, stream)?;
+            gm.proj(
+                gpu,
+                n,
+                ak,
+                Linear::Bf16(proj),
+                s.dyn_k,
+                d.dyn_dim,
+                h,
+                stream,
+            )?;
         }
         if let KvConv::Dynamic { proj, .. } = w.v_conv {
-            gm.proj(gpu, n, av, proj, s.dyn_v, d.dyn_dim, h, stream)?;
+            gm.proj(
+                gpu,
+                n,
+                av,
+                Linear::Bf16(proj),
+                s.dyn_v,
+                d.dyn_dim,
+                h,
+                stream,
+            )?;
         }
 
         // k/v convs, then the per-head epilogues

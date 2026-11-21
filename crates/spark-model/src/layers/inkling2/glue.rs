@@ -9,6 +9,7 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
+use super::weights::Linear;
 use crate::layers::ops;
 
 #[derive(Clone, Copy, Debug)]
@@ -26,6 +27,9 @@ pub(crate) struct GlueKernels {
     pub topk: KernelHandle,
     /// `reshape_and_cache_flash` (BF16 KV)
     pub kv_write: KernelHandle,
+    /// Spark NVFP4 projections: one row, many rows
+    pub w4a16_gemv: KernelHandle,
+    pub w4a16_gemm: KernelHandle,
 }
 
 impl GlueKernels {
@@ -41,6 +45,8 @@ impl GlueKernels {
             dense_gemv_f32: gpu.kernel("gemv", "dense_gemv_bf16_fp32out")?,
             topk: gpu.kernel("moe_topk_sig", "moe_topk_sigmoid_batched_f32")?,
             kv_write: gpu.kernel("reshape_and_cache", "reshape_and_cache_flash")?,
+            w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
+            w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
         })
     }
 }
@@ -73,23 +79,38 @@ impl GlueKernels {
             .launch(s)
     }
 
-    /// `y[rows, n] = x[rows, k] W[n, k]^T`, BF16.
+    /// `y[rows, n] = x[rows, k] W[n, k]^T`, BF16 out: a BF16 weight through
+    /// the dense GEMV / BF16 GEMM, a Spark NVFP4 one through `w4a16_gemv` /
+    /// `w4a16_gemm` (BF16 activations either way).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn proj(
         &self,
         gpu: &dyn GpuBackend,
         rows: usize,
         x: DevicePtr,
-        w: DevicePtr,
+        w: Linear,
         y: DevicePtr,
         n: usize,
         k: usize,
         s: u64,
     ) -> Result<()> {
-        if rows == 1 {
-            self.gemv_with(gpu, self.dense_gemv, x, w, y, n, k, s)
-        } else {
-            ops::bf16_gemm(x, w.0, y, rows as u32, n as u32, k as u32, s)
+        match w {
+            Linear::Bf16(w) if rows == 1 => self.gemv_with(gpu, self.dense_gemv, x, w, y, n, k, s),
+            Linear::Bf16(w) => ops::bf16_gemm(x, w.0, y, rows as u32, n as u32, k as u32, s),
+            Linear::Nvfp4(q) if rows == 1 => {
+                ops::w4a16_gemv(gpu, self.w4a16_gemv, x, &q, y, n as u32, k as u32, s)
+            }
+            Linear::Nvfp4(q) => ops::w4a16_gemm(
+                gpu,
+                self.w4a16_gemm,
+                x,
+                &q,
+                y,
+                rows as u32,
+                n as u32,
+                k as u32,
+                s,
+            ),
         }
     }
 

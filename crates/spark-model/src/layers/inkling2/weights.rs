@@ -13,16 +13,28 @@ use anyhow::{Context, Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::{WeightStore, WeightTensor};
 
+use crate::weight_map::QuantizedWeight;
+
 use super::ops::{GroupedExperts, StackedExperts};
 use spark_runtime::kernel_args::KernelLaunch;
 
 const PREFIX: &str = "model.llm";
+/// The Spark overlay's module names (transformers layout).
+const SPARK: &str = "model.language_model";
 
 fn ptr(store: &WeightStore, name: &str) -> Result<DevicePtr> {
     Ok(store
         .get(name)
         .with_context(|| format!("inkling2 tensor {name}"))?
         .ptr)
+}
+
+/// A dense projection: the checkpoint's BF16 `[N, K]`, or the Spark overlay's
+/// NVFP4 (ModelOpt codes, E4M3 scales, per-tensor global).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Linear {
+    Bf16(DevicePtr),
+    Nvfp4(QuantizedWeight),
 }
 
 /// Static (SWA) or dynamic (full layer) k/v short convolution.
@@ -59,15 +71,15 @@ pub(crate) enum InputNorms {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PhysicalWeights {
     pub input_norms: InputNorms,
-    pub wq: DevicePtr,
-    pub wk: DevicePtr,
-    pub wv: DevicePtr,
-    pub wr: DevicePtr,
+    pub wq: Linear,
+    pub wk: Linear,
+    pub wv: Linear,
+    pub wr: Linear,
     pub rel_proj: DevicePtr,
     pub q_scale: DevicePtr,
     pub rel_scale: DevicePtr,
-    pub gate: DevicePtr,
-    pub wo: DevicePtr,
+    pub gate: Linear,
+    pub wo: Linear,
     pub sink: DevicePtr,
     pub k_conv: KvConv,
     pub v_conv: KvConv,
@@ -213,6 +225,90 @@ fn expert_globals(
     Ok(dev)
 }
 
+/// Physical layer `lp`'s routed experts as the checkpoint ships them.
+fn checkpoint_experts(
+    store: &WeightStore,
+    gpu: &dyn GpuBackend,
+    lp: &str,
+    mxfp8: bool,
+    experts: usize,
+) -> Result<StackedExperts> {
+    let p = |name: &str| ptr(store, name);
+    let ex = format!("{lp}.mlp.experts");
+    let grouped = grouped_experts(store, gpu, &ex, mxfp8)?;
+    Ok(StackedExperts {
+        mxfp8,
+        w13: p(&format!("{ex}.w13_weight"))?,
+        w13_scale: p(&format!("{ex}.w13_weight_scale"))?,
+        w13_global: if mxfp8 {
+            DevicePtr::NULL
+        } else {
+            expert_globals(store, gpu, &format!("{ex}.w13_weight"), experts)?
+        },
+        w2: p(&format!("{ex}.w2_weight"))?,
+        w2_scale: p(&format!("{ex}.w2_weight_scale"))?,
+        w2_global: if mxfp8 {
+            DevicePtr::NULL
+        } else {
+            expert_globals(store, gpu, &format!("{ex}.w2_weight"), experts)?
+        },
+        grouped,
+    })
+}
+
+/// Spark overlay experts for physical layer `l` (`{SPARK}.layers.{l}.mlp.experts`,
+/// ModelOpt NVFP4 with a per-expert `weight_scale_2`), or `None`. The overlay
+/// keeps transformers' gate/up layout (all gate rows, then all up rows), so the
+/// codes and scales are re-interleaved into the checkpoint's row order once.
+fn spark_experts(
+    store: &WeightStore,
+    gpu: &dyn GpuBackend,
+    l: usize,
+) -> Result<Option<StackedExperts>> {
+    let ex = format!("{SPARK}.layers.{l}.mlp.experts");
+    if !store.contains(&format!("{ex}.gate_up_proj.weight")) {
+        return Ok(None);
+    }
+    let t = |name: String| {
+        store
+            .get(&name)
+            .with_context(|| format!("inkling2 tensor {name}"))
+    };
+    let interleave = |name: String| -> Result<DevicePtr> {
+        let w = t(name)?;
+        let [e, n, row_bytes] = w.shape[..] else {
+            anyhow::bail!("inkling2 overlay gate_up shape {:?}", w.shape);
+        };
+        let out = gpu
+            .alloc(e * n * row_bytes)
+            .context("allocate inkling2 interleaved experts")?;
+        let kernel = gpu.kernel("inkling2_moe_prefill", "inkling2_interleave_rows")?;
+        KernelLaunch::new(gpu, kernel)
+            .grid([u32::try_from(e * n)?, 1, 1])
+            .block([128, 1, 1])
+            .arg_ptr(w.ptr)
+            .arg_ptr(out)
+            .arg_u32(u32::try_from(n / 2)?)
+            .arg_u32(u32::try_from(row_bytes)?)
+            .launch(0)?;
+        gpu.synchronize(0)?;
+        Ok(out)
+    };
+    Ok(Some(StackedExperts {
+        mxfp8: false,
+        w13: interleave(format!("{ex}.gate_up_proj.weight"))?,
+        w13_scale: interleave(format!("{ex}.gate_up_proj.weight_scale"))?,
+        w13_global: t(format!("{ex}.gate_up_proj.weight_scale_2"))?.ptr,
+        w2: t(format!("{ex}.down_proj.weight"))?.ptr,
+        w2_scale: t(format!("{ex}.down_proj.weight_scale"))?.ptr,
+        w2_global: t(format!("{ex}.down_proj.weight_scale_2"))?.ptr,
+        grouped: GroupedExperts {
+            w13: DevicePtr::NULL,
+            w2: DevicePtr::NULL,
+        },
+    }))
+}
+
 /// Handles for physical layer `l` (layout already checked by the plan).
 pub(crate) fn physical(
     store: &WeightStore,
@@ -238,25 +334,20 @@ pub(crate) fn physical(
             }
         })
     };
-    let ex = format!("{lp}.mlp.experts");
-    let grouped = grouped_experts(store, gpu, &ex, mxfp8)?;
-    let stacked = StackedExperts {
-        mxfp8,
-        w13: p(&format!("{ex}.w13_weight"))?,
-        w13_scale: p(&format!("{ex}.w13_weight_scale"))?,
-        w13_global: if mxfp8 {
-            DevicePtr::NULL
+    // Spark overlay: an attention projection quantized with the transformers
+    // module names (`{SPARK}.layers.{l}.self_attn.*`, ModelOpt NVFP4) replaces
+    // the checkpoint's BF16 tensor
+    let linear = |ckpt: &str, spark: &str| -> Result<Linear> {
+        let q = format!("{SPARK}.layers.{l}.self_attn.{spark}");
+        Ok(if store.contains(&format!("{q}.weight")) {
+            Linear::Nvfp4(crate::weight_map::quantized(store, &q, gpu)?)
         } else {
-            expert_globals(store, gpu, &format!("{ex}.w13_weight"), experts)?
-        },
-        w2: p(&format!("{ex}.w2_weight"))?,
-        w2_scale: p(&format!("{ex}.w2_weight_scale"))?,
-        w2_global: if mxfp8 {
-            DevicePtr::NULL
-        } else {
-            expert_globals(store, gpu, &format!("{ex}.w2_weight"), experts)?
-        },
-        grouped,
+            Linear::Bf16(p(&format!("{a}.{ckpt}.weight"))?)
+        })
+    };
+    let stacked = match spark_experts(store, gpu, l)? {
+        Some(stacked) => stacked,
+        None => checkpoint_experts(store, gpu, &lp, mxfp8, experts)?,
     };
     let messages = if looped {
         let gate = |c: &str| -> Result<MessageGate> {
@@ -281,15 +372,15 @@ pub(crate) fn physical(
         } else {
             InputNorms::Shared(p(&format!("{lp}.attn_norm.weight"))?)
         },
-        wq: p(&format!("{a}.wq_du.weight"))?,
-        wk: p(&format!("{a}.wk_dv.weight"))?,
-        wv: p(&format!("{a}.wv_dv.weight"))?,
-        wr: p(&format!("{a}.wr_du.weight"))?,
+        wq: linear("wq_du", "q_proj.linear")?,
+        wk: linear("wk_dv", "k_proj.linear")?,
+        wv: linear("wv_dv", "v_proj.linear")?,
+        wr: linear("wr_du", "relative_position_bias.linear")?,
         rel_proj: p(&format!("{a}.rel_logits_proj.proj"))?,
         q_scale: p(&format!("{a}.q_l2_clip.scale"))?,
         rel_scale: p(&format!("{a}.rel_l2_clip.scale"))?,
-        gate: p(&format!("{a}.gate_attn.weight"))?,
-        wo: p(&format!("{a}.wo_ud.weight"))?,
+        gate: linear("gate_attn", "o_proj.gate_proj")?,
+        wo: linear("wo_ud", "o_proj.linear")?,
         sink: p(&format!("{a}.attn_sink_proj.weight"))?,
         k_conv: conv("k")?,
         v_conv: conv("v")?,

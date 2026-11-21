@@ -40,3 +40,16 @@ extern "C" __global__ void inkling2_mxfp8_to_bf16(const unsigned char* __restric
         out[r * K + k] = __float2bfloat16((float)f * s);
     }
 }
+
+// Load time: an overlay's gate_up rows in transformers' order (gate rows 0..half-1, then
+// up rows) into the checkpoint's interleaved order (row 2i gate i, row 2i + 1 up i), per
+// expert. src/dst [E, 2 * half, row_bytes]. grid (E * 2 * half), block 128.
+extern "C" __global__ void inkling2_interleave_rows(const unsigned char* __restrict__ src,
+                                                    unsigned char* __restrict__ dst, const unsigned int half,
+                                                    const unsigned int row_bytes) {
+    const unsigned long long d = blockIdx.x;
+    const unsigned long long n = 2ull * half;
+    const unsigned long long e = d / n, r = d % n;
+    const unsigned long long s = e * n + (r % 2 == 0 ? r / 2 : half + r / 2);
+    for (unsigned int b = threadIdx.x; b < row_bytes; b += blockDim.x) dst[d * row_bytes + b] = src[s * row_bytes + b];
+}
