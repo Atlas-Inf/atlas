@@ -354,6 +354,9 @@ pub(crate) struct MsgGate<'a> {
 
 const MAX_GATES: usize = 3;
 const Z_WARPS: usize = 4;
+/// `inkling2_head_ops.cu` INK_Z_ROWS / INK_OUT_ROWS: rows a gate block covers.
+const Z_ROWS: u32 = 8;
+const OUT_ROWS: u32 = 16;
 
 pub(crate) fn msg_gate(
     gpu: &dyn GpuBackend,
@@ -382,7 +385,11 @@ pub(crate) fn msg_gate(
     let pick = |f: fn(&MessageGate) -> DevicePtr, i: usize| f(&a.gates[i.min(n - 1)]);
     let rows = u32_of(a.rows, "rows")?;
     let mut z = KernelLaunch::new(gpu, kernels.msg_gate_z)
-        .grid([u32_of(a.rank.div_ceil(Z_WARPS), "rank")?, rows, n as u32])
+        .grid([
+            u32_of(a.rank.div_ceil(Z_WARPS), "rank")?,
+            rows.div_ceil(Z_ROWS),
+            n as u32,
+        ])
         .block([(32 * Z_WARPS) as u32, 1, 1])
         .arg_ptr(a.h)
         .arg_ptr(a.m);
@@ -398,8 +405,12 @@ pub(crate) fn msg_gate(
         .arg_f32(a.eps)
         .launch(stream)?;
     let mut out = KernelLaunch::new(gpu, kernels.msg_gate_out)
-        .grid([u32_of(a.hidden.div_ceil(128), "hidden")?, rows, 1])
-        .block([128, 1, 1])
+        .grid([
+            u32_of(a.hidden.div_ceil(32), "hidden")?,
+            rows.div_ceil(OUT_ROWS),
+            1,
+        ])
+        .block([256, 1, 1])
         .arg_ptr(a.h)
         .arg_ptr(a.m);
     for i in 0..MAX_GATES {

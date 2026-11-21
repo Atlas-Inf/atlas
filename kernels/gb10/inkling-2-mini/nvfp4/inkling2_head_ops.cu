@@ -83,7 +83,12 @@ __device__ __forceinline__ const __nv_bfloat16* ink_pick(const __nv_bfloat16* a,
     return g == 0 ? a : (g == 1 ? b : c);
 }
 
-// grid (ceil(rank / INK_Z_WARPS), rows, gates), block 32 * INK_Z_WARPS
+// Rows per block: each block reads its weight rows once for this many rows (one row a
+// block re-read D, F and G from L2 for every prefill row).
+#define INK_Z_ROWS 8
+#define INK_OUT_ROWS 16
+
+// grid (ceil(rank / INK_Z_WARPS), ceil(rows / INK_Z_ROWS), gates), block 32 * INK_Z_WARPS
 extern "C" __global__ void inkling2_msg_gate_z(
     const float* __restrict__ h,                  // [rows, H] per gate
     const float* __restrict__ m,                  // [rows, H] per gate
@@ -99,59 +104,62 @@ extern "C" __global__ void inkling2_msg_gate_z(
     const float eps
 ) {
     atlas_pdl_enter();
-    const unsigned int row = blockIdx.y, g = blockIdx.z;
+    const unsigned int row0 = blockIdx.y * INK_Z_ROWS, g = blockIdx.z;
+    const unsigned int nr = min(INK_Z_ROWS, rows - row0);
     const unsigned int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const float* hp = h + g * h_stride + (unsigned long long)row * H;
-    const float* mp = m + g * m_stride + (unsigned long long)row * H;
-    __shared__ float red[2][INK_Z_WARPS];
-    __shared__ float s_rstd[2];
-    float sh = 0.0f, sm = 0.0f;
-    for (unsigned int e = threadIdx.x; e < H; e += blockDim.x) {
-        sh += hp[e] * hp[e];
-        sm += mp[e] * mp[e];
-    }
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        sh += __shfl_xor_sync(0xffffffff, sh, off);
-        sm += __shfl_xor_sync(0xffffffff, sm, off);
-    }
-    if (lane == 0) {
-        red[0][warp] = sh;
-        red[1][warp] = sm;
-    }
-    __syncthreads();
-    if (threadIdx.x < 2) {
+    const float* hb = h + g * h_stride + (unsigned long long)row0 * H;
+    const float* mb = m + g * m_stride + (unsigned long long)row0 * H;
+    __shared__ float s_rstd[INK_Z_ROWS][2];
+    // one warp per (row, half): the rms of h and of m of each row
+    for (unsigned int t = warp; t < 2 * nr; t += INK_Z_WARPS) {
+        const float* p = (t % 2 ? mb : hb) + (unsigned long long)(t / 2) * H;
         float s = 0.0f;
-        for (unsigned int w = 0; w < INK_Z_WARPS; w++) s += red[threadIdx.x][w];
-        s_rstd[threadIdx.x] = rsqrtf(s / (float)H + eps);
+        for (unsigned int e = lane; e < H; e += 32) s += p[e] * p[e];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffff, s, off);
+        if (lane == 0) s_rstd[t / 2][t % 2] = rsqrtf(s / (float)H + eps);
     }
     __syncthreads();
     const unsigned int r = blockIdx.x * INK_Z_WARPS + warp;
     if (r >= rank) return;
     const __nv_bfloat16* d = ink_pick(D0, D1, D2, g) + (unsigned long long)r * 2 * H;
-    const float rh = s_rstd[0], rm = s_rstd[1];
-    float acc = 0.0f;
+    float acc[INK_Z_ROWS];
+#pragma unroll
+    for (int i = 0; i < INK_Z_ROWS; i++) acc[i] = 0.0f;
     // 8 inputs per lane step; H is a multiple of 8, so a chunk never straddles h and m
     for (unsigned int c = lane; c < 2 * H / 8; c += 32) {
         const unsigned int e = c * 8;
         const uint4 dv = *(const uint4*)(d + e);
         const unsigned int dr[4] = {dv.x, dv.y, dv.z, dv.w};
-        const float* src = e < H ? hp + e : mp + (e - H);
-        const float sc = e < H ? rh : rm;
-        const float4 a = *(const float4*)src, b = *(const float4*)(src + 4);
-        const float in[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+        float w[8];
 #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            const float w = __bfloat162float(__ushort_as_bfloat16((unsigned short)(i % 2 ? dr[i / 2] >> 16 : dr[i / 2] & 0xFFFF)));
-            acc += w * __bfloat162float(__float2bfloat16(in[i] * sc));
+        for (int i = 0; i < 8; i++)
+            w[i] = __bfloat162float(__ushort_as_bfloat16((unsigned short)(i % 2 ? dr[i / 2] >> 16 : dr[i / 2] & 0xFFFF)));
+        const bool in_h = e < H;
+#pragma unroll
+        for (int q = 0; q < INK_Z_ROWS; q++) {
+            if (q >= (int)nr) break;
+            const float* src = (in_h ? hb + e : mb + (e - H)) + (unsigned long long)q * H;
+            const float sc = s_rstd[q][in_h ? 0 : 1];
+            const float4 a = *(const float4*)src, b = *(const float4*)(src + 4);
+            const float in[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+#pragma unroll
+            for (int i = 0; i < 8; i++) acc[q] += w[i] * __bfloat162float(__float2bfloat16(in[i] * sc));
         }
     }
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, off);
-    if (lane == 0) z[((unsigned long long)g * rows + row) * rank + r] = __bfloat162float(__float2bfloat16(acc));
+    for (int q = 0; q < INK_Z_ROWS; q++) {
+        if (q >= (int)nr) break;
+        float v = acc[q];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffff, v, off);
+        if (lane == 0) z[((unsigned long long)g * rows + row0 + q) * rank + r] = __bfloat162float(__float2bfloat16(v));
+    }
 }
 
-// grid (ceil(H / 128), rows), block 128
+// grid (ceil(H / 32), ceil(rows / INK_OUT_ROWS)), block 256: 8 lanes per channel, each
+// holding 8 of its rank weights of every gate in registers across the block's rows
+// (coalesced loads; the partial dots meet in shuffles).
 extern "C" __global__ void inkling2_msg_gate_out(
     const float* __restrict__ h,
     const float* __restrict__ m,
@@ -172,32 +180,63 @@ extern "C" __global__ void inkling2_msg_gate_out(
     const unsigned long long out_stride
 ) {
     atlas_pdl_enter();
-    const unsigned int row = blockIdx.y;
-    __shared__ float zs[INK_MAX_GATES * INK_MAX_RANK];
-    for (unsigned int i = threadIdx.x; i < gates * rank; i += blockDim.x)
-        zs[i] = z[((unsigned long long)(i / rank) * rows + row) * rank + i % rank];
+    const unsigned int row0 = blockIdx.y * INK_OUT_ROWS;
+    const unsigned int nr = min(INK_OUT_ROWS, rows - row0);
+    __shared__ float zs[INK_OUT_ROWS * INK_MAX_GATES * INK_MAX_RANK];
+    for (unsigned int i = threadIdx.x; i < nr * gates * rank; i += blockDim.x) {
+        const unsigned int q = i / (gates * rank), gi = i % (gates * rank);
+        zs[i] = z[((unsigned long long)(gi / rank) * rows + row0 + q) * rank + gi % rank];
+    }
     __syncthreads();
-    const unsigned int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= H) return;
-    float res[INK_MAX_GATES];
-    for (unsigned int g = 0; g < gates; g++) {
-        const __nv_bfloat16* fr = ink_pick(F0, F1, F2, g) + (unsigned long long)e * rank;
-        const __nv_bfloat16* gr = ink_pick(G0, G1, G2, g) + (unsigned long long)e * rank;
-        const float* zg = zs + g * rank;
-        float f = 0.0f, gg = 0.0f;
-        for (unsigned int c = 0; c < rank; c += 8) {
-            const uint4 fv = *(const uint4*)(fr + c), gv = *(const uint4*)(gr + c);
-            const unsigned int fw[4] = {fv.x, fv.y, fv.z, fv.w}, gw[4] = {gv.x, gv.y, gv.z, gv.w};
+    const unsigned int sub = threadIdx.x % 8;                  // this lane's 8 of the rank
+    const unsigned int e = blockIdx.x * 32 + threadIdx.x / 8;  // the channel
+    const bool live = e < H && sub * 8 < rank;
+    float fw[INK_MAX_GATES][8], gw[INK_MAX_GATES][8];
 #pragma unroll
-            for (int i = 0; i < 8; i++) {
-                const unsigned short fb = (unsigned short)(i % 2 ? fw[i / 2] >> 16 : fw[i / 2] & 0xFFFF);
-                const unsigned short gb = (unsigned short)(i % 2 ? gw[i / 2] >> 16 : gw[i / 2] & 0xFFFF);
-                f += __bfloat162float(__ushort_as_bfloat16(fb)) * zg[c + i];
-                gg += __bfloat162float(__ushort_as_bfloat16(gb)) * zg[c + i];
+    for (unsigned int g = 0; g < INK_MAX_GATES; g++) {
+#pragma unroll
+        for (int i = 0; i < 8; i++) fw[g][i] = gw[g][i] = 0.0f;
+        if (g >= gates || !live) continue;
+        const uint4 fv = *(const uint4*)(ink_pick(F0, F1, F2, g) + (unsigned long long)e * rank + sub * 8);
+        const uint4 gv = *(const uint4*)(ink_pick(G0, G1, G2, g) + (unsigned long long)e * rank + sub * 8);
+        const unsigned int fr[4] = {fv.x, fv.y, fv.z, fv.w}, gr[4] = {gv.x, gv.y, gv.z, gv.w};
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            fw[g][i] = __bfloat162float(__ushort_as_bfloat16((unsigned short)(i % 2 ? fr[i / 2] >> 16 : fr[i / 2] & 0xFFFF)));
+            gw[g][i] = __bfloat162float(__ushort_as_bfloat16((unsigned short)(i % 2 ? gr[i / 2] >> 16 : gr[i / 2] & 0xFFFF)));
+        }
+    }
+    // every gate's inputs of a row are read before any of its outputs is written (out
+    // may alias h), row by row
+    for (unsigned int q = 0; q < nr; q++) {
+        float res[INK_MAX_GATES];
+        const unsigned long long at = (unsigned long long)(row0 + q) * H + e;
+        // compile-time gate indices keep fw/gw/res in registers
+#pragma unroll
+        for (unsigned int g = 0; g < INK_MAX_GATES; g++) {
+            if (g >= gates) break;
+            const float* zg = zs + (q * gates + g) * rank + sub * 8;
+            float f = 0.0f, gg = 0.0f;
+            if (live) {
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    f += fw[g][i] * zg[i];
+                    gg += gw[g][i] * zg[i];
+                }
+            }
+#pragma unroll
+            for (int off = 4; off > 0; off >>= 1) {
+                f += __shfl_xor_sync(0xffffffff, f, off);
+                gg += __shfl_xor_sync(0xffffffff, gg, off);
+            }
+            res[g] = (sub == 0 && e < H) ? (1.0f - tanhf(f)) * h[g * h_stride + at] + tanhf(gg) * m[g * m_stride + at] : 0.0f;
+        }
+        if (sub == 0 && e < H) {
+#pragma unroll
+            for (unsigned int g = 0; g < INK_MAX_GATES; g++) {
+                if (g >= gates) break;
+                out[g * out_stride + at] = res[g];
             }
         }
-        const unsigned long long at = (unsigned long long)row * H + e;
-        res[g] = (1.0f - tanhf(f)) * h[g * h_stride + at] + tanhf(gg) * m[g * m_stride + at];
     }
-    for (unsigned int g = 0; g < gates; g++) out[g * out_stride + (unsigned long long)row * H + e] = res[g];
 }
