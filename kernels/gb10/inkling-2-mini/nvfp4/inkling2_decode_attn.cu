@@ -96,7 +96,9 @@ extern "C" __global__ void inkling2_decode_attn(
 
     const unsigned int vec_offset = lane_id * VEC_BF16;
     float q_reg[MAX_GROUP][VEC_BF16], rel_reg[MAX_GROUP];
-    for (unsigned int g = 0; g < group; g++) {
+#pragma unroll
+    for (unsigned int g = 0; g < MAX_GROUP; g++) {
+        if (g >= group) break;
         const unsigned int h = kv_head * group + g;
         const unsigned int* q32 = (const unsigned int*)(Q + row * q_stride + (unsigned long long)h * HDIM + vec_offset);
 #pragma unroll
@@ -105,6 +107,7 @@ extern "C" __global__ void inkling2_decode_attn(
     }
 
     float m[MAX_GROUP], l[MAX_GROUP], o[MAX_GROUP][VEC_BF16];
+#pragma unroll
     for (unsigned int g = 0; g < MAX_GROUP; g++) {
         m[g] = -1e30f;
         l[g] = 0.0f;
@@ -128,7 +131,9 @@ extern "C" __global__ void inkling2_decode_attn(
         const unsigned int dist = q_pos - pos;
         const float pj = (dist < rel_extent && lane_id < d_rel)
                              ? __bfloat162float(rel_proj[(unsigned long long)lane_id * rel_extent + dist]) : 0.0f;
-        for (unsigned int g = 0; g < group; g++) {
+#pragma unroll
+        for (unsigned int g = 0; g < MAX_GROUP; g++) {
+            if (g >= group) break;
             float part = 0.0f;
 #pragma unroll
             for (int i = 0; i < VEC_BF16; i++) part += q_reg[g][i] * k[i];
@@ -149,7 +154,9 @@ extern "C" __global__ void inkling2_decode_attn(
     __shared__ float smem_m[NUM_WARPS][MAX_GROUP];
     __shared__ float smem_l[NUM_WARPS][MAX_GROUP];
     __shared__ float smem_o[NUM_WARPS][MAX_GROUP][HDIM];
-    for (unsigned int g = 0; g < group; g++) {
+#pragma unroll
+    for (unsigned int g = 0; g < MAX_GROUP; g++) {
+        if (g >= group) break;
         if (lane_id == 0) {
             smem_m[warp_id][g] = m[g];
             smem_l[warp_id][g] = l[g];

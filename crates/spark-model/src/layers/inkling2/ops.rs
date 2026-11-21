@@ -149,6 +149,8 @@ pub(crate) fn short_conv(
     );
     ensure!(a.head_dim > 0, "inkling2 conv head_dim");
     let cblocks = u32_of(a.channels.div_ceil(256), "channels")?;
+    // decode rows: the conv kernel rolls its own state (one row a sequence)
+    let roll = a.rows_per_seq == 1;
     KernelLaunch::new(gpu, kernels.sconv)
         .grid([cblocks, u32_of(a.rows, "rows")?, 1])
         .block([256, 1, 1])
@@ -166,7 +168,11 @@ pub(crate) fn short_conv(
         .arg_u32(u32_of(a.out_stride, "out stride")?)
         .arg_u32(u32_of(a.dyn_stride, "dyn stride")?)
         .arg_u32(u32_of(a.head_dim, "head dim")?)
+        .arg_u32(u32::from(roll))
         .launch(stream)?;
+    if roll {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernels.sconv_state)
         .grid([cblocks, u32_of(a.num_seqs, "seqs")?, 1])
         .block([256, 1, 1])

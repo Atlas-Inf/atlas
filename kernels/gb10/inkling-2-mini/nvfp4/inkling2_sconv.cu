@@ -19,7 +19,9 @@
 // earlier inputs of its own sequence from x, and the ones before the sequence's
 // first row from the state. `inkling2_sconv` writes y only; `inkling2_sconv_state`
 // then rolls each sequence's state forward over its rows (stream order keeps the
-// two apart, so no row reads a state another thread is replacing).
+// two apart, so no row reads a state another thread is replacing). With one row a
+// sequence (decode), `roll` has `inkling2_sconv` roll the state itself: the thread of
+// (sequence, channel) is that state's only reader, and it has read it.
 
 #include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
@@ -29,7 +31,7 @@
 extern "C" __global__ void inkling2_sconv(
     const __nv_bfloat16* __restrict__ x,        // [rows, x_stride]
     __nv_bfloat16* __restrict__ out,            // [rows, out_stride]
-    const float* const* __restrict__ states,    // [num_seqs] state bases
+    float* const* __restrict__ states,          // [num_seqs] state bases
     const unsigned int state_off,               // floats from a base to this conv's [C, k-1]
     const unsigned int rows_per_seq,
     const __nv_bfloat16* __restrict__ w,        // static: [C, k]; dynamic: [k, C]
@@ -40,7 +42,8 @@ extern "C" __global__ void inkling2_sconv(
     const unsigned int x_stride,
     const unsigned int out_stride,
     const unsigned int dyn_stride,
-    const unsigned int head_dim                 // channels per dynamic-tap head
+    const unsigned int head_dim,                // channels per dynamic-tap head
+    const unsigned int roll                     // 1: roll the state too (rows_per_seq == 1)
 ) {
     atlas_pdl_enter();
     const unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -48,7 +51,7 @@ extern "C" __global__ void inkling2_sconv(
     if (c >= channels || r >= rows) return;
     const int s = r / rows_per_seq;
     const int first = s * rows_per_seq;
-    const float* st = states[s] + state_off + (unsigned long long)c * (k - 1);
+    float* st = states[s] + state_off + (unsigned long long)c * (k - 1);
     const float xc = __bfloat162float(x[(unsigned long long)r * x_stride + c]);
 
     float acc = 0.0f;
@@ -68,6 +71,11 @@ extern "C" __global__ void inkling2_sconv(
     }
     const float denom = dyn == nullptr ? (float)(k + 1) : (float)(2 * k + 1);
     out[(unsigned long long)r * out_stride + c] = __float2bfloat16((acc + xc) * rsqrtf(denom));
+    if (roll) {
+        // as inkling2_sconv_state with one row: shift, the new input last
+        for (unsigned int j = 0; j + 2 < k; j++) st[j] = st[j + 1];
+        st[k - 2] = xc;
+    }
 }
 
 // state <- the last k-1 inputs of each sequence (its rows, then older state)

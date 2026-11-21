@@ -98,7 +98,10 @@ __device__ __forceinline__ void ink_res_out(
     if (threadIdx.x < nq) {
         const unsigned int q = threadIdx.x;
         float logit[INK_MAX_STATES], rstd[INK_MAX_STATES], mx = -1e30f;
-        for (unsigned int j = 0; j < ns; j++) {
+        // compile-time state indices keep logit / rstd in registers
+#pragma unroll
+        for (unsigned int j = 0; j < INK_MAX_STATES; j++) {
+            if (j >= ns) break;
             float ss = 0.0f, d = 0.0f;
             for (unsigned int c = 0; c < chunks; c++) {
                 const float* t = sums + c * INK_RES_PER + j * (1 + INK_MAX_Q);
@@ -110,11 +113,17 @@ __device__ __forceinline__ void ink_res_out(
             mx = fmaxf(mx, logit[j]);
         }
         float sum = 0.0f;
-        for (unsigned int j = 0; j < ns; j++) {
+#pragma unroll
+        for (unsigned int j = 0; j < INK_MAX_STATES; j++) {
+            if (j >= ns) break;
             logit[j] = __expf(logit[j] - mx);
             sum += logit[j];
         }
-        for (unsigned int j = 0; j < ns; j++) p[q][j] = logit[j] / sum * rstd[j];
+#pragma unroll
+        for (unsigned int j = 0; j < INK_MAX_STATES; j++) {
+            if (j >= ns) break;
+            p[q][j] = logit[j] / sum * rstd[j];
+        }
     }
     __syncthreads();
     for (unsigned int e = chunk * INK_THREADS + threadIdx.x; e < H; e += chunks * INK_THREADS) {
@@ -124,7 +133,11 @@ __device__ __forceinline__ void ink_res_out(
 #pragma unroll
             for (int q = 0; q < INK_MAX_Q; q++) o[q] += (q < (int)nq ? p[q][j] : 0.0f) * s;
         }
-        for (unsigned int q = 0; q < nq; q++) out[((unsigned long long)q * rows + row) * H + e] = o[q];
+#pragma unroll
+        for (unsigned int q = 0; q < INK_MAX_Q; q++) {
+            if (q >= nq) break;
+            out[((unsigned long long)q * rows + row) * H + e] = o[q];
+        }
     }
 }
 
