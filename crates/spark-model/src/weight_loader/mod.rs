@@ -19,6 +19,7 @@ pub mod dflash_loader;
 pub mod dflash_preshrink;
 mod gemma4;
 pub(crate) mod glm5;
+mod inkling2;
 mod laguna;
 mod longcat;
 mod minimax;
@@ -41,6 +42,7 @@ pub use dflash_loader::{
 pub use gemma4::Gemma4WeightLoader;
 pub use glm5::Glm5WeightLoader;
 pub use glm5::mode as glm5_mode;
+pub use inkling2::Inkling2WeightLoader;
 pub use laguna::LagunaWeightLoader;
 pub use longcat::LongcatWeightLoader;
 pub use minimax::MinimaxM2WeightLoader;

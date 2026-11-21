@@ -75,6 +75,8 @@ fn mini_maps_attention_moe_and_logit_fields() {
     assert_eq!(config.final_logit_softcapping, 30.0);
     assert!(config.attn_gated);
     assert_eq!(config.num_ssm_layers(), 0);
+    // checkpoint keys are per physical layer
+    assert_eq!(config.layer_prefix(17), "model.llm.layers.17");
 }
 
 #[test]
@@ -111,27 +113,19 @@ fn with_text(edit: impl FnOnce(&mut serde_json::Value)) -> String {
 
 #[test]
 fn rejects_layouts_the_port_does_not_implement() {
-    let cases: [(&str, Box<dyn FnOnce(&mut serde_json::Value)>); 5] = [
-        (
-            "variable loop",
-            Box::new(|t| t["loop_config"]["is_varloop"] = true.into()),
-        ),
-        (
-            "unaligned core",
-            Box::new(|t| t["loop_config"]["core_start"] = 5.into()),
-        ),
-        (
-            "one pass",
-            Box::new(|t| t["loop_config"]["num_passes"] = 1.into()),
-        ),
-        (
-            "shared experts",
-            Box::new(|t| t["n_shared_experts"] = 1.into()),
-        ),
-        (
-            "window != rel extent",
-            Box::new(|t| t["sliding_window_size"] = 512.into()),
-        ),
+    type Edit = fn(&mut serde_json::Value);
+    let cases: [(&str, Edit); 5] = [
+        ("variable loop", |t| {
+            t["loop_config"]["is_varloop"] = true.into()
+        }),
+        ("unaligned core", |t| {
+            t["loop_config"]["core_start"] = 5.into()
+        }),
+        ("one pass", |t| t["loop_config"]["num_passes"] = 1.into()),
+        ("shared experts", |t| t["n_shared_experts"] = 1.into()),
+        ("window != rel extent", |t| {
+            t["sliding_window_size"] = 512.into()
+        }),
     ];
     for (name, edit) in cases {
         let json = with_text(edit);

@@ -241,7 +241,9 @@ pub(crate) fn parse_inkling2_loop(raw: &Value) -> Result<ModelConfig> {
     config.use_routing_bias = true;
     config.routed_scaling_factor = f64_of(text, "route_scale")?;
     config.final_logit_softcapping = f64_of(text, "final_logit_softcapping")? as f32;
-    config.weight_prefix = "model.llm.".to_string();
+    // Layer keys are `model.llm.layers.<physical>`: callers index by
+    // `Inkling2Config::visit_physical`, never by visit.
+    config.weight_prefix = "model.llm".to_string();
 
     let mtp = get(raw, "mtp_config")?;
     config.dspark_block_size = usize_of(mtp, "block_size")?;
