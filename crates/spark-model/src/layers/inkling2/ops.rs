@@ -23,6 +23,7 @@ pub(crate) const MAX_GATE_RANK: usize = 64;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Inkling2Kernels {
     pub decode_attn: KernelHandle,
+    pub decode_attn_combine: KernelHandle,
     pub sconv: KernelHandle,
     pub sconv_state: KernelHandle,
     pub block_res_sums: KernelHandle,
@@ -41,6 +42,8 @@ impl Inkling2Kernels {
     pub(crate) fn resolve(gpu: &dyn GpuBackend) -> Result<Self> {
         Ok(Self {
             decode_attn: gpu.kernel("inkling2_decode_attn", "inkling2_decode_attn")?,
+            decode_attn_combine: gpu
+                .kernel("inkling2_decode_attn", "inkling2_decode_attn_combine")?,
             sconv: gpu.kernel("inkling2_sconv", "inkling2_sconv")?,
             sconv_state: gpu.kernel("inkling2_sconv", "inkling2_sconv_state")?,
             block_res_sums: gpu.kernel("inkling2_block_res", "inkling2_block_res_sums")?,
@@ -66,6 +69,8 @@ pub(crate) struct DecodeAttn {
     pub q: DevicePtr,
     pub k_cache: DevicePtr,
     pub v_cache: DevicePtr,
+    /// per (row, head, split) max, sum and unnormalised output, fp32
+    pub partials: DevicePtr,
     pub out: DevicePtr,
     pub block_tables: DevicePtr,
     /// `[num_seqs]` query positions; a row attends keys 0 ..= its position
@@ -75,6 +80,8 @@ pub(crate) struct DecodeAttn {
     pub sinks: DevicePtr,
     pub max_blocks_per_seq: usize,
     pub num_seqs: usize,
+    /// key splits per row
+    pub splits: usize,
     pub heads: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
@@ -87,7 +94,7 @@ pub(crate) struct DecodeAttn {
 
 pub(crate) fn decode_attn(
     gpu: &dyn GpuBackend,
-    k: KernelHandle,
+    kernels: &Inkling2Kernels,
     a: &DecodeAttn,
     stream: u64,
 ) -> Result<()> {
@@ -102,21 +109,28 @@ pub(crate) fn decode_attn(
         a.rel_extent
     );
     ensure!(
-        a.kv_heads > 0 && a.heads.is_multiple_of(a.kv_heads),
+        a.kv_heads > 0
+            && a.heads.is_multiple_of(a.kv_heads)
+            && a.heads / a.kv_heads <= MAX_GQA_GROUP,
         "inkling2 GQA heads"
     );
-    KernelLaunch::new(gpu, k)
-        .grid([u32_of(a.heads, "heads")?, u32_of(a.num_seqs, "seqs")?, 1])
+    ensure!(
+        (1..=MAX_ATTN_SPLITS).contains(&a.splits),
+        "inkling2 attention splits {}",
+        a.splits
+    );
+    let rows = u32_of(a.num_seqs, "seqs")?;
+    KernelLaunch::new(gpu, kernels.decode_attn)
+        .grid([u32_of(a.kv_heads, "kv heads")?, a.splits as u32, rows])
         .block([256, 1, 1])
         .arg_ptr(a.q)
         .arg_ptr(a.k_cache)
         .arg_ptr(a.v_cache)
-        .arg_ptr(a.out)
+        .arg_ptr(a.partials)
         .arg_ptr(a.block_tables)
         .arg_ptr(a.positions)
         .arg_ptr(a.rel)
         .arg_ptr(a.rel_proj)
-        .arg_ptr(a.sinks)
         .arg_u32(u32_of(a.max_blocks_per_seq, "max blocks")?)
         .arg_u32(u32_of(a.heads, "heads")?)
         .arg_u32(u32_of(a.kv_heads, "kv heads")?)
@@ -126,7 +140,26 @@ pub(crate) fn decode_attn(
         .arg_u32(u32_of(a.sliding_window, "window")?)
         .arg_u32(u32_of(a.d_rel, "d_rel")?)
         .arg_u32(u32_of(a.rel_extent, "rel extent")?)
+        .launch(stream)?;
+    KernelLaunch::new(gpu, kernels.decode_attn_combine)
+        .grid([u32_of(a.heads, "heads")?, rows, 1])
+        .block([a.head_dim as u32, 1, 1])
+        .arg_ptr(a.partials)
+        .arg_ptr(a.sinks)
+        .arg_ptr(a.out)
+        .arg_u32(u32_of(a.heads, "heads")?)
+        .arg_u32(a.splits as u32)
         .launch(stream)
+}
+
+/// Key splits per decode row (prefill rows run one each).
+pub(crate) const DECODE_ATTN_SPLITS: usize = 32;
+const MAX_ATTN_SPLITS: usize = DECODE_ATTN_SPLITS;
+const MAX_GQA_GROUP: usize = 4;
+
+/// fp32 elements of attention partials for `slots` (row, split) pairs.
+pub(crate) fn attn_partials_len(slots: usize, heads: usize, head_dim: usize) -> usize {
+    slots * heads * (head_dim + 2)
 }
 
 /// Short convolution over flat rows, then the state roll.

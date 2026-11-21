@@ -73,6 +73,14 @@ impl Inkling2Layer {
         stream: u64,
     ) -> Result<Meta> {
         let seqs = batch.seqs.len();
+        let d = &self.dims;
+        ensure!(
+            batch.rows() <= d.max_rows && seqs <= d.max_seqs,
+            "inkling2: {} rows of {seqs} sequences over the buffers ({} rows, {} sequences)",
+            batch.rows(),
+            d.max_rows,
+            d.max_seqs
+        );
         if let Some(m) = ctx.attn_metadata.as_ref()
             && batch.rows_per_seq == 1
             && m.num_seqs as usize >= seqs

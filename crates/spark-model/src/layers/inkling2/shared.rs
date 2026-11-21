@@ -56,6 +56,8 @@ pub(crate) struct Shared {
     pub gate_z: DevicePtr,
     /// block-residual chunk sums, `ops::block_res_sums_per_row` per row
     pub res_sums: DevicePtr,
+    /// attention split partials: decode rows x splits, or prefill rows x 1
+    pub attn_partials: DevicePtr,
     pub resid: DevicePtr,
     pub mlp_in: DevicePtr,
     pub logits: DevicePtr,
@@ -127,6 +129,13 @@ impl Shared {
             msg4: a.take(4 * r * h * f),
             gate_z: a.take(3 * r * super::ops::MAX_GATE_RANK * f),
             res_sums: a.take(r * super::ops::block_res_sums_per_row(h) * f),
+            attn_partials: a.take(
+                super::ops::attn_partials_len(
+                    r.max(d.max_seqs * super::ops::DECODE_ATTN_SPLITS),
+                    d.heads,
+                    d.q_dim / d.heads,
+                ) * f,
+            ),
             resid: a.take(r * h * f),
             mlp_in: a.take(r * h * f),
             logits: a.take(r * d.experts * f),

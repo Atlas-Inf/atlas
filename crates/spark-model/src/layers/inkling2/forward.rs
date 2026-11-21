@@ -260,13 +260,20 @@ impl Inkling2Layer {
         gm.kv_write(
             gpu, n, s.kn, s.vn, k_pool, v_pool, meta.slots, p.kv_heads, p.head_dim, bs, stream,
         )?;
+        // decode rows split their keys over the GPU; prefill rows have rows enough
+        let splits = if batch.rows_per_seq == 1 {
+            ops::DECODE_ATTN_SPLITS
+        } else {
+            1
+        };
         ops::decode_attn(
             gpu,
-            self.k.decode_attn,
+            &self.k,
             &DecodeAttn {
                 q: s.qn,
                 k_cache: k_pool,
                 v_cache: v_pool,
+                partials: s.attn_partials,
                 out: s.attn,
                 block_tables: meta.block_table,
                 positions: meta.positions,
@@ -276,6 +283,7 @@ impl Inkling2Layer {
                 // 0 = every row reads one sequence's table
                 max_blocks_per_seq: meta.table_stride,
                 num_seqs: n,
+                splits,
                 heads: p.heads,
                 kv_heads: p.kv_heads,
                 head_dim: p.head_dim,
