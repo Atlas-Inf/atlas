@@ -24,6 +24,13 @@ fn kv_complete_models_can_use_the_prefix_cache() {
 }
 
 #[test]
+fn inkling2_conv_state_keeps_the_prefix_cache_off() {
+    let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+    config.model_type = "inkling2_loop".to_string();
+    assert!(!config.kv_only_prefix_cache_is_safe());
+}
+
+#[test]
 fn final_norm_identity_only_for_qwen4_exp() {
     let mut config = ModelConfig::qwen3_next_80b_nvfp4();
     assert!(!config.final_norm_is_identity());
