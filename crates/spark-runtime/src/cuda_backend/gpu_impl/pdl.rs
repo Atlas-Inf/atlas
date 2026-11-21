@@ -9,7 +9,8 @@
 //! under `ATLAS_RICURSIVE_PDL=1` ([`RICURSIVE_PDL_KERNELS`]), Qwen3.8-27B under
 //! `ATLAS_QWEN38_PDL=1` (prefill, [`QWEN38_PDL_KERNELS`]) and, separately,
 //! `ATLAS_QWEN38_PDL_DECODE=1` (the decode chain,
-//! [`QWEN38_PDL_DECODE_KERNELS`]). A kernel launches with PDL when a switch
+//! [`QWEN38_PDL_DECODE_KERNELS`]), Inkling 2 Mini under `ATLAS_INKLING2_PDL=1`
+//! (its decode chain, [`INKLING2_PDL_KERNELS`]). A kernel launches with PDL when a switch
 //! that is on lists it. A list is its target's own: a `common/` kernel that
 //! waits for one target's sake is launched with PDL only where a target lists
 //! it (without the launch attribute its `griddepcontrol` instructions are
@@ -84,6 +85,13 @@ pub(super) const PDL_TARGETS: &[PdlTarget] = &[
                 kernels: QWEN38_PDL_DECODE_KERNELS,
             },
         ],
+    },
+    PdlTarget {
+        model: "inkling-2-mini",
+        switches: &[PdlSwitch {
+            name: "ATLAS_INKLING2_PDL",
+            kernels: INKLING2_PDL_KERNELS,
+        }],
     },
 ];
 
@@ -463,3 +471,51 @@ pub(super) const QWEN38_PDL_DECODE_KERNELS: &[&str] = &[
 #[cfg(test)]
 #[path = "pdl_tests.rs"]
 mod tests;
+
+/// Inkling 2 Mini (`ATLAS_INKLING2_PDL=1`): every kernel of the target's own
+/// tree that enters with `atlas_pdl_enter()` (decode, verify, prefill and the
+/// DSpark drafter's), and the `common/` kernels its decode chain launches that
+/// do: the BF16 and NVFP4 GEMVs, routing and the KV write. Not listed: the
+/// router's fp32-out GEMV and the head's argmax and softcap, which do not wait.
+pub(super) const INKLING2_PDL_KERNELS: &[&str] = &[
+    "inkling2_rmsnorm",
+    "inkling2_head_norm",
+    "inkling2_gate_mul",
+    "inkling2_residual",
+    "inkling2_layer_out",
+    "inkling2_f32_to_bf16",
+    "inkling2_sconv",
+    "inkling2_sconv_state",
+    "inkling2_block_res_sums",
+    "inkling2_block_res_out",
+    "inkling2_block_res_row",
+    "inkling2_msg_gate_z",
+    "inkling2_msg_gate_out",
+    "inkling2_msg_gate_fused",
+    "inkling2_decode_attn",
+    "inkling2_decode_attn_combine",
+    "inkling2_flash_prefill",
+    "inkling2_moe_gate_up_nvfp4",
+    "inkling2_moe_down_nvfp4",
+    "inkling2_moe_gate_up_mxfp8",
+    "inkling2_moe_down_mxfp8",
+    "inkling2_moe_combine",
+    "inkling2_moe_grouped_gate_up_nvfp4",
+    "inkling2_moe_grouped_down_nvfp4",
+    "inkling2_moe_grouped_gate_up_mxfp8",
+    "inkling2_moe_grouped_down_mxfp8",
+    "inkling2_moe_tiles",
+    "inkling2_quant_fp4",
+    "inkling2_situ_quant_fp4",
+    "inkling2_quant_mxfp8",
+    "inkling2_situ_quant_mxfp8",
+    "inkling2_dspark_mix",
+    "inkling2_dspark_block_input",
+    "inkling2_dspark_rnn_ctx",
+    "inkling2_dspark_rnn_raw",
+    "inkling2_dspark_rnn_gate",
+    "dense_gemv_bf16",
+    "w4a16_gemv",
+    "moe_topk_sigmoid_batched_f32",
+    "reshape_and_cache_flash",
+];
