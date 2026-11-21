@@ -139,7 +139,9 @@ impl InklingDspark {
         b[RANK * hidden * bf16..(RANK + 1) * hidden * bf16].copy_from_slice(&out_b);
         let rhs = gpu.alloc(b.len())?;
         gpu.copy_h2d(&b, rhs)?;
-        let fold = gpu.alloc(vocab * FOLD_K * bf16).context("Inkling 2 DSpark fold table")?;
+        let fold = gpu
+            .alloc(vocab * FOLD_K * bf16)
+            .context("Inkling 2 DSpark fold table")?;
         let stream = gpu.default_stream();
         ops::dense_gemm(
             gpu,
@@ -221,13 +223,35 @@ impl BlockDiffusionDraftHead {
         scratch: &DflashScratch,
         stream: u64,
     ) -> Result<()> {
-        let sc = scratch.inkling.as_ref().context("Inkling 2 DSpark lane scratch")?;
+        let sc = scratch
+            .inkling
+            .as_ref()
+            .context("Inkling 2 DSpark lane scratch")?;
         let h = self.hidden_size as u32;
         let kv2 = 2 * self.num_kv_heads * self.head_dim;
         let bf16 = 2usize;
         for l in 0..self.num_layers {
-            ink.mix(gpu, src, n, h, l, ink.w.dflare_norms[l].weight, self.rms_norm_eps, fc_dst, stream)?;
-            self.drafter_dense_gemm(gpu, fc_dst, &ink.w.kv_proj_ctx[l], sc.kv_tmp, n, kv2 as u32, h, stream)?;
+            ink.mix(
+                gpu,
+                src,
+                n,
+                h,
+                l,
+                ink.w.dflare_norms[l].weight,
+                self.rms_norm_eps,
+                fc_dst,
+                stream,
+            )?;
+            self.drafter_dense_gemm(
+                gpu,
+                fc_dst,
+                &ink.w.kv_proj_ctx[l],
+                sc.kv_tmp,
+                n,
+                kv2 as u32,
+                h,
+                stream,
+            )?;
             gpu.copy_d2d_2d_async(
                 sc.kv_tmp,
                 kv2 * bf16,
@@ -262,7 +286,10 @@ impl BlockDiffusionDraftHead {
         let Some(ink) = self.inkling.as_ref() else {
             return Ok(());
         };
-        let sc = scratch.inkling.as_ref().context("Inkling 2 DSpark lane scratch")?;
+        let sc = scratch
+            .inkling
+            .as_ref()
+            .context("Inkling 2 DSpark lane scratch")?;
         let h = self.hidden_size;
         KernelLaunch::new(gpu, ink.k.block_input)
             .grid([self.gamma as u32, 1, 1])
@@ -278,7 +305,17 @@ impl BlockDiffusionDraftHead {
                 let row_bytes = INKLING2_DSPARK_TAPS * h * 2;
                 let last = base.offset((rows - 1) * row_bytes);
                 let markov = self.num_layers;
-                ink.mix(gpu, last, 1, h as u32, markov, ink.w.markov_norm.weight, self.rms_norm_eps, sc.f_rnn, stream)
+                ink.mix(
+                    gpu,
+                    last,
+                    1,
+                    h as u32,
+                    markov,
+                    ink.w.markov_norm.weight,
+                    self.rms_norm_eps,
+                    sc.f_rnn,
+                    stream,
+                )
             }
             _ => gpu.memset_async(sc.f_rnn, 0, h * 2, stream),
         }
@@ -297,12 +334,22 @@ impl BlockDiffusionDraftHead {
         scratch: &DflashScratch,
         stream: u64,
     ) -> Result<()> {
-        let sc = scratch.inkling.as_ref().context("Inkling 2 DSpark lane scratch")?;
+        let sc = scratch
+            .inkling
+            .as_ref()
+            .context("Inkling 2 DSpark lane scratch")?;
         let (h, v) = (self.hidden_size as u32, self.vocab_size);
         let steps = self.gamma - 1;
         let bf16 = 2usize;
         let row = |i: usize| scratch.logits.offset(i * v * bf16);
-        ops::argmax_bf16(gpu, self.kernels.argmax, row(0), scratch.draft_tokens_dev, v as u32, stream)?;
+        ops::argmax_bf16(
+            gpu,
+            self.kernels.argmax,
+            row(0),
+            scratch.draft_tokens_dev,
+            v as u32,
+            stream,
+        )?;
         KernelLaunch::new(gpu, ink.k.rnn_ctx)
             .grid([(3 * RANK / 8) as u32, 1, 1])
             .block([256, 1, 1])
@@ -341,8 +388,24 @@ impl BlockDiffusionDraftHead {
                 .arg_ptr(sc.latent)
                 .arg_u32(FOLD_K as u32)
                 .launch(stream)?;
-            ops::dense_gemv(gpu, self.kernels.dense_gemv, sc.latent, &ink.fold, sc.bias, v as u32, FOLD_K as u32, stream)?;
-            ops::residual_add(gpu, self.kernels.residual_add, row(i + 1), sc.bias, v as u32, stream)?;
+            ops::dense_gemv(
+                gpu,
+                self.kernels.dense_gemv,
+                sc.latent,
+                &ink.fold,
+                sc.bias,
+                v as u32,
+                FOLD_K as u32,
+                stream,
+            )?;
+            ops::residual_add(
+                gpu,
+                self.kernels.residual_add,
+                row(i + 1),
+                sc.bias,
+                v as u32,
+                stream,
+            )?;
             ops::argmax_bf16(
                 gpu,
                 self.kernels.argmax,

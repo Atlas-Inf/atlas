@@ -86,7 +86,12 @@ impl TransformerModel {
         // model (Gemma, Inkling 2) samples its C>=2 rows from uncapped logits.
         if self.logit_softcap_kernel.0 != 0 {
             let cap = self.config.final_logit_softcapping;
-            self.apply_logit_softcap(logits, (padded_n * self.config.vocab_size) as u32, cap, stream)?;
+            self.apply_logit_softcap(
+                logits,
+                (padded_n * self.config.vocab_size) as u32,
+                cap,
+                stream,
+            )?;
         }
         Ok(logits)
     }

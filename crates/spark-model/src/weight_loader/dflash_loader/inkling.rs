@@ -65,10 +65,17 @@ pub(super) fn reshape_inkling2_mtp_config(raw: &mut Value) -> Result<()> {
     if !is_inkling {
         return Ok(());
     }
-    let field = |k: &str| raw.get(k).with_context(|| format!("Inkling 2 mtp_config has no `{k}`"));
-    let layers = field("num_hidden_layers")?.as_u64().context("num_hidden_layers")? as usize;
+    let field = |k: &str| {
+        raw.get(k)
+            .with_context(|| format!("Inkling 2 mtp_config has no `{k}`"))
+    };
+    let layers = field("num_hidden_layers")?
+        .as_u64()
+        .context("num_hidden_layers")? as usize;
     let block = field("block_size")?.as_u64().context("block_size")? as usize;
-    let window = field("sliding_window_size")?.as_u64().context("sliding_window_size")? as usize;
+    let window = field("sliding_window_size")?
+        .as_u64()
+        .context("sliding_window_size")? as usize;
     let local: Vec<u64> = serde_json::from_value(field("local_layer_ids")?.clone())
         .context("Inkling 2 mtp_config local_layer_ids")?;
     let taps = field("target_layer_ids")?.clone();
@@ -81,9 +88,17 @@ pub(super) fn reshape_inkling2_mtp_config(raw: &mut Value) -> Result<()> {
         "Inkling 2 mtp_config local_layer_ids {local:?} past {layers} layers"
     );
     let types: Vec<&str> = (0..layers as u64)
-        .map(|i| if local.contains(&i) { "sliding_attention" } else { "full_attention" })
+        .map(|i| {
+            if local.contains(&i) {
+                "sliding_attention"
+            } else {
+                "full_attention"
+            }
+        })
         .collect();
-    let obj = raw.as_object_mut().context("Inkling 2 mtp_config is not an object")?;
+    let obj = raw
+        .as_object_mut()
+        .context("Inkling 2 mtp_config is not an object")?;
     obj.insert("architectures".into(), json!([INKLING2_DSPARK_ARCH]));
     obj.insert("layer_types".into(), json!(types));
     obj.insert("sliding_window".into(), json!(window + block));
@@ -149,17 +164,28 @@ pub fn load_inkling2_dspark(
     for i in 0..layers {
         let lp = format!("layers.{i}");
         dflare_norms.push(dense_auto(store, &format!("{lp}.dflare_norm.weight"), gpu)?);
-        k_norm_ctx.push(dense_auto(store, &format!("{lp}.self_attn.k_norm_ctx.weight"), gpu)?);
+        k_norm_ctx.push(dense_auto(
+            store,
+            &format!("{lp}.self_attn.k_norm_ctx.weight"),
+            gpu,
+        )?);
         // [k_proj_ctx; v_proj_ctx]: one GEMM per layer writes [K | V] rows
-        let fused = gpu.alloc(2 * kv * h * 2).context("Inkling 2 DSpark ctx K/V weight")?;
+        let fused = gpu
+            .alloc(2 * kv * h * 2)
+            .context("Inkling 2 DSpark ctx K/V weight")?;
         for (j, part) in ["k_proj_ctx", "v_proj_ctx"].iter().enumerate() {
             let src = ptr(store, &format!("{lp}.self_attn.{part}.weight"))?;
             gpu.copy_d2d(src, fused.offset(j * kv * h * 2), kv * h * 2)?;
         }
         kv_proj_ctx.push(DenseWeight { weight: fused });
     }
-    let rank = config.markov_rank.context("Inkling 2 DSpark needs markov_rank")?;
-    ensure!(rank == 256, "Inkling 2 DSpark kernels are built for markov_rank 256, got {rank}");
+    let rank = config
+        .markov_rank
+        .context("Inkling 2 DSpark needs markov_rank")?;
+    ensure!(
+        rank == 256,
+        "Inkling 2 DSpark kernels are built for markov_rank 256, got {rank}"
+    );
     let rnn = store.get("markov_head.rnn_proj.weight")?;
     ensure!(
         rnn.shape == [3 * rank, 2 * rank + 2 * h],
@@ -170,7 +196,10 @@ pub fn load_inkling2_dspark(
     );
     tracing::info!(
         "Inkling 2 DSpark: {layers} layers, Markov rnn_hidden rank {rank}, taps {:?}",
-        config.dflash_config.as_ref().map(|c| c.target_layer_ids.as_slice())
+        config
+            .dflash_config
+            .as_ref()
+            .map(|c| c.target_layer_ids.as_slice())
     );
     Ok(Some(Inkling2DsparkWeights {
         alpha: fuse_alpha(store, gpu, layers + 1)?,
@@ -222,8 +251,14 @@ mod tests {
         assert!(!c.query_causal());
         assert_eq!(c.block_size(), 8);
         assert_eq!(c.rope_theta, 1e6);
-        assert_eq!(c.dflash_config.as_ref().unwrap().target_layer_ids, vec![5, 23, 41, 48]);
-        assert_eq!(c.mixed_layer_windows().unwrap(), Some(vec![Some(1032), None, Some(1032)]));
+        assert_eq!(
+            c.dflash_config.as_ref().unwrap().target_layer_ids,
+            vec![5, 23, 41, 48]
+        );
+        assert_eq!(
+            c.mixed_layer_windows().unwrap(),
+            Some(vec![Some(1032), None, Some(1032)])
+        );
     }
 
     #[test]
@@ -244,6 +279,9 @@ mod tests {
     fn bf16_rounding_is_nearest_even() {
         assert_eq!(bf16_round(1.0), 1.0);
         assert_eq!(bf16_round(f32::from_bits(0x3F80_8000)), 1.0); // tie -> even
-        assert_eq!(bf16_round(f32::from_bits(0x3F81_8000)), f32::from_bits(0x3F82_0000));
+        assert_eq!(
+            bf16_round(f32::from_bits(0x3F81_8000)),
+            f32::from_bits(0x3F82_0000)
+        );
     }
 }

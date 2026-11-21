@@ -106,7 +106,9 @@ pub struct DflashLayerWeights {
 /// canonical `z-lab/Qwen3.6-{27B,35B-A3B}-DFlash` checkpoints ship the
 /// bare layout (verified against commit 42d3b34, May 2026).
 pub fn store_has_dflash_weights(store: &WeightStore) -> bool {
-    store.contains("fc.weight") || store.contains("model.fc.weight") || store.contains("fuse_weight")
+    store.contains("fc.weight")
+        || store.contains("model.fc.weight")
+        || store.contains("fuse_weight")
 }
 
 /// Load DFlash drafter weights from a separate [`WeightStore`] pointing at

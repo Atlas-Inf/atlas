@@ -3,7 +3,7 @@
 //! Debug captures for comparing visits with the transformers reference
 //! (off unless their environment variables are set).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::batch::Batch;
@@ -58,9 +58,34 @@ impl Inkling2Layer {
     }
 }
 
-/// Debug: with `ATLAS_INKLING2_DUMP=<file>`, append `(visit u32, position u32,
-/// BF16 hidden row)` records (visit `u32::MAX` = the normed embedding), for
-/// comparison with the transformers reference's per-visit hidden states.
+/// Debug captures, one switch: `ATLAS_INKLING2_DUMP=<file>` appends `(visit
+/// u32, position u32, BF16 hidden row)` records (visit `u32::MAX` = the normed
+/// embedding) for comparison with the transformers reference's per-visit
+/// hidden states; `<file>@<visit>` also records that visit's intermediates to
+/// `<file>.tap` (see [`tap`]).
+struct Switch {
+    dump: String,
+    tap_visit: Option<usize>,
+}
+
+fn switch() -> Option<&'static Switch> {
+    static S: std::sync::OnceLock<Option<Switch>> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        let v = std::env::var("ATLAS_INKLING2_DUMP").ok()?;
+        Some(match v.rsplit_once('@') {
+            Some((path, visit)) => Switch {
+                dump: path.to_string(),
+                tap_visit: visit.parse().ok(),
+            },
+            None => Switch {
+                dump: v,
+                tap_visit: None,
+            },
+        })
+    })
+    .as_ref()
+}
+
 pub(super) fn dump(
     gpu: &dyn GpuBackend,
     hidden: DevicePtr,
@@ -69,8 +94,7 @@ pub(super) fn dump(
     visit: u32,
     stream: u64,
 ) -> Result<()> {
-    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    let Some(path) = PATH.get_or_init(|| std::env::var("ATLAS_INKLING2_DUMP").ok()) else {
+    let Some(path) = switch().map(|s| &s.dump) else {
         return Ok(());
     };
     use std::io::Write;
@@ -89,26 +113,20 @@ pub(super) fn dump(
     Ok(())
 }
 
-/// Debug: the visit whose intermediates `ATLAS_INKLING2_TAP=<file>` records.
 /// `dump`'s visit number for the model output (after the final block residual).
 pub(super) const FINAL: u32 = 1000;
 
 /// Whether a debug capture is on (each one synchronizes, so graphs stay off).
 pub(super) fn enabled() -> bool {
-    std::env::var_os("ATLAS_INKLING2_DUMP").is_some() || tap_visit().is_some()
+    switch().is_some()
 }
 
+/// The visit whose intermediates the switch records, if any.
 pub(super) fn tap_visit() -> Option<usize> {
-    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("ATLAS_INKLING2_TAP")
-            .ok()
-            .and(std::env::var("ATLAS_INKLING2_TAP_VISIT").ok())
-            .and_then(|v| v.parse().ok())
-    })
+    switch().and_then(|s| s.tap_visit)
 }
 
-/// Append `(tag u32, position u32, len u32, raw bytes)` to `ATLAS_INKLING2_TAP`.
+/// Append `(tag u32, position u32, len u32, raw bytes)` to `<dump file>.tap`.
 fn tap(
     gpu: &dyn GpuBackend,
     ptr: DevicePtr,
@@ -118,7 +136,12 @@ fn tap(
     stream: u64,
 ) -> Result<()> {
     use std::io::Write;
-    let path = std::env::var("ATLAS_INKLING2_TAP")?;
+    let path = format!(
+        "{}.tap",
+        switch()
+            .context("inkling2 tap without the dump switch")?
+            .dump
+    );
     gpu.synchronize(stream)?;
     let mut buf = vec![0u8; bytes];
     gpu.copy_d2h(ptr, &mut buf)?;

@@ -187,7 +187,8 @@ impl Shared {
             positions: a.take(r * 4),
             slots: a.take(r * 8),
             // one table a row: up to MAX_VERIFY_ROWS verify rows of each sequence
-            block_table: a.take(d.max_seqs * super::layer::MAX_VERIFY_ROWS * d.max_blocks_per_seq * 4),
+            block_table: a
+                .take(d.max_seqs * super::layer::MAX_VERIFY_ROWS * d.max_blocks_per_seq * 4),
             state_tables: a.take(d.visits * d.max_seqs * 8),
             pad_conv: a.take(d.conv_state_bytes()),
         }

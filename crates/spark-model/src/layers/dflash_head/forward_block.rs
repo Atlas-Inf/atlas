@@ -359,7 +359,10 @@ impl BlockDiffusionDraftHead {
             gpu.memset(scratch.stream_buf, 0, eff_ctx * self.hidden_size * bf16)?;
         }
         if self.inkling.is_some() {
-            anyhow::ensure!(option_b_on, "Inkling 2 DSpark proposes only on the paged path");
+            anyhow::ensure!(
+                option_b_on,
+                "Inkling 2 DSpark proposes only on the paged path"
+            );
             self.inkling_prepare(gpu, scratch, ctx_buffer, stream)?;
         }
         // ATLAS_DFLASH_DEBUG_FORCE_NOISE_PATTERN=1: overwrite noise rows

@@ -220,7 +220,16 @@ impl TransformerLayer for Inkling2Layer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        self.verify_run(hidden, num_tokens, state, kv_cache, seq_len, block_table, ctx, stream)
+        self.verify_run(
+            hidden,
+            num_tokens,
+            state,
+            kv_cache,
+            seq_len,
+            block_table,
+            ctx,
+            stream,
+        )
     }
 
     /// Keep the first `num_accepted` of the last verify's `k` rows in the conv
@@ -311,7 +320,10 @@ impl TransformerLayer for Inkling2Layer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let runs = owner_runs(&row_owner[..num_rows.min(row_owner.len())], seq_states.len())?;
+        let runs = owner_runs(
+            &row_owner[..num_rows.min(row_owner.len())],
+            seq_states.len(),
+        )?;
         ensure!(
             runs.iter().map(|r| r.1).sum::<usize>() == num_rows,
             "inkling2: {num_rows} verify rows but {} owned rows",
@@ -320,7 +332,10 @@ impl TransformerLayer for Inkling2Layer {
         let k = runs[0].1;
         if runs.iter().all(|r| r.1 == k) && k <= MAX_VERIFY_ROWS {
             let mut batch = Batch {
-                seqs: runs.iter().map(|&(first, _)| (seq_lens[first], block_tables[first].as_slice())).collect(),
+                seqs: runs
+                    .iter()
+                    .map(|&(first, _)| (seq_lens[first], block_tables[first].as_slice()))
+                    .collect(),
                 rows_per_seq: k,
                 journals: Vec::with_capacity(runs.len()),
             };
@@ -411,7 +426,10 @@ impl TransformerLayer for Inkling2Layer {
 
     /// Every padding row writes the one shared pad state.
     fn padding_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
-        ensure!(self.shared.is_attached(), "inkling2: padding state before attach");
+        ensure!(
+            self.shared.is_attached(),
+            "inkling2: padding state before attach"
+        );
         Ok(Box::new(Inkling2SeqState {
             conv: self.shared.pad_conv,
             journal: DevicePtr::NULL,
@@ -447,7 +465,10 @@ mod owner_run_tests {
     #[test]
     fn rows_group_by_sequence_in_order() {
         assert_eq!(owner_runs(&[0, 0, 0], 1).unwrap(), vec![(0, 3)]);
-        assert_eq!(owner_runs(&[0, 0, 1, 1, 1], 2).unwrap(), vec![(0, 2), (2, 3)]);
+        assert_eq!(
+            owner_runs(&[0, 0, 1, 1, 1], 2).unwrap(),
+            vec![(0, 2), (2, 3)]
+        );
     }
 
     #[test]
