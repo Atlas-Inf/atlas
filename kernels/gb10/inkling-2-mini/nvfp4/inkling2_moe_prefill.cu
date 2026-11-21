@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // Inkling 2 routed experts for prefill rows: the pieces around the grouped GEMMs
-// (moe_sort_by_expert, inkling2_moe_gemm_{w4a4,nvfp4,mxfp8}, moe_unpermute_reduce_indexed).
+// (moe_sort_by_expert, inkling2_moe_gemm_{w4a4,w8a8}, moe_unpermute_reduce_indexed).
 // Reference: transformers PR #51050 `Inkling2SoftcappedSwiGLU` (Apache-2.0).
 //
 // The checkpoint quantizes the inputs of its expert projections
@@ -20,7 +20,9 @@
 #include <cuda_fp8.h>
 #include <float.h>
 
-// The softcapped SwiGLU of one (gate, up) pair, rounded to BF16 as the reference does.
+// The softcapped SwiGLU of one (gate, up) pair (gate_up rows interleave them, as the
+// checkpoint's w13 rows do), rounded to BF16 as the reference does:
+//   BF16(tanh(g / cg) * cg * sigmoid(g) * tanh(u / cu) * cu).
 __device__ __forceinline__ float ink_situ(const float g, const float u, const float cg, const float cu) {
     const float v = tanhf(g / cg) * cg * (1.0f / (1.0f + __expf(-g))) * tanhf(u / cu) * cu;
     return __bfloat162float(__float2bfloat16(v));
@@ -221,21 +223,6 @@ extern "C" __global__ void inkling2_situ_quant_mxfp8(const __nv_bfloat16* __rest
     if (i >= I) return;
     const __nv_bfloat162 p = ((const __nv_bfloat162*)(gu + r * 2 * I))[i];
     ink_store_mxfp8(ink_situ(__low2float(p), __high2float(p), cg, cu), q, s, r * I + i);
-}
-
-// act[r, i] = BF16(tanh(g / cg) * cg * sigmoid(g) * tanh(u / cu) * cu) with g = gu[r, 2i],
-// u = gu[r, 2i + 1] (the checkpoint's interleaved w13 rows, so the grouped GEMM output is
-// interleaved too), both already BF16 as the reference rounds them.
-// grid (rows, ceil(I / 256)), block 256
-extern "C" __global__ void inkling2_softcap_swiglu(const __nv_bfloat16* __restrict__ gu,
-                                                   __nv_bfloat16* __restrict__ act, const unsigned int I,
-                                                   const float cg, const float cu) {
-    atlas_pdl_enter();
-    const unsigned int i = blockIdx.y * blockDim.x + threadIdx.x;
-    const unsigned long long r = blockIdx.x;
-    if (i >= I) return;
-    const __nv_bfloat162 p = ((const __nv_bfloat162*)(gu + r * 2 * I))[i];
-    act[r * I + i] = __float2bfloat16(ink_situ(__low2float(p), __high2float(p), cg, cu));
 }
 
 // Load time: an overlay's gate_up rows in transformers' order (gate rows 0..half-1, then

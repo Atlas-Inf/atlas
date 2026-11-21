@@ -54,8 +54,6 @@ pub(crate) struct Inkling2Kernels {
     /// weighted unpermute, around this target's softcapped SwiGLU
     pub moe_sort: KernelHandle,
     pub moe_unpermute: KernelHandle,
-    pub moe_gemm_nvfp4: KernelHandle,
-    pub moe_gemm_mxfp8: KernelHandle,
     pub moe_gemm_w4a4: KernelHandle,
     pub moe_gemm_w8a8: KernelHandle,
     pub moe_tiles: KernelHandle,
@@ -63,7 +61,6 @@ pub(crate) struct Inkling2Kernels {
     pub situ_quant_fp4: KernelHandle,
     pub quant_mxfp8: KernelHandle,
     pub situ_quant_mxfp8: KernelHandle,
-    pub softcap_swiglu: KernelHandle,
 }
 
 impl Inkling2Kernels {
@@ -100,8 +97,6 @@ impl Inkling2Kernels {
             moe_combine: gpu.kernel("inkling2_moe_decode", "inkling2_moe_combine")?,
             moe_sort: gpu.kernel("moe", "moe_sort_by_expert")?,
             moe_unpermute: gpu.kernel("moe", "moe_unpermute_reduce_indexed")?,
-            moe_gemm_nvfp4: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_gemm_nvfp4")?,
-            moe_gemm_mxfp8: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_gemm_mxfp8")?,
             moe_gemm_w4a4: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_gemm_w4a4")?,
             moe_gemm_w8a8: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_gemm_w8a8")?,
             moe_tiles: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_tiles")?,
@@ -109,7 +104,6 @@ impl Inkling2Kernels {
             situ_quant_fp4: gpu.kernel("inkling2_moe_prefill", "inkling2_situ_quant_fp4")?,
             quant_mxfp8: gpu.kernel("inkling2_moe_prefill", "inkling2_quant_mxfp8")?,
             situ_quant_mxfp8: gpu.kernel("inkling2_moe_prefill", "inkling2_situ_quant_mxfp8")?,
-            softcap_swiglu: gpu.kernel("inkling2_moe_prefill", "inkling2_softcap_swiglu")?,
         })
     }
 }

@@ -13,10 +13,6 @@ use super::ops::{Inkling2Kernels, u32_of};
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StackedExperts {
     pub mxfp8: bool,
-    /// The checkpoint's own experts: prefill quantizes their inputs as its
-    /// `hf_quant_config.json` requires (NVFP4 rows for NVFP4 experts, MXFP8
-    /// rows for MXFP8 ones). The Spark overlay's experts take BF16 rows.
-    pub act_quant: bool,
     pub w13: DevicePtr,
     pub w13_scale: DevicePtr,
     /// NVFP4: per-expert `amax / denominator` (F32 `[E]`); NULL for MXFP8
@@ -24,6 +20,20 @@ pub(crate) struct StackedExperts {
     pub w2: DevicePtr,
     pub w2_scale: DevicePtr,
     pub w2_global: DevicePtr,
+}
+
+impl StackedExperts {
+    /// Code rows are read 16 bytes and scale rows `scale_align` bytes at a time.
+    fn ensure_aligned(&self, scale_align: u64) -> Result<()> {
+        ensure!(
+            self.w13.0.is_multiple_of(16)
+                && self.w2.0.is_multiple_of(16)
+                && self.w13_scale.0.is_multiple_of(scale_align)
+                && self.w2_scale.0.is_multiple_of(scale_align),
+            "inkling2: expert tensors not aligned for their loads ({scale_align}-byte scales)"
+        );
+        Ok(())
+    }
 }
 
 /// Largest hidden / intermediate size the MoE kernels stage in shared memory.
@@ -60,14 +70,8 @@ pub(crate) fn moe_decode(
         "inkling2 MoE dims must be multiples of 32 up to {MAX_MOE_DIM}"
     );
     let e = a.experts;
-    // the kernels read code rows 16 bytes and NVFP4 scales 2 bytes at a time
-    ensure!(
-        e.w13.0.is_multiple_of(16)
-            && e.w2.0.is_multiple_of(16)
-            && e.w13_scale.0.is_multiple_of(2)
-            && e.w2_scale.0.is_multiple_of(2),
-        "inkling2: expert tensors not aligned for 16-byte loads"
-    );
+    // the GEMVs read code rows 16 bytes and scale rows 4 bytes at a time
+    e.ensure_aligned(4)?;
     let (gate_up, down) = if e.mxfp8 {
         (kernels.moe_gate_up_mxfp8, kernels.moe_down_mxfp8)
     } else {
@@ -117,7 +121,8 @@ pub(crate) fn moe_decode(
 /// Routed experts for many rows (prefill): sort the rows' expert slots by
 /// expert, one grouped GEMM per projection over all experts (each expert's
 /// weights read once per tile of its rows, not once per row), the softcapped
-/// SwiGLU between, then the top-k weighted sum back in row order.
+/// SwiGLU between, then the top-k weighted sum back in row order. Prefill takes
+/// the checkpoint's experts at its declared numerics ([`moe_prefill_lowp`]).
 pub(crate) struct MoePrefill {
     pub x: DevicePtr,
     pub experts: StackedExperts,
@@ -142,11 +147,8 @@ pub(crate) struct MoePrefill {
     pub up_softcap: f32,
 }
 
-/// Output columns per CTA of `inkling2_moe_gemm_nvfp4` (its GN).
+/// Output columns per CTA of `inkling2_moe_gemm_w4a4` / `_w8a8`.
 const GEMM_N_TILE: u32 = 128;
-// tile rows: MXFP8 64, NVFP4 128 (inkling2_moe_gemm.cu GM / GM_FP4)
-const GEMM_M_TILE_MX: usize = 64;
-const GEMM_M_TILE_FP4: usize = 128;
 
 /// Rows from which the routed experts run as grouped GEMMs (fewer rows read
 /// each expert once per row through the decode GEMVs).
@@ -170,16 +172,11 @@ pub(crate) fn moe_prefill(
     a: &MoePrefill,
     stream: u64,
 ) -> Result<()> {
-    let e = a.experts;
     let te = a.rows * a.top_k;
     let (sorted_rows, sorted_experts) = (a.sort, a.sort.offset(te * 4));
     let offsets = a.sort.offset(te * 8);
     let to_perm = offsets.offset((a.num_experts + 1) * 4);
-    let (ne, h, i) = (
-        u32_of(a.num_experts, "experts")?,
-        u32_of(a.hidden, "hidden")?,
-        u32_of(a.inter, "inter")?,
-    );
+    let ne = u32_of(a.num_experts, "experts")?;
     super::super::ops::moe_sort_by_expert(
         gpu,
         k.moe_sort,
@@ -193,100 +190,7 @@ pub(crate) fn moe_prefill(
         u32_of(a.top_k, "top_k")?,
         stream,
     )?;
-    if e.act_quant {
-        return moe_prefill_lowp(gpu, k, a, sorted_rows, offsets, to_perm, stream);
-    }
-    // an expert takes each row at most once
-    let m_tiles = u32_of(
-        a.rows
-            .div_ceil(if e.mxfp8 {
-                GEMM_M_TILE_MX
-            } else {
-                GEMM_M_TILE_FP4
-            })
-            .max(1),
-        "m tiles",
-    )?;
-    let gemm = |x: DevicePtr,
-                w: DevicePtr,
-                sc: DevicePtr,
-                g: DevicePtr,
-                y: DevicePtr,
-                gather: DevicePtr,
-                n: u32,
-                kk: u32| {
-        // the checkpoint's stacked tensors, on this target's tensor-core kernel
-        if e.mxfp8 {
-            KernelLaunch::new(gpu, k.moe_gemm_mxfp8)
-                .grid([n.div_ceil(GEMM_N_TILE), m_tiles, ne])
-                .block([256, 1, 1])
-                .arg_ptr(x)
-                .arg_ptr(w)
-                .arg_ptr(sc)
-                .arg_ptr(y)
-                .arg_ptr(offsets)
-                .arg_ptr(gather)
-                .arg_u32(n)
-                .arg_u32(kk)
-                .launch(stream)
-        } else {
-            KernelLaunch::new(gpu, k.moe_gemm_nvfp4)
-                .grid([n.div_ceil(GEMM_N_TILE), m_tiles, ne])
-                .block([256, 1, 1])
-                .arg_ptr(x)
-                .arg_ptr(w)
-                .arg_ptr(sc)
-                .arg_ptr(g)
-                .arg_ptr(y)
-                .arg_ptr(offsets)
-                .arg_ptr(gather)
-                .arg_u32(n)
-                .arg_u32(kk)
-                .launch(stream)
-        }
-    };
-    // gate and up rows stay interleaved in the output, as the checkpoint stores them
-    gemm(
-        a.x,
-        e.w13,
-        e.w13_scale,
-        e.w13_global,
-        a.gu,
-        sorted_rows,
-        2 * i,
-        h,
-    )?;
-    KernelLaunch::new(gpu, k.softcap_swiglu)
-        .grid([u32_of(te, "slots")?, i.div_ceil(256), 1])
-        .block([256, 1, 1])
-        .arg_ptr(a.gu)
-        .arg_ptr(a.act)
-        .arg_u32(i)
-        .arg_f32(a.gate_softcap)
-        .arg_f32(a.up_softcap)
-        .launch(stream)?;
-    gemm(
-        a.act,
-        e.w2,
-        e.w2_scale,
-        e.w2_global,
-        a.y,
-        DevicePtr::NULL,
-        h,
-        i,
-    )?;
-    super::super::ops::moe_unpermute_reduce_indexed(
-        gpu,
-        k.moe_unpermute,
-        a.y,
-        a.out,
-        to_perm,
-        a.weights,
-        h,
-        u32_of(a.rows, "rows")?,
-        u32_of(a.top_k, "top_k")?,
-        stream,
-    )
+    moe_prefill_lowp(gpu, k, a, sorted_rows, offsets, to_perm, stream)
 }
 
 /// `inkling2_situ_quant_fp4`: 32 lanes x INK_SITU_BLOCKS blocks of 16.
@@ -295,7 +199,7 @@ const SITU_MAX_INTER: usize = 32 * 3 * 16;
 /// Tile rows of `inkling2_moe_gemm_w4a4` / `_w8a8` (nvfp4_w4a4_tile.cuh `W4_BM`).
 const LOWP_M_TILE: usize = 128;
 
-/// [`moe_prefill`] over the checkpoint's experts at its declared numerics: each
+/// The grouped experts of [`moe_prefill`] at the checkpoint's declared numerics: each
 /// row quantized once (NVFP4 for NVFP4 experts, MXFP8 for MXFP8 ones; staged in
 /// `y`, which the down projection fills only later), the gate_up GEMM on the
 /// block-scaled tensor cores (W4A4 or W8A8), the softcapped SwiGLU quantized per
@@ -319,11 +223,7 @@ fn moe_prefill_lowp(
         "inkling2 low-precision experts need dims that are multiples of 128 (inter up to {SITU_MAX_INTER})"
     );
     // the tile copies each row's scales 4 (W8A8) or 8 (W4A4) bytes at a time
-    let scale_align = if mx { 4 } else { 8 };
-    ensure!(
-        e.w13_scale.0.is_multiple_of(scale_align) && e.w2_scale.0.is_multiple_of(scale_align),
-        "inkling2: expert scales not {scale_align}-byte aligned"
-    );
+    e.ensure_aligned(if mx { 4 } else { 8 })?;
     let (ne, h, i) = (
         u32_of(a.num_experts, "experts")?,
         u32_of(a.hidden, "hidden")?,
@@ -476,6 +376,7 @@ pub(crate) fn moe_batched(
         "inkling2 grouped expert GEMVs stage rows of at most {GROUPED_MAX_K}"
     );
     let e = a.experts;
+    e.ensure_aligned(4)?;
     let te = a.rows * a.top_k;
     let (sorted_rows, sorted_experts) = (a.sort, a.sort.offset(te * 4));
     let offsets = a.sort.offset(te * 8);
