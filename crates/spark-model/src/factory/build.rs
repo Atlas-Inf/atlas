@@ -216,6 +216,23 @@ pub fn build_model(
         && let Some(ref sub) = args.drafter_config.dflash_config
     {
         config.dflash_capture_layers = sub.target_layer_ids.clone();
+        // Inkling 2 DSpark taps name visit INPUTS (tap t = what enters visit
+        // t; t = visit count = the final-norm output). Atlas captures after a
+        // layer, so tap t is visit t - 1's output; the drafter applies the
+        // final norm to the last tap itself (`dflash_head/inkling.rs`).
+        if args.drafter_config.is_inkling2_dspark() {
+            anyhow::ensure!(
+                config.model_type == "inkling2_loop"
+                    && sub
+                        .target_layer_ids
+                        .iter()
+                        .all(|&t| (1..=config.num_hidden_layers).contains(&t)),
+                "Inkling 2 DSpark taps {:?} need an Inkling 2 target of {} visits",
+                sub.target_layer_ids,
+                config.num_hidden_layers
+            );
+            config.dflash_capture_layers = sub.target_layer_ids.iter().map(|&t| t - 1).collect();
+        }
         // `--draft-model-alt`: one capture covers both drafters' layers.
         if let Some(alt) = args
             .alt
@@ -858,7 +875,10 @@ pub fn build_model(
             1, // tp_size for the drafter side: replicated, so always 1
         )?;
         match weights {
-            Some(weights) => {
+            Some(mut weights) => {
+                if let Some(ink) = weights.inkling.as_mut() {
+                    ink.attach_target(&store, config.rms_norm_eps as f32)?;
+                }
                 if lightning_dspark_admitted {
                     anyhow::ensure!(
                         weights.markov_w1.is_some() && weights.markov_w2.is_some(),

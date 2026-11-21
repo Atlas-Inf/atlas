@@ -120,3 +120,5 @@ hidden_size = 2304
 # MoE runs this target's own stacked-expert kernels).
 [expected_absent.w4a16]
 w4a16_gemm_t_p3 = "3-deep pipeline twin shipped only in qwen3.6-27b's shadow; probed by the model build, never dispatched for Inkling (no dense NVFP4 FFN)."
+fp8_gemm_t_row_scaled = "FP8 drafter twin of the DFlash head (ATLAS_DFLASH_FP8 drafters only); the Inkling 2 DSpark drafter is BF16 with NVFP4 layer twins."
+fp8_gemm_t_row_scaled_m16 = "Small-M FP8 drafter head GEMM (DflashQuantization::Fp8Weights only); never dispatched for the BF16 Inkling 2 DSpark drafter."

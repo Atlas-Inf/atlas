@@ -34,12 +34,16 @@ use crate::weight_map::{DenseWeight, QuantizedWeight, dense_auto};
 mod config;
 mod conv;
 mod dspine;
+mod inkling;
 mod layer_attention;
 mod own_head;
 
 pub use config::*;
 pub use conv::DflashConvWeights;
 pub use dspine::*;
+pub use inkling::{
+    INKLING2_DSPARK_ARCH, INKLING2_DSPARK_TAPS, Inkling2DsparkWeights, load_inkling2_dspark,
+};
 pub(crate) use own_head::own_lm_head_present;
 
 /// DFlash2 bilinear candidate selector weights.
@@ -71,6 +75,9 @@ pub struct DflashWeights {
     pub lm_head: Option<QuantizedWeight>,
     /// DSpine's code bridge (`selected_prefix_bridge.*`), when declared.
     pub dspine: Option<DspineBridgeWeights>,
+    /// Inkling 2's DSpark tensors (fuse mix, context K/V, rnn Markov head);
+    /// its `fc` and `hidden_norm` are then unused NULL placeholders.
+    pub inkling: Option<Inkling2DsparkWeights>,
 }
 
 /// Per-drafter-layer raw weights (BF16).
@@ -99,7 +106,7 @@ pub struct DflashLayerWeights {
 /// canonical `z-lab/Qwen3.6-{27B,35B-A3B}-DFlash` checkpoints ship the
 /// bare layout (verified against commit 42d3b34, May 2026).
 pub fn store_has_dflash_weights(store: &WeightStore) -> bool {
-    store.contains("fc.weight") || store.contains("model.fc.weight")
+    store.contains("fc.weight") || store.contains("model.fc.weight") || store.contains("fuse_weight")
 }
 
 /// Load DFlash drafter weights from a separate [`WeightStore`] pointing at
@@ -154,12 +161,23 @@ pub fn load_dflash_weights(
         ""
     };
 
+    // Inkling 2 mixes its taps per layer instead of one `fc` + `hidden_norm`.
+    let inkling = load_inkling2_dspark(drafter_store, drafter_config, gpu)?;
+    let placeholder = DenseWeight {
+        weight: spark_runtime::gpu::DevicePtr::NULL,
+    };
     // dense_auto: BF16 as-is, packed NVFP4 (Lightning DSpark MLP/fc/markov_w2)
     // dequanted once at load.
-    let fc = dense_auto(drafter_store, &format!("{prefix}fc.weight"), gpu)
-        .context("DFlash drafter: load fc.weight")?;
-    let hidden_norm = dense_auto(drafter_store, &format!("{prefix}hidden_norm.weight"), gpu)
-        .context("DFlash drafter: load hidden_norm.weight")?;
+    let fc = match &inkling {
+        Some(_) => placeholder,
+        None => dense_auto(drafter_store, &format!("{prefix}fc.weight"), gpu)
+            .context("DFlash drafter: load fc.weight")?,
+    };
+    let hidden_norm = match &inkling {
+        Some(_) => placeholder,
+        None => dense_auto(drafter_store, &format!("{prefix}hidden_norm.weight"), gpu)
+            .context("DFlash drafter: load hidden_norm.weight")?,
+    };
     let norm = dense_auto(drafter_store, &format!("{prefix}norm.weight"), gpu)
         .context("DFlash drafter: load norm.weight")?;
 
@@ -356,6 +374,7 @@ pub fn load_dflash_weights(
         candidate_selector,
         lm_head,
         dspine,
+        inkling,
     }))
 }
 

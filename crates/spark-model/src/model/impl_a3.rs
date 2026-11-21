@@ -339,6 +339,21 @@ impl TransformerModel {
                 h,
                 stream,
             )?;
+        } else if self.batched_head_gemv(num_tokens as usize) {
+            // Inkling 2's BF16 head over a DSpark verify block (8 rows): one
+            // weight pass instead of the tile GEMM (11.5 ms a step, GB10 nsys).
+            ops::dense_gemv_batchm(
+                self.gpu.as_ref(),
+                self.dense_gemv_batchm_kernel,
+                hidden,
+                &self.lm_head_weight,
+                logits,
+                num_tokens,
+                v,
+                h,
+                v,
+                stream,
+            )?;
         } else if self.config.model_type == "ricursive" {
             // BF16 head over the verify rows: cuBLASLt streams the 1 GB weight
             // ~6x faster than the scalar `dense_gemm` tile kernel.

@@ -358,6 +358,10 @@ impl BlockDiffusionDraftHead {
         if eff_ctx > 0 {
             gpu.memset(scratch.stream_buf, 0, eff_ctx * self.hidden_size * bf16)?;
         }
+        if self.inkling.is_some() {
+            anyhow::ensure!(option_b_on, "Inkling 2 DSpark proposes only on the paged path");
+            self.inkling_prepare(gpu, scratch, ctx_buffer, stream)?;
+        }
         // ATLAS_DFLASH_DEBUG_FORCE_NOISE_PATTERN=1: overwrite noise rows
         // [eff_ctx..n_attn) with a deterministic pattern matching the
         // PyTorch reference. Lets us compare layer-0 q/k/v post-projection

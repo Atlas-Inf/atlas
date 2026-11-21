@@ -80,6 +80,25 @@ impl TransformerModel {
         bf16: usize,
         stream: u64,
     ) -> Result<DevicePtr> {
+        let logits = self.lm_head_project_batched_raw(normed, padded_n, h, bf16, stream)?;
+        // The single-row head and the verify head (`lm_head_batched`) cap
+        // their logits; the batched decode rows must too, or a softcapped
+        // model (Gemma, Inkling 2) samples its C>=2 rows from uncapped logits.
+        if self.logit_softcap_kernel.0 != 0 {
+            let cap = self.config.final_logit_softcapping;
+            self.apply_logit_softcap(logits, (padded_n * self.config.vocab_size) as u32, cap, stream)?;
+        }
+        Ok(logits)
+    }
+
+    fn lm_head_project_batched_raw(
+        &self,
+        normed: DevicePtr,
+        padded_n: usize,
+        h: usize,
+        bf16: usize,
+        stream: u64,
+    ) -> Result<DevicePtr> {
         let logits = self.buffers.logits();
         let v = self.config.vocab_size;
         // qwen3_5's batch lever (`exact_verify.rs`): each row the single-row
@@ -247,7 +266,7 @@ impl TransformerModel {
     /// Whether a batched BF16 head of `rows` rows runs the batch GEMV (one
     /// weight pass, at most 8 rows) instead of the tile GEMM. Inkling 2 only:
     /// the other models keep the path they were measured on.
-    fn batched_head_gemv(&self, rows: usize) -> bool {
+    pub(in crate::model) fn batched_head_gemv(&self, rows: usize) -> bool {
         self.config.model_type == "inkling2_loop"
             && self.dense_gemv_batchm_kernel.0 != 0
             && (1..=ops::DENSE_GEMV_BATCHM_MAX_M as usize).contains(&rows)

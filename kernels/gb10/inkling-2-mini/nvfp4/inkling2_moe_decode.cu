@@ -190,10 +190,13 @@ extern "C" __global__ void inkling2_moe_combine(const __nv_bfloat16* __restrict_
 // Decode batches of a few rows: the rows' expert slots sorted by expert (moe_sort_by_expert),
 // each expert's weights read once and applied to every row that chose it (up to INK_GR rows
 // staged per pass), outputs in sorted-slot order for moe_unpermute_reduce_indexed.
-//   _grouped_gate_up: grid (ceil(I/8), E), 256 threads; act[slot, i]
-//   _grouped_down:    grid (ceil(H/32), E), 256 threads; y[slot, n]
+// A block stages an expert's rows once for INK_GR_TILES output tiles (the staging was more
+// traffic than the weights at one tile a block).
+//   _grouped_gate_up: grid (ceil(I/(8*INK_GR_TILES)), E), 256 threads; act[slot, i]
+//   _grouped_down:    grid (ceil(H/(32*INK_GR_TILES)), E), 256 threads; y[slot, n]
 #define INK_GR 8
 #define INK_GR_MAX_K 2304
+#define INK_GR_TILES 4
 
 // R dots of one weight row against R staged activation rows, this lane's share.
 template <bool MX, int L>
@@ -257,28 +260,30 @@ __device__ __forceinline__ void ink_grouped_gate_up(const __nv_bfloat16* __restr
     __shared__ __align__(16) __nv_bfloat16 a[INK_GR * INK_GR_MAX_K];
     __shared__ float2 lut[256];
     if (!MX) ink_stage_lut(lut);
-    const unsigned int i = blockIdx.x * INK_GU_WARPS + threadIdx.x / 32;
     const unsigned int lane = threadIdx.x % 32;
-    const unsigned long long row = (unsigned long long)e * 2ull * I + 2ull * (i < I ? i : 0) + lane / 16;
-    const unsigned char* c = codes + row * (MX ? K : K / 2);
-    const unsigned char* sc = scales + row * (K / (MX ? 32 : 16));
     for (int base = 0; base < cnt; base += INK_GR) {
         const int nr = min(INK_GR, cnt - base);
         __syncthreads();
         ink_stage_rows(A, rows, s0 + base, nr, K, a);
         __syncthreads();
-        if (i >= I) continue;
-        float d[INK_GR];
-        ink_dot_rows<MX, 16>(lut, c, sc, MX ? 1.0f : s2[e], a, K, lane % 16, nr, d);
+        for (unsigned int t = 0; t < INK_GR_TILES; t++) {
+            const unsigned int i = (blockIdx.x * INK_GR_TILES + t) * INK_GU_WARPS + threadIdx.x / 32;
+            if (i >= I) break;
+            const unsigned long long row = (unsigned long long)e * 2ull * I + 2ull * i + lane / 16;
+            const unsigned char* c = codes + row * (MX ? K : K / 2);
+            const unsigned char* sc = scales + row * (K / (MX ? 32 : 16));
+            float d[INK_GR];
+            ink_dot_rows<MX, 16>(lut, c, sc, MX ? 1.0f : s2[e], a, K, lane % 16, nr, d);
 #pragma unroll
-        for (int r = 0; r < INK_GR; r++) {
-            if (r >= nr) break;
-            const float other = __shfl_sync(0xffffffff, d[r], 16);
-            if (lane == 0) {
-                const float gg = __bfloat162float(__float2bfloat16(d[r]));
-                const float u = __bfloat162float(__float2bfloat16(other));
-                const float v = tanhf(gg / cg) * cg * (1.0f / (1.0f + __expf(-gg))) * tanhf(u / cu) * cu;
-                act[(unsigned long long)(s0 + base + r) * I + i] = __float2bfloat16(v);
+            for (int r = 0; r < INK_GR; r++) {
+                if (r >= nr) break;
+                const float other = __shfl_sync(0xffffffff, d[r], 16);
+                if (lane == 0) {
+                    const float gg = __bfloat162float(__float2bfloat16(d[r]));
+                    const float u = __bfloat162float(__float2bfloat16(other));
+                    const float v = tanhf(gg / cg) * cg * (1.0f / (1.0f + __expf(-gg))) * tanhf(u / cu) * cu;
+                    act[(unsigned long long)(s0 + base + r) * I + i] = __float2bfloat16(v);
+                }
             }
         }
     }
@@ -296,22 +301,25 @@ __device__ __forceinline__ void ink_grouped_down(const __nv_bfloat16* __restrict
     __shared__ float2 lut[256];
     if (!MX) ink_stage_lut(lut);
     const unsigned int lane = threadIdx.x % 32;
-    const unsigned int n = blockIdx.x * INK_DN_ROWS + (threadIdx.x / 32) * 4 + lane / 8;
-    const unsigned long long row = (unsigned long long)e * H + (n < H ? n : 0);
-    const unsigned char* c = codes + row * (MX ? I : I / 2);
-    const unsigned char* sc = scales + row * (I / (MX ? 32 : 16));
     for (int base = 0; base < cnt; base += INK_GR) {
         const int nr = min(INK_GR, cnt - base);
         __syncthreads();
         ink_stage_rows(act, nullptr, s0 + base, nr, I, a);
         __syncthreads();
-        float d[INK_GR];
-        ink_dot_rows<MX, 8>(lut, c, sc, MX ? 1.0f : s2[e], a, I, lane % 8, nr, d);
-        if (lane % 8 == 0 && n < H) {
+        for (unsigned int t = 0; t < INK_GR_TILES; t++) {
+            const unsigned int n = (blockIdx.x * INK_GR_TILES + t) * INK_DN_ROWS + (threadIdx.x / 32) * 4 + lane / 8;
+            if ((blockIdx.x * INK_GR_TILES + t) * INK_DN_ROWS >= H) break;
+            const unsigned long long row = (unsigned long long)e * H + (n < H ? n : 0);
+            const unsigned char* c = codes + row * (MX ? I : I / 2);
+            const unsigned char* sc = scales + row * (I / (MX ? 32 : 16));
+            float d[INK_GR];
+            ink_dot_rows<MX, 8>(lut, c, sc, MX ? 1.0f : s2[e], a, I, lane % 8, nr, d);
+            if (lane % 8 == 0 && n < H) {
 #pragma unroll
-            for (int r = 0; r < INK_GR; r++) {
-                if (r >= nr) break;
-                y[(unsigned long long)(s0 + base + r) * H + n] = __float2bfloat16(d[r]);
+                for (int r = 0; r < INK_GR; r++) {
+                    if (r >= nr) break;
+                    y[(unsigned long long)(s0 + base + r) * H + n] = __float2bfloat16(d[r]);
+                }
             }
         }
     }

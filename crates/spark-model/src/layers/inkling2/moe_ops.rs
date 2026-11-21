@@ -319,7 +319,7 @@ pub(crate) fn moe_batched(
         (k.moe_grouped_gate_up_nvfp4, k.moe_grouped_down_nvfp4)
     };
     KernelLaunch::new(gpu, gate_up)
-        .grid([i.div_ceil(8), ne, 1])
+        .grid([i.div_ceil(8 * GROUPED_TILES), ne, 1])
         .block([256, 1, 1])
         .arg_ptr(a.x)
         .arg_ptr(e.w13)
@@ -334,7 +334,7 @@ pub(crate) fn moe_batched(
         .arg_f32(a.up_softcap)
         .launch(stream)?;
     KernelLaunch::new(gpu, down)
-        .grid([h.div_ceil(32), ne, 1])
+        .grid([h.div_ceil(32 * GROUPED_TILES), ne, 1])
         .block([256, 1, 1])
         .arg_ptr(a.act)
         .arg_ptr(e.w2)
@@ -361,3 +361,5 @@ pub(crate) fn moe_batched(
 
 /// `inkling2_moe_decode.cu` INK_GR_MAX_K: the longest row the grouped GEMVs stage.
 const GROUPED_MAX_K: usize = 2304;
+/// `inkling2_moe_decode.cu` INK_GR_TILES: output tiles a grouped block covers.
+const GROUPED_TILES: u32 = 4;

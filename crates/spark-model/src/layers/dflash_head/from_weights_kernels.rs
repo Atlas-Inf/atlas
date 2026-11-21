@@ -51,9 +51,11 @@ pub(super) fn dense_gemv_tc_kernels(gpu: &dyn GpuBackend, glm_series: bool) -> [
     })
 }
 
-/// Startup small-M GEMV policy given the tensor-core GEMV set.
-pub(super) fn small_m_gemv(dense_gemv_tc: &[KernelHandle; 2]) -> bool {
-    super::small_m_gemm::small_m_gemv_enabled(dense_gemv_tc.iter().all(|k| k.0 != 0))
+/// Startup small-M GEMV policy given the tensor-core GEMV set. Inkling 2's
+/// DSpark drafter runs every projection at 8 rows or fewer, where the batch
+/// GEMV wins without the tensor-core tiers too.
+pub(super) fn small_m_gemv(dense_gemv_tc: &[KernelHandle; 2], inkling: bool) -> bool {
+    super::small_m_gemm::small_m_gemv_enabled(inkling || dense_gemv_tc.iter().all(|k| k.0 != 0))
 }
 
 /// The 8/16/32-row MXFP8 tensor-core GEMVs (0 when absent).

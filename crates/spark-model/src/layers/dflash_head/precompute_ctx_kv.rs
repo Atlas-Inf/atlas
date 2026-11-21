@@ -117,6 +117,17 @@ impl BlockDiffusionDraftHead {
         let src = ctx_base_ptr.offset(start_slot * ctx_slot_bytes);
         if let Some(turn) = split {
             self.walk_ctx_split(turn, src, gpu, scratch, stream)?;
+        } else if let Some(ink) = self.inkling.as_ref() {
+            self.inkling_ctx_kv_project(
+                ink,
+                gpu,
+                src,
+                n,
+                scratch.fc_proj,
+                scratch.fused_kv_out,
+                scratch,
+                stream,
+            )?;
         } else {
             self.ctx_kv_project(
                 gpu,
@@ -175,6 +186,10 @@ impl BlockDiffusionDraftHead {
         let Some(fused_kv) = self.fused_kv_weight else {
             anyhow::bail!("DFlash ctx_kv_project called without fused_kv_weight — build-order bug");
         };
+        anyhow::ensure!(
+            self.inkling.is_none(),
+            "Inkling 2 DSpark projects its context per layer (inkling_ctx_kv_project)"
+        );
         let bf16 = 2usize;
         let kv_dim = (self.num_kv_heads * self.head_dim) as u32;
         let l_total = self.num_layers;
@@ -342,7 +357,7 @@ impl BlockDiffusionDraftHead {
                 gpu,
                 self.kernels.rms_norm,
                 k_l,
-                &self.layers[l].k_norm,
+                self.ctx_k_norm(l),
                 k_l,
                 n * self.num_kv_heads as u32,
                 self.head_dim as u32,
