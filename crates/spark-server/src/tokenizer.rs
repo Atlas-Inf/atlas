@@ -69,6 +69,7 @@ mod ids_only;
 mod jinja_helpers;
 mod large_encode;
 mod message_preprocess;
+mod py_tojson;
 
 pub(crate) use message_preprocess::{
     autoclose_assistant_think, remap_developer_role, resolve_think_control,

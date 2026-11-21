@@ -180,6 +180,8 @@ pub(super) struct StreamState {
     pub(super) reasoning_xml_scan_state: crate::literal_xml::LiteralXmlState,
     /// Streaming tool-call detector (`Some` iff `tools_active`).
     pub(super) detector: Option<tool_parser::StreamingToolDetector>,
+    /// Inkling 2's turn rewrite (`crate::inkling_turn`), set by the caller.
+    pub(super) inkling: Option<crate::inkling_turn::InklingTurn>,
     /// True iff the reasoning/`<think>` phase has finished. Starts
     /// `true` when the request did not enable thinking.
     pub(super) thinking_done: bool,
@@ -263,6 +265,7 @@ impl StreamState {
             } else {
                 None
             },
+            inkling: None,
             thinking_done: !enable_thinking,
             buffered_tool_chunks: HashMap::new(),
             pending_retry: None,

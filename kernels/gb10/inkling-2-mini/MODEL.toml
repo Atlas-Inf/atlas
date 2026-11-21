@@ -1,6 +1,7 @@
 # Thinking Machines Inkling 2 Mini (`model_type: inkling2_loop`), Strict.
-# Work in progress: single-sequence decode (prefill runs it per token), no
-# DSpark drafter, no vision tower, no tool or reasoning parser yet.
+# Work in progress: no DSpark drafter, no vision tower, no CUDA graphs. Its
+# message blocks reach the reasoning and tool paths through spark-server's
+# inkling_turn.rs (reasoning parser `inkling2`, tool parser `hermes`).
 #
 # 24 physical layers (20 sliding-window 1024 + 4 full), the core 6-17 run
 # three times with shared weights: the engine sees 48 visits, each with its
@@ -100,6 +101,10 @@ verbatim_prompt = true
 default_kv_dtype = "bf16"
 use_sampling_presets_for_core = true
 disable_cwd_hint_injection = true
+# Inkling calls tools in its own JSON blocks (spark-server inkling_turn.rs maps
+# them to Hermes after generation); a Hermes grammar would force a format the
+# checkpoint never emits.
+disable_tool_grammar = true
 
 [[model_types]]
 model_type = "inkling2_loop"

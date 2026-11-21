@@ -961,6 +961,20 @@ pub(crate) fn load_model(
         tokenizer_limits.glm_tool_boundary,
         tool_call_start_token,
     )?;
+    // A think end that also closes the turn's other blocks (Inkling 2's
+    // `<|end_message|>`) splits reasoning in the chat paths only: the
+    // scheduler's think masks and budgets would forbid the closes the answer
+    // needs.
+    let scheduler_think_end = think_end_token.filter(|_| {
+        reasoning_parser_box
+            .as_ref()
+            .is_none_or(|p| p.end_tag_closes_only_reasoning())
+    });
+    let inkling_markers =
+        crate::inkling_turn::InklingMarkers::resolve(&config.model_type, &tokenizer);
+    if config.model_type == "inkling2_loop" && inkling_markers.is_none() {
+        anyhow::bail!("inkling2_loop tokenizer lacks the Inkling 2 message markers");
+    }
 
     // 7. Create scheduler channel + spawn scheduler
     spark_runtime::progress::phase(9, "scheduler");
@@ -1253,7 +1267,7 @@ pub(crate) fn load_model(
                 swap_space_gb,
                 high_speed_swap_cfg,
                 block_size,
-                think_end_token,
+                scheduler_think_end,
                 think_start_token,
                 tool_call_start_token,
                 tool_call_end_token,
@@ -1473,6 +1487,7 @@ pub(crate) fn load_model(
         reasoning_parser: reasoning_parser_box,
         think_end_token_id: think_end_token,
         glm_tool_boundary: tokenizer_limits.glm_tool_boundary,
+        inkling_markers,
         think_start_token_id: think_start_token,
         tool_max_tokens: args.tool_max_tokens,
         sampling_presets,

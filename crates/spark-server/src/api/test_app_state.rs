@@ -50,6 +50,7 @@ pub(crate) fn app_state(tokenizer: crate::tokenizer::ChatTokenizer) -> AppState 
         sampling_presets: Default::default(),
         tool_call_start_token_id: None,
         glm_tool_boundary: None,
+        inkling_markers: None,
         auto_compact_threshold: None,
         request_timeout: 0,
         effective_context: 0,
