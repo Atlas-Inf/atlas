@@ -8,3 +8,5 @@
 pub(crate) mod ops;
 #[allow(dead_code)]
 pub(crate) mod schedule;
+#[allow(dead_code)]
+pub(crate) mod weights;
