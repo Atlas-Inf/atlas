@@ -37,7 +37,8 @@
 //   KERNEL_NAME, K_CACHE_TYPE, V_CACHE_TYPE, KERNEL_EXTRA_PARAMS, KERNEL_PREAMBLE
 // Optional (Inkling 2, as kernels/gb10/common/prefill_paged_compute.cuh): INKLING2_PREFILL_BIAS
 // adds rel_bias[row][head][query - key] (params rel_bias, rel_extent) to the 32-row body's
-// scores; INKLING2_ROW_SINKS reads its sinks per query row.
+// scores; INKLING2_PREFILL_BIAS_INLINE computes that bias in place from ink_rel [rows, heads, 16]
+// and ink_rel_proj_t [rel_extent, 16] F32; INKLING2_ROW_SINKS reads its sinks per query row.
 //   (optionally PREFILL_BATCHED)
 
 #include <cuda_bf16.h>
@@ -290,6 +291,16 @@ extern "C" __global__ void KERNEL_NAME(
         smem_ml[r][0] = -1e30f;
         smem_ml[r][1] = 0.0f;
     }
+#ifdef INKLING2_PREFILL_BIAS_INLINE
+    // Inkling 2 (AMD): this row thread's relative-bias coefficients rel[row][q_head][0..16).
+    float ink_relv[16];
+    if (tid < BR) {
+        const unsigned int rr = min(q_start + tid, q_len_eff - 1);
+        const __nv_bfloat16* rp = ink_rel + ((unsigned long long)rr * num_q_heads + q_head) * 16;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) ink_relv[j] = __bfloat162float(rp[j]);
+    }
+#endif
 
     // ---- Q tile load (synchronous, BF16 contiguous) ----
     {
@@ -381,6 +392,16 @@ extern "C" __global__ void KERNEL_NAME(
                 // after the scale as on gb10 (masked keys are overwritten below).
                 if (row_valid && qr >= kpos && qr - kpos < rel_extent)
                     s += __bfloat162float(rel_bias[((unsigned long long)(q_start + r) * num_q_heads + q_head) * rel_extent + (qr - kpos)]);
+#endif
+#ifdef INKLING2_PREFILL_BIAS_INLINE
+                // the same bias computed here: BF16(sum_j rel[j] * rel_proj[j][dist]), fp32 in j order
+                if (row_valid && qr >= kpos && qr - kpos < rel_extent) {
+                    const float* pt = ink_rel_proj_t + (unsigned long long)(qr - kpos) * 16;
+                    float acc = 0.0f;
+                    #pragma unroll
+                    for (int j = 0; j < 16; j++) acc += ink_relv[j] * pt[j];
+                    s += __bfloat162float(__float2bfloat16(acc));
+                }
 #endif
                 if (s_end >= 0) {
                     // Prefix-bidirectional: state rows see the state, question rows see all.

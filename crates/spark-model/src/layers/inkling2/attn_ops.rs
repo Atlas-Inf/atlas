@@ -189,31 +189,46 @@ pub(crate) fn prefill_attn(
             .arg_f32((a.head_dim as f32).powf(-0.5))
             .launch(stream);
     }
-    let bias_rows = u32_of(a.q_len * a.heads, "bias rows")?;
-    let mut table = KernelLaunch::new(gpu, k.rel_bias_table);
     if cfg!(atlas_scale) {
-        // AMD: every prefill row count lands here, so rows * heads can pass gridDim.y's
-        // 65535; the AMD kernel grid-strides over the (row, head) pairs.
-        table = table
-            .grid([extent.div_ceil(256), bias_rows.min(65535), 1])
-            .block([256, 1, 1])
+        // AMD: the bias is computed inside the prefill body (no table); 16 coefficients a head.
+        ensure!(a.d_rel == 16, "inkling2 AMD prefill attention takes d_rel 16, not {}", a.d_rel);
+        return KernelLaunch::new(gpu, k.prefill_attn)
+            .grid([heads, q_len.div_ceil(32), 1])
+            .block([128, 1, 1])
+            .arg_ptr(a.q)
+            .arg_ptr(a.k_cache)
+            .arg_ptr(a.v_cache)
+            .arg_ptr(a.out)
+            .arg_ptr(a.block_table)
+            .arg_u32(q_len)
+            .arg_u32(u32_of(a.q_offset + a.q_len, "kv_len")?)
+            .arg_u32(u32_of(a.q_offset, "q_offset")?)
+            .arg_u32(heads)
+            .arg_u32(kv_heads)
+            .arg_u32(u32_of(a.head_dim, "head dim")?)
+            .arg_u32(u32_of(a.block_size, "block size")?)
+            .arg_u32(u32_of(a.sliding_window, "window")?)
+            .arg_u32(1)
+            .arg_f32((a.head_dim as f32).powf(-0.5))
+            .arg_ptr(a.sinks)
             .arg_ptr(a.rel)
-            .arg_ptr(a.rel_proj)
-            .arg_ptr(a.bias)
-            .arg_u32(u32_of(a.d_rel, "d_rel")?)
             .arg_u32(extent)
-            .arg_u32(bias_rows);
-    } else {
-        table = table
-            .grid([extent.div_ceil(256), bias_rows, 1])
-            .block([256, 1, 1])
-            .arg_ptr(a.rel)
-            .arg_ptr(a.rel_proj)
-            .arg_ptr(a.bias)
-            .arg_u32(u32_of(a.d_rel, "d_rel")?)
-            .arg_u32(extent);
+            .arg_ptr(a.rel_proj_t)
+            .launch(stream);
     }
-    table.launch(stream)?;
+    KernelLaunch::new(gpu, k.rel_bias_table)
+        .grid([
+            extent.div_ceil(256),
+            u32_of(a.q_len * a.heads, "bias rows")?,
+            1,
+        ])
+        .block([256, 1, 1])
+        .arg_ptr(a.rel)
+        .arg_ptr(a.rel_proj)
+        .arg_ptr(a.bias)
+        .arg_u32(u32_of(a.d_rel, "d_rel")?)
+        .arg_u32(extent)
+        .launch(stream)?;
     KernelLaunch::new(gpu, k.prefill_attn)
         .grid([heads, q_len.div_ceil(32), 1])
         .block([128, 1, 1])
