@@ -193,7 +193,11 @@ pub(crate) fn moe_prefill(
         u32_of(a.top_k, "top_k")?,
         stream,
     )?;
-    if e.act_quant {
+    // AMD (strix-hip): the W4A4 / W8A8 block-scaled GEMMs and their activation quantizers
+    // are gb10 tensor-core PTX; the checkpoint's experts take BF16 rows there, on the
+    // target's WMMA port of the BF16-row GEMM (kernels/strix-hip/inkling-2-mini/nvfp4/
+    // inkling2_moe_gemm.cu), as decode and the Spark overlay's experts do everywhere.
+    if e.act_quant && !cfg!(atlas_scale) {
         return moe_prefill_lowp(gpu, k, a, sorted_rows, offsets, to_perm, stream);
     }
     // an expert takes each row at most once

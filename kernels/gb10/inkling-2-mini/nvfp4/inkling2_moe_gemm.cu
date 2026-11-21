@@ -20,8 +20,8 @@
 #include "../../common/atlas_pdl.cuh"
 #if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
 // AMD (strix-hip): these kernels are mma.sync / cp.async / block-scaled MMA PTX. The
-// symbols exist so the kernel table resolves; spark-model never launches them under
-// cfg!(atlas_scale) (inkling2/moe_ops.rs routes prefill rows to the grouped GEMVs).
+// strix-hip target ships its own WMMA inkling2_moe_gemm.cu (same stem, shadows this
+// file); these stubs only keep any other AMD build that links this file resolvable.
 extern "C" __global__ void inkling2_moe_gemm_nvfp4() { __builtin_trap(); }
 extern "C" __global__ void inkling2_moe_tiles() { __builtin_trap(); }
 extern "C" __global__ void inkling2_moe_gemm_w4a4() { __builtin_trap(); }

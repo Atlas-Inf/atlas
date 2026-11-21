@@ -1,12 +1,15 @@
 # Thinking Machines Inkling 2 Mini (`model_type: inkling2_loop`), Strict, on AMD
 # Strix Halo (gfx1151). The model, its Rust layer and its kernels are the gb10 target's
 # (kernels/gb10/inkling-2-mini, see its MODEL.toml); this target's `nvfp4/` links those
-# .cu files. Their tensor-core / block-scaled MMA kernels (flash prefill, fused message
-# gates, grouped expert GEMMs, the W4A4 / W8A8 activation quantizers) compile to stubs
-# on AMD, and spark-model routes around them under cfg!(atlas_scale): the per-head
-# paged prefill body (common/prefill_paged_compute.cuh with the Inkling bias and
-# per-row sinks), the two-kernel message gates, and the grouped expert GEMVs over BF16
-# rows for every row count. No kernel_source: the rest is strix-hip/common.
+# .cu files, except inkling2_moe_gemm.cu: its own WMMA port of the BF16-row grouped expert
+# GEMM and the dense NVFP4 GEMM (same entry points and numerics). The other tensor-core /
+# block-scaled kernels (flash prefill, fused message gates, the W4A4 / W8A8 expert GEMMs and
+# their activation quantizers) compile to stubs on AMD, and spark-model routes around them
+# under cfg!(atlas_scale): the per-head paged prefill body (strix-hip/common/
+# prefill_paged_compute.cuh with the Inkling bias and per-row sinks), the two-kernel message
+# gates, and BF16 expert rows in prefill (gb10 Strict quantizes them to the checkpoint's
+# declared NVFP4 / MXFP8 inputs; decode keeps BF16 rows on both). No kernel_source: the rest
+# is strix-hip/common.
 
 [model]
 name = "inkling-2-mini"

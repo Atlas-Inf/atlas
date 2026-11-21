@@ -190,9 +190,7 @@ impl Inkling2Layer {
                 gate_softcap: p.gate_softcap,
                 up_softcap: p.up_softcap,
             };
-            // AMD (strix-hip): the grouped GEMMs are mma.sync / block-scaled MMA PTX (stubs
-            // there); the grouped GEMVs take any row count.
-            if !cfg!(atlas_scale) && n >= ops::MOE_GROUPED_MIN_ROWS {
+            if n >= ops::MOE_GROUPED_MIN_ROWS {
                 ops::moe_prefill(gpu, &self.k, &args, stream)?;
             } else {
                 ops::moe_batched(gpu, &self.k, &args, stream)?;

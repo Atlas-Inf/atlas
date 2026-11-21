@@ -114,25 +114,6 @@ impl GlueKernels {
                 };
                 ops::w4a16_gemv_batchm(gpu, kernel, x, &q, y, rows as u32, n as u32, k as u32, s)
             }
-            // AMD (strix-hip): `inkling2_gemm_nvfp4` is mma.sync PTX (a stub there); the
-            // 16-row batched GEMV over consecutive row groups instead.
-            Linear::Nvfp4(q) if cfg!(atlas_scale) => {
-                for r0 in (0..rows).step_by(16) {
-                    let m = (rows - r0).min(16);
-                    ops::w4a16_gemv_batchm(
-                        gpu,
-                        self.w4a16_gemv_b16,
-                        x.offset(r0 * k * 2),
-                        &q,
-                        y.offset(r0 * n * 2),
-                        m as u32,
-                        n as u32,
-                        k as u32,
-                        s,
-                    )?;
-                }
-                Ok(())
-            }
             // this target's tensor-core tile (BF16 activations, weights dequantised to BF16)
             Linear::Nvfp4(q) => KernelLaunch::new(gpu, self.gemm_nvfp4)
                 .grid([(n as u32).div_ceil(128), (rows as u32).div_ceil(128), 1])
