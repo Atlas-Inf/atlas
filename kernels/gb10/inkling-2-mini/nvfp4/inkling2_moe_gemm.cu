@@ -18,6 +18,17 @@
 // grouped grid (N / 128, ceil(max rows of an expert / tile rows), E), block 256.
 
 #include "../../common/atlas_pdl.cuh"
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+// AMD (strix-hip): these kernels are mma.sync / cp.async / block-scaled MMA PTX. The
+// symbols exist so the kernel table resolves; spark-model never launches them under
+// cfg!(atlas_scale) (inkling2/moe_ops.rs routes prefill rows to the grouped GEMVs).
+extern "C" __global__ void inkling2_moe_gemm_nvfp4() { __builtin_trap(); }
+extern "C" __global__ void inkling2_moe_tiles() { __builtin_trap(); }
+extern "C" __global__ void inkling2_moe_gemm_w4a4() { __builtin_trap(); }
+extern "C" __global__ void inkling2_moe_gemm_w8a8() { __builtin_trap(); }
+extern "C" __global__ void inkling2_moe_gemm_mxfp8() { __builtin_trap(); }
+extern "C" __global__ void inkling2_gemm_nvfp4() { __builtin_trap(); }
+#else
 #include "../../common/nvfp4_w4a4_tile.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -354,3 +365,4 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_gemm_nvfp4(
     if (m0 >= (int)M) return;
     ink_gemm_tile<false, GM_FP4>(A, codes, scales, s2, C, 0, (int)M, m0, nullptr, N, K);
 }
+#endif  // AMD

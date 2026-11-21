@@ -31,11 +31,24 @@
 __device__ __constant__ float INK_E2M1[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
                                               -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+// Standard E4M3 (1-4-3, bias 7) by bit math: the AMD compat __nv_fp8_e4m3 -> float
+// decode is not the standard format (see common/dense_gemv_fp8w.cu scl_fp8).
+__device__ __forceinline__ float ink_e4m3(unsigned char b) {
+    const unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u;
+    float v;
+    if (e == 0u) v = (float)m * 0.001953125f;
+    else if (e == 15u && m == 7u) v = 0.0f;
+    else v = __uint_as_float(((e + 120u) << 23) | (m << 20));
+    return s ? -v : v;
+}
+#else
 __device__ __forceinline__ float ink_e4m3(unsigned char b) {
     __nv_fp8_e4m3 f;
     *(unsigned char*)&f = b;
     return (float)f;
 }
+#endif
 
 __device__ __forceinline__ float ink_bf(unsigned int raw, int hi) {
     return __bfloat162float(__ushort_as_bfloat16((unsigned short)(hi ? raw >> 16 : raw & 0xFFFF)));

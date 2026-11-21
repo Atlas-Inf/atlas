@@ -15,7 +15,9 @@
 // for operation.
 
 #include "../../common/atlas_pdl.cuh"
+#if !(defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__))
 #include "../../common/nvfp4_block_quant.cuh"
+#endif
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <float.h>
@@ -26,6 +28,15 @@ __device__ __forceinline__ float ink_situ(const float g, const float u, const fl
     return __bfloat162float(__float2bfloat16(v));
 }
 
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+// AMD (strix-hip): the activation quantizers are e2m1 / e4m3 cvt PTX. They feed only
+// the block-scaled W4A4 / W8A8 prefill GEMMs, which spark-model does not take under
+// cfg!(atlas_scale) (the experts take BF16 rows there, as decode does).
+extern "C" __global__ void inkling2_quant_fp4() { __builtin_trap(); }
+extern "C" __global__ void inkling2_situ_quant_fp4() { __builtin_trap(); }
+extern "C" __global__ void inkling2_quant_mxfp8() { __builtin_trap(); }
+extern "C" __global__ void inkling2_situ_quant_mxfp8() { __builtin_trap(); }
+#else
 // x's MXFP8 E4M3 code under the scale of its 32-value block (absolute max `amax`):
 // the power of two at or above amax / 448; `e` its UE8M0 exponent.
 __device__ __forceinline__ unsigned int ink_mxfp8(const float x, const float amax, unsigned int& e) {
@@ -222,6 +233,8 @@ extern "C" __global__ void inkling2_situ_quant_mxfp8(const __nv_bfloat16* __rest
     const __nv_bfloat162 p = ((const __nv_bfloat162*)(gu + r * 2 * I))[i];
     ink_store_mxfp8(ink_situ(__low2float(p), __high2float(p), cg, cu), q, s, r * I + i);
 }
+
+#endif  // AMD
 
 // act[r, i] = BF16(tanh(g / cg) * cg * sigmoid(g) * tanh(u / cu) * cu) with g = gu[r, 2i],
 // u = gu[r, 2i + 1] (the checkpoint's interleaved w13 rows, so the grouped GEMM output is

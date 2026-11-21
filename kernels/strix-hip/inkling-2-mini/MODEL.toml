@@ -1,0 +1,112 @@
+# Thinking Machines Inkling 2 Mini (`model_type: inkling2_loop`), Strict, on AMD
+# Strix Halo (gfx1151). The model, its Rust layer and its kernels are the gb10 target's
+# (kernels/gb10/inkling-2-mini, see its MODEL.toml); this target's `nvfp4/` links those
+# .cu files. Their tensor-core / block-scaled MMA kernels (flash prefill, fused message
+# gates, grouped expert GEMMs, the W4A4 / W8A8 activation quantizers) compile to stubs
+# on AMD, and spark-model routes around them under cfg!(atlas_scale): the per-head
+# paged prefill body (common/prefill_paged_compute.cuh with the Inkling bias and
+# per-row sinks), the two-kernel message gates, and the grouped expert GEMVs over BF16
+# rows for every row count. No kernel_source: the rest is strix-hip/common.
+
+[model]
+name = "inkling-2-mini"
+hf_id = "thinkingmachines/Inkling-2-Mini"
+model_type = "inkling2_loop"
+architecture = "Looped hybrid sliding/full attention MoE (no RoPE, relative bias, block attention residuals)"
+parameters = "26.4B-A3.4B"
+layers_total = 48
+layers_sliding_attention = 40
+layers_full_attention = 8
+layer_pattern = "24 physical layers (5 sliding + 1 full, x4); layers 6-17 run three times"
+hidden_dim = 2304
+head_dim = 128
+q_heads = 24
+kv_heads = 8
+moe_experts = 128
+moe_topk = 8
+moe_intermediate = 1152
+moe_scoring_func = "sigmoid"
+moe_routing_bias = true
+vocab_size = 201024
+max_position_embeddings = 1048576
+sliding_window = 1024
+vision = false
+mtp_layers = 0
+
+# Neutral presets until the release's own defaults are wired; request values win.
+[sampling.thinking_text]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.thinking_coding]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.non_thinking]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.tools]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[behavior]
+enable_think_loop_watchdog = false
+honor_eos_inside_thinking = true
+confidence_early_stop = false
+rollback_resteer = false
+thinking_in_tools = true
+cap_thinking_at_max_tokens = false
+# Inkling reasons by default: an effort-silent request renders the template's
+# own default effort (0.9), as transformers does.
+thinking_default = true
+verbatim_prompt = true
+default_kv_dtype = "bf16"
+use_sampling_presets_for_core = true
+disable_cwd_hint_injection = true
+# Inkling calls tools in its own JSON blocks (spark-server inkling_turn.rs maps
+# them to Hermes after generation); a Hermes grammar would force a format the
+# checkpoint never emits.
+disable_tool_grammar = true
+# 2026-11-21 RigMark (Strict, temp 0): the stream loop guard ended a Go answer
+# with table-driven tests at 2,982 tokens (a 30-character phrase seen four
+# times, reported as `length`). As on SparkQwen/SparkGLM, a loop runs to the
+# request's max_tokens; clients bound it there.
+enable_loop_watchdog = false
+enable_stream_loop_guards = false
+
+[[model_types]]
+model_type = "inkling2_loop"
+hidden_size = 2304
+
+# Probed at model build for dense NVFP4 FFNs, which Inkling has none of (its
+# MoE runs this target's own stacked-expert kernels).
+[expected_absent.w4a16]
+w4a16_gemm_t_p3 = "3-deep pipeline twin shipped only in qwen3.6-27b's shadow; probed by the model build, never dispatched for Inkling (no dense NVFP4 FFN)."
+fp8_gemm_t_row_scaled = "FP8 drafter twin of the DFlash head (ATLAS_DFLASH_FP8 drafters only); the Inkling 2 DSpark drafter is BF16 with NVFP4 layer twins."
+fp8_gemm_t_row_scaled_m16 = "Small-M FP8 drafter head GEMM (DflashQuantization::Fp8Weights only); never dispatched for the BF16 Inkling 2 DSpark drafter."

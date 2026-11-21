@@ -35,6 +35,9 @@
 // Expects the including file to define:
 //   LOAD_KV_TILE(cache, block_table, smem, kv_start, kv_len, kv_head, tid, stride)
 //   KERNEL_NAME, K_CACHE_TYPE, V_CACHE_TYPE, KERNEL_EXTRA_PARAMS, KERNEL_PREAMBLE
+// Optional (Inkling 2, as kernels/gb10/common/prefill_paged_compute.cuh): INKLING2_PREFILL_BIAS
+// adds rel_bias[row][head][query - key] (params rel_bias, rel_extent) to the 32-row body's
+// scores; INKLING2_ROW_SINKS reads its sinks per query row.
 //   (optionally PREFILL_BATCHED)
 
 #include <cuda_bf16.h>
@@ -372,6 +375,13 @@ extern "C" __global__ void KERNEL_NAME(
                 float s = smem_S[r][c] * inv_sqrt_d;
                 unsigned int kpos = kv_start + c;
                 bool masked = (c >= kv_tile_len) || !row_valid;
+#ifdef INKLING2_PREFILL_BIAS
+                // Inkling 2 (kernels/gb10/inkling-2-mini): additive relative bias
+                // rel_bias[row][q_head][dist] for 0 <= dist = query - key < rel_extent,
+                // after the scale as on gb10 (masked keys are overwritten below).
+                if (row_valid && qr >= kpos && qr - kpos < rel_extent)
+                    s += __bfloat162float(rel_bias[((unsigned long long)(q_start + r) * num_q_heads + q_head) * rel_extent + (qr - kpos)]);
+#endif
                 if (s_end >= 0) {
                     // Prefix-bidirectional: state rows see the state, question rows see all.
                     const unsigned int lim = (qr < (unsigned int)s_end) ? (unsigned int)s_end : kv_len;
@@ -479,7 +489,12 @@ extern "C" __global__ void KERNEL_NAME(
     // same C-fragment map the PV loop uses (row = pv_warp_m + 2*e + lane_hi).
     if (sinks != nullptr) {
         if (tid < BR) {
+#ifdef INKLING2_ROW_SINKS
+            // Inkling 2: one sink logit per (query row, head), sinks [q_len, num_q_heads]
+            float sg = __bfloat162float(sinks[(unsigned long long)min(q_start + tid, q_len_eff - 1) * num_q_heads + q_head]);
+#else
             float sg = __bfloat162float(sinks[q_head]);
+#endif
             float m = smem_ml[tid][0], l = smem_ml[tid][1];
             float mn = fmaxf(m, sg);
             float eo = sw_exp(m - mn);

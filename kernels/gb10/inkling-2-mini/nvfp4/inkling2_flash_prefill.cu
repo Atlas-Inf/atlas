@@ -15,6 +15,11 @@
 //
 // grid (num_kv_heads, ceil(q_len / 64)), block 384. HDIM 128, group 3.
 
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+// AMD (strix-hip): mma.sync / cp.async / ldmatrix PTX. Never launched under
+// cfg!(atlas_scale): inkling2/attn_ops.rs takes inkling2_prefill_attn instead.
+extern "C" __global__ void inkling2_flash_prefill() { __builtin_trap(); }
+#else
 #include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
@@ -275,3 +280,4 @@ extern "C" __global__ void __launch_bounds__(FP_THREADS, 1) inkling2_flash_prefi
             *(__nv_bfloat162*)&O[(unsigned long long)r1 * os + col] = __floats2bfloat162_rn(acc[d][2] * inv1, acc[d][3] * inv1);
     }
 }
+#endif  // AMD
