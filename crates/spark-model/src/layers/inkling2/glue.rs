@@ -29,7 +29,7 @@ pub(crate) struct GlueKernels {
     pub kv_write: KernelHandle,
     /// Spark NVFP4 projections: one row, many rows
     pub w4a16_gemv: KernelHandle,
-    pub w4a16_gemm: KernelHandle,
+    pub gemm_nvfp4: KernelHandle,
 }
 
 impl GlueKernels {
@@ -46,7 +46,7 @@ impl GlueKernels {
             topk: gpu.kernel("moe_topk_sig", "moe_topk_sigmoid_batched_f32")?,
             kv_write: gpu.kernel("reshape_and_cache", "reshape_and_cache_flash")?,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
-            w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
+            gemm_nvfp4: gpu.kernel("inkling2_moe_gemm", "inkling2_gemm_nvfp4")?,
         })
     }
 }
@@ -81,7 +81,7 @@ impl GlueKernels {
 
     /// `y[rows, n] = x[rows, k] W[n, k]^T`, BF16 out: a BF16 weight through
     /// the dense GEMV / BF16 GEMM, a Spark NVFP4 one through `w4a16_gemv` /
-    /// `w4a16_gemm` (BF16 activations either way).
+    /// `inkling2_gemm_nvfp4` (BF16 activations either way).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn proj(
         &self,
@@ -100,17 +100,19 @@ impl GlueKernels {
             Linear::Nvfp4(q) if rows == 1 => {
                 ops::w4a16_gemv(gpu, self.w4a16_gemv, x, &q, y, n as u32, k as u32, s)
             }
-            Linear::Nvfp4(q) => ops::w4a16_gemm(
-                gpu,
-                self.w4a16_gemm,
-                x,
-                &q,
-                y,
-                rows as u32,
-                n as u32,
-                k as u32,
-                s,
-            ),
+            // this target's tensor-core tile (BF16 activations, weights dequantised to BF16)
+            Linear::Nvfp4(q) => KernelLaunch::new(gpu, self.gemm_nvfp4)
+                .grid([(n as u32).div_ceil(128), (rows as u32).div_ceil(64), 1])
+                .block([256, 1, 1])
+                .arg_ptr(x)
+                .arg_ptr(q.weight)
+                .arg_ptr(q.weight_scale)
+                .arg_f32(q.weight_scale_2)
+                .arg_ptr(y)
+                .arg_u32(rows as u32)
+                .arg_u32(n as u32)
+                .arg_u32(k as u32)
+                .launch(s),
         }
     }
 

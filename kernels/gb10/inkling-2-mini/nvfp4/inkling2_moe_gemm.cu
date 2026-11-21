@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Inkling 2 grouped expert GEMM for prefill rows: C[m, n] = sum_k A[row(m), k] * W_e[n, k]
+// Inkling 2 NVFP4 GEMMs for prefill rows: the grouped expert GEMM C[m, n] = sum_k A[row(m), k] * W_e[n, k]
 // for the rows m of each expert e (the moe_sort_by_expert order), W_e read straight from
 // the checkpoint's stacked NVFP4 tensor (codes [E, N, K/2], even element in the low nibble;
 // E4M3 scales [E, N, K/16]; per-expert global s2[e]). Each 32-wide K step of W is
@@ -11,7 +11,8 @@
 // Tile 64 rows x 128 outputs, 256 threads (8 warps as 2 x 4, 32 x 32 each), K step 32,
 // cp.async double buffering of the activation rows and the raw codes. Rows are gathered
 // through `rows` (sorted -> source row) or taken in order when it is NULL.
-// grid (N / 128, ceil(max rows of an expert / 64), E), block 256.
+// The dense entry runs the same tile for one NVFP4 projection (Spark mode's attention).
+// grouped grid (N / 128, ceil(max rows of an expert / 64), E), block 256.
 
 #include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
@@ -40,35 +41,21 @@ __device__ __forceinline__ void ink_mma(float* c, const unsigned int* a, const u
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
-extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4(
-    const __nv_bfloat16* __restrict__ A,       // [source rows, K]
-    const unsigned char* __restrict__ codes,   // [E, N, K/2]
-    const unsigned char* __restrict__ scales,  // [E, N, K/16]
-    const float* __restrict__ s2,              // [E]
-    __nv_bfloat16* __restrict__ C,             // [sorted rows, N]
-    const int* __restrict__ offsets,           // [E + 1]
-    const int* __restrict__ rows,              // [sorted rows] -> source row, or NULL
-    const unsigned int N,
-    const unsigned int K
+// One 64 x 128 tile of rows m_start + m0 .. of `C` against one NVFP4 weight [N, K/2]
+// (codes wc, scales ws, global g).
+__device__ __forceinline__ void ink_gemm_tile(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ wc,
+    const unsigned char* __restrict__ ws, const float g, __nv_bfloat16* __restrict__ C,
+    const int m_start, const int m_count, const int m0, const int* __restrict__ rows,
+    const unsigned int N, const unsigned int K
 ) {
-    atlas_pdl_enter();
     __shared__ __align__(16) __nv_bfloat16 As[2][GM][GSTRIDE];
     __shared__ __align__(16) __nv_bfloat16 Bs[2][GN][GSTRIDE];
     __shared__ __align__(16) unsigned char Braw[2][GN][16];
     __shared__ float lut[16];
-
-    const unsigned int e = blockIdx.z;
-    const int m_start = offsets[e], m_count = offsets[e + 1] - m_start;
-    const int m0 = blockIdx.y * GM;
-    if (m0 >= m_count) return;
     const unsigned int n0 = blockIdx.x * GN;
     const unsigned int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
     if (tid < 16) lut[tid] = INK_GEMM_E2M1[tid];
-
-    const unsigned long long ne = (unsigned long long)e * N;
-    const unsigned char* wc = codes + ne * (K / 2);
-    const unsigned char* ws = scales + ne * (K / 16);
-    const float g = s2[e];
 
     // this thread's activation chunk: row tid / 4, 16 bytes (8 values) at (tid % 4) * 8
     const int a_row = tid / 4, a_col = (tid % 4) * 8;
@@ -166,4 +153,38 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4(
                 *(__nv_bfloat162*)&C[(unsigned long long)(m_start + r0 + 8) * N + c] = __floats2bfloat162_rn(acc[i][j][2], acc[i][j][3]);
         }
     }
+}
+
+// Routed experts: blockIdx.z is the expert; its rows are offsets[e] .. offsets[e + 1].
+extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4(
+    const __nv_bfloat16* __restrict__ A,       // [source rows, K]
+    const unsigned char* __restrict__ codes,   // [E, N, K/2]
+    const unsigned char* __restrict__ scales,  // [E, N, K/16]
+    const float* __restrict__ s2,              // [E]
+    __nv_bfloat16* __restrict__ C,             // [sorted rows, N]
+    const int* __restrict__ offsets,           // [E + 1]
+    const int* __restrict__ rows,              // [sorted rows] -> source row, or NULL
+    const unsigned int N,
+    const unsigned int K
+) {
+    atlas_pdl_enter();
+    const unsigned int e = blockIdx.z;
+    const int m_start = offsets[e], m_count = offsets[e + 1] - m_start;
+    const int m0 = blockIdx.y * GM;
+    if (m0 >= m_count) return;
+    const unsigned long long ne = (unsigned long long)e * N;
+    ink_gemm_tile(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K);
+}
+
+// A dense NVFP4 projection (ModelOpt codes [N, K/2], E4M3 scales [N, K/16], scalar
+// global) of M BF16 rows: C [M, N] = A [M, K] W^T. grid (N / 128, ceil(M / 64)), block 256.
+extern "C" __global__ void __launch_bounds__(256) inkling2_gemm_nvfp4(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales, const float s2, __nv_bfloat16* __restrict__ C,
+    const unsigned int M, const unsigned int N, const unsigned int K
+) {
+    atlas_pdl_enter();
+    const int m0 = blockIdx.y * GM;
+    if (m0 >= (int)M) return;
+    ink_gemm_tile(A, codes, scales, s2, C, 0, (int)M, m0, nullptr, N, K);
 }
