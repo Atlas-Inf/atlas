@@ -21,6 +21,9 @@ pub(crate) struct GlueKernels {
     pub f32_to_bf16: KernelHandle,
     /// `dense_gemv_bf16`: y[N] = W[N, K] x[K], BF16
     pub dense_gemv: KernelHandle,
+    /// AMD (strix-hip): `dense_gemv_bf16_batchm`, a decode batch / verify block of up to 8
+    /// rows of a BF16 projection reading the weight once (NULL elsewhere)
+    pub dense_gemv_batchm: KernelHandle,
     /// `dense_gemv_bf16_fp32out`: one row of router logits
     pub dense_gemv_f32: KernelHandle,
     /// `moe_topk_sigmoid_batched_f32`
@@ -44,6 +47,11 @@ impl GlueKernels {
             layer_out: m("inkling2_layer_out")?,
             f32_to_bf16: m("inkling2_f32_to_bf16")?,
             dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            dense_gemv_batchm: if cfg!(atlas_scale) {
+                gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?
+            } else {
+                KernelHandle(0)
+            },
             dense_gemv_f32: gpu.kernel("gemv", "dense_gemv_bf16_fp32out")?,
             topk: gpu.kernel("moe_topk_sig", "moe_topk_sigmoid_batched_f32")?,
             kv_write: gpu.kernel("reshape_and_cache", "reshape_and_cache_flash")?,
@@ -101,6 +109,20 @@ impl GlueKernels {
     ) -> Result<()> {
         match w {
             Linear::Bf16(w) if rows == 1 => self.gemv_with(gpu, self.dense_gemv, x, w, y, n, k, s),
+            // AMD (strix-hip): a verify block / decode batch of up to 8 rows reads the BF16
+            // weight once in the row-batched GEMV; hipBLASLt's small-M tile took ~1.75x the
+            // weight-read time there (f352: 81.7 us vs 46.8 us for one row of the same weight).
+            Linear::Bf16(w) if cfg!(atlas_scale) && rows <= 8 => KernelLaunch::new(gpu, self.dense_gemv_batchm)
+                .grid([(n as u32).div_ceil(4), 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(x)
+                .arg_ptr(w.0)
+                .arg_ptr(y)
+                .arg_u32(rows as u32)
+                .arg_u32(n as u32)
+                .arg_u32(k as u32)
+                .arg_u32(n as u32)
+                .launch(s),
             Linear::Bf16(w) => ops::bf16_gemm(x, w.0, y, rows as u32, n as u32, k as u32, s),
             Linear::Nvfp4(q) if rows == 1 => {
                 ops::w4a16_gemv(gpu, self.w4a16_gemv, x, &q, y, n as u32, k as u32, s)
