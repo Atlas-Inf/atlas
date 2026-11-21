@@ -6,7 +6,7 @@ use spark_runtime::{
     kernel_args::KernelLaunch,
 };
 
-pub const MAX_ROWS: usize = 128;
+pub const MAX_ROWS: usize = 256;
 
 pub(crate) fn gemm(
     gpu: &dyn GpuBackend,
