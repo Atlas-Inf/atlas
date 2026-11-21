@@ -33,12 +33,20 @@ pub(crate) struct Dims {
     pub max_seqs: usize,
     /// Visits (layers the engine sees), one state table each.
     pub visits: usize,
+    /// Short-conv width (a visit's conv state keeps `conv_k - 1` columns).
+    pub conv_k: usize,
 }
 
 impl Dims {
     /// Elements between two blocks of the stack (block-major `[block, row, H]`).
     pub(crate) fn block_stride(&self) -> usize {
         self.max_rows * self.hidden
+    }
+
+    /// One visit's conv state: k, v, post-attention and post-MLP convs,
+    /// `[channels, conv_k - 1]` fp32 each.
+    pub(crate) fn conv_state_bytes(&self) -> usize {
+        (2 * self.kv_dim + 2 * self.hidden) * (self.conv_k - 1) * 4
     }
 }
 
@@ -101,6 +109,8 @@ pub(crate) struct Shared {
     pub block_table: DevicePtr,
     /// `[visits, max_seqs]` conv-state base pointers, a visit's own row each
     pub state_tables: DevicePtr,
+    /// The conv state of every graph-padding row (written, never read)
+    pub pad_conv: DevicePtr,
 }
 
 /// Carves one allocation into 256-byte aligned pieces.
@@ -178,6 +188,7 @@ impl Shared {
             slots: a.take(r * 8),
             block_table: a.take(d.max_seqs * d.max_blocks_per_seq * 4),
             state_tables: a.take(d.visits * d.max_seqs * 8),
+            pad_conv: a.take(d.conv_state_bytes()),
         }
     }
 

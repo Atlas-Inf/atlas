@@ -212,6 +212,22 @@ impl TransformerModel {
                     stream,
                 )?,
             }
+        } else if self.batched_head_gemv(padded_n) {
+            // One pass over the BF16 head for every row: on Inkling 2's
+            // 201K x 2304 head `dense_gemm` took 11.4 ms at 2 rows (2026-11-21
+            // nsys, GB10) for bytes a GEMV reads in ~3.6 ms.
+            ops::dense_gemv_batchm(
+                self.gpu.as_ref(),
+                self.dense_gemv_batchm_kernel,
+                normed,
+                &self.lm_head_weight,
+                logits,
+                padded_n as u32,
+                v as u32,
+                h as u32,
+                v as u32,
+                stream,
+            )?;
         } else {
             ops::dense_gemm(
                 self.gpu.as_ref(),
@@ -226,6 +242,15 @@ impl TransformerModel {
             )?;
         }
         Ok(logits)
+    }
+
+    /// Whether a batched BF16 head of `rows` rows runs the batch GEMV (one
+    /// weight pass, at most 8 rows) instead of the tile GEMM. Inkling 2 only:
+    /// the other models keep the path they were measured on.
+    fn batched_head_gemv(&self, rows: usize) -> bool {
+        self.config.model_type == "inkling2_loop"
+            && self.dense_gemv_batchm_kernel.0 != 0
+            && (1..=ops::DENSE_GEMV_BATCHM_MAX_M as usize).contains(&rows)
     }
 }
 

@@ -59,6 +59,9 @@ impl Inkling2Layer {
             debug::dump(gpu, hidden, batch, h, u32::MAX, stream)?;
         }
         let states = self.bind_states(gpu, conv_states, ctx.graph_capture, stream)?;
+        if let Some(j) = batch.journal {
+            gpu.copy_d2d_async(conv_states[0], j, self.conv_state_bytes(), stream)?;
+        }
         if v.restart {
             // the previous pass: its blocks after the prelude's and its own first push,
             // and its output (this visit's input); then back to the prelude's output
@@ -212,6 +215,7 @@ impl Inkling2Layer {
         // each state: k, v, post-attention, post-MLP convs (fp32 elements)
         let kvs = d.kv_dim * (p.conv_k - 1);
         let hs = h * (p.conv_k - 1);
+        self.journal_inputs(gpu, batch, [s.k_lin, s.v_lin], 0, stream)?;
         self.conv(
             gpu, n, seqs, s.k_lin, s.kc, states, 0, w.k_conv, s.dyn_k, d.kv_dim, p.head_dim, stream,
         )?;
@@ -344,6 +348,7 @@ impl Inkling2Layer {
         }
         gm.gate_mul(gpu, s.attn, s.gate, s.gated, n * d.q_dim, stream)?;
         gm.proj(gpu, n, s.gated, w.wo, s.proj, h, d.q_dim, stream)?;
+        self.journal_inputs(gpu, batch, [s.proj], 2, stream)?;
         self.conv(
             gpu,
             n,
@@ -427,6 +432,7 @@ impl Inkling2Layer {
             stream,
         )?;
         self.routed_experts(gpu, n, stream)?;
+        self.journal_inputs(gpu, batch, [s.moe_out], 3, stream)?;
         self.conv(
             gpu,
             n,

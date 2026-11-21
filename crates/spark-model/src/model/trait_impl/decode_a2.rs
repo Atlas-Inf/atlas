@@ -279,7 +279,7 @@ impl TransformerModel {
         let layer_veto = self
             .layers
             .iter()
-            .any(|l| l.batched_decode_graph_unsupported());
+            .any(|l| l.multi_seq_decode_graph_unsupported());
         let (glm_dynamic, glm_graphs_ok) = self.glm_multiseq_graph_gate()?;
         let graph_key = if glm_graphs_ok
             && !ms_profile
@@ -378,6 +378,15 @@ impl TransformerModel {
 
         // 1d. Upload metadata with fixed stride (active + padding)
         let metadata = self.upload_batch_metadata_fixed(seqs, dispatch_n, &mut kv_cache, stream)?;
+
+        // 1e. Per-sequence state tables the captured kernels read
+        for (li, layer) in self.layers.iter().enumerate() {
+            let mut states: Vec<&mut dyn LayerState> = seqs
+                .iter_mut()
+                .map(|s| s.layer_states[li].as_mut() as &mut dyn LayerState)
+                .collect();
+            layer.multi_seq_prestage(&mut states, dispatch_n, self.gpu.as_ref(), stream)?;
+        }
 
         let ctx = ForwardContext {
             ssm_batch,
@@ -500,7 +509,7 @@ impl TransformerModel {
                         }));
                         ssm_idx += 1;
                     } else {
-                        dummy.push(layer.alloc_state(self.gpu.as_ref())?);
+                        dummy.push(layer.padding_state(self.gpu.as_ref())?);
                     }
                 }
                 all_layer_states.push(dummy);

@@ -56,6 +56,7 @@ fn dims(config: &ModelConfig, stack_blocks: usize, max_rows: usize, max_seqs: us
         max_rows,
         max_seqs,
         visits: config.num_hidden_layers,
+        conv_k: ink.sconv_kernel_size,
     }
 }
 
@@ -190,7 +191,8 @@ impl ModelWeightLoader for Inkling2WeightLoader {
             config,
             max_blocks(&schedule(ink)),
             max_tokens.max(1),
-            max_seqs.max(1),
+            // batched decode pads its rows up the graph ladder
+            spark_runtime::buffers::padded_batch_rung(max_seqs.max(1)),
         );
         let shared = Shared::alloc(gpu, &d)?;
         for (i, layer) in layers.iter_mut().enumerate() {

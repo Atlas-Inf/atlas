@@ -10,13 +10,13 @@
 use std::any::Any;
 use std::sync::Mutex;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::batch::Batch;
 use super::glue::GlueKernels;
-use super::ops::Inkling2Kernels;
+use super::ops::{self, Inkling2Kernels};
 use super::schedule::Visit;
 use super::shared::{Dims, Shared};
 use super::weights::{GlobalWeights, PhysicalWeights};
@@ -47,6 +47,14 @@ pub(crate) struct Params {
 /// convs, `[channels, k - 1]` fp32 each.
 pub(crate) struct Inkling2SeqState {
     pub conv: DevicePtr,
+    /// Verify journal: the conv state before the last verify, then that
+    /// verify's conv inputs (k, v, post-attention, post-MLP), so a rejected
+    /// tail can be rolled back.
+    pub journal: DevicePtr,
+    /// Rows the journal holds for the last verify (0 = none).
+    pub journal_rows: usize,
+    /// A graph-padding row's state: the shared pad buffer, owned by no one.
+    pub pad: bool,
 }
 
 impl LayerState for Inkling2SeqState {
@@ -75,17 +83,67 @@ pub(crate) struct Inkling2Layer {
 }
 
 impl Inkling2Layer {
-    fn conv_state_bytes(&self) -> usize {
-        (2 * self.dims.kv_dim + 2 * self.dims.hidden) * (self.p.conv_k - 1) * 4
+    pub(super) fn conv_state_bytes(&self) -> usize {
+        self.dims.conv_state_bytes()
+    }
+
+    /// Each conv's channels, its offset in the state (fp32 elements) and its
+    /// input rows' offset in the journal (bytes past the saved state).
+    pub(super) fn conv_layout(&self) -> [(usize, usize, usize); 4] {
+        let (kv, h, km1) = (self.dims.kv_dim, self.dims.hidden, self.p.conv_k - 1);
+        let rows = MAX_VERIFY_ROWS * 2;
+        [
+            (kv, 0, 0),
+            (kv, kv * km1, kv * rows),
+            (h, 2 * kv * km1, 2 * kv * rows),
+            (h, (2 * kv + h) * km1, (2 * kv + h) * rows),
+        ]
+    }
+
+    fn journal_bytes(&self) -> usize {
+        self.conv_state_bytes()
+            + MAX_VERIFY_ROWS * (2 * self.dims.kv_dim + 2 * self.dims.hidden) * 2
     }
 }
 
-fn conv_base(state: &mut dyn LayerState) -> Result<DevicePtr> {
-    Ok(state
+/// Verify rows a journal holds (a DSpark block is 8).
+pub(super) const MAX_VERIFY_ROWS: usize = 16;
+
+fn seq_state(state: &mut dyn LayerState) -> Result<&mut Inkling2SeqState> {
+    state
         .as_any_mut()
         .downcast_mut::<Inkling2SeqState>()
-        .context("inkling2 layer state")?
-        .conv)
+        .context("inkling2 layer state")
+}
+
+fn conv_base(state: &mut dyn LayerState) -> Result<DevicePtr> {
+    Ok(seq_state(state)?.conv)
+}
+
+impl Inkling2Layer {
+    /// `rows` consecutive tokens of one sequence from `seq_len`, journaled
+    /// (when it fits) so a verify's rejected rows can be rolled back.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_run(
+        &self,
+        hidden: DevicePtr,
+        rows: usize,
+        state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        block_table: &[u32],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let st = seq_state(state)?;
+        let mut batch = Batch::one(seq_len, rows, block_table);
+        st.journal_rows = 0;
+        if rows <= MAX_VERIFY_ROWS {
+            batch.journal = Some(st.journal);
+            st.journal_rows = rows;
+        }
+        self.forward(hidden, &batch, &[st.conv], kv_cache, ctx, stream)
+    }
 }
 
 impl TransformerLayer for Inkling2Layer {
@@ -140,18 +198,59 @@ impl TransformerLayer for Inkling2Layer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let batch = Batch::one(seq_len, num_tokens, block_table);
-        self.forward(hidden, &batch, &[conv_base(state)?], kv_cache, ctx, stream)
+        self.verify_run(hidden, num_tokens, state, kv_cache, seq_len, block_table, ctx, stream)
     }
 
-    /// One token each of `active_seqs` sequences (rows past them are graph
-    /// padding, which this eager layer never sees used).
+    /// Keep the first `num_accepted` of the last verify's `k` rows in the conv
+    /// states: restore the journaled state and replay the accepted rows.
+    fn rollback_aux_verify(
+        &self,
+        state: &mut dyn LayerState,
+        num_accepted: usize,
+        k: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let st = seq_state(state)?;
+        if num_accepted >= k {
+            st.journal_rows = 0;
+            return Ok(());
+        }
+        ensure!(
+            st.journal_rows == k,
+            "inkling2 visit {}: no journal for a {k}-row verify (have {})",
+            self.visit_idx,
+            st.journal_rows
+        );
+        gpu.copy_d2d_async(st.journal, st.conv, self.conv_state_bytes(), stream)?;
+        if num_accepted > 0 {
+            let inputs = st.journal.offset(self.conv_state_bytes());
+            for (channels, state_off, journal_off) in self.conv_layout() {
+                ops::sconv_rewind(
+                    gpu,
+                    &self.k,
+                    inputs.offset(journal_off),
+                    st.conv.offset(state_off * 4),
+                    channels,
+                    self.p.conv_k,
+                    num_accepted,
+                    stream,
+                )?;
+            }
+        }
+        st.journal_rows = 0;
+        Ok(())
+    }
+
+    /// One token each of `num_seqs` rows: `active_seqs` sequences, then graph
+    /// padding (the model's seq_len 0, dummy block and pad state), so a graph
+    /// of this width replays for any batch that pads to it.
     fn decode_multi_seq<'a, 'b: 'a>(
         &self,
         hidden: DevicePtr,
         _residual: DevicePtr,
-        _num_seqs: usize,
-        active_seqs: usize,
+        num_seqs: usize,
+        _active_seqs: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         kv_cache: &mut PagedKvCache,
         seq_lens: &[usize],
@@ -160,34 +259,44 @@ impl TransformerLayer for Inkling2Layer {
         stream: u64,
     ) -> Result<()> {
         let batch = Batch {
-            seqs: (0..active_seqs)
+            seqs: (0..num_seqs)
                 .map(|i| (seq_lens[i], block_tables[i].as_slice()))
                 .collect(),
             rows_per_seq: 1,
+            journal: None,
         };
-        let bases = states[..active_seqs]
+        let bases = states[..num_seqs]
             .iter_mut()
             .map(|s| conv_base(&mut **s))
             .collect::<Result<Vec<_>>>()?;
         self.forward(hidden, &batch, &bases, kv_cache, ctx, stream)
     }
 
-    /// The default would run each row with a throwaway state, losing the conv
-    /// history; verify rows wait for the DSpark drafter.
+    /// The verify rows of one sequence run as [`Self::decode_batched`] does
+    /// (the default would give each row a throwaway state, losing the conv
+    /// history). Rows of several sequences are not supported yet.
     fn decode_multi_seq_rows<'a, 'b: 'a>(
         &self,
-        _hidden: DevicePtr,
+        hidden: DevicePtr,
         _residual: DevicePtr,
-        _num_rows: usize,
-        _seq_states: &'a mut [&'b mut (dyn LayerState + 'static)],
-        _row_owner: &[usize],
-        _kv_cache: &mut PagedKvCache,
-        _seq_lens: &[usize],
-        _block_tables: &[Vec<u32>],
-        _ctx: &ForwardContext,
-        _stream: u64,
+        num_rows: usize,
+        seq_states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        row_owner: &[usize],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
     ) -> Result<()> {
-        bail!("inkling2: multi-sequence verify rows are not supported yet")
+        ensure!(
+            num_rows > 0 && row_owner.len() >= num_rows && row_owner[..num_rows].iter().all(|&o| o == 0),
+            "inkling2: verify rows of several sequences are not supported yet"
+        );
+        let [state] = seq_states else {
+            bail!("inkling2: one sequence's verify rows with {} states", seq_states.len());
+        };
+        // row r sits at seq_lens[0] + r of the first row's block table
+        self.verify_run(hidden, num_rows, &mut **state, kv_cache, seq_lens[0], &block_tables[0], ctx, stream)
     }
 
     /// Bind the decode sequence's conv state into this visit's table before
@@ -209,25 +318,70 @@ impl TransformerLayer for Inkling2Layer {
         super::debug::enabled()
     }
 
-    /// Batched decode and verify graphs would bake one batch's state tables,
-    /// and their keys do not change with the batch's sequences here.
+    /// Verify graphs would bake one batch's state tables, and their keys do
+    /// not change with the batch's sequences here.
     fn batched_decode_graph_unsupported(&self) -> bool {
         true
+    }
+
+    /// Multi-sequence decode refreshes the tables first (`multi_seq_prestage`).
+    fn multi_seq_decode_graph_unsupported(&self) -> bool {
+        super::debug::enabled()
+    }
+
+    /// Bind the step's conv states, then the pad state up to `padded_n`.
+    fn multi_seq_prestage(
+        &self,
+        states: &mut [&mut dyn LayerState],
+        padded_n: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let mut bases = states
+            .iter_mut()
+            .map(|s| conv_base(&mut **s))
+            .collect::<Result<Vec<_>>>()?;
+        bases.resize(padded_n.max(bases.len()), self.shared.pad_conv);
+        self.bind_states(gpu, &bases, false, stream).map(|_| ())
     }
 
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
         let bytes = self.conv_state_bytes();
         let conv = gpu.alloc(bytes).context("allocate inkling2 conv state")?;
         gpu.copy_h2d(&vec![0u8; bytes], conv)?;
-        Ok(Box::new(Inkling2SeqState { conv }))
+        let journal = gpu
+            .alloc(self.journal_bytes())
+            .context("allocate inkling2 verify journal")?;
+        Ok(Box::new(Inkling2SeqState {
+            conv,
+            journal,
+            journal_rows: 0,
+            pad: false,
+        }))
+    }
+
+    /// Every padding row writes the one shared pad state.
+    fn padding_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
+        ensure!(self.shared.is_attached(), "inkling2: padding state before attach");
+        Ok(Box::new(Inkling2SeqState {
+            conv: self.shared.pad_conv,
+            journal: DevicePtr::NULL,
+            journal_rows: 0,
+            pad: true,
+        }))
     }
 
     fn free_state(&self, gpu: &dyn GpuBackend, state: &mut dyn LayerState) -> Result<()> {
         if let Some(st) = state.as_any_mut().downcast_mut::<Inkling2SeqState>()
+            && !st.pad
             && !st.conv.is_null()
         {
             gpu.free(st.conv)?;
             st.conv = DevicePtr::NULL;
+            if !st.journal.is_null() {
+                gpu.free(st.journal)?;
+                st.journal = DevicePtr::NULL;
+            }
         }
         Ok(())
     }

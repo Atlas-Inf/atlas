@@ -105,6 +105,12 @@ disable_cwd_hint_injection = true
 # them to Hermes after generation); a Hermes grammar would force a format the
 # checkpoint never emits.
 disable_tool_grammar = true
+# 2026-11-21 RigMark (Strict, temp 0): the stream loop guard ended a Go answer
+# with table-driven tests at 2,982 tokens (a 30-character phrase seen four
+# times, reported as `length`). As on SparkQwen/SparkGLM, a loop runs to the
+# request's max_tokens; clients bound it there.
+enable_loop_watchdog = false
+enable_stream_loop_guards = false
 
 [[model_types]]
 model_type = "inkling2_loop"

@@ -97,3 +97,25 @@ extern "C" __global__ void inkling2_sconv_state(
                           : old[j + n];
     }
 }
+
+// Verify rollback: one sequence's state (fp32 [C, k-1] at `state`, already restored to its
+// pre-verify value) rolled forward over the first `rows` of its journaled conv inputs
+// (BF16 [rows, C]), as inkling2_sconv_state would have. grid (ceil(C / 256)), block 256.
+extern "C" __global__ void inkling2_sconv_rewind(
+    const __nv_bfloat16* __restrict__ x,
+    float* __restrict__ state,
+    const unsigned int channels,
+    const unsigned int k,
+    const unsigned int rows
+) {
+    const unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels || rows == 0) return;
+    float* st = state + (unsigned long long)c * (k - 1);
+    float old[INK_MAX_K - 1];
+    for (unsigned int j = 0; j + 1 < k; j++) old[j] = st[j];
+    const int n = (int)rows;
+    for (unsigned int j = 0; j + 1 < k; j++) {
+        const int back = (int)(k - 1 - j);
+        st[j] = back <= n ? __bfloat162float(x[(unsigned long long)(n - back) * channels + c]) : old[j + n];
+    }
+}

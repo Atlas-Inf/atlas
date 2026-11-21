@@ -16,6 +16,8 @@ pub(super) struct Batch<'a> {
     pub seqs: Vec<(usize, &'a [u32])>,
     /// Rows of each sequence; more than one only for a single sequence.
     pub rows_per_seq: usize,
+    /// A verify run's journal (see `Inkling2SeqState::journal`).
+    pub journal: Option<DevicePtr>,
 }
 
 impl<'a> Batch<'a> {
@@ -23,6 +25,7 @@ impl<'a> Batch<'a> {
         Self {
             seqs: vec![(start, table)],
             rows_per_seq: rows,
+            journal: None,
         }
     }
 
@@ -204,12 +207,32 @@ impl Inkling2Layer {
                 "inkling2 visit {}: conv-state table changed under graph capture",
                 self.visit_idx
             );
-            // the previous forward's convs may still read the old table
-            gpu.synchronize(stream)?;
+            // stream-ordered after the previous forward's convs
             let bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_le_bytes()).collect();
-            gpu.copy_h2d(&bytes, table)?;
+            gpu.copy_h2d_async(&bytes, table, stream)?;
             *bound = ptrs;
         }
         Ok(table)
+    }
+
+    /// A verify run's conv inputs `xs` (convs `first..`) into its journal.
+    pub(super) fn journal_inputs<const N: usize>(
+        &self,
+        gpu: &dyn GpuBackend,
+        batch: &Batch<'_>,
+        xs: [DevicePtr; N],
+        first: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let Some(journal) = batch.journal else {
+            return Ok(());
+        };
+        let layout = self.conv_layout();
+        for (i, x) in xs.into_iter().enumerate() {
+            let (channels, _, off) = layout[first + i];
+            let dst = journal.offset(self.conv_state_bytes() + off);
+            gpu.copy_d2d_async(x, dst, batch.rows() * channels * 2, stream)?;
+        }
+        Ok(())
     }
 }

@@ -267,6 +267,27 @@ pub trait TransformerLayer: Send + Sync {
         self.decode_graph_unsupported()
     }
 
+    /// Like [`Self::batched_decode_graph_unsupported`], for the multi-sequence
+    /// decode graphs only (one token per sequence), which call
+    /// [`Self::multi_seq_prestage`] before every capture and replay.
+    fn multi_seq_decode_graph_unsupported(&self) -> bool {
+        self.batched_decode_graph_unsupported()
+    }
+
+    /// Host work before a multi-sequence decode step's graph capture, replay or
+    /// eager run: `states` are the step's sequences, rows past them up to
+    /// `padded_n` are graph padding. A layer whose kernels reach per-sequence
+    /// state through a device table refreshes it here. Default no-op.
+    fn multi_seq_prestage(
+        &self,
+        _states: &mut [&mut dyn LayerState],
+        _padded_n: usize,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// True when [`Self::decode_graph_unsupported`] is an indexer whose only
     /// step-dependent work, inside its inert bound, is the ingest a staged
     /// run splits off (`layers/qsa_staged.rs`): the qwen4_exp piecewise
@@ -1075,6 +1096,14 @@ pub trait TransformerLayer: Send + Sync {
     /// - `EmptyLayerState` for pure attention layers
     /// - `SsmLayerState` for SSM/recurrent layers
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>>;
+
+    /// The state of a graph-padding row of a batched step: its kernels may
+    /// write it, nothing reads it back, and it is dropped without
+    /// [`Self::free_state`]. Default: a fresh [`Self::alloc_state`], for
+    /// layers whose states own no device memory.
+    fn padding_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
+        self.alloc_state(gpu)
+    }
 
     /// Release whatever `alloc_state` allocated for ONE finished sequence.
     ///

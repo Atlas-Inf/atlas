@@ -31,6 +31,7 @@ pub(crate) struct Inkling2Kernels {
     pub rel_bias_table: KernelHandle,
     pub sconv: KernelHandle,
     pub sconv_state: KernelHandle,
+    pub sconv_rewind: KernelHandle,
     pub block_res_sums: KernelHandle,
     pub block_res_out: KernelHandle,
     pub head_norm: KernelHandle,
@@ -65,6 +66,7 @@ impl Inkling2Kernels {
             rel_bias_table: gpu.kernel("inkling2_prefill_attn", "inkling2_rel_bias_table")?,
             sconv: gpu.kernel("inkling2_sconv", "inkling2_sconv")?,
             sconv_state: gpu.kernel("inkling2_sconv", "inkling2_sconv_state")?,
+            sconv_rewind: gpu.kernel("inkling2_sconv", "inkling2_sconv_rewind")?,
             block_res_sums: gpu.kernel("inkling2_block_res", "inkling2_block_res_sums")?,
             block_res_out: gpu.kernel("inkling2_block_res", "inkling2_block_res_out")?,
             head_norm: gpu.kernel("inkling2_head_ops", "inkling2_head_norm")?,
@@ -162,6 +164,30 @@ pub(crate) fn short_conv(
         .arg_u32(u32_of(a.channels, "channels")?)
         .arg_u32(u32_of(a.k, "k")?)
         .arg_u32(u32_of(a.x_stride, "x stride")?)
+        .launch(stream)
+}
+
+/// Verify rollback of one sequence's conv state (already restored to its
+/// pre-verify value): roll it forward over the first `rows` journaled inputs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sconv_rewind(
+    gpu: &dyn GpuBackend,
+    kernels: &Inkling2Kernels,
+    inputs: DevicePtr,
+    state: DevicePtr,
+    channels: usize,
+    k: usize,
+    rows: usize,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernels.sconv_rewind)
+        .grid([u32_of(channels.div_ceil(256), "channels")?, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(inputs)
+        .arg_ptr(state)
+        .arg_u32(u32_of(channels, "channels")?)
+        .arg_u32(u32_of(k, "k")?)
+        .arg_u32(u32_of(rows, "rows")?)
         .launch(stream)
 }
 
