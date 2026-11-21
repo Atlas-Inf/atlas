@@ -110,3 +110,15 @@ hidden_size = 2304
 w4a16_gemm_t_p3 = "3-deep pipeline twin shipped only in qwen3.6-27b's shadow; probed by the model build, never dispatched for Inkling (no dense NVFP4 FFN)."
 fp8_gemm_t_row_scaled = "FP8 drafter twin of the DFlash head (ATLAS_DFLASH_FP8 drafters only); the Inkling 2 DSpark drafter is BF16 with NVFP4 layer twins."
 fp8_gemm_t_row_scaled_m16 = "Small-M FP8 drafter head GEMM (DflashQuantization::Fp8Weights only); never dispatched for the BF16 Inkling 2 DSpark drafter."
+
+# strix-hip: kernels the model build probes that strix-hip/common does not carry.
+# Every site gates on handle != 0; none is on Inkling's dispatch path.
+[expected_absent.ssm_h_dtype]
+ssm_h_state_f16_to_f32 = "FP16 SSM h-state converter (model/impl_a1.rs:573), only under ATLAS_SSM_H_FP16; Inkling has no SSM state."
+ssm_h_state_f32_to_f16 = "Same, reverse direction (impl_a1.rs:571)."
+
+[expected_absent.token_overlay]
+embed_rowdiff_bf16 = "Routed-token overlay feature (ops/token_overlay.rs:47); every hook guards kernel.0 == 0, feature unused here."
+embed_overlay_routed_bf16 = "Same feature (token_overlay.rs:48)."
+lmhead_overlay_routed_bf16 = "Same feature (token_overlay.rs:49)."
+lmhead_overlay_routed_f32 = "Same feature (token_overlay.rs:50)."
