@@ -1,0 +1,103 @@
+# Thinking Machines Inkling 2 Mini (`model_type: inkling2_loop`), Strict.
+# Work in progress: single-sequence decode (prefill runs it per token), no
+# DSpark drafter, no vision tower, no tool or reasoning parser yet.
+#
+# 24 physical layers (20 sliding-window 1024 + 4 full), the core 6-17 run
+# three times with shared weights: the engine sees 48 visits, each with its
+# own BF16 KV pool and conv state. No RoPE: a learned relative-position bias
+# and per-token sinks in attention, L2-clipped q/k, gamma-free v norm, short
+# causal convs, block attention residuals, a 128-expert top-8 sigmoid-routed
+# MoE with a softcapped SwiGLU, final logit softcap 30.
+# Checkpoint formats are kept (Strict): NVFP4 experts in layers 0-19, MXFP8 in
+# 20-23 (read from the stacked tensors by this target's own kernels), BF16
+# everything else.
+#
+# KERNELS: the compiled set is Laguna-S-2.1's (`kernel_source`): head_dim 128
+# BF16 paged attention support, BF16 KV write, dense GEMVs, sigmoid top-k.
+# This target's `nvfp4/` overlay adds the Inkling kernels (decode attention
+# with relative bias and sinks, short convs, block residuals, head epilogues,
+# loop message gates, stacked-expert MoE, glue) and the logit softcap.
+
+[model]
+name = "inkling-2-mini"
+hf_id = "thinkingmachines/Inkling-2-Mini"
+model_type = "inkling2_loop"
+architecture = "Looped hybrid sliding/full attention MoE (no RoPE, relative bias, block attention residuals)"
+parameters = "26.4B-A3.4B"
+kernel_source = "laguna-s-2.1"
+layers_total = 48
+layers_sliding_attention = 40
+layers_full_attention = 8
+layer_pattern = "24 physical layers (5 sliding + 1 full, x4); layers 6-17 run three times"
+hidden_dim = 2304
+head_dim = 128
+q_heads = 24
+kv_heads = 8
+moe_experts = 128
+moe_topk = 8
+moe_intermediate = 1152
+moe_scoring_func = "sigmoid"
+moe_routing_bias = true
+vocab_size = 201024
+max_position_embeddings = 1048576
+sliding_window = 1024
+vision = false
+mtp_layers = 0
+
+# Neutral presets until the release's own defaults are wired; request values win.
+[sampling.thinking_text]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.thinking_coding]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.non_thinking]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.tools]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[behavior]
+enable_think_loop_watchdog = false
+honor_eos_inside_thinking = true
+confidence_early_stop = false
+rollback_resteer = false
+thinking_in_tools = true
+cap_thinking_at_max_tokens = false
+thinking_default = false
+default_kv_dtype = "bf16"
+use_sampling_presets_for_core = true
+disable_cwd_hint_injection = true
+
+[[model_types]]
+model_type = "inkling2_loop"
+hidden_size = 2304

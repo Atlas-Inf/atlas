@@ -55,7 +55,6 @@ pub(crate) enum InputNorms {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PhysicalWeights {
-    pub index: usize,
     pub input_norms: InputNorms,
     pub wq: DevicePtr,
     pub wk: DevicePtr,
@@ -193,7 +192,6 @@ pub(crate) fn physical(
         None
     };
     Ok(PhysicalWeights {
-        index: l,
         input_norms: if full {
             InputNorms::Separate {
                 q: p(&format!("{lp}.q_input_norm.weight"))?,
