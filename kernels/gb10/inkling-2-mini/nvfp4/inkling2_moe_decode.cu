@@ -18,7 +18,7 @@
 // inkling2_moe_down_*:    act -> y [rows, top_k, H] (BF16);    grid (ceil(H/4), top_k, rows)
 // inkling2_moe_combine:   out[r, h] = BF16(sum_s y[r, s, h] * w[r, s]) in fp32.
 
-#include "atlas_pdl.cuh"
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 

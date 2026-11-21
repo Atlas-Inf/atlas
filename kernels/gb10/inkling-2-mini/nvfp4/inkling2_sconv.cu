@@ -20,7 +20,7 @@
 // then rolls each sequence's state forward over its rows (stream order keeps the
 // two apart, so no row reads a state another thread is replacing).
 
-#include "atlas_pdl.cuh"
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 #define INK_MAX_K 4

@@ -5,7 +5,7 @@
 // `Inkling2LogScale` and `Inkling2LoopMessageGate` (Apache-2.0). Roundings follow the
 // reference: a clipped head is rounded to BF16 before the log scale and again after.
 
-#include "atlas_pdl.cuh"
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 #define INK_MAX_HD 128

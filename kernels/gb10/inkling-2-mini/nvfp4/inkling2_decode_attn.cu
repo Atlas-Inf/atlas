@@ -20,7 +20,7 @@
 //
 // Grid: (num_q_heads, num_seqs, 1). Block: (256, 1, 1). HDIM = 128.
 
-#include "atlas_pdl.cuh"
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 #define WARP_SIZE 32

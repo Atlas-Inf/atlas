@@ -15,7 +15,7 @@
 // dot(q, n_j) = rstd_j * dot(q, s_j), so the first pass reads each state once for all
 // queries and the second builds the outputs.
 
-#include "atlas_pdl.cuh"
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 #define INK_MAX_STATES 9   // up to 8 blocks + the partial

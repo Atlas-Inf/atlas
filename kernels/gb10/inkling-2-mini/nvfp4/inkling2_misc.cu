@@ -8,7 +8,7 @@
 //   inkling2_layer_out    BF16(r + m)                 (r fp32, m BF16)
 //   inkling2_f32_to_bf16
 
-#include "atlas_pdl.cuh"
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 // one CTA (256) per row; exactly one of x_f32 / x_bf16 non-NULL
