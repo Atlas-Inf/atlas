@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::layer::Inkling2Layer;
-use super::ops::{self, BlockRes, HeadNorm, HeadNormArgs, MsgGate, ShortConv};
+use super::ops::{self, BlockRes, HeadNorm, HeadNormArgs, MoeDecode, MsgGate, ShortConv};
 use super::weights::KvConv;
 
 impl Inkling2Layer {
@@ -164,5 +164,60 @@ impl Inkling2Layer {
             },
             stream,
         )
+    }
+
+    /// The routed experts over this forward's `n` rows (router output in
+    /// `ids` / `weights`, input `mlp_normed`, output `moe_out`): grouped GEMMs
+    /// for prefill-sized row counts, the decode GEMVs otherwise.
+    pub(super) fn routed_experts(&self, gpu: &dyn GpuBackend, n: usize, stream: u64) -> Result<()> {
+        let (s, w, d, p, h) = (&self.shared, &self.w, &self.dims, &self.p, self.dims.hidden);
+        if n >= ops::MOE_GROUPED_MIN_ROWS && std::env::var_os("INK_OLD_MOE").is_none() {
+            ops::moe_prefill(
+                gpu,
+                &self.k,
+                &ops::MoePrefill {
+                    x: s.mlp_normed,
+                    experts: w.experts,
+                    expert_ids: s.ids,
+                    weights: s.weights,
+                    gu: s.gu,
+                    act: s.act,
+                    y: s.y,
+                    out: s.moe_out,
+                    sort: s.moe_sort,
+                    rows: n,
+                    top_k: d.top_k,
+                    hidden: h,
+                    inter: d.inter,
+                    num_experts: d.experts,
+                    gate_softcap: p.gate_softcap,
+                    up_softcap: p.up_softcap,
+                },
+                stream,
+            )?;
+        } else {
+            ops::moe_decode(
+                gpu,
+                &self.k,
+                &MoeDecode {
+                    x: s.mlp_normed,
+                    experts: w.experts,
+                    expert_ids: s.ids,
+                    weights: s.weights,
+                    act: s.act,
+                    y: s.y,
+                    out: s.moe_out,
+                    rows: n,
+                    top_k: d.top_k,
+                    hidden: h,
+                    inter: d.inter,
+                    out_stride: h,
+                    gate_softcap: p.gate_softcap,
+                    up_softcap: p.up_softcap,
+                },
+                stream,
+            )?;
+        }
+        Ok(())
     }
 }

@@ -14,7 +14,7 @@ use spark_runtime::kv_cache::PagedKvCache;
 use super::batch::Batch;
 use super::debug;
 use super::layer::Inkling2Layer;
-use super::ops::{self, DecodeAttn, HeadNorm, MoeDecode};
+use super::ops::{self, DecodeAttn, HeadNorm};
 use super::weights::{InputNorms, KvConv};
 use crate::layer::ForwardContext;
 
@@ -260,41 +260,73 @@ impl Inkling2Layer {
         gm.kv_write(
             gpu, n, s.kn, s.vn, k_pool, v_pool, meta.slots, p.kv_heads, p.head_dim, bs, stream,
         )?;
-        // decode rows split their keys over the GPU; prefill rows have rows enough
-        let splits = if batch.rows_per_seq == 1 {
-            ops::DECODE_ATTN_SPLITS
+        if batch.seqs.len() == 1
+            && batch.rows_per_seq > 1
+            && std::env::var_os("INK_OLD_ATTN").is_none()
+        {
+            // a prefill chunk (or verify run) of one sequence: tensor cores
+            ops::prefill_attn(
+                gpu,
+                &self.k,
+                &ops::PrefillAttn {
+                    q: s.qn,
+                    k_cache: k_pool,
+                    v_cache: v_pool,
+                    out: s.attn,
+                    block_table: meta.block_table,
+                    rel: s.rn,
+                    rel_proj: w.rel_proj,
+                    bias: s.rel_table,
+                    sinks: s.sink,
+                    q_len: n,
+                    q_offset: batch.seqs[0].0,
+                    heads: p.heads,
+                    kv_heads: p.kv_heads,
+                    head_dim: p.head_dim,
+                    block_size: bs,
+                    sliding_window: if v.full { 0 } else { p.sliding_window },
+                    d_rel: p.d_rel,
+                    rel_extent: p.rel_extent,
+                },
+                stream,
+            )?;
         } else {
-            1
-        };
-        ops::decode_attn(
-            gpu,
-            &self.k,
-            &DecodeAttn {
-                q: s.qn,
-                k_cache: k_pool,
-                v_cache: v_pool,
-                partials: s.attn_partials,
-                out: s.attn,
-                block_tables: meta.block_table,
-                positions: meta.positions,
-                rel: s.rn,
-                rel_proj: w.rel_proj,
-                sinks: s.sink,
-                // 0 = every row reads one sequence's table
-                max_blocks_per_seq: meta.table_stride,
-                num_seqs: n,
-                splits,
-                heads: p.heads,
-                kv_heads: p.kv_heads,
-                head_dim: p.head_dim,
-                block_size: bs,
-                q_stride: d.q_dim,
-                sliding_window: if v.full { 0 } else { p.sliding_window },
-                d_rel: p.d_rel,
-                rel_extent: p.rel_extent,
-            },
-            stream,
-        )?;
+            // decode rows split their keys over the GPU; prefill rows have rows enough
+            let splits = if batch.rows_per_seq == 1 {
+                ops::DECODE_ATTN_SPLITS
+            } else {
+                1
+            };
+            ops::decode_attn(
+                gpu,
+                &self.k,
+                &DecodeAttn {
+                    q: s.qn,
+                    k_cache: k_pool,
+                    v_cache: v_pool,
+                    partials: s.attn_partials,
+                    out: s.attn,
+                    block_tables: meta.block_table,
+                    positions: meta.positions,
+                    rel: s.rn,
+                    rel_proj: w.rel_proj,
+                    sinks: s.sink,
+                    // 0 = every row reads one sequence's table
+                    max_blocks_per_seq: meta.table_stride,
+                    num_seqs: n,
+                    splits,
+                    heads: p.heads,
+                    kv_heads: p.kv_heads,
+                    head_dim: p.head_dim,
+                    block_size: bs,
+                    q_stride: d.q_dim,
+                    sliding_window: if v.full { 0 } else { p.sliding_window },
+                    d_rel: p.d_rel,
+                    rel_extent: p.rel_extent,
+                },
+                stream,
+            )?;
+        }
         gm.gate_mul(gpu, s.attn, s.gate, s.gated, n * d.q_dim, stream)?;
         gm.proj(gpu, n, s.gated, w.wo, s.proj, h, d.q_dim, stream)?;
         self.conv(
@@ -379,53 +411,7 @@ impl Inkling2Layer {
             p.route_scale,
             stream,
         )?;
-        if n >= ops::MOE_GROUPED_MIN_ROWS {
-            ops::moe_prefill(
-                gpu,
-                &self.k,
-                &ops::MoePrefill {
-                    x: s.mlp_normed,
-                    experts: w.experts,
-                    expert_ids: s.ids,
-                    weights: s.weights,
-                    gu: s.gu,
-                    act: s.act,
-                    y: s.y,
-                    out: s.moe_out,
-                    sort: s.moe_sort,
-                    rows: n,
-                    top_k: d.top_k,
-                    hidden: h,
-                    inter: d.inter,
-                    num_experts: d.experts,
-                    gate_softcap: p.gate_softcap,
-                    up_softcap: p.up_softcap,
-                },
-                stream,
-            )?;
-        } else {
-            ops::moe_decode(
-                gpu,
-                &self.k,
-                &MoeDecode {
-                    x: s.mlp_normed,
-                    experts: w.experts,
-                    expert_ids: s.ids,
-                    weights: s.weights,
-                    act: s.act,
-                    y: s.y,
-                    out: s.moe_out,
-                    rows: n,
-                    top_k: d.top_k,
-                    hidden: h,
-                    inter: d.inter,
-                    out_stride: h,
-                    gate_softcap: p.gate_softcap,
-                    up_softcap: p.up_softcap,
-                },
-                stream,
-            )?;
-        }
+        self.routed_experts(gpu, n, stream)?;
         self.conv(
             gpu,
             n,
@@ -463,6 +449,7 @@ impl Inkling2Layer {
                 stream,
             )?;
             gm.cast_bf16(gpu, s.final_out, hidden, n * h, stream)?;
+            debug::dump(gpu, hidden, batch, h, debug::FINAL, stream)?;
         }
         Ok(())
     }

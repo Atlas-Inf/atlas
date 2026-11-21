@@ -4,12 +4,14 @@
 //! prefill and decode batches), its forward, kernel launchers, visit
 //! schedule, weight handles and shared buffers.
 
+mod attn_ops;
 mod batch;
 mod calls;
 mod debug;
 mod forward;
 pub(crate) mod glue;
 pub(crate) mod layer;
+mod moe_ops;
 pub(crate) mod ops;
 pub(crate) mod schedule;
 pub(crate) mod shared;

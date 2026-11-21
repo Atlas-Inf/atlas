@@ -58,6 +58,8 @@ pub(crate) struct Shared {
     pub res_sums: DevicePtr,
     /// attention split partials: decode rows x splits, or prefill rows x 1
     pub attn_partials: DevicePtr,
+    /// prefill relative-bias table `[rows, heads, rel_extent]` BF16
+    pub rel_table: DevicePtr,
     pub resid: DevicePtr,
     pub mlp_in: DevicePtr,
     pub logits: DevicePtr,
@@ -132,6 +134,7 @@ impl Shared {
             msg4: a.take(4 * r * h * f),
             gate_z: a.take(3 * r * super::ops::MAX_GATE_RANK * f),
             res_sums: a.take(r * super::ops::block_res_sums_per_row(h) * f),
+            rel_table: a.take(r * d.heads * super::ops::MAX_REL_EXTENT * b),
             attn_partials: a.take(
                 super::ops::attn_partials_len(
                     r.max(d.max_seqs * super::ops::DECODE_ATTN_SPLITS),

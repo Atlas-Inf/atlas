@@ -14,6 +14,9 @@
 // Expects the including file to define:
 //   LOAD_KV_TILE(cache, block_table, smem, kv_start, kv_len, kv_head, tid, stride)
 //   KERNEL_NAME, K_CACHE_TYPE, V_CACHE_TYPE, KERNEL_EXTRA_PARAMS, KERNEL_PREAMBLE
+// Optional (Inkling 2, kernels/gb10/inkling-2-mini): INKLING2_PREFILL_BIAS adds
+// rel_bias[row][head][query - key] (params rel_bias, rel_extent) to the 32-row body's
+// scores; INKLING2_ROW_SINKS reads its sinks per query row.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -432,6 +435,23 @@ extern "C" __global__ void KERNEL_NAME(
                 unsigned int c0=nt*8+tid_in_group*2, c1=c0+1;
                 // Slot-space mask coordinate (kpos = slot index); see kv_block_lo note.
                 unsigned int qr0=q_offset+q_start+row0, qr1=q_offset+q_start+row1;
+#ifdef INKLING2_PREFILL_BIAS
+                // Inkling 2: additive relative bias rel_bias[row][q_head][dist] for
+                // 0 <= dist = query - key < rel_extent (masked keys are set below).
+                {
+                    const unsigned int k0=kv_start+c0, k1=kv_start+c1;
+                    if(row0<q_tile_len){
+                        const __nv_bfloat16* rb=rel_bias+((unsigned long long)(q_start+row0)*num_q_heads+q_head)*rel_extent;
+                        if(qr0>=k0&&qr0-k0<rel_extent) acc_s[nt][0]+=__bfloat162float(rb[qr0-k0]);
+                        if(qr0>=k1&&qr0-k1<rel_extent) acc_s[nt][1]+=__bfloat162float(rb[qr0-k1]);
+                    }
+                    if(row1<q_tile_len){
+                        const __nv_bfloat16* rb=rel_bias+((unsigned long long)(q_start+row1)*num_q_heads+q_head)*rel_extent;
+                        if(qr1>=k0&&qr1-k0<rel_extent) acc_s[nt][2]+=__bfloat162float(rb[qr1-k0]);
+                        if(qr1>=k1&&qr1-k1<rel_extent) acc_s[nt][3]+=__bfloat162float(rb[qr1-k1]);
+                    }
+                }
+#endif
                 // Causal mask: only enforce when causal_mask_enabled (default 1).
                 // DFlash γ-block runs with causal_mask_enabled=0 so the γ
                 // queries attend bidirectionally within their block; the prefix
@@ -607,25 +627,31 @@ extern "C" __global__ void KERNEL_NAME(
 
 #ifdef ATLAS_ATTN_SINKS
     if (sinks != nullptr) {
-        float sg = __bfloat162float(sinks[q_head]);
         unsigned int r0s = pv_warp_m + group_id, r1s = r0s + 8;
+#ifdef INKLING2_ROW_SINKS
+        // Inkling 2: one sink logit per (query row, head), sinks [q_len, num_q_heads]
+        const float sg0 = __bfloat162float(sinks[(unsigned long long)min(q_start + r0s, q_len_eff - 1) * num_q_heads + q_head]);
+        const float sg1 = __bfloat162float(sinks[(unsigned long long)min(q_start + r1s, q_len_eff - 1) * num_q_heads + q_head]);
+#else
+        const float sg0 = __bfloat162float(sinks[q_head]), sg1 = sg0;
+#endif
         float eo0, eo1;
         if (warp_id < 2) {
-            float mn0 = fmaxf(m_r0, sg);
+            float mn0 = fmaxf(m_r0, sg0);
             eo0 = __expf(m_r0 - mn0);
-            l_r0 = l_r0 * eo0 + __expf(sg - mn0);
-            float mn1 = fmaxf(m_r1, sg);
+            l_r0 = l_r0 * eo0 + __expf(sg0 - mn0);
+            float mn1 = fmaxf(m_r1, sg1);
             eo1 = __expf(m_r1 - mn1);
-            l_r1 = l_r1 * eo1 + __expf(sg - mn1);
+            l_r1 = l_r1 * eo1 + __expf(sg1 - mn1);
         } else {
             float cm0 = smem_ml[r0s][0], cl0 = smem_ml[r0s][1];
-            float mn0 = fmaxf(cm0, sg);
+            float mn0 = fmaxf(cm0, sg0);
             eo0 = __expf(cm0 - mn0);
-            smem_ml[r0s][1] = cl0 * eo0 + __expf(sg - mn0);
+            smem_ml[r0s][1] = cl0 * eo0 + __expf(sg0 - mn0);
             float cm1 = smem_ml[r1s][0], cl1 = smem_ml[r1s][1];
-            float mn1 = fmaxf(cm1, sg);
+            float mn1 = fmaxf(cm1, sg1);
             eo1 = __expf(cm1 - mn1);
-            smem_ml[r1s][1] = cl1 * eo1 + __expf(sg - mn1);
+            smem_ml[r1s][1] = cl1 * eo1 + __expf(sg1 - mn1);
         }
         #pragma unroll
         for (int nt = 0; nt < N_TILES_PER_WARP; nt++) {

@@ -18,7 +18,8 @@ impl Inkling2Layer {
     ) -> Result<()> {
         let (s, d, p) = (&self.shared, &self.dims, &self.p);
         let h = d.hidden;
-        let taps: [(u32, DevicePtr, usize); 16] = [
+        let slot = batch.rows() * h * 4; // between the q, k, v (, mlp) slots of res3 / msg4
+        let taps: [(u32, DevicePtr, usize); 20] = [
             (1, s.res3, h * 4),
             (2, s.normed3, h * 2),
             (3, s.qn, d.q_dim * 2),
@@ -35,6 +36,11 @@ impl Inkling2Layer {
             (14, s.ids, d.top_k * 4),
             (16, s.moe_out, h * 2),
             (17, s.mlp_conv, h * 2),
+            // loop passes: the q and k messages and the gated q and k inputs
+            (18, s.msg4, h * 4),
+            (19, s.msg4.offset(slot), h * 4),
+            (20, s.res3, h * 4),
+            (21, s.res3.offset(slot), h * 4),
         ];
         for r in 0..batch.rows() {
             for (tag, ptr, row_bytes) in taps {
@@ -84,6 +90,9 @@ pub(super) fn dump(
 }
 
 /// Debug: the visit whose intermediates `ATLAS_INKLING2_TAP=<file>` records.
+/// `dump`'s visit number for the model output (after the final block residual).
+pub(super) const FINAL: u32 = 1000;
+
 /// Whether a debug capture is on (each one synchronizes, so graphs stay off).
 pub(super) fn enabled() -> bool {
     std::env::var_os("ATLAS_INKLING2_DUMP").is_some() || tap_visit().is_some()
