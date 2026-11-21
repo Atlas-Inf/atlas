@@ -317,8 +317,10 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_msg_gate_fused(
             float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             if (ar < nr) v = *(const float4*)((in_h ? hg + k0 : mg + (k0 - H)) + (unsigned long long)(row0 + ar) * H + ac);
             const float sc = s_rstd[g][ar][in_h ? 0 : 1];
-            *(__nv_bfloat162*)&s_a[ar][ac] = __floats2bfloat162_rn(v.x * sc, v.y * sc);
-            *(__nv_bfloat162*)&s_a[ar][ac + 2] = __floats2bfloat162_rn(v.z * sc, v.w * sc);
+            s_a[ar][ac] = __float2bfloat16(v.x * sc);
+            s_a[ar][ac + 1] = __float2bfloat16(v.y * sc);
+            s_a[ar][ac + 2] = __float2bfloat16(v.z * sc);
+            s_a[ar][ac + 3] = __float2bfloat16(v.w * sc);
             for (unsigned int i = tid; i < RANK * INK_FG_K / 8; i += 256) {
                 const unsigned int r = i / (INK_FG_K / 8), c = (i % (INK_FG_K / 8)) * 8;
                 *(uint4*)&s_w[r][c] = *(const uint4*)(d + (unsigned long long)r * 2 * H + k0 + c);
