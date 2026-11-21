@@ -93,7 +93,10 @@ confidence_early_stop = false
 rollback_resteer = false
 thinking_in_tools = true
 cap_thinking_at_max_tokens = false
-thinking_default = false
+# Inkling reasons by default: an effort-silent request renders the template's
+# own default effort (0.9), as transformers does.
+thinking_default = true
+verbatim_prompt = true
 default_kv_dtype = "bf16"
 use_sampling_presets_for_core = true
 disable_cwd_hint_injection = true
