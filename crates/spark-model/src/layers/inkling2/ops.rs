@@ -66,7 +66,8 @@ pub(crate) struct DecodeAttn {
     pub v_cache: DevicePtr,
     pub out: DevicePtr,
     pub block_tables: DevicePtr,
-    pub seq_lens: DevicePtr,
+    /// `[num_seqs]` query positions; a row attends keys 0 ..= its position
+    pub positions: DevicePtr,
     pub rel: DevicePtr,
     pub rel_proj: DevicePtr,
     pub sinks: DevicePtr,
@@ -110,7 +111,7 @@ pub(crate) fn decode_attn(
         .arg_ptr(a.v_cache)
         .arg_ptr(a.out)
         .arg_ptr(a.block_tables)
-        .arg_ptr(a.seq_lens)
+        .arg_ptr(a.positions)
         .arg_ptr(a.rel)
         .arg_ptr(a.rel_proj)
         .arg_ptr(a.sinks)
@@ -134,8 +135,8 @@ pub(crate) struct ShortConv {
     pub states: DevicePtr,
     /// fp32 elements from a base to this conv's `[channels, k - 1]` state
     pub state_offset: usize,
-    pub row_seq: DevicePtr,
-    pub seq_start: DevicePtr,
+    /// sequence `s` owns rows `s * rows_per_seq ..`
+    pub rows_per_seq: usize,
     /// static `[C, k]`, or dynamic static taps `[k, C]`
     pub weight: DevicePtr,
     /// dynamic per-token taps `[rows, dyn_stride]`; NULL for a static conv
@@ -170,8 +171,7 @@ pub(crate) fn short_conv(
         .arg_ptr(a.out)
         .arg_ptr(a.states)
         .arg_u32(u32_of(a.state_offset, "state offset")?)
-        .arg_ptr(a.row_seq)
-        .arg_ptr(a.seq_start)
+        .arg_u32(u32_of(a.rows_per_seq, "rows per seq")?)
         .arg_ptr(a.weight)
         .arg_ptr(a.dyn_taps)
         .arg_u32(u32_of(a.rows, "rows")?)
@@ -188,7 +188,7 @@ pub(crate) fn short_conv(
         .arg_ptr(a.x)
         .arg_ptr(a.states)
         .arg_u32(u32_of(a.state_offset, "state offset")?)
-        .arg_ptr(a.seq_start)
+        .arg_u32(u32_of(a.rows_per_seq, "rows per seq")?)
         .arg_u32(u32_of(a.num_seqs, "seqs")?)
         .arg_u32(u32_of(a.channels, "channels")?)
         .arg_u32(u32_of(a.k, "k")?)

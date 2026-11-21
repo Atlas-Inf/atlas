@@ -88,12 +88,8 @@ pub(crate) struct Shared {
     // row metadata (visit 0 uploads)
     pub positions: DevicePtr,
     pub slots: DevicePtr,
-    pub seq_lens: DevicePtr,
     /// `[seqs, stride]` block tables (one shared table for a prefill chunk)
     pub block_table: DevicePtr,
-    /// `[rows]` sequence of each row, `[seqs + 1]` first row of each
-    pub row_seq: DevicePtr,
-    pub seq_start: DevicePtr,
     /// `[visits, max_seqs]` conv-state base pointers, a visit's own row each
     pub state_tables: DevicePtr,
 }
@@ -160,10 +156,7 @@ impl Shared {
             ids: a.take(r * d.top_k * 4),
             positions: a.take(r * 4),
             slots: a.take(r * 8),
-            seq_lens: a.take(r * 4),
             block_table: a.take(d.max_seqs * d.max_blocks_per_seq * 4),
-            row_seq: a.take(r * 4),
-            seq_start: a.take((d.max_seqs + 1) * 4),
             state_tables: a.take(d.visits * d.max_seqs * 8),
         }
     }

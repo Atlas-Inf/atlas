@@ -18,8 +18,9 @@
 // `eager_attention_forward` (Apache-2.0); numerics in fp32 here, the reference adds
 // the bias in BF16.
 //
-// Prefill rows of one sequence run as `num_seqs` single-query rows sharing one block
-// table (max_blocks_per_seq = 0) with seq_lens[r] = position + 1.
+// Every row is one query at positions[r] over keys 0 .. positions[r]: decode rows of
+// several sequences (one block table each), or prefill rows of one sequence sharing one
+// table (max_blocks_per_seq = 0).
 //
 // Grid: (num_q_heads, num_seqs, 1). Block: (256, 1, 1). HDIM = 128.
 
@@ -47,7 +48,7 @@ extern "C" __global__ void inkling2_decode_attn(
     const __nv_bfloat16* __restrict__ V_cache,  // same layout
     __nv_bfloat16* __restrict__ O,              // [num_seqs, num_q_heads, HDIM]
     const int* __restrict__ block_tables,       // row s at s * max_blocks_per_seq (0: one shared table)
-    const int* __restrict__ seq_lens,           // [num_seqs], including the current token
+    const int* __restrict__ positions,          // [num_seqs] query positions (u32 or i32)
     const __nv_bfloat16* __restrict__ rel,      // [num_seqs, num_q_heads, d_rel]
     const __nv_bfloat16* __restrict__ rel_proj, // [d_rel, rel_extent]
     const __nv_bfloat16* __restrict__ sinks,    // [num_seqs, num_q_heads]
@@ -68,8 +69,7 @@ extern "C" __global__ void inkling2_decode_attn(
     const unsigned int warp_id = tid / WARP_SIZE;
     const unsigned int lane_id = tid % WARP_SIZE;
     if (q_head >= num_q_heads) return;
-    const unsigned int seq_len = (unsigned int)seq_lens[seq_idx];
-    if (seq_len == 0) return;
+    const unsigned int seq_len = (unsigned int)positions[seq_idx] + 1;
 
     // bias[d] for d = 0 .. rel_extent - 1
     __shared__ float s_rel[MAX_D_REL];

@@ -276,7 +276,10 @@ impl TransformerModel {
         // ATLAS_LORA_EAGER: same LoRA graph-vs-eager debugging hatch as decode_a.
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
         // Host-maintained QSA/PLE state cannot advance under graph replay.
-        let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
+        let layer_veto = self
+            .layers
+            .iter()
+            .any(|l| l.batched_decode_graph_unsupported());
         let (glm_dynamic, glm_graphs_ok) = self.glm_multiseq_graph_gate()?;
         let graph_key = if glm_graphs_ok
             && !ms_profile

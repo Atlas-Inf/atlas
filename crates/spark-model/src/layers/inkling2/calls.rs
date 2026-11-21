@@ -28,7 +28,6 @@ impl Inkling2Layer {
         head_dim: usize,
         stream: u64,
     ) -> Result<()> {
-        let s = &self.shared;
         let (weight, dyn_taps) = match conv {
             KvConv::Static { weight } => (weight, DevicePtr::NULL),
             KvConv::Dynamic { static_w, .. } => (static_w, dyn_taps),
@@ -41,8 +40,7 @@ impl Inkling2Layer {
                 out,
                 states,
                 state_offset,
-                row_seq: s.row_seq,
-                seq_start: s.seq_start,
+                rows_per_seq: n / num_seqs,
                 weight,
                 dyn_taps,
                 rows: n,
@@ -139,7 +137,8 @@ impl Inkling2Layer {
         x: DevicePtr,
         y: DevicePtr,
         scale: DevicePtr,
-        log_scaled: bool,
+        // the rows' positions for the log-length scale; NULL = none
+        positions: DevicePtr,
         heads: usize,
         head_dim: usize,
         norm: HeadNorm,
@@ -152,11 +151,7 @@ impl Inkling2Layer {
                 x,
                 y,
                 scale,
-                positions: if log_scaled {
-                    self.shared.positions
-                } else {
-                    DevicePtr::NULL
-                },
+                positions,
                 rows: n,
                 heads,
                 head_dim,

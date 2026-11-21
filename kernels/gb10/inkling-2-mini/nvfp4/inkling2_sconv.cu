@@ -15,7 +15,7 @@
 // at states[s] + state_off (floats): each sequence keeps its own allocation.
 //
 // Rows are flat [rows, C] (row stride x_stride / out_stride elements). Sequence s
-// owns rows seq_start[s] .. seq_start[s+1] and the state at states[s]. A row reads
+// owns rows s * rows_per_seq .. (s + 1) * rows_per_seq and the state at states[s]. A row reads
 // earlier inputs of its own sequence from x, and the ones before the sequence's
 // first row from the state. `inkling2_sconv` writes y only; `inkling2_sconv_state`
 // then rolls each sequence's state forward over its rows (stream order keeps the
@@ -31,8 +31,7 @@ extern "C" __global__ void inkling2_sconv(
     __nv_bfloat16* __restrict__ out,            // [rows, out_stride]
     const float* const* __restrict__ states,    // [num_seqs] state bases
     const unsigned int state_off,               // floats from a base to this conv's [C, k-1]
-    const int* __restrict__ row_seq,            // [rows] sequence of each row
-    const int* __restrict__ seq_start,          // [num_seqs + 1]
+    const unsigned int rows_per_seq,
     const __nv_bfloat16* __restrict__ w,        // static: [C, k]; dynamic: [k, C]
     const __nv_bfloat16* __restrict__ dyn,      // dynamic: [rows, dyn_stride]; NULL = static
     const unsigned int rows,
@@ -47,8 +46,8 @@ extern "C" __global__ void inkling2_sconv(
     const unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int r = blockIdx.y;
     if (c >= channels || r >= rows) return;
-    const int s = row_seq[r];
-    const int first = seq_start[s];
+    const int s = r / rows_per_seq;
+    const int first = s * rows_per_seq;
     const float* st = states[s] + state_off + (unsigned long long)c * (k - 1);
     const float xc = __bfloat162float(x[(unsigned long long)r * x_stride + c]);
 
@@ -76,7 +75,7 @@ extern "C" __global__ void inkling2_sconv_state(
     const __nv_bfloat16* __restrict__ x,
     float* const* __restrict__ states,
     const unsigned int state_off,
-    const int* __restrict__ seq_start,
+    const unsigned int rows_per_seq,
     const unsigned int num_seqs,
     const unsigned int channels,
     const unsigned int k,
@@ -86,7 +85,7 @@ extern "C" __global__ void inkling2_sconv_state(
     const unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int s = blockIdx.y;
     if (c >= channels || s >= num_seqs) return;
-    const int first = seq_start[s], end = seq_start[s + 1];
+    const int first = s * rows_per_seq, end = first + rows_per_seq;
     float* st = states[s] + state_off + (unsigned long long)c * (k - 1);
     float old[INK_MAX_K - 1];
     for (unsigned int j = 0; j + 1 < k; j++) old[j] = st[j];

@@ -42,9 +42,9 @@ impl Inkling2Layer {
         let bstride = d.block_stride() * 2; // bytes between stack blocks
         let bs = kv_cache.block_size();
         let gm = &self.gk;
+        let meta = self.meta(gpu, batch, ctx, bs, v.first, stream)?;
 
         if v.first {
-            self.upload_meta(gpu, batch, bs, stream)?;
             gm.rmsnorm(
                 gpu,
                 n,
@@ -58,7 +58,7 @@ impl Inkling2Layer {
             )?;
             debug::dump(gpu, hidden, batch, h, u32::MAX, stream)?;
         }
-        let states = self.bind_states(gpu, conv_states, stream)?;
+        let states = self.bind_states(gpu, conv_states, ctx.graph_capture, stream)?;
         if v.restart {
             // the previous pass: its blocks after the prelude's and its own first push,
             // and its output (this visit's input); then back to the prelude's output
@@ -204,8 +204,14 @@ impl Inkling2Layer {
         let clip = HeadNorm::Clip {
             threshold: p.qk_clip,
         };
+        // full layers scale q and the relative-bias queries by log length
+        let log_pos = if v.full {
+            meta.positions
+        } else {
+            DevicePtr::NULL
+        };
         self.head_norm(
-            gpu, n, s.q, s.qn, w.q_scale, v.full, p.heads, p.head_dim, clip, stream,
+            gpu, n, s.q, s.qn, w.q_scale, log_pos, p.heads, p.head_dim, clip, stream,
         )?;
         self.head_norm(
             gpu,
@@ -213,7 +219,7 @@ impl Inkling2Layer {
             s.kc,
             s.kn,
             DevicePtr::NULL,
-            false,
+            DevicePtr::NULL,
             p.kv_heads,
             p.head_dim,
             clip,
@@ -225,7 +231,7 @@ impl Inkling2Layer {
             s.vc,
             s.vn,
             DevicePtr::NULL,
-            false,
+            DevicePtr::NULL,
             p.kv_heads,
             p.head_dim,
             HeadNorm::Rms { eps: p.eps },
@@ -237,7 +243,7 @@ impl Inkling2Layer {
             s.r,
             s.rn,
             w.rel_scale,
-            v.full,
+            log_pos,
             p.heads,
             p.d_rel,
             HeadNorm::Clip {
@@ -252,7 +258,7 @@ impl Inkling2Layer {
             kv_cache.v_pool_ptr(self.visit_idx),
         );
         gm.kv_write(
-            gpu, n, s.kn, s.vn, k_pool, v_pool, s.slots, p.kv_heads, p.head_dim, bs, stream,
+            gpu, n, s.kn, s.vn, k_pool, v_pool, meta.slots, p.kv_heads, p.head_dim, bs, stream,
         )?;
         ops::decode_attn(
             gpu,
@@ -262,13 +268,13 @@ impl Inkling2Layer {
                 k_cache: k_pool,
                 v_cache: v_pool,
                 out: s.attn,
-                block_tables: s.block_table,
-                seq_lens: s.seq_lens,
+                block_tables: meta.block_table,
+                positions: meta.positions,
                 rel: s.rn,
                 rel_proj: w.rel_proj,
                 sinks: s.sink,
                 // 0 = every row reads one sequence's table
-                max_blocks_per_seq: batch.table_stride(),
+                max_blocks_per_seq: meta.table_stride,
                 num_seqs: n,
                 heads: p.heads,
                 kv_heads: p.kv_heads,

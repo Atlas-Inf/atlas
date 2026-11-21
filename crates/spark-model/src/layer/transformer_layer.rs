@@ -259,6 +259,14 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
+    /// Like [`Self::decode_graph_unsupported`], for the batched decode and
+    /// verify graphs only: a layer whose per-sequence state reaches its
+    /// kernels through a table that only single-sequence decode refreshes
+    /// before replay (Inkling 2's conv states) vetoes those, not the C1 graph.
+    fn batched_decode_graph_unsupported(&self) -> bool {
+        self.decode_graph_unsupported()
+    }
+
     /// True when [`Self::decode_graph_unsupported`] is an indexer whose only
     /// step-dependent work, inside its inert bound, is the ingest a staged
     /// run splits off (`layers/qsa_staged.rs`): the qwen4_exp piecewise

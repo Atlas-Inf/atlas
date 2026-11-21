@@ -190,8 +190,28 @@ impl TransformerLayer for Inkling2Layer {
         bail!("inkling2: multi-sequence verify rows are not supported yet")
     }
 
-    /// Visit 0 uploads the batch's metadata from the host every forward.
+    /// Bind the decode sequence's conv state into this visit's table before
+    /// the step's graph capture or replay.
+    fn decode_prestage(
+        &self,
+        _token: u32,
+        state: &mut dyn LayerState,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        self.bind_states(gpu, &[conv_base(state)?], false, stream)
+            .map(|_| ())
+    }
+
+    /// Single-sequence decode reads the model's staged metadata and the
+    /// prestaged state table, so it can be graphed (not with a debug capture).
     fn decode_graph_unsupported(&self) -> bool {
+        super::debug::enabled()
+    }
+
+    /// Batched decode and verify graphs would bake one batch's state tables,
+    /// and their keys do not change with the batch's sequences here.
+    fn batched_decode_graph_unsupported(&self) -> bool {
         true
     }
 

@@ -84,6 +84,11 @@ pub(super) fn dump(
 }
 
 /// Debug: the visit whose intermediates `ATLAS_INKLING2_TAP=<file>` records.
+/// Whether a debug capture is on (each one synchronizes, so graphs stay off).
+pub(super) fn enabled() -> bool {
+    std::env::var_os("ATLAS_INKLING2_DUMP").is_some() || tap_visit().is_some()
+}
+
 pub(super) fn tap_visit() -> Option<usize> {
     static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
