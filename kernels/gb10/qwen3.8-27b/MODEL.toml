@@ -56,9 +56,14 @@ kernel_source = "qwen3.6-27b"
 # made its 27B default on 2026-11-20. It resolves to this target through
 # `match_names`, and it loads with no engine change. Shard-header diff against
 # nvidia/Qwen3.8-27B-NVFP4 (2026-11-21):
-#  * It ships NO MTP head (`mtp.*` is absent). `--speculative` logs that no MTP
-#    weights loaded and then serves serially, so the MTP recipes lose all
-#    speculation on it. Serve it with the DFlash2 drafter in [dflash] below.
+#  * Its MTP head is incomplete: 11 of the 15 `mtp.*` tensors, byte-identical to
+#    nvidia/Qwen3.8-27B-NVFP4's. mtp.fc, mtp.norm and mtp.pre_fc_norm_{embedding,
+#    hidden} are missing, and the loader gates on mtp.fc, so `--speculative` loads no
+#    head and serves serially. Grafting those 4 tensors back from the stock checkpoint
+#    rebuilds its head exactly, and MTP then runs exact (greedy == serial 8/8). Even
+#    so, the DFlash2 drafter in [dflash] below is faster through C2 and on agentic
+#    turns (decode-floor 56.1 vs 31.6 tok/s, 5.7 vs 10.3 s/turn), so serve it with
+#    DFlash2. MTP leads only at C8 aggregate (100.9 vs 89.4 tok/s).
 #  * Gated DeltaNet in_proj_qkv / in_proj_z / out_proj are NVFP4 in 38 of the
 #    48 GDN layers. qkv and z share one weight_scale_2, so they fuse as stored.
 #    The other 10 layers (0-2, 4, 5, 57, 58, 60-62) are FP8 per-tensor and stay
