@@ -116,7 +116,7 @@ impl GlueKernels {
             }
             // this target's tensor-core tile (BF16 activations, weights dequantised to BF16)
             Linear::Nvfp4(q) => KernelLaunch::new(gpu, self.gemm_nvfp4)
-                .grid([(n as u32).div_ceil(128), (rows as u32).div_ceil(64), 1])
+                .grid([(n as u32).div_ceil(128), (rows as u32).div_ceil(128), 1])
                 .block([256, 1, 1])
                 .arg_ptr(x)
                 .arg_ptr(q.weight)

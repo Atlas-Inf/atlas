@@ -119,7 +119,9 @@ pub(crate) struct PrefillAttn {
     pub block_table: DevicePtr,
     pub rel: DevicePtr,
     pub rel_proj: DevicePtr,
-    /// `[q_len, heads, rel_extent]` BF16 scratch
+    /// `rel_proj` as F32 `[rel_extent, d_rel]`
+    pub rel_proj_t: DevicePtr,
+    /// `[q_len, heads, rel_extent]` BF16 scratch (the per-head kernel's table)
     pub bias: DevicePtr,
     pub sinks: DevicePtr,
     pub q_len: usize,
@@ -132,6 +134,14 @@ pub(crate) struct PrefillAttn {
     pub d_rel: usize,
     pub rel_extent: usize,
 }
+
+/// Rows from which a prefill run takes `inkling2_flash_prefill` (64-token
+/// tiles; a verify block of a few rows keeps the per-head kernel, whose grid
+/// covers the GPU at that size).
+const FLASH_MIN_ROWS: usize = 64;
+/// `inkling2_flash_prefill.cu` FP_GROUP: query heads per KV head; FP_D_REL.
+const FLASH_GROUP: usize = 3;
+const FLASH_D_REL: usize = 16;
 
 pub(crate) fn prefill_attn(
     gpu: &dyn GpuBackend,
@@ -147,6 +157,32 @@ pub(crate) fn prefill_attn(
         u32_of(a.heads, "heads")?,
         u32_of(a.rel_extent, "rel extent")?,
     );
+    let q_len = u32_of(a.q_len, "q_len")?;
+    let kv_heads = u32_of(a.kv_heads, "kv heads")?;
+    if a.q_len >= FLASH_MIN_ROWS && a.heads == FLASH_GROUP * a.kv_heads && a.d_rel == FLASH_D_REL {
+        // a prefill chunk: one CTA per (KV head, 64 tokens) shares each K/V tile
+        // with the group's query heads, computing the bias where it adds it
+        return KernelLaunch::new(gpu, k.flash_prefill)
+            .grid([kv_heads, q_len.div_ceil(64), 1])
+            .block([384, 1, 1])
+            .arg_ptr(a.q)
+            .arg_ptr(a.k_cache)
+            .arg_ptr(a.v_cache)
+            .arg_ptr(a.out)
+            .arg_ptr(a.block_table)
+            .arg_ptr(a.rel)
+            .arg_ptr(a.rel_proj_t)
+            .arg_ptr(a.sinks)
+            .arg_u32(q_len)
+            .arg_u32(u32_of(a.q_offset, "q_offset")?)
+            .arg_u32(heads)
+            .arg_u32(kv_heads)
+            .arg_u32(u32_of(a.block_size, "block size")?)
+            .arg_u32(u32_of(a.sliding_window, "window")?)
+            .arg_u32(extent)
+            .arg_f32((a.head_dim as f32).powf(-0.5))
+            .launch(stream);
+    }
     KernelLaunch::new(gpu, k.rel_bias_table)
         .grid([
             extent.div_ceil(256),
@@ -160,7 +196,6 @@ pub(crate) fn prefill_attn(
         .arg_u32(u32_of(a.d_rel, "d_rel")?)
         .arg_u32(extent)
         .launch(stream)?;
-    let q_len = u32_of(a.q_len, "q_len")?;
     KernelLaunch::new(gpu, k.prefill_attn)
         .grid([heads, q_len.div_ceil(32), 1])
         .block([128, 1, 1])

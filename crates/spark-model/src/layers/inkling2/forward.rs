@@ -295,6 +295,7 @@ impl Inkling2Layer {
                     block_table: meta.block_table,
                     rel: s.rn,
                     rel_proj: w.rel_proj,
+                    rel_proj_t: w.rel_proj_t,
                     bias: s.rel_table,
                     sinks: s.sink,
                     q_len: n,

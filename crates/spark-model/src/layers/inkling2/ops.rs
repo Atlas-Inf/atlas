@@ -29,14 +29,17 @@ pub(crate) struct Inkling2Kernels {
     pub decode_attn_combine: KernelHandle,
     pub prefill_attn: KernelHandle,
     pub rel_bias_table: KernelHandle,
+    pub flash_prefill: KernelHandle,
     pub sconv: KernelHandle,
     pub sconv_state: KernelHandle,
     pub sconv_rewind: KernelHandle,
     pub block_res_sums: KernelHandle,
     pub block_res_out: KernelHandle,
+    pub block_res_row: KernelHandle,
     pub head_norm: KernelHandle,
     pub msg_gate_z: KernelHandle,
     pub msg_gate_out: KernelHandle,
+    pub msg_gate_fused: KernelHandle,
     pub moe_gate_up_nvfp4: KernelHandle,
     pub moe_gate_up_mxfp8: KernelHandle,
     pub moe_down_nvfp4: KernelHandle,
@@ -53,6 +56,13 @@ pub(crate) struct Inkling2Kernels {
     pub moe_unpermute: KernelHandle,
     pub moe_gemm_nvfp4: KernelHandle,
     pub moe_gemm_mxfp8: KernelHandle,
+    pub moe_gemm_w4a4: KernelHandle,
+    pub moe_gemm_w8a8: KernelHandle,
+    pub moe_tiles: KernelHandle,
+    pub quant_fp4: KernelHandle,
+    pub situ_quant_fp4: KernelHandle,
+    pub quant_mxfp8: KernelHandle,
+    pub situ_quant_mxfp8: KernelHandle,
     pub softcap_swiglu: KernelHandle,
 }
 
@@ -64,14 +74,17 @@ impl Inkling2Kernels {
                 .kernel("inkling2_decode_attn", "inkling2_decode_attn_combine")?,
             prefill_attn: gpu.kernel("inkling2_prefill_attn", "inkling2_prefill_attn")?,
             rel_bias_table: gpu.kernel("inkling2_prefill_attn", "inkling2_rel_bias_table")?,
+            flash_prefill: gpu.kernel("inkling2_flash_prefill", "inkling2_flash_prefill")?,
             sconv: gpu.kernel("inkling2_sconv", "inkling2_sconv")?,
             sconv_state: gpu.kernel("inkling2_sconv", "inkling2_sconv_state")?,
             sconv_rewind: gpu.kernel("inkling2_sconv", "inkling2_sconv_rewind")?,
             block_res_sums: gpu.kernel("inkling2_block_res", "inkling2_block_res_sums")?,
             block_res_out: gpu.kernel("inkling2_block_res", "inkling2_block_res_out")?,
+            block_res_row: gpu.kernel("inkling2_block_res", "inkling2_block_res_row")?,
             head_norm: gpu.kernel("inkling2_head_ops", "inkling2_head_norm")?,
             msg_gate_z: gpu.kernel("inkling2_head_ops", "inkling2_msg_gate_z")?,
             msg_gate_out: gpu.kernel("inkling2_head_ops", "inkling2_msg_gate_out")?,
+            msg_gate_fused: gpu.kernel("inkling2_head_ops", "inkling2_msg_gate_fused")?,
             moe_gate_up_nvfp4: gpu.kernel("inkling2_moe_decode", "inkling2_moe_gate_up_nvfp4")?,
             moe_gate_up_mxfp8: gpu.kernel("inkling2_moe_decode", "inkling2_moe_gate_up_mxfp8")?,
             moe_down_nvfp4: gpu.kernel("inkling2_moe_decode", "inkling2_moe_down_nvfp4")?,
@@ -89,6 +102,13 @@ impl Inkling2Kernels {
             moe_unpermute: gpu.kernel("moe", "moe_unpermute_reduce_indexed")?,
             moe_gemm_nvfp4: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_gemm_nvfp4")?,
             moe_gemm_mxfp8: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_gemm_mxfp8")?,
+            moe_gemm_w4a4: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_gemm_w4a4")?,
+            moe_gemm_w8a8: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_gemm_w8a8")?,
+            moe_tiles: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_tiles")?,
+            quant_fp4: gpu.kernel("inkling2_moe_prefill", "inkling2_quant_fp4")?,
+            situ_quant_fp4: gpu.kernel("inkling2_moe_prefill", "inkling2_situ_quant_fp4")?,
+            quant_mxfp8: gpu.kernel("inkling2_moe_prefill", "inkling2_quant_mxfp8")?,
+            situ_quant_mxfp8: gpu.kernel("inkling2_moe_prefill", "inkling2_situ_quant_mxfp8")?,
             softcap_swiglu: gpu.kernel("inkling2_moe_prefill", "inkling2_softcap_swiglu")?,
         })
     }
@@ -228,11 +248,28 @@ pub(crate) fn block_res(
         a.partial_f32.is_null() != a.partial_bf16.is_null(),
         "inkling2 block residual needs exactly one partial"
     );
-    let grid = [
-        u32_of(a.hidden.div_ceil(RES_CHUNK), "hidden")?,
-        u32_of(a.rows, "rows")?,
-        1,
-    ];
+    if a.rows > RES_ROW_CTA_MIN_ROWS {
+        // prefill rows: both passes in one CTA a row
+        return KernelLaunch::new(gpu, kernels.block_res_row)
+            .grid([u32_of(a.rows, "rows")?, 1, 1])
+            .block([RES_CHUNK as u32, 1, 1])
+            .arg_ptr(a.blocks)
+            .arg_ptr(a.partial_f32)
+            .arg_ptr(a.partial_bf16)
+            .arg_ptr(a.queries)
+            .arg_ptr(a.out)
+            .arg_u32(u32_of(a.rows, "rows")?)
+            .arg_u32(u32_of(a.hidden, "hidden")?)
+            .arg_u32(u32_of(a.num_blocks, "blocks")?)
+            .arg_u32(u32_of(a.row_stride, "row stride")?)
+            .arg_u64(a.block_stride as u64)
+            .arg_u32(u32_of(a.num_queries, "queries")?)
+            .arg_f32(a.eps)
+            .launch(stream);
+    }
+    // decode rows spread their channels over the GPU
+    let chunks = a.hidden.div_ceil(RES_CHUNK);
+    let grid = [u32_of(chunks, "chunks")?, u32_of(a.rows, "rows")?, 1];
     KernelLaunch::new(gpu, kernels.block_res_sums)
         .grid(grid)
         .block([RES_CHUNK as u32, 1, 1])
@@ -267,6 +304,8 @@ pub(crate) fn block_res(
 
 /// Channels per block-residual CTA (the kernels' INK_THREADS).
 const RES_CHUNK: usize = 256;
+/// Rows above which each row takes one block-residual CTA.
+const RES_ROW_CTA_MIN_ROWS: usize = 64;
 
 /// fp32 elements of `inkling2_block_res_sums` output per row: per hidden chunk,
 /// per state (blocks + partial), the sum of squares and each query's dot.
@@ -357,6 +396,9 @@ const Z_WARPS: usize = 4;
 /// `inkling2_head_ops.cu` INK_Z_ROWS / INK_OUT_ROWS: rows a gate block covers.
 const Z_ROWS: u32 = 8;
 const OUT_ROWS: u32 = 16;
+/// `inkling2_msg_gate_fused`: rows a CTA takes, and the rows from which a
+/// launch takes it (its 16-row MMA tiles; decode rows keep the two kernels).
+const FUSED_ROWS: usize = 16;
 
 pub(crate) fn msg_gate(
     gpu: &dyn GpuBackend,
@@ -384,6 +426,32 @@ pub(crate) fn msg_gate(
     );
     let pick = |f: fn(&MessageGate) -> DevicePtr, i: usize| f(&a.gates[i.min(n - 1)]);
     let rows = u32_of(a.rows, "rows")?;
+    if a.rows >= FUSED_ROWS && a.rank == MAX_GATE_RANK && a.hidden.is_multiple_of(64) {
+        let mut f = KernelLaunch::new(gpu, kernels.msg_gate_fused)
+            .grid([rows.div_ceil(FUSED_ROWS as u32), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(a.h)
+            .arg_ptr(a.m);
+        for w in [
+            |g: &MessageGate| g.down,
+            |g: &MessageGate| g.forget,
+            |g: &MessageGate| g.gain,
+        ] {
+            for i in 0..MAX_GATES {
+                f = f.arg_ptr(pick(w, i));
+            }
+        }
+        return f
+            .arg_ptr(a.out)
+            .arg_u32(rows)
+            .arg_u32(u32_of(a.hidden, "hidden")?)
+            .arg_u32(n as u32)
+            .arg_u64(a.h_stride as u64)
+            .arg_u64(a.m_stride as u64)
+            .arg_u64(a.out_stride as u64)
+            .arg_f32(a.eps)
+            .launch(stream);
+    }
     let mut z = KernelLaunch::new(gpu, kernels.msg_gate_z)
         .grid([
             u32_of(a.rank.div_ceil(Z_WARPS), "rank")?,

@@ -30,35 +30,29 @@ __device__ __forceinline__ float ink_state(const __nv_bfloat16* __restrict__ blo
     return pf != nullptr ? pf[row * H + e] : __bfloat162float(pb[row * H + e]);
 }
 
-// Two launches, the hidden dimension split into chunks of INK_THREADS so a decode row
-// spreads over the GPU: `_sums` writes each chunk's per-state sum of squares and query
-// dots, `_out` adds the chunks up, takes the softmax and writes its chunk of outputs.
-// Grid (ceil(H / INK_THREADS), rows) for both.
+// Decode rows: two launches, the hidden dimension split into `chunks` CTAs a row
+// (gridDim.x), each covering the channels e = chunk * INK_THREADS + threadIdx.x (mod
+// chunks * INK_THREADS), so a row spreads over the GPU. `_sums` writes each chunk's
+// per-state sum of squares and query dots, `_out` adds the chunks up, takes the softmax
+// and writes its channels. Grid (chunks, rows) for both. Prefill rows: `_row`, one CTA a
+// row for both passes.
 
-// sums[row][chunk][state][0] = sum s^2, [1 + q] = sum q . s
-extern "C" __global__ void inkling2_block_res_sums(
-    const __nv_bfloat16* __restrict__ blocks,   // see row_stride / block_stride
-    const float* __restrict__ partial_f32,      // [rows, H] or NULL
-    const __nv_bfloat16* __restrict__ partial_bf16, // [rows, H] when partial_f32 is NULL
-    const float* __restrict__ queries,          // [nq, H]
-    float* __restrict__ sums,                   // [rows, chunks, INK_MAX_STATES, 1 + INK_MAX_Q]
-    const unsigned int H,
-    const unsigned int nb,                      // saved blocks (the partial is state nb)
-    const unsigned int row_stride,              // elements between rows of a block
-    const unsigned long long block_stride,      // elements between blocks
-    const unsigned int nq
-) {
-    atlas_pdl_enter();
-    const unsigned long long row = blockIdx.y;
-    const unsigned int chunk = blockIdx.x, chunks = gridDim.x;
-    const unsigned int e = chunk * INK_THREADS + threadIdx.x;
+// This chunk's per-state sum of squares and query dots of `row` into sums[0 .. PER)
+// (global or shared): [state][0] = sum s^2, [state][1 + q] = sum q . s.
+#define INK_RES_PER (INK_MAX_STATES * (1 + INK_MAX_Q))
+__device__ __forceinline__ void ink_res_sums(
+    const __nv_bfloat16* __restrict__ blocks, const float* __restrict__ partial_f32,
+    const __nv_bfloat16* __restrict__ partial_bf16, const float* __restrict__ queries, float* sums,
+    const unsigned long long row, const unsigned int chunk, const unsigned int chunks, const unsigned int H,
+    const unsigned int nb, const unsigned int row_stride, const unsigned long long block_stride,
+    const unsigned int nq) {
     const unsigned int ns = nb + 1;
     float acc[INK_MAX_STATES][1 + INK_MAX_Q];
 #pragma unroll
     for (int j = 0; j < INK_MAX_STATES; j++)
 #pragma unroll
         for (int q = 0; q <= INK_MAX_Q; q++) acc[j][q] = 0.0f;
-    if (e < H) {
+    for (unsigned int e = chunk * INK_THREADS + threadIdx.x; e < H; e += chunks * INK_THREADS) {
         float qv[INK_MAX_Q];
 #pragma unroll
         for (int q = 0; q < INK_MAX_Q; q++) qv[q] = q < (int)nq ? queries[(unsigned long long)q * H + e] : 0.0f;
@@ -83,13 +77,74 @@ extern "C" __global__ void inkling2_block_res_sums(
             if (lane == 0) red[warp][j][q] = v;
         }
     __syncthreads();
-    constexpr unsigned int PER = INK_MAX_STATES * (1 + INK_MAX_Q);
-    if (threadIdx.x < PER) {
+    if (threadIdx.x < INK_RES_PER) {
         const unsigned int j = threadIdx.x / (1 + INK_MAX_Q), q = threadIdx.x % (1 + INK_MAX_Q);
         float v = 0.0f;
         for (unsigned int w = 0; w < INK_THREADS / 32; w++) v += red[w][j][q];
-        sums[(row * chunks + chunk) * PER + threadIdx.x] = v;
+        sums[threadIdx.x] = v;
     }
+}
+
+// The softmax weights (times each state's rstd) of `row` from its chunks' sums, into
+// p[q][state], then its output channels of this chunk.
+__device__ __forceinline__ void ink_res_out(
+    const __nv_bfloat16* __restrict__ blocks, const float* __restrict__ partial_f32,
+    const __nv_bfloat16* __restrict__ partial_bf16, const float* sums, float* __restrict__ out,
+    const unsigned long long row, const unsigned int chunk, const unsigned int chunks, const unsigned int rows,
+    const unsigned int H, const unsigned int nb, const unsigned int row_stride,
+    const unsigned long long block_stride, const unsigned int nq, const float eps) {
+    const unsigned int ns = nb + 1;
+    __shared__ float p[INK_MAX_Q][INK_MAX_STATES];   // softmax weight x rstd
+    if (threadIdx.x < nq) {
+        const unsigned int q = threadIdx.x;
+        float logit[INK_MAX_STATES], rstd[INK_MAX_STATES], mx = -1e30f;
+        for (unsigned int j = 0; j < ns; j++) {
+            float ss = 0.0f, d = 0.0f;
+            for (unsigned int c = 0; c < chunks; c++) {
+                const float* t = sums + c * INK_RES_PER + j * (1 + INK_MAX_Q);
+                ss += t[0];
+                d += t[1 + q];
+            }
+            rstd[j] = rsqrtf(ss / (float)H + eps);
+            logit[j] = d * rstd[j] * rsqrtf((float)H);
+            mx = fmaxf(mx, logit[j]);
+        }
+        float sum = 0.0f;
+        for (unsigned int j = 0; j < ns; j++) {
+            logit[j] = __expf(logit[j] - mx);
+            sum += logit[j];
+        }
+        for (unsigned int j = 0; j < ns; j++) p[q][j] = logit[j] / sum * rstd[j];
+    }
+    __syncthreads();
+    for (unsigned int e = chunk * INK_THREADS + threadIdx.x; e < H; e += chunks * INK_THREADS) {
+        float o[INK_MAX_Q] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (unsigned int j = 0; j < ns; j++) {
+            const float s = ink_state(blocks, partial_f32, partial_bf16, row, row_stride, block_stride, H, nb, j, e);
+#pragma unroll
+            for (int q = 0; q < INK_MAX_Q; q++) o[q] += (q < (int)nq ? p[q][j] : 0.0f) * s;
+        }
+        for (unsigned int q = 0; q < nq; q++) out[((unsigned long long)q * rows + row) * H + e] = o[q];
+    }
+}
+
+// sums[row][chunk][...] (ink_res_sums)
+extern "C" __global__ void inkling2_block_res_sums(
+    const __nv_bfloat16* __restrict__ blocks,   // see row_stride / block_stride
+    const float* __restrict__ partial_f32,      // [rows, H] or NULL
+    const __nv_bfloat16* __restrict__ partial_bf16, // [rows, H] when partial_f32 is NULL
+    const float* __restrict__ queries,          // [nq, H]
+    float* __restrict__ sums,                   // [rows, chunks, INK_MAX_STATES, 1 + INK_MAX_Q]
+    const unsigned int H,
+    const unsigned int nb,                      // saved blocks (the partial is state nb)
+    const unsigned int row_stride,              // elements between rows of a block
+    const unsigned long long block_stride,      // elements between blocks
+    const unsigned int nq
+) {
+    atlas_pdl_enter();
+    const unsigned long long row = blockIdx.y;
+    ink_res_sums(blocks, partial_f32, partial_bf16, queries, sums + (row * gridDim.x + blockIdx.x) * INK_RES_PER,
+                 row, blockIdx.x, gridDim.x, H, nb, row_stride, block_stride, nq);
 }
 
 extern "C" __global__ void inkling2_block_res_out(
@@ -108,39 +163,32 @@ extern "C" __global__ void inkling2_block_res_out(
 ) {
     atlas_pdl_enter();
     const unsigned long long row = blockIdx.y;
-    const unsigned int chunks = gridDim.x;
-    const unsigned int ns = nb + 1;
-    constexpr unsigned int PER = INK_MAX_STATES * (1 + INK_MAX_Q);
-    __shared__ float p[INK_MAX_Q][INK_MAX_STATES];   // softmax weight x rstd
-    if (threadIdx.x < nq) {
-        const unsigned int q = threadIdx.x;
-        float logit[INK_MAX_STATES], rstd[INK_MAX_STATES], mx = -1e30f;
-        for (unsigned int j = 0; j < ns; j++) {
-            float ss = 0.0f, d = 0.0f;
-            for (unsigned int c = 0; c < chunks; c++) {
-                const float* t = sums + (row * chunks + c) * PER + j * (1 + INK_MAX_Q);
-                ss += t[0];
-                d += t[1 + q];
-            }
-            rstd[j] = rsqrtf(ss / (float)H + eps);
-            logit[j] = d * rstd[j] * rsqrtf((float)H);
-            mx = fmaxf(mx, logit[j]);
-        }
-        float sum = 0.0f;
-        for (unsigned int j = 0; j < ns; j++) {
-            logit[j] = __expf(logit[j] - mx);
-            sum += logit[j];
-        }
-        for (unsigned int j = 0; j < ns; j++) p[q][j] = logit[j] / sum * rstd[j];
-    }
+    ink_res_out(blocks, partial_f32, partial_bf16, sums + row * gridDim.x * INK_RES_PER, out, row, blockIdx.x,
+                gridDim.x, rows, H, nb, row_stride, block_stride, nq, eps);
+}
+
+// Both passes for prefill rows, one CTA a row: the sums stay in shared memory and the
+// second read of the row's states is served by the cache. Bit for bit the two kernels
+// with one chunk a row. grid (rows), block INK_THREADS.
+extern "C" __global__ void inkling2_block_res_row(
+    const __nv_bfloat16* __restrict__ blocks,
+    const float* __restrict__ partial_f32,
+    const __nv_bfloat16* __restrict__ partial_bf16,
+    const float* __restrict__ queries,
+    float* __restrict__ out,                    // [nq, rows, H]
+    const unsigned int rows,
+    const unsigned int H,
+    const unsigned int nb,
+    const unsigned int row_stride,
+    const unsigned long long block_stride,
+    const unsigned int nq,
+    const float eps
+) {
+    atlas_pdl_enter();
+    __shared__ float sums[INK_RES_PER];
+    const unsigned long long row = blockIdx.x;
+    ink_res_sums(blocks, partial_f32, partial_bf16, queries, sums, row, 0, 1, H, nb, row_stride, block_stride, nq);
     __syncthreads();
-    const unsigned int e = blockIdx.x * INK_THREADS + threadIdx.x;
-    if (e >= H) return;
-    float o[INK_MAX_Q] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (unsigned int j = 0; j < ns; j++) {
-        const float s = ink_state(blocks, partial_f32, partial_bf16, row, row_stride, block_stride, H, nb, j, e);
-#pragma unroll
-        for (int q = 0; q < INK_MAX_Q; q++) o[q] += (q < (int)nq ? p[q][j] : 0.0f) * s;
-    }
-    for (unsigned int q = 0; q < nq; q++) out[((unsigned long long)q * rows + row) * H + e] = o[q];
+    ink_res_out(blocks, partial_f32, partial_bf16, sums, out, row, 0, 1, rows, H, nb, row_stride, block_stride, nq,
+                eps);
 }

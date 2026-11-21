@@ -74,6 +74,9 @@ pub(crate) struct PhysicalWeights {
     pub wv: Linear,
     pub wr: Linear,
     pub rel_proj: DevicePtr,
+    /// `rel_proj` transposed to F32 `[rel_extent, d_rel]` (the prefill attention reads
+    /// one distance's weights as 16-byte loads)
+    pub rel_proj_t: DevicePtr,
     pub q_scale: DevicePtr,
     pub rel_scale: DevicePtr,
     pub gate: Linear,
@@ -118,6 +121,31 @@ pub(crate) fn global(store: &WeightStore) -> Result<GlobalWeights> {
     })
 }
 
+/// A BF16 `[rows, cols]` tensor as F32 `[cols, rows]` in a new device array.
+fn transposed_f32(store: &WeightStore, gpu: &dyn GpuBackend, name: &str) -> Result<DevicePtr> {
+    let t = store
+        .get(name)
+        .with_context(|| format!("inkling2 tensor {name}"))?;
+    let [rows, cols] = t.shape[..] else {
+        anyhow::bail!("inkling2 {name}: shape {:?}", t.shape);
+    };
+    let mut raw = vec![0u8; rows * cols * 2];
+    gpu.copy_d2h(t.ptr, &mut raw)?;
+    let mut out = Vec::with_capacity(rows * cols * 4);
+    for c in 0..cols {
+        for r in 0..rows {
+            let o = (r * cols + c) * 2;
+            let bits = u32::from(u16::from_le_bytes([raw[o], raw[o + 1]])) << 16;
+            out.extend_from_slice(&f32::from_bits(bits).to_le_bytes());
+        }
+    }
+    let dev = gpu
+        .alloc(out.len())
+        .with_context(|| format!("allocate {name} transposed"))?;
+    gpu.copy_h2d(&out, dev)?;
+    Ok(dev)
+}
+
 /// `amax[e] / denominator` as an F32 `[E]` device array.
 fn expert_globals(
     store: &WeightStore,
@@ -160,6 +188,7 @@ fn checkpoint_experts(
     let ex = format!("{lp}.mlp.experts");
     Ok(StackedExperts {
         mxfp8,
+        act_quant: true,
         w13: p(&format!("{ex}.w13_weight"))?,
         w13_scale: p(&format!("{ex}.w13_weight_scale"))?,
         w13_global: if mxfp8 {
@@ -217,6 +246,7 @@ fn spark_experts(
     };
     Ok(Some(StackedExperts {
         mxfp8: false,
+        act_quant: false,
         w13: interleave(format!("{ex}.gate_up_proj.weight"))?,
         w13_scale: interleave(format!("{ex}.gate_up_proj.weight_scale"))?,
         w13_global: t(format!("{ex}.gate_up_proj.weight_scale_2"))?.ptr,
@@ -294,6 +324,7 @@ pub(crate) fn physical(
         wv: linear("wv_dv", "v_proj.linear")?,
         wr: linear("wr_du", "relative_position_bias.linear")?,
         rel_proj: p(&format!("{a}.rel_logits_proj.proj"))?,
+        rel_proj_t: transposed_f32(store, gpu, &format!("{a}.rel_logits_proj.proj"))?,
         q_scale: p(&format!("{a}.q_l2_clip.scale"))?,
         rel_scale: p(&format!("{a}.rel_l2_clip.scale"))?,
         gate: linear("gate_attn", "o_proj.gate_proj")?,

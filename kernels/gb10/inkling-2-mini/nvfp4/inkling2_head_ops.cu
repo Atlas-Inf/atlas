@@ -240,3 +240,155 @@ extern "C" __global__ void inkling2_msg_gate_out(
         }
     }
 }
+
+// The same message gates for prefill rows, fused on the tensor cores: a CTA takes 16 rows
+// and every gate of the launch. Per gate, the rms of its h and m rows, then
+// z = BF16(D BF16([rms0(h); rms0(m)])) (mma.sync m16n8k16, the BF16 inputs staged 64
+// columns a step); then, 64 channels a step, F z and G z for every gate and
+// out = (1 - tanh(F z)) * h + tanh(G z) * m, each element's inputs for all gates read
+// before any of its outputs is written (out may alias h). The two-kernel path re-read
+// every row once per four rank outputs; this one reads a row three times (rms, z, out).
+// Rank 64. grid (ceil(rows / 16)), block 256.
+#define INK_FG_ROWS 16
+#define INK_FG_K 64
+#define INK_FG_CH 64
+#define INK_FG_PITCH (INK_FG_K + 8)   // BF16 pitch: conflict-free fragment loads
+
+__device__ __forceinline__ void ink_mma16816(float* c, const unsigned int* a, unsigned int b0, unsigned int b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ void ink_frag_a(const __nv_bfloat16 (*s)[INK_FG_PITCH], unsigned int kk, unsigned int g8,
+                                           unsigned int t2, unsigned int (&a)[4]) {
+    a[0] = *(const unsigned int*)&s[g8][kk + t2];
+    a[1] = *(const unsigned int*)&s[g8 + 8][kk + t2];
+    a[2] = *(const unsigned int*)&s[g8][kk + t2 + 8];
+    a[3] = *(const unsigned int*)&s[g8 + 8][kk + t2 + 8];
+}
+
+extern "C" __global__ void __launch_bounds__(256) inkling2_msg_gate_fused(
+    const float* h, const float* m,
+    const __nv_bfloat16* __restrict__ D0, const __nv_bfloat16* __restrict__ D1, const __nv_bfloat16* __restrict__ D2,
+    const __nv_bfloat16* __restrict__ F0, const __nv_bfloat16* __restrict__ F1, const __nv_bfloat16* __restrict__ F2,
+    const __nv_bfloat16* __restrict__ G0, const __nv_bfloat16* __restrict__ G1, const __nv_bfloat16* __restrict__ G2,
+    float* out,
+    const unsigned int rows,
+    const unsigned int H,
+    const unsigned int gates,
+    const unsigned long long h_stride,
+    const unsigned long long m_stride,
+    const unsigned long long out_stride,
+    const float eps
+) {
+    atlas_pdl_enter();
+    constexpr unsigned int RANK = INK_MAX_RANK;
+    __shared__ float s_rstd[INK_MAX_GATES][INK_FG_ROWS][2];
+    __shared__ __align__(16) __nv_bfloat16 s_a[INK_FG_ROWS][INK_FG_PITCH];
+    __shared__ __align__(16) __nv_bfloat16 s_w[RANK][INK_FG_PITCH];      // D (z) or F (out) step
+    __shared__ __align__(16) __nv_bfloat16 s_w2[INK_FG_CH][INK_FG_PITCH]; // G (out) step
+    __shared__ __align__(16) __nv_bfloat16 s_z[INK_MAX_GATES][INK_FG_ROWS][INK_FG_PITCH];
+    const unsigned int row0 = blockIdx.x * INK_FG_ROWS, nr = min(INK_FG_ROWS, rows - row0);
+    const unsigned int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+    const unsigned int g8 = lane / 4, t2 = (lane % 4) * 2;
+
+    // rms of every gate's h and m rows: one warp per (gate, row, half)
+    for (unsigned int t = warp; t < gates * INK_FG_ROWS * 2; t += 8) {
+        const unsigned int g = t / (2 * INK_FG_ROWS), q = (t / 2) % INK_FG_ROWS, half = t % 2;
+        float s = 0.0f;
+        if (q < nr) {
+            const float* p = (half ? m + g * m_stride : h + g * h_stride) + (unsigned long long)(row0 + q) * H;
+            for (unsigned int e = 4 * lane; e < H; e += 128) {
+                const float4 v = *(const float4*)(p + e);
+                s += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+            }
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffff, s, off);
+        }
+        if (lane == 0) s_rstd[g][q][half] = rsqrtf(s / (float)H + eps);
+    }
+    __syncthreads();
+
+    // z per gate: warp w owns rank columns 8w .. 8w + 7
+    for (unsigned int g = 0; g < gates; g++) {
+        const float* hg = h + g * h_stride;
+        const float* mg = m + g * m_stride;
+        const __nv_bfloat16* d = ink_pick(D0, D1, D2, g);
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        const unsigned int ar = tid / 16, ac = (tid % 16) * 4;   // this thread's 4 inputs a step
+        for (unsigned int k0 = 0; k0 < 2 * H; k0 += INK_FG_K) {
+            const bool in_h = k0 < H;
+            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (ar < nr) v = *(const float4*)((in_h ? hg + k0 : mg + (k0 - H)) + (unsigned long long)(row0 + ar) * H + ac);
+            const float sc = s_rstd[g][ar][in_h ? 0 : 1];
+            *(__nv_bfloat162*)&s_a[ar][ac] = __floats2bfloat162_rn(v.x * sc, v.y * sc);
+            *(__nv_bfloat162*)&s_a[ar][ac + 2] = __floats2bfloat162_rn(v.z * sc, v.w * sc);
+            for (unsigned int i = tid; i < RANK * INK_FG_K / 8; i += 256) {
+                const unsigned int r = i / (INK_FG_K / 8), c = (i % (INK_FG_K / 8)) * 8;
+                *(uint4*)&s_w[r][c] = *(const uint4*)(d + (unsigned long long)r * 2 * H + k0 + c);
+            }
+            __syncthreads();
+#pragma unroll
+            for (unsigned int kk = 0; kk < INK_FG_K; kk += 16) {
+                unsigned int a[4];
+                ink_frag_a(s_a, kk, g8, t2, a);
+                const __nv_bfloat16* b = &s_w[8 * warp + g8][kk + t2];
+                ink_mma16816(acc, a, *(const unsigned int*)b, *(const unsigned int*)(b + 8));
+            }
+            __syncthreads();
+        }
+        *(__nv_bfloat162*)&s_z[g][g8][8 * warp + t2] = __floats2bfloat162_rn(acc[0], acc[1]);
+        *(__nv_bfloat162*)&s_z[g][g8 + 8][8 * warp + t2] = __floats2bfloat162_rn(acc[2], acc[3]);
+    }
+    __syncthreads();
+
+    // outputs, 64 channels a step: warp w owns channels c0 + 8w .. + 7
+    for (unsigned int c0 = 0; c0 < H; c0 += INK_FG_CH) {
+        float res[INK_MAX_GATES][4];
+#pragma unroll
+        for (unsigned int g = 0; g < INK_MAX_GATES; g++) {
+            if (g >= gates) break;
+            const __nv_bfloat16* f = ink_pick(F0, F1, F2, g);
+            const __nv_bfloat16* gw = ink_pick(G0, G1, G2, g);
+            for (unsigned int i = tid; i < INK_FG_CH * RANK / 8; i += 256) {
+                const unsigned int r = i / (RANK / 8), c = (i % (RANK / 8)) * 8;
+                *(uint4*)&s_w[r][c] = *(const uint4*)(f + (unsigned long long)(c0 + r) * RANK + c);
+                *(uint4*)&s_w2[r][c] = *(const uint4*)(gw + (unsigned long long)(c0 + r) * RANK + c);
+            }
+            __syncthreads();
+            float fa[4] = {0.0f, 0.0f, 0.0f, 0.0f}, ga[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (unsigned int kk = 0; kk < RANK; kk += 16) {
+                unsigned int a[4];
+                ink_frag_a(s_z[g], kk, g8, t2, a);
+                const __nv_bfloat16* bf = &s_w[8 * warp + g8][kk + t2];
+                const __nv_bfloat16* bg = &s_w2[8 * warp + g8][kk + t2];
+                ink_mma16816(fa, a, *(const unsigned int*)bf, *(const unsigned int*)(bf + 8));
+                ink_mma16816(ga, a, *(const unsigned int*)bg, *(const unsigned int*)(bg + 8));
+            }
+            __syncthreads();
+            const unsigned int ch = c0 + 8 * warp + t2;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const unsigned int q = g8 + 8 * (j / 2);
+                res[g][j] = 0.0f;
+                if (q >= nr) continue;
+                const unsigned long long at = (unsigned long long)(row0 + q) * H + ch + (j % 2);
+                res[g][j] = (1.0f - tanhf(fa[j])) * h[g * h_stride + at] + tanhf(ga[j]) * m[g * m_stride + at];
+            }
+        }
+        const unsigned int ch = c0 + 8 * warp + t2;
+#pragma unroll
+        for (unsigned int g = 0; g < INK_MAX_GATES; g++) {
+            if (g >= gates) break;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const unsigned int q = g8 + 8 * (j / 2);
+                if (q < nr) out[g * out_stride + (unsigned long long)(row0 + q) * H + ch + (j % 2)] = res[g][j];
+            }
+        }
+    }
+}

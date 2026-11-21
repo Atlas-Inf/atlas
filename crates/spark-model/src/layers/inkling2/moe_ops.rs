@@ -13,6 +13,10 @@ use super::ops::{Inkling2Kernels, u32_of};
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StackedExperts {
     pub mxfp8: bool,
+    /// The checkpoint's own experts: prefill quantizes their inputs as its
+    /// `hf_quant_config.json` requires (NVFP4 rows for NVFP4 experts, MXFP8
+    /// rows for MXFP8 ones). The Spark overlay's experts take BF16 rows.
+    pub act_quant: bool,
     pub w13: DevicePtr,
     pub w13_scale: DevicePtr,
     /// NVFP4: per-expert `amax / denominator` (F32 `[E]`); NULL for MXFP8
@@ -140,15 +144,24 @@ pub(crate) struct MoePrefill {
 
 /// Output columns per CTA of `inkling2_moe_gemm_nvfp4` (its GN).
 const GEMM_N_TILE: u32 = 128;
+// tile rows: MXFP8 64, NVFP4 128 (inkling2_moe_gemm.cu GM / GM_FP4)
+const GEMM_M_TILE_MX: usize = 64;
+const GEMM_M_TILE_FP4: usize = 128;
 
 /// Rows from which the routed experts run as grouped GEMMs (fewer rows read
 /// each expert once per row through the decode GEMVs).
 pub(crate) const MOE_GROUPED_MIN_ROWS: usize = 16;
 
 /// Sort scratch for `expanded` expert slots: sorted rows, their experts, the
-/// expert offsets and each slot's sorted position.
+/// expert offsets, each slot's sorted position, then the low-precision GEMMs'
+/// row-tile list (`inkling2_moe_tiles`: a count and at most one partial tile per
+/// expert beyond the full ones).
 pub(crate) fn moe_sort_bytes(expanded: usize, experts: usize) -> usize {
-    (3 * expanded + experts + 1) * 4
+    (3 * expanded + experts + 1 + 1 + max_row_tiles(expanded, experts)) * 4
+}
+
+fn max_row_tiles(expanded: usize, experts: usize) -> usize {
+    expanded.div_ceil(LOWP_M_TILE) + experts
 }
 
 pub(crate) fn moe_prefill(
@@ -180,8 +193,20 @@ pub(crate) fn moe_prefill(
         u32_of(a.top_k, "top_k")?,
         stream,
     )?;
+    if e.act_quant {
+        return moe_prefill_lowp(gpu, k, a, sorted_rows, offsets, to_perm, stream);
+    }
     // an expert takes each row at most once
-    let m_tiles = u32_of(a.rows.div_ceil(64).max(1), "m tiles")?;
+    let m_tiles = u32_of(
+        a.rows
+            .div_ceil(if e.mxfp8 {
+                GEMM_M_TILE_MX
+            } else {
+                GEMM_M_TILE_FP4
+            })
+            .max(1),
+        "m tiles",
+    )?;
     let gemm = |x: DevicePtr,
                 w: DevicePtr,
                 sc: DevicePtr,
@@ -232,7 +257,7 @@ pub(crate) fn moe_prefill(
         h,
     )?;
     KernelLaunch::new(gpu, k.softcap_swiglu)
-        .grid([i.div_ceil(256), u32_of(te, "slots")?, 1])
+        .grid([u32_of(te, "slots")?, i.div_ceil(256), 1])
         .block([256, 1, 1])
         .arg_ptr(a.gu)
         .arg_ptr(a.act)
@@ -259,6 +284,178 @@ pub(crate) fn moe_prefill(
         a.weights,
         h,
         u32_of(a.rows, "rows")?,
+        u32_of(a.top_k, "top_k")?,
+        stream,
+    )
+}
+
+/// `inkling2_situ_quant_fp4`: 32 lanes x INK_SITU_BLOCKS blocks of 16.
+const SITU_MAX_INTER: usize = 32 * 3 * 16;
+
+/// Tile rows of `inkling2_moe_gemm_w4a4` / `_w8a8` (nvfp4_w4a4_tile.cuh `W4_BM`).
+const LOWP_M_TILE: usize = 128;
+
+/// [`moe_prefill`] over the checkpoint's experts at its declared numerics: each
+/// row quantized once (NVFP4 for NVFP4 experts, MXFP8 for MXFP8 ones; staged in
+/// `y`, which the down projection fills only later), the gate_up GEMM on the
+/// block-scaled tensor cores (W4A4 or W8A8), the softcapped SwiGLU quantized per
+/// expert row the same way (staged in `act`), the down GEMM likewise, then the
+/// weighted combine.
+#[allow(clippy::too_many_arguments)]
+fn moe_prefill_lowp(
+    gpu: &dyn GpuBackend,
+    k: &Inkling2Kernels,
+    a: &MoePrefill,
+    sorted_rows: DevicePtr,
+    offsets: DevicePtr,
+    to_perm: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    let e = a.experts;
+    let mx = e.mxfp8;
+    let te = a.rows * a.top_k;
+    ensure!(
+        a.hidden.is_multiple_of(128) && a.inter.is_multiple_of(128) && a.inter <= SITU_MAX_INTER,
+        "inkling2 low-precision experts need dims that are multiples of 128 (inter up to {SITU_MAX_INTER})"
+    );
+    // the tile copies each row's scales 4 (W8A8) or 8 (W4A4) bytes at a time
+    let scale_align = if mx { 4 } else { 8 };
+    ensure!(
+        e.w13_scale.0.is_multiple_of(scale_align) && e.w2_scale.0.is_multiple_of(scale_align),
+        "inkling2: expert scales not {scale_align}-byte aligned"
+    );
+    let (ne, h, i) = (
+        u32_of(a.num_experts, "experts")?,
+        u32_of(a.hidden, "hidden")?,
+        u32_of(a.inter, "inter")?,
+    );
+    // codes, block scales (and NVFP4 outer scales) of the rows, then of the SwiGLU
+    // rows: NVFP4 packs two values a byte, one scale per 16; MXFP8 one, per 32
+    let (per_byte, group) = if mx { (1, 32) } else { (2, 16) };
+    let plane = |base: DevicePtr, n: usize, width: usize| {
+        let s = base.offset(n * width / per_byte);
+        (base, s, s.offset(n * width / group))
+    };
+    let (xq, xs, xo) = plane(a.y, a.rows, a.hidden);
+    let (aq, as_, ao) = plane(a.act, te, a.inter);
+    let rows = u32_of(a.rows, "rows")?;
+    let slots = u32_of(te, "slots")?;
+    if mx {
+        KernelLaunch::new(gpu, k.quant_mxfp8)
+            .grid([u32_of((a.rows * a.hidden).div_ceil(256), "x")?, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(a.x)
+            .arg_ptr(xq)
+            .arg_ptr(xs)
+            .arg_u64((a.rows * a.hidden) as u64)
+            .launch(stream)?;
+    } else {
+        KernelLaunch::new(gpu, k.quant_fp4)
+            .grid([rows.div_ceil(8), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(a.x)
+            .arg_ptr(xq)
+            .arg_ptr(xs)
+            .arg_ptr(xo)
+            .arg_u32(rows)
+            .arg_u32(h)
+            .launch(stream)?;
+    }
+    // the experts' row tiles, one CTA row each
+    ensure!(a.num_experts <= 1024, "inkling2: over 1024 experts");
+    let tiles = to_perm.offset(te * 4);
+    KernelLaunch::new(gpu, k.moe_tiles)
+        .grid([1, 1, 1])
+        .block([u32_of(a.num_experts.next_multiple_of(32), "experts")?, 1, 1])
+        .arg_ptr(offsets)
+        .arg_ptr(tiles)
+        .arg_u32(ne)
+        .launch(stream)?;
+    let m_tiles = u32_of(max_row_tiles(te, a.num_experts), "row tiles")?;
+    let gemm = |q: DevicePtr,
+                qs: DevicePtr,
+                outer: DevicePtr,
+                w: DevicePtr,
+                sc: DevicePtr,
+                g: DevicePtr,
+                y: DevicePtr,
+                gather: DevicePtr,
+                n: u32,
+                kk: u32| {
+        let l = KernelLaunch::new(gpu, if mx { k.moe_gemm_w8a8 } else { k.moe_gemm_w4a4 })
+            .grid([n.div_ceil(GEMM_N_TILE), m_tiles, 1])
+            .block([256, 1, 1])
+            .arg_ptr(q)
+            .arg_ptr(qs);
+        let l = if mx { l } else { l.arg_ptr(outer) };
+        let l = l.arg_ptr(w).arg_ptr(sc);
+        let l = if mx { l } else { l.arg_ptr(g) };
+        l.arg_ptr(y)
+            .arg_ptr(offsets)
+            .arg_ptr(tiles)
+            .arg_ptr(gather)
+            .arg_u32(n)
+            .arg_u32(kk)
+            .launch(stream)
+    };
+    gemm(
+        xq,
+        xs,
+        xo,
+        e.w13,
+        e.w13_scale,
+        e.w13_global,
+        a.gu,
+        sorted_rows,
+        2 * i,
+        h,
+    )?;
+    if mx {
+        KernelLaunch::new(gpu, k.situ_quant_mxfp8)
+            .grid([slots, i.div_ceil(256), 1])
+            .block([256, 1, 1])
+            .arg_ptr(a.gu)
+            .arg_ptr(aq)
+            .arg_ptr(as_)
+            .arg_u32(i)
+            .arg_f32(a.gate_softcap)
+            .arg_f32(a.up_softcap)
+            .launch(stream)?;
+    } else {
+        KernelLaunch::new(gpu, k.situ_quant_fp4)
+            .grid([slots.div_ceil(8), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(a.gu)
+            .arg_ptr(aq)
+            .arg_ptr(as_)
+            .arg_ptr(ao)
+            .arg_u32(slots)
+            .arg_u32(i)
+            .arg_f32(a.gate_softcap)
+            .arg_f32(a.up_softcap)
+            .launch(stream)?;
+    }
+    gemm(
+        aq,
+        as_,
+        ao,
+        e.w2,
+        e.w2_scale,
+        e.w2_global,
+        a.y,
+        DevicePtr::NULL,
+        h,
+        i,
+    )?;
+    super::super::ops::moe_unpermute_reduce_indexed(
+        gpu,
+        k.moe_unpermute,
+        a.y,
+        a.out,
+        to_perm,
+        a.weights,
+        h,
+        rows,
         u32_of(a.top_k, "top_k")?,
         stream,
     )
