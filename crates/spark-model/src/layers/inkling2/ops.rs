@@ -8,6 +8,8 @@ use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
+use super::weights::MessageGate;
+
 /// Compile-time limits of the kernels (keep in step with the `.cu` files).
 pub(crate) const MAX_REL_EXTENT: usize = 1024;
 pub(crate) const MAX_D_REL: usize = 32;
@@ -25,7 +27,8 @@ pub(crate) struct Inkling2Kernels {
     pub sconv_state: KernelHandle,
     pub block_res: KernelHandle,
     pub head_norm: KernelHandle,
-    pub msg_gate: KernelHandle,
+    pub msg_gate_z: KernelHandle,
+    pub msg_gate_out: KernelHandle,
     pub moe_gate_up_nvfp4: KernelHandle,
     pub moe_gate_up_mxfp8: KernelHandle,
     pub moe_down_nvfp4: KernelHandle,
@@ -41,7 +44,8 @@ impl Inkling2Kernels {
             sconv_state: gpu.kernel("inkling2_sconv", "inkling2_sconv_state")?,
             block_res: gpu.kernel("inkling2_block_res", "inkling2_block_res")?,
             head_norm: gpu.kernel("inkling2_head_ops", "inkling2_head_norm")?,
-            msg_gate: gpu.kernel("inkling2_head_ops", "inkling2_msg_gate")?,
+            msg_gate_z: gpu.kernel("inkling2_head_ops", "inkling2_msg_gate_z")?,
+            msg_gate_out: gpu.kernel("inkling2_head_ops", "inkling2_msg_gate_out")?,
             moe_gate_up_nvfp4: gpu.kernel("inkling2_moe_decode", "inkling2_moe_gate_up_nvfp4")?,
             moe_gate_up_mxfp8: gpu.kernel("inkling2_moe_decode", "inkling2_moe_gate_up_mxfp8")?,
             moe_down_nvfp4: gpu.kernel("inkling2_moe_decode", "inkling2_moe_down_nvfp4")?,
@@ -304,44 +308,90 @@ pub(crate) fn head_norm(
         .launch(stream)
 }
 
-/// The loop's cross-pass message gate, fp32 rows.
-pub(crate) struct MsgGate {
+/// Up to three of a visit's loop message gates over fp32 rows: gate `i` reads
+/// `h + i * h_stride`, `m + i * m_stride` (elements) and writes
+/// `out + i * out_stride`, which may alias `h`.
+pub(crate) struct MsgGate<'a> {
+    pub gates: &'a [MessageGate],
     pub h: DevicePtr,
+    pub h_stride: usize,
     pub m: DevicePtr,
-    pub down: DevicePtr,
-    pub forget: DevicePtr,
-    pub gain: DevicePtr,
+    pub m_stride: usize,
     pub out: DevicePtr,
+    pub out_stride: usize,
+    /// `[gates, rows, rank]` fp32 scratch
+    pub z: DevicePtr,
     pub rows: usize,
     pub hidden: usize,
     pub rank: usize,
     pub eps: f32,
 }
 
+const MAX_GATES: usize = 3;
+const Z_WARPS: usize = 4;
+
 pub(crate) fn msg_gate(
     gpu: &dyn GpuBackend,
-    k: KernelHandle,
-    a: &MsgGate,
+    kernels: &Inkling2Kernels,
+    a: &MsgGate<'_>,
     stream: u64,
 ) -> Result<()> {
+    let n = a.gates.len();
     ensure!(
-        a.rank <= MAX_GATE_RANK,
-        "inkling2 loop gate rank {} over 64",
-        a.rank
+        (1..=MAX_GATES).contains(&n),
+        "inkling2: {n} message gates in one launch"
     );
-    KernelLaunch::new(gpu, k)
-        .grid([u32_of(a.rows, "rows")?, 1, 1])
-        .block([256, 1, 1])
+    ensure!(
+        a.rank <= MAX_GATE_RANK && a.rank.is_multiple_of(8) && a.hidden.is_multiple_of(8),
+        "inkling2 loop gate rank {} / hidden {}",
+        a.rank,
+        a.hidden
+    );
+    // both kernels read the weights 16 bytes at a time
+    ensure!(
+        a.gates.iter().all(|g| [g.down, g.forget, g.gain]
+            .iter()
+            .all(|p| p.0.is_multiple_of(16))),
+        "inkling2: message gate weights not 16-byte aligned"
+    );
+    let pick = |f: fn(&MessageGate) -> DevicePtr, i: usize| f(&a.gates[i.min(n - 1)]);
+    let rows = u32_of(a.rows, "rows")?;
+    let mut z = KernelLaunch::new(gpu, kernels.msg_gate_z)
+        .grid([u32_of(a.rank.div_ceil(Z_WARPS), "rank")?, rows, n as u32])
+        .block([(32 * Z_WARPS) as u32, 1, 1])
         .arg_ptr(a.h)
-        .arg_ptr(a.m)
-        .arg_ptr(a.down)
-        .arg_ptr(a.forget)
-        .arg_ptr(a.gain)
-        .arg_ptr(a.out)
-        .arg_u32(u32_of(a.rows, "rows")?)
+        .arg_ptr(a.m);
+    for i in 0..MAX_GATES {
+        z = z.arg_ptr(pick(|g| g.down, i));
+    }
+    z.arg_ptr(a.z)
+        .arg_u32(rows)
         .arg_u32(u32_of(a.hidden, "hidden")?)
         .arg_u32(u32_of(a.rank, "rank")?)
+        .arg_u64(a.h_stride as u64)
+        .arg_u64(a.m_stride as u64)
         .arg_f32(a.eps)
+        .launch(stream)?;
+    let mut out = KernelLaunch::new(gpu, kernels.msg_gate_out)
+        .grid([u32_of(a.hidden.div_ceil(128), "hidden")?, rows, 1])
+        .block([128, 1, 1])
+        .arg_ptr(a.h)
+        .arg_ptr(a.m);
+    for i in 0..MAX_GATES {
+        out = out.arg_ptr(pick(|g| g.forget, i));
+    }
+    for i in 0..MAX_GATES {
+        out = out.arg_ptr(pick(|g| g.gain, i));
+    }
+    out.arg_ptr(a.z)
+        .arg_ptr(a.out)
+        .arg_u32(rows)
+        .arg_u32(u32_of(a.hidden, "hidden")?)
+        .arg_u32(u32_of(a.rank, "rank")?)
+        .arg_u32(n as u32)
+        .arg_u64(a.h_stride as u64)
+        .arg_u64(a.m_stride as u64)
+        .arg_u64(a.out_stride as u64)
         .launch(stream)
 }
 

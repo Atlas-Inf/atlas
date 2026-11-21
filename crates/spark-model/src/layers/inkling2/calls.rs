@@ -93,31 +93,35 @@ impl Inkling2Layer {
         )
     }
 
+    /// Message gates `which` (consecutive, at most three) of this loop layer;
+    /// strides in fp32 elements between the gates' `h`, `m` and `out` rows.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn msg_gate(
+    pub(super) fn msg_gates(
         &self,
         gpu: &dyn GpuBackend,
         n: usize,
-        which: usize,
-        h: DevicePtr,
-        m: DevicePtr,
-        out: DevicePtr,
+        which: std::ops::Range<usize>,
+        (h, h_stride): (DevicePtr, usize),
+        (m, m_stride): (DevicePtr, usize),
+        (out, out_stride): (DevicePtr, usize),
         stream: u64,
     ) -> Result<()> {
-        let g = self
+        let gates = self
             .w
             .messages
-            .context("inkling2: message gate on a layer outside the loop")?[which];
+            .context("inkling2: message gate on a layer outside the loop")?;
         ops::msg_gate(
             gpu,
-            self.k.msg_gate,
+            &self.k,
             &MsgGate {
+                gates: &gates[which],
                 h,
+                h_stride,
                 m,
-                down: g.down,
-                forget: g.forget,
-                gain: g.gain,
+                m_stride,
                 out,
+                out_stride,
+                z: self.shared.gate_z,
                 rows: n,
                 hidden: self.dims.hidden,
                 rank: self.p.gate_rank,

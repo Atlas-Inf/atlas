@@ -52,6 +52,8 @@ pub(crate) struct Shared {
     // fp32 scratch
     pub res3: DevicePtr,
     pub msg4: DevicePtr,
+    /// `[3, rows, 64]` message-gate projections (z)
+    pub gate_z: DevicePtr,
     pub resid: DevicePtr,
     pub mlp_in: DevicePtr,
     pub logits: DevicePtr,
@@ -125,6 +127,7 @@ impl Shared {
             msg_h: a.take(r * h * b),
             res3: a.take(3 * r * h * f),
             msg4: a.take(4 * r * h * f),
+            gate_z: a.take(3 * r * super::ops::MAX_GATE_RANK * f),
             resid: a.take(r * h * f),
             mlp_in: a.take(r * h * f),
             logits: a.take(r * d.experts * f),

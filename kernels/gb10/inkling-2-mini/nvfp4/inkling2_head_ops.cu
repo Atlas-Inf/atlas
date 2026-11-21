@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Inkling 2 per-head epilogues and the loop's cross-pass message gate. Reference:
+// Inkling 2 per-head epilogues and the loop's cross-pass message gates. Reference:
 // transformers PR #51050 `Inkling2(Scaled|LogScaled)L2Clip`, `Inkling2UnweightedRMSNorm`,
 // `Inkling2LogScale` and `Inkling2LoopMessageGate` (Apache-2.0). Roundings follow the
 // reference: a clipped head is rounded to BF16 before the log scale and again after.
@@ -67,31 +67,44 @@ extern "C" __global__ void inkling2_head_norm(
     }
 }
 
-// out = (1 - tanh(F z)) * h + tanh(G z) * m,  z = BF16(D BF16([rms0(h); rms0(m)])).
-// One CTA (256 threads) per row; rank <= 64.
+// The loop's message gates, out = (1 - tanh(F z)) * h + tanh(G z) * m with
+// z = BF16(D BF16([rms0(h); rms0(m)])), for up to three gates of one visit at once
+// (gate g reads h + g * h_stride, m + g * m_stride and writes out + g * out_stride;
+// h_stride 0 fans one input out to several gates). Two launches spread the work over
+// the GPU: `_z` one warp per (row, gate, rank element), `_out` one thread per
+// (row, channel) looping over the gates, every gate's inputs read before any output
+// is written (out may alias h).
 #define INK_MAX_RANK 64
-extern "C" __global__ void inkling2_msg_gate(
-    const float* __restrict__ h,           // [rows, H]
-    const float* __restrict__ m,           // [rows, H]
-    const __nv_bfloat16* __restrict__ D,   // [rank, 2H]
-    const __nv_bfloat16* __restrict__ F,   // [H, rank] forget
-    const __nv_bfloat16* __restrict__ G,   // [H, rank] message (gain)
-    float* __restrict__ out,               // [rows, H] (may alias h)
+#define INK_MAX_GATES 3
+#define INK_Z_WARPS 4
+
+__device__ __forceinline__ const __nv_bfloat16* ink_pick(const __nv_bfloat16* a, const __nv_bfloat16* b,
+                                                         const __nv_bfloat16* c, unsigned int g) {
+    return g == 0 ? a : (g == 1 ? b : c);
+}
+
+// grid (ceil(rank / INK_Z_WARPS), rows, gates), block 32 * INK_Z_WARPS
+extern "C" __global__ void inkling2_msg_gate_z(
+    const float* __restrict__ h,                  // [rows, H] per gate
+    const float* __restrict__ m,                  // [rows, H] per gate
+    const __nv_bfloat16* __restrict__ D0,         // [rank, 2H] per gate
+    const __nv_bfloat16* __restrict__ D1,
+    const __nv_bfloat16* __restrict__ D2,
+    float* __restrict__ z,                        // [gates, rows, rank]
     const unsigned int rows,
     const unsigned int H,
     const unsigned int rank,
+    const unsigned long long h_stride,
+    const unsigned long long m_stride,
     const float eps
 ) {
     atlas_pdl_enter();
-    const unsigned long long row = blockIdx.x;
-    if (row >= rows) return;
-    const float* hp = h + row * H;
-    const float* mp = m + row * H;
-    __shared__ float red[2][8];
+    const unsigned int row = blockIdx.y, g = blockIdx.z;
+    const unsigned int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const float* hp = h + g * h_stride + (unsigned long long)row * H;
+    const float* mp = m + g * m_stride + (unsigned long long)row * H;
+    __shared__ float red[2][INK_Z_WARPS];
     __shared__ float s_rstd[2];
-    __shared__ float z[INK_MAX_RANK];
-    const unsigned int warp = threadIdx.x / 32, lane = threadIdx.x % 32, nwarps = blockDim.x / 32;
-
     float sh = 0.0f, sm = 0.0f;
     for (unsigned int e = threadIdx.x; e < H; e += blockDim.x) {
         sh += hp[e] * hp[e];
@@ -109,31 +122,82 @@ extern "C" __global__ void inkling2_msg_gate(
     __syncthreads();
     if (threadIdx.x < 2) {
         float s = 0.0f;
-        for (unsigned int w = 0; w < nwarps; w++) s += red[threadIdx.x][w];
+        for (unsigned int w = 0; w < INK_Z_WARPS; w++) s += red[threadIdx.x][w];
         s_rstd[threadIdx.x] = rsqrtf(s / (float)H + eps);
     }
     __syncthreads();
-
-    // z: each warp takes rank rows in turn, lanes stride the 2H inputs
-    for (unsigned int r = warp; r < rank; r += nwarps) {
-        const __nv_bfloat16* d = D + (unsigned long long)r * 2 * H;
-        float acc = 0.0f;
-        for (unsigned int e = lane; e < 2 * H; e += 32) {
-            const float in = e < H ? hp[e] * s_rstd[0] : mp[e - H] * s_rstd[1];
-            acc += __bfloat162float(d[e]) * __bfloat162float(__float2bfloat16(in));
-        }
+    const unsigned int r = blockIdx.x * INK_Z_WARPS + warp;
+    if (r >= rank) return;
+    const __nv_bfloat16* d = ink_pick(D0, D1, D2, g) + (unsigned long long)r * 2 * H;
+    const float rh = s_rstd[0], rm = s_rstd[1];
+    float acc = 0.0f;
+    // 8 inputs per lane step; H is a multiple of 8, so a chunk never straddles h and m
+    for (unsigned int c = lane; c < 2 * H / 8; c += 32) {
+        const unsigned int e = c * 8;
+        const uint4 dv = *(const uint4*)(d + e);
+        const unsigned int dr[4] = {dv.x, dv.y, dv.z, dv.w};
+        const float* src = e < H ? hp + e : mp + (e - H);
+        const float sc = e < H ? rh : rm;
+        const float4 a = *(const float4*)src, b = *(const float4*)(src + 4);
+        const float in[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
 #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, off);
-        if (lane == 0) z[r] = __bfloat162float(__float2bfloat16(acc));
-    }
-    __syncthreads();
-
-    for (unsigned int e = threadIdx.x; e < H; e += blockDim.x) {
-        float f = 0.0f, g = 0.0f;
-        for (unsigned int r = 0; r < rank; r++) {
-            f += __bfloat162float(F[(unsigned long long)e * rank + r]) * z[r];
-            g += __bfloat162float(G[(unsigned long long)e * rank + r]) * z[r];
+        for (int i = 0; i < 8; i++) {
+            const float w = __bfloat162float(__ushort_as_bfloat16((unsigned short)(i % 2 ? dr[i / 2] >> 16 : dr[i / 2] & 0xFFFF)));
+            acc += w * __bfloat162float(__float2bfloat16(in[i] * sc));
         }
-        out[row * H + e] = (1.0f - tanhf(f)) * hp[e] + tanhf(g) * mp[e];
     }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, off);
+    if (lane == 0) z[((unsigned long long)g * rows + row) * rank + r] = __bfloat162float(__float2bfloat16(acc));
+}
+
+// grid (ceil(H / 128), rows), block 128
+extern "C" __global__ void inkling2_msg_gate_out(
+    const float* __restrict__ h,
+    const float* __restrict__ m,
+    const __nv_bfloat16* __restrict__ F0,         // [H, rank] forget, per gate
+    const __nv_bfloat16* __restrict__ F1,
+    const __nv_bfloat16* __restrict__ F2,
+    const __nv_bfloat16* __restrict__ G0,         // [H, rank] message, per gate
+    const __nv_bfloat16* __restrict__ G1,
+    const __nv_bfloat16* __restrict__ G2,
+    const float* __restrict__ z,                  // [gates, rows, rank]
+    float* out,                                   // may alias h
+    const unsigned int rows,
+    const unsigned int H,
+    const unsigned int rank,
+    const unsigned int gates,
+    const unsigned long long h_stride,
+    const unsigned long long m_stride,
+    const unsigned long long out_stride
+) {
+    atlas_pdl_enter();
+    const unsigned int row = blockIdx.y;
+    __shared__ float zs[INK_MAX_GATES * INK_MAX_RANK];
+    for (unsigned int i = threadIdx.x; i < gates * rank; i += blockDim.x)
+        zs[i] = z[((unsigned long long)(i / rank) * rows + row) * rank + i % rank];
+    __syncthreads();
+    const unsigned int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= H) return;
+    float res[INK_MAX_GATES];
+    for (unsigned int g = 0; g < gates; g++) {
+        const __nv_bfloat16* fr = ink_pick(F0, F1, F2, g) + (unsigned long long)e * rank;
+        const __nv_bfloat16* gr = ink_pick(G0, G1, G2, g) + (unsigned long long)e * rank;
+        const float* zg = zs + g * rank;
+        float f = 0.0f, gg = 0.0f;
+        for (unsigned int c = 0; c < rank; c += 8) {
+            const uint4 fv = *(const uint4*)(fr + c), gv = *(const uint4*)(gr + c);
+            const unsigned int fw[4] = {fv.x, fv.y, fv.z, fv.w}, gw[4] = {gv.x, gv.y, gv.z, gv.w};
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const unsigned short fb = (unsigned short)(i % 2 ? fw[i / 2] >> 16 : fw[i / 2] & 0xFFFF);
+                const unsigned short gb = (unsigned short)(i % 2 ? gw[i / 2] >> 16 : gw[i / 2] & 0xFFFF);
+                f += __bfloat162float(__ushort_as_bfloat16(fb)) * zg[c + i];
+                gg += __bfloat162float(__ushort_as_bfloat16(gb)) * zg[c + i];
+            }
+        }
+        const unsigned long long at = (unsigned long long)row * H + e;
+        res[g] = (1.0f - tanhf(f)) * h[g * h_stride + at] + tanhf(gg) * m[g * m_stride + at];
+    }
+    for (unsigned int g = 0; g < gates; g++) out[g * out_stride + (unsigned long long)row * H + e] = res[g];
 }

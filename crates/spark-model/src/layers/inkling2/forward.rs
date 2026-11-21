@@ -108,12 +108,18 @@ impl Inkling2Layer {
                 s.msg4,
                 stream,
             )?;
-            // q, k, v inputs gated by their messages; SWA layers fan one input out
-            // to three, so write slots 2 and 1 before slot 0 is overwritten
-            for i in [2usize, 1, 0] {
-                let src = if v.full { res(i) } else { res(0) };
-                self.msg_gate(gpu, n, i, src, s.msg4.offset(i * rf), res(i), stream)?;
-            }
+            // q, k, v inputs gated by their messages in one pass; SWA layers fan
+            // their one input out to the three
+            let row_elems = n * h;
+            self.msg_gates(
+                gpu,
+                n,
+                0..3,
+                (res(0), if v.full { row_elems } else { 0 }),
+                (s.msg4, row_elems),
+                (res(0), row_elems),
+                stream,
+            )?;
         }
         // input norms -> normed3
         let inputs_split = v.full || gated_inputs;
@@ -313,7 +319,16 @@ impl Inkling2Layer {
             stream,
         )?;
         if gated_inputs {
-            self.msg_gate(gpu, n, 3, s.mlp_in, s.msg4.offset(3 * rf), s.mlp_in, stream)?;
+            let mlp_msg = s.msg4.offset(3 * rf);
+            self.msg_gates(
+                gpu,
+                n,
+                3..4,
+                (s.mlp_in, 0),
+                (mlp_msg, 0),
+                (s.mlp_in, 0),
+                stream,
+            )?;
         }
         gm.rmsnorm(
             gpu,
