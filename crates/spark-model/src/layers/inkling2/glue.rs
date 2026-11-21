@@ -116,7 +116,7 @@ impl GlueKernels {
                 .grid([(n as u32).div_ceil(4), 1, 1])
                 .block([256, 1, 1])
                 .arg_ptr(x)
-                .arg_ptr(w.0)
+                .arg_ptr(w)
                 .arg_ptr(y)
                 .arg_u32(rows as u32)
                 .arg_u32(n as u32)
