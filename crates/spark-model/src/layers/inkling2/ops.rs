@@ -201,6 +201,9 @@ pub(crate) struct BlockRes {
     pub rows: usize,
     pub hidden: usize,
     pub num_blocks: usize,
+    /// elements between rows of one block
+    pub row_stride: usize,
+    /// elements between blocks
     pub block_stride: usize,
     pub num_queries: usize,
     pub eps: f32,
@@ -233,7 +236,8 @@ pub(crate) fn block_res(
         .arg_u32(u32_of(a.rows, "rows")?)
         .arg_u32(u32_of(a.hidden, "hidden")?)
         .arg_u32(u32_of(a.num_blocks, "blocks")?)
-        .arg_u32(u32_of(a.block_stride, "block stride")?)
+        .arg_u32(u32_of(a.row_stride, "row stride")?)
+        .arg_u64(a.block_stride as u64)
         .arg_u32(u32_of(a.num_queries, "queries")?)
         .arg_f32(a.eps)
         .launch(stream)

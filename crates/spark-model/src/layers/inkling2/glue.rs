@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The small glue kernels of `inkling2_misc.cu` and the shared Atlas kernels
-//! the Inkling 2 layer reuses (BF16 GEMVs, fp32 sigmoid top-k, BF16 KV write).
+//! the Inkling 2 layer reuses: BF16 projections (the M=1 GEMVs for decode,
+//! the BF16 GEMMs for prefill rows), fp32 router logits, batched fp32 sigmoid
+//! top-k and the BF16 KV write. All buffers are contiguous `[rows, dim]`.
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
+
+use crate::layers::ops;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GlueKernels {
@@ -16,9 +20,9 @@ pub(crate) struct GlueKernels {
     pub f32_to_bf16: KernelHandle,
     /// `dense_gemv_bf16`: y[N] = W[N, K] x[K], BF16
     pub dense_gemv: KernelHandle,
-    /// `dense_gemv_bf16_fp32out`: the router's fp32 logits
+    /// `dense_gemv_bf16_fp32out`: one row of router logits
     pub dense_gemv_f32: KernelHandle,
-    /// `moe_topk_sigmoid_f32`
+    /// `moe_topk_sigmoid_batched_f32`
     pub topk: KernelHandle,
     /// `reshape_and_cache_flash` (BF16 KV)
     pub kv_write: KernelHandle,
@@ -35,7 +39,7 @@ impl GlueKernels {
             f32_to_bf16: m("inkling2_f32_to_bf16")?,
             dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
             dense_gemv_f32: gpu.kernel("gemv", "dense_gemv_bf16_fp32out")?,
-            topk: gpu.kernel("moe_topk_sig", "moe_topk_sigmoid_f32")?,
+            topk: gpu.kernel("moe_topk_sig", "moe_topk_sigmoid_batched_f32")?,
             kv_write: gpu.kernel("reshape_and_cache", "reshape_and_cache_flash")?,
         })
     }
@@ -46,10 +50,35 @@ fn blocks(n: usize) -> u32 {
 }
 
 impl GlueKernels {
-    /// One BF16 row: y[n] = W[n] . x
-    pub(crate) fn gemv(
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_with(
         &self,
         gpu: &dyn GpuBackend,
+        k: KernelHandle,
+        x: DevicePtr,
+        w: DevicePtr,
+        y: DevicePtr,
+        n: usize,
+        kk: usize,
+        s: u64,
+    ) -> Result<()> {
+        KernelLaunch::new(gpu, k)
+            .grid([(n as u32).div_ceil(4), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(x)
+            .arg_ptr(w)
+            .arg_ptr(y)
+            .arg_u32(n as u32)
+            .arg_u32(kk as u32)
+            .launch(s)
+    }
+
+    /// `y[rows, n] = x[rows, k] W[n, k]^T`, BF16.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn proj(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: usize,
         x: DevicePtr,
         w: DevicePtr,
         y: DevicePtr,
@@ -57,20 +86,19 @@ impl GlueKernels {
         k: usize,
         s: u64,
     ) -> Result<()> {
-        KernelLaunch::new(gpu, self.dense_gemv)
-            .grid([(n as u32).div_ceil(4), 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(x)
-            .arg_ptr(w)
-            .arg_ptr(y)
-            .arg_u32(n as u32)
-            .arg_u32(k as u32)
-            .launch(s)
+        if rows == 1 {
+            self.gemv_with(gpu, self.dense_gemv, x, w, y, n, k, s)
+        } else {
+            ops::bf16_gemm(x, w.0, y, rows as u32, n as u32, k as u32, s)
+        }
     }
 
-    pub(crate) fn gemv_f32(
+    /// The same with fp32 outputs (router logits).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn proj_f32(
         &self,
         gpu: &dyn GpuBackend,
+        rows: usize,
         x: DevicePtr,
         w: DevicePtr,
         y: DevicePtr,
@@ -78,21 +106,19 @@ impl GlueKernels {
         k: usize,
         s: u64,
     ) -> Result<()> {
-        KernelLaunch::new(gpu, self.dense_gemv_f32)
-            .grid([(n as u32).div_ceil(4), 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(x)
-            .arg_ptr(w)
-            .arg_ptr(y)
-            .arg_u32(n as u32)
-            .arg_u32(k as u32)
-            .launch(s)
+        if rows == 1 {
+            self.gemv_with(gpu, self.dense_gemv_f32, x, w, y, n, k, s)
+        } else {
+            ops::bf16_gemm_f32out(x, w.0, y, rows as u32, n as u32, k as u32, s)
+        }
     }
 
-    /// One row; exactly one of `x_f32` / `x_bf16` non-NULL.
+    /// Exactly one of `x_f32` / `x_bf16` non-NULL.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn rmsnorm(
         &self,
         gpu: &dyn GpuBackend,
+        rows: usize,
         x_f32: DevicePtr,
         x_bf16: DevicePtr,
         w: DevicePtr,
@@ -102,7 +128,7 @@ impl GlueKernels {
         s: u64,
     ) -> Result<()> {
         KernelLaunch::new(gpu, self.rmsnorm)
-            .grid([1, 1, 1])
+            .grid([rows as u32, 1, 1])
             .block([256, 1, 1])
             .arg_ptr(x_f32)
             .arg_ptr(x_bf16)
@@ -134,6 +160,7 @@ impl GlueKernels {
             .launch(s)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn residual(
         &self,
         gpu: &dyn GpuBackend,
@@ -191,10 +218,12 @@ impl GlueKernels {
             .launch(s)
     }
 
-    /// Sigmoid top-k over fp32 logits, normalised, x `scale` (one token).
+    /// Sigmoid top-k over fp32 logits `[rows, experts]`, normalised, x `scale`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn route(
         &self,
         gpu: &dyn GpuBackend,
+        rows: usize,
         logits: DevicePtr,
         bias: DevicePtr,
         ids: DevicePtr,
@@ -205,7 +234,7 @@ impl GlueKernels {
         s: u64,
     ) -> Result<()> {
         KernelLaunch::new(gpu, self.topk)
-            .grid([1, 1, 1])
+            .grid([rows as u32, 1, 1])
             .block([256, 1, 1])
             .arg_ptr(logits)
             .arg_ptr(bias)
@@ -218,16 +247,17 @@ impl GlueKernels {
             .launch(s)
     }
 
-    /// Write one token's K and V rows into this visit's BF16 pages.
+    /// Write `rows` tokens' K and V into this visit's BF16 pages at `slots`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn kv_write(
         &self,
         gpu: &dyn GpuBackend,
+        rows: usize,
         k: DevicePtr,
         v: DevicePtr,
         k_pool: DevicePtr,
         v_pool: DevicePtr,
-        slot: DevicePtr,
+        slots: DevicePtr,
         kv_heads: usize,
         head_dim: usize,
         block_size: usize,
@@ -235,13 +265,13 @@ impl GlueKernels {
     ) -> Result<()> {
         let stride = (kv_heads * head_dim) as u32;
         KernelLaunch::new(gpu, self.kv_write)
-            .grid([1, 1, 1])
+            .grid([rows as u32, 1, 1])
             .block([256, 1, 1])
             .arg_ptr(k)
             .arg_ptr(v)
             .arg_ptr(k_pool)
             .arg_ptr(v_pool)
-            .arg_ptr(slot)
+            .arg_ptr(slots)
             .arg_u32(kv_heads as u32)
             .arg_u32(head_dim as u32)
             .arg_u32(block_size as u32)

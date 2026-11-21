@@ -495,6 +495,5 @@ pub(super) fn convert_python_jinja_to_minijinja(template: &str) -> String {
     t = t.replace("tojson(ensure_ascii=True)", "tojson");
 
     // messages[1:] — minijinja 2.x supports slice syntax natively
-
-    t
+    super::hf_tags::neutralize_generation_tags(&t)
 }

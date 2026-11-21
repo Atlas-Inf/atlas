@@ -38,7 +38,7 @@ fn header(store: &WeightStore) -> Result<plan::Header> {
         .collect()
 }
 
-fn dims(config: &ModelConfig, stack_blocks: usize) -> Dims {
+fn dims(config: &ModelConfig, stack_blocks: usize, max_rows: usize) -> Dims {
     let ink = config.inkling2.as_ref().expect("inkling2 config");
     Dims {
         hidden: config.hidden_size,
@@ -53,6 +53,7 @@ fn dims(config: &ModelConfig, stack_blocks: usize) -> Dims {
         // blocks of at least 8 tokens over the longest context
         max_blocks_per_seq: config.max_position_embeddings.div_ceil(8),
         stack_blocks,
+        max_rows,
     }
 }
 
@@ -144,7 +145,8 @@ impl ModelWeightLoader for Inkling2WeightLoader {
             up_softcap: ink.mlp_up_softcap,
             route_scale: config.routed_scaling_factor as f32,
         };
-        let d = dims(config, max_blocks(&visits));
+        // the real row capacity arrives with attach_layer_buffers
+        let d = dims(config, max_blocks(&visits), 1);
         tracing::info!(
             "Inkling2: {} physical layers, {} visits, block stack {}",
             physical.len(),
@@ -177,16 +179,18 @@ impl ModelWeightLoader for Inkling2WeightLoader {
         layers: &mut [Box<dyn TransformerLayer>],
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
-        _max_tokens: usize,
+        max_tokens: usize,
     ) -> Result<()> {
         let ink = config.inkling2.as_ref().context("inkling2 config")?;
-        let shared = Shared::alloc(gpu, &dims(config, max_blocks(&schedule(ink))))?;
+        let d = dims(config, max_blocks(&schedule(ink)), max_tokens.max(1));
+        let shared = Shared::alloc(gpu, &d)?;
         for (i, layer) in layers.iter_mut().enumerate() {
-            layer
+            let visit = layer
                 .as_any_mut()
                 .and_then(|a| a.downcast_mut::<Inkling2Layer>())
-                .with_context(|| format!("inkling2 visit {i} is not an Inkling2Layer"))?
-                .shared = shared;
+                .with_context(|| format!("inkling2 visit {i} is not an Inkling2Layer"))?;
+            visit.shared = shared;
+            visit.dims = d;
         }
         Ok(())
     }

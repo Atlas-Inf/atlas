@@ -11,7 +11,7 @@
 #include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
-// one CTA (256) per row; exactly one of x_f32 / x_bf16 non-NULL
+// one CTA (256) per row (grid = rows); exactly one of x_f32 / x_bf16 non-NULL
 extern "C" __global__ void inkling2_rmsnorm(const float* __restrict__ x_f32, const __nv_bfloat16* __restrict__ x_bf16,
                                             const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y,
                                             unsigned int H, unsigned int in_stride, unsigned int out_stride, float eps) {

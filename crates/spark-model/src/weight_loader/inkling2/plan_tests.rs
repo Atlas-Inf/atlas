@@ -55,6 +55,21 @@ fn release_header_matches_the_plan() {
 }
 
 #[test]
+fn tokenizer_capped_vocab_still_matches() {
+    // the server caps vocab_size at the tokenizer's 200058; the release pads to 201024
+    let (header, mut config) = release();
+    config.vocab_size = 200058;
+    plan(&header, &config).expect("padded vocabulary rows are accepted");
+    config.vocab_size = 201025;
+    assert!(
+        plan(&header, &config)
+            .unwrap_err()
+            .to_string()
+            .contains("embed.weight")
+    );
+}
+
+#[test]
 fn missing_tensor_fails() {
     let (mut header, config) = release();
     header.remove("model.llm.layers.11.attn.k_sconv.static_w");

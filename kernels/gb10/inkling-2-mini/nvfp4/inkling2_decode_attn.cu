@@ -18,6 +18,9 @@
 // `eager_attention_forward` (Apache-2.0); numerics in fp32 here, the reference adds
 // the bias in BF16.
 //
+// Prefill rows of one sequence run as `num_seqs` single-query rows sharing one block
+// table (max_blocks_per_seq = 0) with seq_lens[r] = position + 1.
+//
 // Grid: (num_q_heads, num_seqs, 1). Block: (256, 1, 1). HDIM = 128.
 
 #include "../../common/atlas_pdl.cuh"
@@ -43,7 +46,7 @@ extern "C" __global__ void inkling2_decode_attn(
     const __nv_bfloat16* __restrict__ K_cache,  // [num_blocks, block_size, num_kv_heads, HDIM]
     const __nv_bfloat16* __restrict__ V_cache,  // same layout
     __nv_bfloat16* __restrict__ O,              // [num_seqs, num_q_heads, HDIM]
-    const int* __restrict__ block_tables,       // [num_seqs, max_blocks_per_seq]
+    const int* __restrict__ block_tables,       // row s at s * max_blocks_per_seq (0: one shared table)
     const int* __restrict__ seq_lens,           // [num_seqs], including the current token
     const __nv_bfloat16* __restrict__ rel,      // [num_seqs, num_q_heads, d_rel]
     const __nv_bfloat16* __restrict__ rel_proj, // [d_rel, rel_extent]

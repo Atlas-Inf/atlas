@@ -65,6 +65,16 @@ impl Expect<'_> {
         Ok(())
     }
 
+    /// A BF16 `[rows, h]` vocabulary matrix with `rows >= vocab`.
+    fn vocab_rows(&mut self, name: &str, vocab: usize, h: usize) -> Result<()> {
+        let rows = self
+            .header
+            .get(name)
+            .map(|t| t.1.first().copied().unwrap_or(0))
+            .unwrap_or(0);
+        self.tensor(name, WeightDtype::BF16, &[rows.max(vocab), h])
+    }
+
     fn bf16(&mut self, name: &str, shape: &[usize]) -> Result<()> {
         self.tensor(name, WeightDtype::BF16, shape)
     }
@@ -85,10 +95,13 @@ pub(crate) fn plan(header: &Header, config: &ModelConfig) -> Result<Plan> {
         seen: BTreeSet::new(),
     };
     let (h, v) = (config.hidden_size, config.vocab_size);
-    e.bf16(&format!("{PREFIX}.embed.weight"), &[v, h])?;
+    // the release pads the vocabulary (201024 rows); the server may cap
+    // `vocab_size` at the tokenizer's 200058, so accept at least that many
+    for name in ["embed", "unembed"] {
+        e.vocab_rows(&format!("{PREFIX}.{name}.weight"), v, h)?;
+    }
     e.bf16(&format!("{PREFIX}.embed_norm.weight"), &[h])?;
     e.bf16(&format!("{PREFIX}.norm.weight"), &[h])?;
-    e.bf16(&format!("{PREFIX}.unembed.weight"), &[v, h])?;
     e.f32(&format!("{PREFIX}.attn_res.output_query"), &[h])?;
     let core_len = ink.core_end - ink.core_start;
     // per loop layer: (q, mlp) and (k, v) message queries

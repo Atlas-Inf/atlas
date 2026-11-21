@@ -9,7 +9,7 @@
 //   p_{q,j} = softmax_j(q . n_j / sqrt(H))
 //   out_q   = sum_j p_{q,j} n_j    (fp32)
 //
-// Saved blocks are BF16 layer inputs [rows, block_stride] (block j at column j * H); the
+// Saved blocks are BF16 layer inputs, block j of row r at r * row_stride + j * block_stride; the
 // partial is fp32 or BF16 [rows, H]. Queries are fp32 [nq, H] (1 for an attention or MLP
 // input, 3 for the q/k/v inputs of a full layer, 4 for a loop message). One CTA per row;
 // dot(q, n_j) = rstd_j * dot(q, s_j), so the first pass reads each state once for all
@@ -24,14 +24,14 @@
 
 __device__ __forceinline__ float ink_state(const __nv_bfloat16* __restrict__ blocks, const float* __restrict__ pf,
                                            const __nv_bfloat16* __restrict__ pb, unsigned long long row,
-                                           unsigned int block_stride, unsigned int H, unsigned int nb,
-                                           unsigned int j, unsigned int e) {
-    if (j < nb) return __bfloat162float(blocks[row * block_stride + (unsigned long long)j * H + e]);
+                                           unsigned int row_stride, unsigned long long block_stride,
+                                           unsigned int H, unsigned int nb, unsigned int j, unsigned int e) {
+    if (j < nb) return __bfloat162float(blocks[row * row_stride + (unsigned long long)j * block_stride + e]);
     return pf != nullptr ? pf[row * H + e] : __bfloat162float(pb[row * H + e]);
 }
 
 extern "C" __global__ void inkling2_block_res(
-    const __nv_bfloat16* __restrict__ blocks,   // [rows, block_stride]
+    const __nv_bfloat16* __restrict__ blocks,   // see row_stride / block_stride
     const float* __restrict__ partial_f32,      // [rows, H] or NULL
     const __nv_bfloat16* __restrict__ partial_bf16, // [rows, H] when partial_f32 is NULL
     const float* __restrict__ queries,          // [nq, H]
@@ -39,7 +39,8 @@ extern "C" __global__ void inkling2_block_res(
     const unsigned int rows,
     const unsigned int H,
     const unsigned int nb,                      // saved blocks (the partial is state nb)
-    const unsigned int block_stride,
+    const unsigned int row_stride,              // elements between rows of a block
+    const unsigned long long block_stride,      // elements between blocks
     const unsigned int nq,
     const float eps
 ) {
@@ -61,7 +62,7 @@ extern "C" __global__ void inkling2_block_res(
 #pragma unroll
         for (int j = 0; j < INK_MAX_STATES; j++) {
             if (j >= (int)ns) break;
-            const float s = ink_state(blocks, partial_f32, partial_bf16, row, block_stride, H, nb, j, e);
+            const float s = ink_state(blocks, partial_f32, partial_bf16, row, row_stride, block_stride, H, nb, j, e);
             acc[j][0] += s * s;
 #pragma unroll
             for (int q = 0; q < INK_MAX_Q; q++) acc[j][1 + q] += qv[q] * s;
@@ -106,7 +107,7 @@ extern "C" __global__ void inkling2_block_res(
     for (unsigned int e = threadIdx.x; e < H; e += blockDim.x) {
         float o[INK_MAX_Q] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (unsigned int j = 0; j < ns; j++) {
-            const float s = ink_state(blocks, partial_f32, partial_bf16, row, block_stride, H, nb, j, e);
+            const float s = ink_state(blocks, partial_f32, partial_bf16, row, row_stride, block_stride, H, nb, j, e);
 #pragma unroll
             for (int q = 0; q < INK_MAX_Q; q++) o[q] += (q < (int)nq ? p[q][j] : 0.0f) * s;
         }

@@ -101,3 +101,8 @@ disable_cwd_hint_injection = true
 [[model_types]]
 model_type = "inkling2_loop"
 hidden_size = 2304
+
+# Probed at model build for dense NVFP4 FFNs, which Inkling has none of (its
+# MoE runs this target's own stacked-expert kernels).
+[expected_absent.w4a16]
+w4a16_gemm_t_p3 = "3-deep pipeline twin shipped only in qwen3.6-27b's shadow; probed by the model build, never dispatched for Inkling (no dense NVFP4 FFN)."

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Buffers every Inkling 2 visit shares within one forward: the block stack,
-//! the prelude's saved output, the previous pass's message states, scratch
-//! for one row, and the token metadata visit 0 uploads (position, slot,
-//! length, block table) for the other visits. Decode only, one row (the
-//! prefill fallback runs decode per token); multi-row comes with the batched
-//! kernels.
+//! Buffers every Inkling 2 visit shares within one forward of up to
+//! `max_rows` tokens of one sequence (a decode step or a prefill chunk): the
+//! block stack, the prelude's saved output, the previous pass's message
+//! states, per-row scratch, and the rows' metadata visit 0 uploads (positions,
+//! slots, lengths, block table) for the other visits. The model runs prefill
+//! layer-major, so every per-token state here is per row.
 
 use anyhow::{Context, Result};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -25,11 +25,20 @@ pub(crate) struct Dims {
     pub max_blocks_per_seq: usize,
     /// Blocks the stack can hold (schedule max).
     pub stack_blocks: usize,
+    /// Rows one forward may carry (the prefill chunk).
+    pub max_rows: usize,
+}
+
+impl Dims {
+    /// Elements between two blocks of the stack (block-major `[block, row, H]`).
+    pub(crate) fn block_stride(&self) -> usize {
+        self.max_rows * self.hidden
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Shared {
-    // forward state
+    // forward state, BF16; the stacks are block-major [block, max_rows, H]
     pub blocks: DevicePtr,
     pub prelude_h: DevicePtr,
     pub msg_blocks: DevicePtr,
@@ -68,12 +77,12 @@ pub(crate) struct Shared {
     pub moe_out: DevicePtr,
     pub mlp_conv: DevicePtr,
     pub ids: DevicePtr,
-    // token metadata (visit 0 uploads)
-    pub position: DevicePtr,
-    pub slot: DevicePtr,
-    pub seq_len: DevicePtr,
+    // row metadata (visit 0 uploads)
+    pub positions: DevicePtr,
+    pub slots: DevicePtr,
+    pub seq_lens: DevicePtr,
     pub block_table: DevicePtr,
-    /// constant one-row conv bookkeeping: row_seq [0], seq_start [0, 1], slots [0]
+    /// conv bookkeeping for one sequence: row_seq all 0, seq_start [0, rows], slot 0
     pub row_seq: DevicePtr,
     pub seq_start: DevicePtr,
     pub conv_slot: DevicePtr,
@@ -100,49 +109,49 @@ impl Arena {
 
 impl Shared {
     fn carve(a: &mut Arena, d: &Dims) -> Self {
-        let (h, f, b) = (d.hidden, 4usize, 2usize);
+        let (h, r, f, b) = (d.hidden, d.max_rows, 4usize, 2usize);
         Self {
-            blocks: a.take(d.stack_blocks * h * b),
-            prelude_h: a.take(h * b),
-            msg_blocks: a.take(d.stack_blocks * h * b),
-            msg_h: a.take(h * b),
-            res3: a.take(3 * h * f),
-            msg4: a.take(4 * h * f),
-            resid: a.take(h * f),
-            mlp_in: a.take(h * f),
-            logits: a.take(d.experts * f),
-            weights: a.take(d.top_k * f),
-            final_out: a.take(h * f),
-            normed3: a.take(3 * h * b),
-            q: a.take(d.q_dim * b),
-            k_lin: a.take(d.kv_dim * b),
-            v_lin: a.take(d.kv_dim * b),
-            r: a.take(d.rel_dim * b),
-            gate: a.take(d.q_dim * b),
-            sink: a.take(d.heads * b),
-            dyn_k: a.take(d.dyn_dim * b),
-            dyn_v: a.take(d.dyn_dim * b),
-            kc: a.take(d.kv_dim * b),
-            vc: a.take(d.kv_dim * b),
-            qn: a.take(d.q_dim * b),
-            kn: a.take(d.kv_dim * b),
-            vn: a.take(d.kv_dim * b),
-            rn: a.take(d.rel_dim * b),
-            attn: a.take(d.q_dim * b),
-            gated: a.take(d.q_dim * b),
-            proj: a.take(h * b),
-            conv_out: a.take(h * b),
-            mlp_normed: a.take(h * b),
-            act: a.take(d.top_k * d.inter * b),
-            y: a.take(d.top_k * h * b),
-            moe_out: a.take(h * b),
-            mlp_conv: a.take(h * b),
-            ids: a.take(d.top_k * 4),
-            position: a.take(4),
-            slot: a.take(8),
-            seq_len: a.take(4),
+            blocks: a.take(d.stack_blocks * r * h * b),
+            prelude_h: a.take(r * h * b),
+            msg_blocks: a.take(d.stack_blocks * r * h * b),
+            msg_h: a.take(r * h * b),
+            res3: a.take(3 * r * h * f),
+            msg4: a.take(4 * r * h * f),
+            resid: a.take(r * h * f),
+            mlp_in: a.take(r * h * f),
+            logits: a.take(r * d.experts * f),
+            weights: a.take(r * d.top_k * f),
+            final_out: a.take(r * h * f),
+            normed3: a.take(3 * r * h * b),
+            q: a.take(r * d.q_dim * b),
+            k_lin: a.take(r * d.kv_dim * b),
+            v_lin: a.take(r * d.kv_dim * b),
+            r: a.take(r * d.rel_dim * b),
+            gate: a.take(r * d.q_dim * b),
+            sink: a.take(r * d.heads * b),
+            dyn_k: a.take(r * d.dyn_dim * b),
+            dyn_v: a.take(r * d.dyn_dim * b),
+            kc: a.take(r * d.kv_dim * b),
+            vc: a.take(r * d.kv_dim * b),
+            qn: a.take(r * d.q_dim * b),
+            kn: a.take(r * d.kv_dim * b),
+            vn: a.take(r * d.kv_dim * b),
+            rn: a.take(r * d.rel_dim * b),
+            attn: a.take(r * d.q_dim * b),
+            gated: a.take(r * d.q_dim * b),
+            proj: a.take(r * h * b),
+            conv_out: a.take(r * h * b),
+            mlp_normed: a.take(r * h * b),
+            act: a.take(r * d.top_k * d.inter * b),
+            y: a.take(r * d.top_k * h * b),
+            moe_out: a.take(r * h * b),
+            mlp_conv: a.take(r * h * b),
+            ids: a.take(r * d.top_k * 4),
+            positions: a.take(r * 4),
+            slots: a.take(r * 8),
+            seq_lens: a.take(r * 4),
             block_table: a.take(d.max_blocks_per_seq * 4),
-            row_seq: a.take(4),
+            row_seq: a.take(r * 4),
             seq_start: a.take(8),
             conv_slot: a.take(4),
         }
@@ -163,6 +172,7 @@ impl Shared {
         !self.blocks.is_null()
     }
 
+    /// Zeroed buffers (row_seq and the conv slot stay 0: one sequence, slot 0).
     pub(crate) fn alloc(gpu: &dyn GpuBackend, d: &Dims) -> Result<Self> {
         let mut probe = Arena {
             base: DevicePtr::NULL,
@@ -173,14 +183,11 @@ impl Shared {
             .alloc(probe.used)
             .context("allocate inkling2 shared buffers")?;
         gpu.copy_h2d(&vec![0u8; probe.used], base)?;
-        let s = Self::carve(&mut Arena { base, used: 0 }, d);
-        // one-row conv bookkeeping
-        gpu.copy_h2d(&0i32.to_le_bytes(), s.row_seq)?;
-        gpu.copy_h2d(
-            &[0i32.to_le_bytes(), 1i32.to_le_bytes()].concat(),
-            s.seq_start,
-        )?;
-        gpu.copy_h2d(&0i32.to_le_bytes(), s.conv_slot)?;
-        Ok(s)
+        tracing::info!(
+            "Inkling2 shared buffers: {:.1} MB for {} rows",
+            probe.used as f64 / 1e6,
+            d.max_rows
+        );
+        Ok(Self::carve(&mut Arena { base, used: 0 }, d))
     }
 }
