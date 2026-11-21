@@ -72,7 +72,7 @@ impl Inkling2Layer {
     ) -> Result<()> {
         ops::block_res(
             gpu,
-            self.k.block_res,
+            &self.k,
             &BlockRes {
                 blocks,
                 partial_f32,
@@ -85,6 +85,7 @@ impl Inkling2Layer {
                 row_stride: self.dims.hidden,
                 block_stride: self.dims.block_stride(),
                 num_queries: nq,
+                sums: self.shared.res_sums,
                 eps: 1e-6,
             },
             stream,

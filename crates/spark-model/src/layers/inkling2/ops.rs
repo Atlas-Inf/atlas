@@ -25,7 +25,8 @@ pub(crate) struct Inkling2Kernels {
     pub decode_attn: KernelHandle,
     pub sconv: KernelHandle,
     pub sconv_state: KernelHandle,
-    pub block_res: KernelHandle,
+    pub block_res_sums: KernelHandle,
+    pub block_res_out: KernelHandle,
     pub head_norm: KernelHandle,
     pub msg_gate_z: KernelHandle,
     pub msg_gate_out: KernelHandle,
@@ -42,7 +43,8 @@ impl Inkling2Kernels {
             decode_attn: gpu.kernel("inkling2_decode_attn", "inkling2_decode_attn")?,
             sconv: gpu.kernel("inkling2_sconv", "inkling2_sconv")?,
             sconv_state: gpu.kernel("inkling2_sconv", "inkling2_sconv_state")?,
-            block_res: gpu.kernel("inkling2_block_res", "inkling2_block_res")?,
+            block_res_sums: gpu.kernel("inkling2_block_res", "inkling2_block_res_sums")?,
+            block_res_out: gpu.kernel("inkling2_block_res", "inkling2_block_res_out")?,
             head_norm: gpu.kernel("inkling2_head_ops", "inkling2_head_norm")?,
             msg_gate_z: gpu.kernel("inkling2_head_ops", "inkling2_msg_gate_z")?,
             msg_gate_out: gpu.kernel("inkling2_head_ops", "inkling2_msg_gate_out")?,
@@ -212,12 +214,14 @@ pub(crate) struct BlockRes {
     /// elements between blocks
     pub block_stride: usize,
     pub num_queries: usize,
+    /// per-row chunk sums scratch, [`block_res_sums_per_row`] fp32 each
+    pub sums: DevicePtr,
     pub eps: f32,
 }
 
 pub(crate) fn block_res(
     gpu: &dyn GpuBackend,
-    k: KernelHandle,
+    kernels: &Inkling2Kernels,
     a: &BlockRes,
     stream: u64,
 ) -> Result<()> {
@@ -231,13 +235,32 @@ pub(crate) fn block_res(
         a.partial_f32.is_null() != a.partial_bf16.is_null(),
         "inkling2 block residual needs exactly one partial"
     );
-    KernelLaunch::new(gpu, k)
-        .grid([u32_of(a.rows, "rows")?, 1, 1])
-        .block([256, 1, 1])
+    let grid = [
+        u32_of(a.hidden.div_ceil(RES_CHUNK), "hidden")?,
+        u32_of(a.rows, "rows")?,
+        1,
+    ];
+    KernelLaunch::new(gpu, kernels.block_res_sums)
+        .grid(grid)
+        .block([RES_CHUNK as u32, 1, 1])
         .arg_ptr(a.blocks)
         .arg_ptr(a.partial_f32)
         .arg_ptr(a.partial_bf16)
         .arg_ptr(a.queries)
+        .arg_ptr(a.sums)
+        .arg_u32(u32_of(a.hidden, "hidden")?)
+        .arg_u32(u32_of(a.num_blocks, "blocks")?)
+        .arg_u32(u32_of(a.row_stride, "row stride")?)
+        .arg_u64(a.block_stride as u64)
+        .arg_u32(u32_of(a.num_queries, "queries")?)
+        .launch(stream)?;
+    KernelLaunch::new(gpu, kernels.block_res_out)
+        .grid(grid)
+        .block([RES_CHUNK as u32, 1, 1])
+        .arg_ptr(a.blocks)
+        .arg_ptr(a.partial_f32)
+        .arg_ptr(a.partial_bf16)
+        .arg_ptr(a.sums)
         .arg_ptr(a.out)
         .arg_u32(u32_of(a.rows, "rows")?)
         .arg_u32(u32_of(a.hidden, "hidden")?)
@@ -247,6 +270,15 @@ pub(crate) fn block_res(
         .arg_u32(u32_of(a.num_queries, "queries")?)
         .arg_f32(a.eps)
         .launch(stream)
+}
+
+/// Channels per block-residual CTA (the kernels' INK_THREADS).
+const RES_CHUNK: usize = 256;
+
+/// fp32 elements of `inkling2_block_res_sums` output per row: per hidden chunk,
+/// per state (blocks + partial), the sum of squares and each query's dot.
+pub(crate) fn block_res_sums_per_row(hidden: usize) -> usize {
+    hidden.div_ceil(RES_CHUNK) * MAX_BLOCK_STATES * (1 + MAX_RES_QUERIES)
 }
 
 /// Per-head epilogue.

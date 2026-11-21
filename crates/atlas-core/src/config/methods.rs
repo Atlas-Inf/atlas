@@ -298,8 +298,12 @@ impl ModelConfig {
         if self.kv_lora_rank > 0 {
             return true;
         }
-        // Laguna and Ricursive ship lm_head in BF16; Strict keeps checkpoint precision.
-        if matches!(self.model_type.as_str(), "laguna" | "ricursive") {
+        // Laguna, Ricursive and Inkling 2 ship lm_head in BF16; Strict keeps
+        // checkpoint precision.
+        if matches!(
+            self.model_type.as_str(),
+            "laguna" | "ricursive" | "inkling2_loop"
+        ) {
             return true;
         }
         if self.model_type == "gemma4" && self.num_experts == 0 {
