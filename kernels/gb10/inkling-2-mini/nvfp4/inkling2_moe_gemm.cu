@@ -12,6 +12,8 @@
 // cp.async double buffering of the activation rows and the raw codes. Rows are gathered
 // through `rows` (sorted -> source row) or taken in order when it is NULL.
 // The dense entry runs the same tile for one NVFP4 projection (Spark mode's attention).
+// The MXFP8 entry reads the coda layers' experts (E4M3 codes [E, N, K], E8M0 scales per
+// 32 inputs [E, N, K/32]): an E4M3 value times a power of two is exact in BF16.
 // grouped grid (N / 128, ceil(max rows of an expert / 64), E), block 256.
 
 #include "../../common/atlas_pdl.cuh"
@@ -41,8 +43,9 @@ __device__ __forceinline__ void ink_mma(float* c, const unsigned int* a, const u
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
-// One 64 x 128 tile of rows m_start + m0 .. of `C` against one NVFP4 weight [N, K/2]
-// (codes wc, scales ws, global g).
+// One 64 x 128 tile of rows m_start + m0 .. of `C` against one weight: NVFP4 [N, K/2]
+// (codes wc, E4M3 scales ws per 16, global g) or MXFP8 [N, K] (E8M0 scales per 32).
+template <bool MX>
 __device__ __forceinline__ void ink_gemm_tile(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ wc,
     const unsigned char* __restrict__ ws, const float g, __nv_bfloat16* __restrict__ C,
@@ -51,7 +54,7 @@ __device__ __forceinline__ void ink_gemm_tile(
 ) {
     __shared__ __align__(16) __nv_bfloat16 As[2][GM][GSTRIDE];
     __shared__ __align__(16) __nv_bfloat16 Bs[2][GN][GSTRIDE];
-    __shared__ __align__(16) unsigned char Braw[2][GN][16];
+    __shared__ __align__(16) unsigned char Braw[2][GN][MX ? 32 : 16];
     __shared__ float lut[16];
     const unsigned int n0 = blockIdx.x * GN;
     const unsigned int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
@@ -62,27 +65,45 @@ __device__ __forceinline__ void ink_gemm_tile(
     const bool a_ok = m0 + a_row < m_count;
     const long long src = a_ok ? (rows ? rows[m_start + m0 + a_row] : m_start + m0 + a_row) : 0;
     const __nv_bfloat16* a_ptr = A + (unsigned long long)src * K + a_col;
-    // this thread's raw code chunk (threads 0..127): row n0 + tid, 16 bytes = 32 values
-    const unsigned char* c_ptr = wc + (unsigned long long)(n0 + (tid & 127)) * (K / 2);
+    // this thread's raw code chunk: row n0 + tid % 128, 16 bytes (NVFP4: threads 0..127,
+    // 32 values; MXFP8: both halves of the row's 32 bytes)
+    const unsigned int c_row = tid & 127, c_half = tid >> 7;
+    const unsigned char* c_ptr = wc + (unsigned long long)(n0 + c_row) * (MX ? K : K / 2);
 
     auto issue = [&](int buf, unsigned int k0) {
         ink_cp16(&As[buf][a_row][a_col], a_ptr + k0, a_ok);
-        if (tid < GN) ink_cp16(&Braw[buf][tid][0], c_ptr + k0 / 2, n0 + tid < N);
+        if (MX) ink_cp16(&Braw[buf][c_row][c_half * 16], c_ptr + k0 + c_half * 16, n0 + c_row < N);
+        else if (tid < GN) ink_cp16(&Braw[buf][tid][0], c_ptr + k0 / 2, n0 + tid < N);
         asm volatile("cp.async.commit_group;\n" ::);
     };
     // dequantise this step's codes: thread t takes row t / 2, half t % 2 (16 values, one scale)
     auto dequant = [&](int buf, unsigned int k0) {
         const unsigned int r = tid / 2, h = tid % 2;
         const unsigned int n = n0 + r;
-        const float s = n < N ? (float)(*(const __nv_fp8_e4m3*)&ws[(unsigned long long)n * (K / 16) + k0 / 16 + h]) * g : 0.0f;
-        const uint2 q = *(const uint2*)&Braw[buf][r][h * 8];
-        const unsigned int w[2] = {q.x, q.y};
         unsigned int out[8];
+        if (MX) {
+            const float s = n < N ? exp2f((float)ws[(unsigned long long)n * (K / 32) + k0 / 32] - 127.0f) : 0.0f;
+            const uint4 q = *(const uint4*)&Braw[buf][r][h * 16];
+            const unsigned int w[4] = {q.x, q.y, q.z, q.w};
 #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            const unsigned int byte = (w[i / 4] >> (8 * (i % 4))) & 0xFF;
-            const __nv_bfloat16 lo = __float2bfloat16(lut[byte & 0xF] * s), hi = __float2bfloat16(lut[byte >> 4] * s);
-            out[i] = (unsigned int)__bfloat16_as_ushort(lo) | ((unsigned int)__bfloat16_as_ushort(hi) << 16);
+            for (int i = 0; i < 8; i++) {
+                const unsigned int pair = (w[i / 2] >> (16 * (i % 2))) & 0xFFFF;
+                __nv_fp8_e4m3 a, b;
+                *(unsigned char*)&a = pair & 0xFF;
+                *(unsigned char*)&b = pair >> 8;
+                const __nv_bfloat16 lo = __float2bfloat16((float)a * s), hi = __float2bfloat16((float)b * s);
+                out[i] = (unsigned int)__bfloat16_as_ushort(lo) | ((unsigned int)__bfloat16_as_ushort(hi) << 16);
+            }
+        } else {
+            const float s = n < N ? (float)(*(const __nv_fp8_e4m3*)&ws[(unsigned long long)n * (K / 16) + k0 / 16 + h]) * g : 0.0f;
+            const uint2 q = *(const uint2*)&Braw[buf][r][h * 8];
+            const unsigned int w[2] = {q.x, q.y};
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const unsigned int byte = (w[i / 4] >> (8 * (i % 4))) & 0xFF;
+                const __nv_bfloat16 lo = __float2bfloat16(lut[byte & 0xF] * s), hi = __float2bfloat16(lut[byte >> 4] * s);
+                out[i] = (unsigned int)__bfloat16_as_ushort(lo) | ((unsigned int)__bfloat16_as_ushort(hi) << 16);
+            }
         }
         uint4* dst = (uint4*)&Bs[buf][r][h * 16];
         dst[0] = make_uint4(out[0], out[1], out[2], out[3]);
@@ -173,7 +194,27 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4(
     const int m0 = blockIdx.y * GM;
     if (m0 >= m_count) return;
     const unsigned long long ne = (unsigned long long)e * N;
-    ink_gemm_tile(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K);
+    ink_gemm_tile<false>(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K);
+}
+
+// The same over MXFP8 experts (codes [E, N, K], E8M0 scales [E, N, K/32], no global).
+extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_mxfp8(
+    const __nv_bfloat16* __restrict__ A,       // [source rows, K]
+    const unsigned char* __restrict__ codes,   // [E, N, K]
+    const unsigned char* __restrict__ scales,  // [E, N, K/32]
+    __nv_bfloat16* __restrict__ C,             // [sorted rows, N]
+    const int* __restrict__ offsets,           // [E + 1]
+    const int* __restrict__ rows,              // [sorted rows] -> source row, or NULL
+    const unsigned int N,
+    const unsigned int K
+) {
+    atlas_pdl_enter();
+    const unsigned int e = blockIdx.z;
+    const int m_start = offsets[e], m_count = offsets[e + 1] - m_start;
+    const int m0 = blockIdx.y * GM;
+    if (m0 >= m_count) return;
+    const unsigned long long ne = (unsigned long long)e * N;
+    ink_gemm_tile<true>(A, codes + ne * K, scales + ne * (K / 32), 1.0f, C, m_start, m_count, m0, rows, N, K);
 }
 
 // A dense NVFP4 projection (ModelOpt codes [N, K/2], E4M3 scales [N, K/16], scalar
@@ -186,5 +227,5 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_gemm_nvfp4(
     atlas_pdl_enter();
     const int m0 = blockIdx.y * GM;
     if (m0 >= (int)M) return;
-    ink_gemm_tile(A, codes, scales, s2, C, 0, (int)M, m0, nullptr, N, K);
+    ink_gemm_tile<false>(A, codes, scales, s2, C, 0, (int)M, m0, nullptr, N, K);
 }

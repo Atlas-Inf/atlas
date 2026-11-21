@@ -5,17 +5,15 @@
 //! pointers into the weight store (BF16/F32/U8/F8 as the checkpoint stores
 //! them), so every visit of a physical layer copies the same struct. Derived at
 //! load: the experts' per-expert global scales (`amax /
-//! outer_scale_denominator`, F32 `[E]`) and, for the MXFP8 layers, an exact
-//! BF16 copy of the experts with per-expert pointer tables for Atlas's grouped
-//! BF16 prefill GEMM.
+//! outer_scale_denominator`, F32 `[E]`).
 
 use anyhow::{Context, Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
-use spark_runtime::weights::{WeightStore, WeightTensor};
+use spark_runtime::weights::WeightStore;
 
 use crate::weight_map::QuantizedWeight;
 
-use super::ops::{GroupedExperts, StackedExperts};
+use super::ops::StackedExperts;
 use spark_runtime::kernel_args::KernelLaunch;
 
 const PREFIX: &str = "model.llm";
@@ -120,81 +118,6 @@ pub(crate) fn global(store: &WeightStore) -> Result<GlobalWeights> {
     })
 }
 
-/// `[E]` device table of `base + e * stride` (no copy).
-fn ptr_table(
-    gpu: &dyn GpuBackend,
-    base: DevicePtr,
-    experts: usize,
-    stride: usize,
-) -> Result<DevicePtr> {
-    let ptrs: Vec<u8> = (0..experts)
-        .flat_map(|e| (base.0 + (e * stride) as u64).to_le_bytes())
-        .collect();
-    let dev = gpu
-        .alloc(ptrs.len())
-        .context("allocate expert pointer table")?;
-    gpu.copy_h2d(&ptrs, dev)?;
-    Ok(dev)
-}
-
-/// One stacked expert tensor `[E, N, K]` (MXFP8, with E8M0 scales `[E, N, K/32]`)
-/// as BF16 `[E, N, K]`.
-fn mxfp8_as_bf16(
-    gpu: &dyn GpuBackend,
-    codes: &WeightTensor,
-    scales: DevicePtr,
-) -> Result<DevicePtr> {
-    let [e, n, k] = codes.shape[..] else {
-        anyhow::bail!("inkling2 MXFP8 experts shape {:?}", codes.shape);
-    };
-    let out = gpu
-        .alloc(e * n * k * 2)
-        .context("allocate inkling2 BF16 experts")?;
-    let kernel = gpu.kernel("inkling2_moe_prefill", "inkling2_mxfp8_to_bf16")?;
-    KernelLaunch::new(gpu, kernel)
-        .grid([u32::try_from(e * n)?, 1, 1])
-        .block([256, 1, 1])
-        .arg_ptr(codes.ptr)
-        .arg_ptr(scales)
-        .arg_ptr(out)
-        .arg_u32(u32::try_from(k)?)
-        .launch(0)?;
-    gpu.synchronize(0)?;
-    Ok(out)
-}
-
-/// For an MXFP8 layer, per-expert tables over BF16 copies of its experts for
-/// `moe_bf16_grouped_gemm`; NVFP4 layers need none (their prefill kernel reads
-/// the stacked tensors).
-fn grouped_experts(
-    store: &WeightStore,
-    gpu: &dyn GpuBackend,
-    ex: &str,
-    mxfp8: bool,
-) -> Result<GroupedExperts> {
-    if !mxfp8 {
-        return Ok(GroupedExperts {
-            w13: DevicePtr::NULL,
-            w2: DevicePtr::NULL,
-        });
-    }
-    let t = |name: String| {
-        store
-            .get(&name)
-            .with_context(|| format!("inkling2 tensor {name}"))
-    };
-    let table = |w: &str| -> Result<DevicePtr> {
-        let codes = t(format!("{ex}.{w}"))?;
-        let bf16 = mxfp8_as_bf16(gpu, codes, t(format!("{ex}.{w}_scale"))?.ptr)?;
-        let e = codes.shape[0];
-        ptr_table(gpu, bf16, e, codes.num_elements() / e * 2)
-    };
-    Ok(GroupedExperts {
-        w13: table("w13_weight")?,
-        w2: table("w2_weight")?,
-    })
-}
-
 /// `amax[e] / denominator` as an F32 `[E]` device array.
 fn expert_globals(
     store: &WeightStore,
@@ -235,7 +158,6 @@ fn checkpoint_experts(
 ) -> Result<StackedExperts> {
     let p = |name: &str| ptr(store, name);
     let ex = format!("{lp}.mlp.experts");
-    let grouped = grouped_experts(store, gpu, &ex, mxfp8)?;
     Ok(StackedExperts {
         mxfp8,
         w13: p(&format!("{ex}.w13_weight"))?,
@@ -252,7 +174,6 @@ fn checkpoint_experts(
         } else {
             expert_globals(store, gpu, &format!("{ex}.w2_weight"), experts)?
         },
-        grouped,
     })
 }
 
@@ -302,10 +223,6 @@ fn spark_experts(
         w2: t(format!("{ex}.down_proj.weight"))?.ptr,
         w2_scale: t(format!("{ex}.down_proj.weight_scale"))?.ptr,
         w2_global: t(format!("{ex}.down_proj.weight_scale_2"))?.ptr,
-        grouped: GroupedExperts {
-            w13: DevicePtr::NULL,
-            w2: DevicePtr::NULL,
-        },
     }))
 }
 

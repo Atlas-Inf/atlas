@@ -52,7 +52,7 @@ pub(crate) struct Inkling2Kernels {
     pub moe_sort: KernelHandle,
     pub moe_unpermute: KernelHandle,
     pub moe_gemm_nvfp4: KernelHandle,
-    pub moe_gemm_bf16: KernelHandle,
+    pub moe_gemm_mxfp8: KernelHandle,
     pub softcap_swiglu: KernelHandle,
 }
 
@@ -88,7 +88,7 @@ impl Inkling2Kernels {
             moe_sort: gpu.kernel("moe", "moe_sort_by_expert")?,
             moe_unpermute: gpu.kernel("moe", "moe_unpermute_reduce_indexed")?,
             moe_gemm_nvfp4: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_gemm_nvfp4")?,
-            moe_gemm_bf16: gpu.kernel("moe_bf16_grouped_gemm", "moe_bf16_grouped_gemm")?,
+            moe_gemm_mxfp8: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_gemm_mxfp8")?,
             softcap_swiglu: gpu.kernel("inkling2_moe_prefill", "inkling2_softcap_swiglu")?,
         })
     }
