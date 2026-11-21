@@ -29,6 +29,8 @@ pub(crate) struct GlueKernels {
     pub kv_write: KernelHandle,
     /// Spark NVFP4 projections: one row, many rows
     pub w4a16_gemv: KernelHandle,
+    pub w4a16_gemv_b8: KernelHandle,
+    pub w4a16_gemv_b16: KernelHandle,
     pub gemm_nvfp4: KernelHandle,
 }
 
@@ -46,6 +48,8 @@ impl GlueKernels {
             topk: gpu.kernel("moe_topk_sig", "moe_topk_sigmoid_batched_f32")?,
             kv_write: gpu.kernel("reshape_and_cache", "reshape_and_cache_flash")?,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
+            w4a16_gemv_b8: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch8")?,
+            w4a16_gemv_b16: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch16")?,
             gemm_nvfp4: gpu.kernel("inkling2_moe_gemm", "inkling2_gemm_nvfp4")?,
         })
     }
@@ -81,7 +85,8 @@ impl GlueKernels {
 
     /// `y[rows, n] = x[rows, k] W[n, k]^T`, BF16 out: a BF16 weight through
     /// the dense GEMV / BF16 GEMM, a Spark NVFP4 one through `w4a16_gemv` /
-    /// `inkling2_gemm_nvfp4` (BF16 activations either way).
+    /// `w4a16_gemv_batch8/16` / `inkling2_gemm_nvfp4` by row count (BF16
+    /// activations throughout).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn proj(
         &self,
@@ -99,6 +104,15 @@ impl GlueKernels {
             Linear::Bf16(w) => ops::bf16_gemm(x, w.0, y, rows as u32, n as u32, k as u32, s),
             Linear::Nvfp4(q) if rows == 1 => {
                 ops::w4a16_gemv(gpu, self.w4a16_gemv, x, &q, y, n as u32, k as u32, s)
+            }
+            // a decode batch: Atlas's batched GEMV reads the weight once for all rows
+            Linear::Nvfp4(q) if rows <= 16 => {
+                let kernel = if rows <= 8 {
+                    self.w4a16_gemv_b8
+                } else {
+                    self.w4a16_gemv_b16
+                };
+                ops::w4a16_gemv_batchm(gpu, kernel, x, &q, y, rows as u32, n as u32, k as u32, s)
             }
             // this target's tensor-core tile (BF16 activations, weights dequantised to BF16)
             Linear::Nvfp4(q) => KernelLaunch::new(gpu, self.gemm_nvfp4)

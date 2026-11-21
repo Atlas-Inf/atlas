@@ -171,30 +171,30 @@ impl Inkling2Layer {
     /// for prefill-sized row counts, the decode GEMVs otherwise.
     pub(super) fn routed_experts(&self, gpu: &dyn GpuBackend, n: usize, stream: u64) -> Result<()> {
         let (s, w, d, p, h) = (&self.shared, &self.w, &self.dims, &self.p, self.dims.hidden);
-        if n >= ops::MOE_GROUPED_MIN_ROWS && std::env::var_os("INK_OLD_MOE").is_none() {
-            ops::moe_prefill(
-                gpu,
-                &self.k,
-                &ops::MoePrefill {
-                    x: s.mlp_normed,
-                    experts: w.experts,
-                    expert_ids: s.ids,
-                    weights: s.weights,
-                    gu: s.gu,
-                    act: s.act,
-                    y: s.y,
-                    out: s.moe_out,
-                    sort: s.moe_sort,
-                    rows: n,
-                    top_k: d.top_k,
-                    hidden: h,
-                    inter: d.inter,
-                    num_experts: d.experts,
-                    gate_softcap: p.gate_softcap,
-                    up_softcap: p.up_softcap,
-                },
-                stream,
-            )?;
+        if n > 1 {
+            let args = ops::MoePrefill {
+                x: s.mlp_normed,
+                experts: w.experts,
+                expert_ids: s.ids,
+                weights: s.weights,
+                gu: s.gu,
+                act: s.act,
+                y: s.y,
+                out: s.moe_out,
+                sort: s.moe_sort,
+                rows: n,
+                top_k: d.top_k,
+                hidden: h,
+                inter: d.inter,
+                num_experts: d.experts,
+                gate_softcap: p.gate_softcap,
+                up_softcap: p.up_softcap,
+            };
+            if n >= ops::MOE_GROUPED_MIN_ROWS {
+                ops::moe_prefill(gpu, &self.k, &args, stream)?;
+            } else {
+                ops::moe_batched(gpu, &self.k, &args, stream)?;
+            }
         } else {
             ops::moe_decode(
                 gpu,

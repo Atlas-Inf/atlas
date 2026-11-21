@@ -40,6 +40,11 @@ pub(crate) struct Inkling2Kernels {
     pub moe_gate_up_mxfp8: KernelHandle,
     pub moe_down_nvfp4: KernelHandle,
     pub moe_down_mxfp8: KernelHandle,
+    /// decode batches: per-expert GEMVs over the rows' sorted expert slots
+    pub moe_grouped_gate_up_nvfp4: KernelHandle,
+    pub moe_grouped_gate_up_mxfp8: KernelHandle,
+    pub moe_grouped_down_nvfp4: KernelHandle,
+    pub moe_grouped_down_mxfp8: KernelHandle,
     pub moe_combine: KernelHandle,
     /// prefill: Atlas's sort, grouped GEMMs (NVFP4 pointer table, BF16) and
     /// weighted unpermute, around this target's softcapped SwiGLU
@@ -69,6 +74,14 @@ impl Inkling2Kernels {
             moe_gate_up_mxfp8: gpu.kernel("inkling2_moe_decode", "inkling2_moe_gate_up_mxfp8")?,
             moe_down_nvfp4: gpu.kernel("inkling2_moe_decode", "inkling2_moe_down_nvfp4")?,
             moe_down_mxfp8: gpu.kernel("inkling2_moe_decode", "inkling2_moe_down_mxfp8")?,
+            moe_grouped_gate_up_nvfp4: gpu
+                .kernel("inkling2_moe_decode", "inkling2_moe_grouped_gate_up_nvfp4")?,
+            moe_grouped_gate_up_mxfp8: gpu
+                .kernel("inkling2_moe_decode", "inkling2_moe_grouped_gate_up_mxfp8")?,
+            moe_grouped_down_nvfp4: gpu
+                .kernel("inkling2_moe_decode", "inkling2_moe_grouped_down_nvfp4")?,
+            moe_grouped_down_mxfp8: gpu
+                .kernel("inkling2_moe_decode", "inkling2_moe_grouped_down_mxfp8")?,
             moe_combine: gpu.kernel("inkling2_moe_decode", "inkling2_moe_combine")?,
             moe_sort: gpu.kernel("moe", "moe_sort_by_expert")?,
             moe_unpermute: gpu.kernel("moe", "moe_unpermute_reduce_indexed")?,

@@ -275,3 +275,89 @@ pub(crate) fn moe_prefill(
         stream,
     )
 }
+
+/// Routed experts for a decode batch of a few rows: the rows' expert slots
+/// sorted by expert, each expert's weights read once for every row that chose
+/// it (the per-row GEMVs read them once per row), then the weighted sum back in
+/// row order. Same buffers as [`MoePrefill`] (`gu` unused).
+pub(crate) fn moe_batched(
+    gpu: &dyn GpuBackend,
+    k: &Inkling2Kernels,
+    a: &MoePrefill,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        a.hidden <= GROUPED_MAX_K && a.inter <= GROUPED_MAX_K,
+        "inkling2 grouped expert GEMVs stage rows of at most {GROUPED_MAX_K}"
+    );
+    let e = a.experts;
+    let te = a.rows * a.top_k;
+    let (sorted_rows, sorted_experts) = (a.sort, a.sort.offset(te * 4));
+    let offsets = a.sort.offset(te * 8);
+    let to_perm = offsets.offset((a.num_experts + 1) * 4);
+    let (ne, h, i) = (
+        u32_of(a.num_experts, "experts")?,
+        u32_of(a.hidden, "hidden")?,
+        u32_of(a.inter, "inter")?,
+    );
+    super::super::ops::moe_sort_by_expert(
+        gpu,
+        k.moe_sort,
+        a.expert_ids,
+        sorted_rows,
+        sorted_experts,
+        offsets,
+        to_perm,
+        u32_of(te, "slots")?,
+        ne,
+        u32_of(a.top_k, "top_k")?,
+        stream,
+    )?;
+    let (gate_up, down) = if e.mxfp8 {
+        (k.moe_grouped_gate_up_mxfp8, k.moe_grouped_down_mxfp8)
+    } else {
+        (k.moe_grouped_gate_up_nvfp4, k.moe_grouped_down_nvfp4)
+    };
+    KernelLaunch::new(gpu, gate_up)
+        .grid([i.div_ceil(8), ne, 1])
+        .block([256, 1, 1])
+        .arg_ptr(a.x)
+        .arg_ptr(e.w13)
+        .arg_ptr(e.w13_scale)
+        .arg_ptr(e.w13_global)
+        .arg_ptr(sorted_rows)
+        .arg_ptr(offsets)
+        .arg_ptr(a.act)
+        .arg_u32(i)
+        .arg_u32(h)
+        .arg_f32(a.gate_softcap)
+        .arg_f32(a.up_softcap)
+        .launch(stream)?;
+    KernelLaunch::new(gpu, down)
+        .grid([h.div_ceil(32), ne, 1])
+        .block([256, 1, 1])
+        .arg_ptr(a.act)
+        .arg_ptr(e.w2)
+        .arg_ptr(e.w2_scale)
+        .arg_ptr(e.w2_global)
+        .arg_ptr(offsets)
+        .arg_ptr(a.y)
+        .arg_u32(h)
+        .arg_u32(i)
+        .launch(stream)?;
+    super::super::ops::moe_unpermute_reduce_indexed(
+        gpu,
+        k.moe_unpermute,
+        a.y,
+        a.out,
+        to_perm,
+        a.weights,
+        h,
+        u32_of(a.rows, "rows")?,
+        u32_of(a.top_k, "top_k")?,
+        stream,
+    )
+}
+
+/// `inkling2_moe_decode.cu` INK_GR_MAX_K: the longest row the grouped GEMVs stage.
+const GROUPED_MAX_K: usize = 2304;

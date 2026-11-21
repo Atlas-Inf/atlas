@@ -185,3 +185,161 @@ extern "C" __global__ void inkling2_moe_combine(const __nv_bfloat16* __restrict_
         acc += __bfloat162float(y[((unsigned long long)r * top_k + s) * H + h]) * w[r * top_k + s];
     out[(unsigned long long)r * out_stride + h] = __float2bfloat16(acc);
 }
+
+// ---------------------------------------------------------------------------------------
+// Decode batches of a few rows: the rows' expert slots sorted by expert (moe_sort_by_expert),
+// each expert's weights read once and applied to every row that chose it (up to INK_GR rows
+// staged per pass), outputs in sorted-slot order for moe_unpermute_reduce_indexed.
+//   _grouped_gate_up: grid (ceil(I/8), E), 256 threads; act[slot, i]
+//   _grouped_down:    grid (ceil(H/32), E), 256 threads; y[slot, n]
+#define INK_GR 8
+#define INK_GR_MAX_K 2304
+
+// R dots of one weight row against R staged activation rows, this lane's share.
+template <bool MX, int L>
+__device__ __forceinline__ void ink_dot_rows(const float2* lut, const unsigned char* __restrict__ codes,
+                                             const unsigned char* __restrict__ scales, float s2,
+                                             const __nv_bfloat16* a, unsigned int K, unsigned int g, int nr,
+                                             float* acc) {
+    constexpr unsigned int V = MX ? 16 : 32;
+#pragma unroll
+    for (int r = 0; r < INK_GR; r++) acc[r] = 0.0f;
+    for (unsigned int c = g; c < K / V; c += L) {
+        const uint4 cv = *(const uint4*)(codes + c * 16);
+        float sa = 1.0f, sb = 1.0f;
+        if (MX) {
+            sa = exp2f((float)scales[c / 2] - 127.0f);
+        } else {
+            const unsigned short sv = *(const unsigned short*)(scales + c * 2);
+            sa = ink_e4m3(sv & 0xFF) * s2;
+            sb = ink_e4m3(sv >> 8) * s2;
+        }
+#pragma unroll
+        for (int r = 0; r < INK_GR; r++) {
+            if (r >= nr) break;
+            const uint4* ap = (const uint4*)(a + (unsigned long long)r * K + c * V);
+            if (MX) {
+                const uint4 a0 = ap[0], a1 = ap[1];
+                acc[r] += sa * (ink_fp8x4(cv.x, a0.x, a0.y) + ink_fp8x4(cv.y, a0.z, a0.w)
+                              + ink_fp8x4(cv.z, a1.x, a1.y) + ink_fp8x4(cv.w, a1.z, a1.w));
+            } else {
+                acc[r] += sa * (ink_fp4x8(lut, cv.x, ap[0]) + ink_fp4x8(lut, cv.y, ap[1]))
+                        + sb * (ink_fp4x8(lut, cv.z, ap[2]) + ink_fp4x8(lut, cv.w, ap[3]));
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < INK_GR; r++)
+#pragma unroll
+        for (int off = L / 2; off > 0; off >>= 1) acc[r] += __shfl_xor_sync(0xffffffff, acc[r], off);
+}
+
+// stage rows src_row(s0 + base + r) (r < nr) of X [*, K] into smem a [nr][K]
+__device__ __forceinline__ void ink_stage_rows(const __nv_bfloat16* __restrict__ X, const int* __restrict__ rows,
+                                               int first, int nr, unsigned int K, __nv_bfloat16* a) {
+    const unsigned int chunks = K / 8;
+    for (unsigned int i = threadIdx.x; i < nr * chunks; i += blockDim.x) {
+        const int r = i / chunks;
+        const unsigned long long src = rows ? (unsigned long long)rows[first + r] : (unsigned long long)(first + r);
+        ((uint4*)(a + (unsigned long long)r * K))[i % chunks] = ((const uint4*)(X + src * K))[i % chunks];
+    }
+}
+
+template <bool MX>
+__device__ __forceinline__ void ink_grouped_gate_up(const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
+                                                    const unsigned char* __restrict__ scales, const float* __restrict__ s2,
+                                                    const int* __restrict__ rows, const int* __restrict__ offsets,
+                                                    __nv_bfloat16* __restrict__ act, unsigned int I, unsigned int K,
+                                                    float cg, float cu) {
+    const unsigned int e = blockIdx.y;
+    const int s0 = offsets[e], cnt = offsets[e + 1] - s0;
+    if (cnt <= 0) return;
+    __shared__ __align__(16) __nv_bfloat16 a[INK_GR * INK_GR_MAX_K];
+    __shared__ float2 lut[256];
+    if (!MX) ink_stage_lut(lut);
+    const unsigned int i = blockIdx.x * INK_GU_WARPS + threadIdx.x / 32;
+    const unsigned int lane = threadIdx.x % 32;
+    const unsigned long long row = (unsigned long long)e * 2ull * I + 2ull * (i < I ? i : 0) + lane / 16;
+    const unsigned char* c = codes + row * (MX ? K : K / 2);
+    const unsigned char* sc = scales + row * (K / (MX ? 32 : 16));
+    for (int base = 0; base < cnt; base += INK_GR) {
+        const int nr = min(INK_GR, cnt - base);
+        __syncthreads();
+        ink_stage_rows(A, rows, s0 + base, nr, K, a);
+        __syncthreads();
+        if (i >= I) continue;
+        float d[INK_GR];
+        ink_dot_rows<MX, 16>(lut, c, sc, MX ? 1.0f : s2[e], a, K, lane % 16, nr, d);
+#pragma unroll
+        for (int r = 0; r < INK_GR; r++) {
+            if (r >= nr) break;
+            const float other = __shfl_sync(0xffffffff, d[r], 16);
+            if (lane == 0) {
+                const float gg = __bfloat162float(__float2bfloat16(d[r]));
+                const float u = __bfloat162float(__float2bfloat16(other));
+                const float v = tanhf(gg / cg) * cg * (1.0f / (1.0f + __expf(-gg))) * tanhf(u / cu) * cu;
+                act[(unsigned long long)(s0 + base + r) * I + i] = __float2bfloat16(v);
+            }
+        }
+    }
+}
+
+template <bool MX>
+__device__ __forceinline__ void ink_grouped_down(const __nv_bfloat16* __restrict__ act, const unsigned char* __restrict__ codes,
+                                                 const unsigned char* __restrict__ scales, const float* __restrict__ s2,
+                                                 const int* __restrict__ offsets, __nv_bfloat16* __restrict__ y,
+                                                 unsigned int H, unsigned int I) {
+    const unsigned int e = blockIdx.y;
+    const int s0 = offsets[e], cnt = offsets[e + 1] - s0;
+    if (cnt <= 0) return;
+    __shared__ __align__(16) __nv_bfloat16 a[INK_GR * INK_GR_MAX_K];
+    __shared__ float2 lut[256];
+    if (!MX) ink_stage_lut(lut);
+    const unsigned int lane = threadIdx.x % 32;
+    const unsigned int n = blockIdx.x * INK_DN_ROWS + (threadIdx.x / 32) * 4 + lane / 8;
+    const unsigned long long row = (unsigned long long)e * H + (n < H ? n : 0);
+    const unsigned char* c = codes + row * (MX ? I : I / 2);
+    const unsigned char* sc = scales + row * (I / (MX ? 32 : 16));
+    for (int base = 0; base < cnt; base += INK_GR) {
+        const int nr = min(INK_GR, cnt - base);
+        __syncthreads();
+        ink_stage_rows(act, nullptr, s0 + base, nr, I, a);
+        __syncthreads();
+        float d[INK_GR];
+        ink_dot_rows<MX, 8>(lut, c, sc, MX ? 1.0f : s2[e], a, I, lane % 8, nr, d);
+        if (lane % 8 == 0 && n < H) {
+#pragma unroll
+            for (int r = 0; r < INK_GR; r++) {
+                if (r >= nr) break;
+                y[(unsigned long long)(s0 + base + r) * H + n] = __float2bfloat16(d[r]);
+            }
+        }
+    }
+}
+
+#define INK_GGU_ARGS                                                                                         \
+    const __nv_bfloat16 *__restrict__ A, const unsigned char *__restrict__ codes,                           \
+        const unsigned char *__restrict__ scales, const float *__restrict__ s2, const int *__restrict__ rows, \
+        const int *__restrict__ offsets, __nv_bfloat16 *__restrict__ act, unsigned int I, unsigned int K,     \
+        float cg, float cu
+#define INK_GDN_ARGS                                                                                         \
+    const __nv_bfloat16 *__restrict__ act, const unsigned char *__restrict__ codes,                         \
+        const unsigned char *__restrict__ scales, const float *__restrict__ s2, const int *__restrict__ offsets, \
+        __nv_bfloat16 *__restrict__ y, unsigned int H, unsigned int I
+
+extern "C" __global__ void inkling2_moe_grouped_gate_up_nvfp4(INK_GGU_ARGS) {
+    atlas_pdl_enter();
+    ink_grouped_gate_up<false>(A, codes, scales, s2, rows, offsets, act, I, K, cg, cu);
+}
+extern "C" __global__ void inkling2_moe_grouped_gate_up_mxfp8(INK_GGU_ARGS) {
+    atlas_pdl_enter();
+    ink_grouped_gate_up<true>(A, codes, scales, s2, rows, offsets, act, I, K, cg, cu);
+}
+extern "C" __global__ void inkling2_moe_grouped_down_nvfp4(INK_GDN_ARGS) {
+    atlas_pdl_enter();
+    ink_grouped_down<false>(act, codes, scales, s2, offsets, y, H, I);
+}
+extern "C" __global__ void inkling2_moe_grouped_down_mxfp8(INK_GDN_ARGS) {
+    atlas_pdl_enter();
+    ink_grouped_down<true>(act, codes, scales, s2, offsets, y, H, I);
+}

@@ -278,10 +278,7 @@ impl Inkling2Layer {
         gm.kv_write(
             gpu, n, s.kn, s.vn, k_pool, v_pool, meta.slots, p.kv_heads, p.head_dim, bs, stream,
         )?;
-        if batch.seqs.len() == 1
-            && batch.rows_per_seq > 1
-            && std::env::var_os("INK_OLD_ATTN").is_none()
-        {
+        if batch.seqs.len() == 1 && batch.rows_per_seq > 1 {
             // a prefill chunk (or verify run) of one sequence: tensor cores
             ops::prefill_attn(
                 gpu,
