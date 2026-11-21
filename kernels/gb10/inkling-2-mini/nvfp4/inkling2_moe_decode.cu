@@ -54,21 +54,20 @@ __device__ __forceinline__ float ink_bf(unsigned int raw, int hi) {
 }
 
 #if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
-// AMD (strix-hip): no cvt.rn.f16x2.e2m1x2 / ld.global.nc.L1::no_allocate. E2M1 by bit math
-// (exact: sign, 2-bit exponent, 1-bit mantissa; e = 0 is the 0 / 0.5 subnormal pair) and a
-// plain 16-byte load.
-__device__ __forceinline__ float ink_e2m1(unsigned int n) {
-    const unsigned int e = (n >> 1) & 3u, m = n & 1u;
-    const float v = e == 0u ? 0.5f * (float)m : __uint_as_float(((e + 126u) << 23) | (m << 22));
-    return (n & 8u) ? -v : v;
-}
+// AMD (strix-hip): no cvt.rn.f16x2.e2m1x2 / ld.global.nc.L1::no_allocate. E2M1 decode, exact and
+// branch-free: a code's sign and 3 magnitude bits placed at FP16 bits 15 and 9..11 read as an FP16
+// of 2^(e-15) (1 + m/2) (e > 0) or m 2^-15 (e = 0, subnormal); times 2^14 that is E2M1's
+// 2^(e-1) (1 + m/2) or m / 2 exactly. Two codes a half2. A plain 16-byte load.
 __device__ __forceinline__ float ink_fp4x8(unsigned int w, uint4 av) {
     const unsigned int a[4] = {av.x, av.y, av.z, av.w};
+    const __half2 k = __float2half2_rn(16384.0f);
     float acc = 0.0f;
 #pragma unroll
     for (int b = 0; b < 4; b++) {
         const unsigned int byte = (w >> (8 * b)) & 0xFFu;
-        acc += ink_e2m1(byte & 0xFu) * ink_bf(a[b], 0) + ink_e2m1(byte >> 4) * ink_bf(a[b], 1);
+        const unsigned int hw = ((byte & 0x7u) << 9) | ((byte & 0x8u) << 12) | ((byte & 0x70u) << 21) | ((byte & 0x80u) << 24);
+        const float2 v = __half22float2(__hmul2(*(const __half2*)&hw, k));
+        acc += v.x * ink_bf(a[b], 0) + v.y * ink_bf(a[b], 1);
     }
     return acc;
 }
