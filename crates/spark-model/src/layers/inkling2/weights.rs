@@ -3,15 +3,18 @@
 //! Device handles for one physical Inkling 2 layer and for the model-level
 //! block-residual and loop-message queries. Handles are plain device
 //! pointers into the weight store (BF16/F32/U8/F8 as the checkpoint stores
-//! them), so every visit of a physical layer copies the same struct. The only
-//! derived tensors are the experts' per-expert global scales
-//! (`amax / outer_scale_denominator`, F32 `[E]`), computed once at load.
+//! them), so every visit of a physical layer copies the same struct. Derived at
+//! load: the experts' per-expert global scales (`amax /
+//! outer_scale_denominator`, F32 `[E]`), the per-expert pointer tables the
+//! grouped prefill GEMMs take, and a BF16 copy of each MXFP8 layer's experts
+//! (exact; no grouped MXFP8 GEMM exists).
 
 use anyhow::{Context, Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
-use spark_runtime::weights::WeightStore;
+use spark_runtime::weights::{WeightStore, WeightTensor};
 
-use super::ops::StackedExperts;
+use super::ops::{GroupedExperts, StackedExperts};
+use spark_runtime::kernel_args::KernelLaunch;
 
 const PREFIX: &str = "model.llm";
 
@@ -105,6 +108,86 @@ pub(crate) fn global(store: &WeightStore) -> Result<GlobalWeights> {
     })
 }
 
+/// `[E]` device table of `base + e * stride` (no copy).
+fn ptr_table(
+    gpu: &dyn GpuBackend,
+    base: DevicePtr,
+    experts: usize,
+    stride: usize,
+) -> Result<DevicePtr> {
+    let ptrs: Vec<u8> = (0..experts)
+        .flat_map(|e| (base.0 + (e * stride) as u64).to_le_bytes())
+        .collect();
+    let dev = gpu
+        .alloc(ptrs.len())
+        .context("allocate expert pointer table")?;
+    gpu.copy_h2d(&ptrs, dev)?;
+    Ok(dev)
+}
+
+/// One stacked expert tensor `[E, N, K]` (MXFP8, with E8M0 scales `[E, N, K/32]`)
+/// as BF16 `[E, N, K]`.
+fn mxfp8_as_bf16(
+    gpu: &dyn GpuBackend,
+    codes: &WeightTensor,
+    scales: DevicePtr,
+) -> Result<DevicePtr> {
+    let [e, n, k] = codes.shape[..] else {
+        anyhow::bail!("inkling2 MXFP8 experts shape {:?}", codes.shape);
+    };
+    let out = gpu
+        .alloc(e * n * k * 2)
+        .context("allocate inkling2 BF16 experts")?;
+    let kernel = gpu.kernel("inkling2_moe_prefill", "inkling2_mxfp8_to_bf16")?;
+    KernelLaunch::new(gpu, kernel)
+        .grid([u32::try_from(e * n)?, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(codes.ptr)
+        .arg_ptr(scales)
+        .arg_ptr(out)
+        .arg_u32(u32::try_from(k)?)
+        .launch(0)?;
+    gpu.synchronize(0)?;
+    Ok(out)
+}
+
+/// Per-expert tables over `{ex}.w13_weight` / `{ex}.w2_weight` for the grouped GEMMs.
+fn grouped_experts(
+    store: &WeightStore,
+    gpu: &dyn GpuBackend,
+    ex: &str,
+    mxfp8: bool,
+) -> Result<GroupedExperts> {
+    let t = |name: String| {
+        store
+            .get(&name)
+            .with_context(|| format!("inkling2 tensor {name}"))
+    };
+    let one = |w: &str| -> Result<(DevicePtr, DevicePtr)> {
+        let codes = t(format!("{ex}.{w}"))?;
+        let scales = t(format!("{ex}.{w}_scale"))?;
+        let e = codes.shape[0];
+        let per = |x: &WeightTensor| x.num_elements() / e;
+        Ok(if mxfp8 {
+            let bf16 = mxfp8_as_bf16(gpu, codes, scales.ptr)?;
+            (ptr_table(gpu, bf16, e, per(codes) * 2)?, DevicePtr::NULL)
+        } else {
+            (
+                ptr_table(gpu, codes.ptr, e, per(codes))?,
+                ptr_table(gpu, scales.ptr, e, per(scales))?,
+            )
+        })
+    };
+    let (w13, w13_scale) = one("w13_weight")?;
+    let (w2, w2_scale) = one("w2_weight")?;
+    Ok(GroupedExperts {
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+    })
+}
+
 /// `amax[e] / denominator` as an F32 `[E]` device array.
 fn expert_globals(
     store: &WeightStore,
@@ -161,6 +244,7 @@ pub(crate) fn physical(
         })
     };
     let ex = format!("{lp}.mlp.experts");
+    let grouped = grouped_experts(store, gpu, &ex, mxfp8)?;
     let stacked = StackedExperts {
         mxfp8,
         w13: p(&format!("{ex}.w13_weight"))?,
@@ -177,6 +261,7 @@ pub(crate) fn physical(
         } else {
             expert_globals(store, gpu, &format!("{ex}.w2_weight"), experts)?
         },
+        grouped,
     };
     let messages = if looped {
         let gate = |c: &str| -> Result<MessageGate> {

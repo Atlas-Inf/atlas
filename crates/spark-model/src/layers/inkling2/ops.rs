@@ -36,6 +36,13 @@ pub(crate) struct Inkling2Kernels {
     pub moe_down_nvfp4: KernelHandle,
     pub moe_down_mxfp8: KernelHandle,
     pub moe_combine: KernelHandle,
+    /// prefill: Atlas's sort, grouped GEMMs (NVFP4 pointer table, BF16) and
+    /// weighted unpermute, around this target's softcapped SwiGLU
+    pub moe_sort: KernelHandle,
+    pub moe_unpermute: KernelHandle,
+    pub moe_gemm_nvfp4: KernelHandle,
+    pub moe_gemm_bf16: KernelHandle,
+    pub softcap_swiglu: KernelHandle,
 }
 
 impl Inkling2Kernels {
@@ -56,6 +63,11 @@ impl Inkling2Kernels {
             moe_down_nvfp4: gpu.kernel("inkling2_moe_decode", "inkling2_moe_down_nvfp4")?,
             moe_down_mxfp8: gpu.kernel("inkling2_moe_decode", "inkling2_moe_down_mxfp8")?,
             moe_combine: gpu.kernel("inkling2_moe_decode", "inkling2_moe_combine")?,
+            moe_sort: gpu.kernel("moe", "moe_sort_by_expert")?,
+            moe_unpermute: gpu.kernel("moe", "moe_unpermute_reduce_indexed")?,
+            moe_gemm_nvfp4: gpu.kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable")?,
+            moe_gemm_bf16: gpu.kernel("moe_bf16_grouped_gemm", "moe_bf16_grouped_gemm")?,
+            softcap_swiglu: gpu.kernel("inkling2_moe_prefill", "inkling2_softcap_swiglu")?,
         })
     }
 }
@@ -460,6 +472,17 @@ pub(crate) fn msg_gate(
         .launch(stream)
 }
 
+/// One layer's per-expert tables for Atlas's grouped prefill GEMMs: device
+/// `u64 [E]` pointers into the stacked NVFP4 tensors (codes, scales), or into
+/// a load-time BF16 copy of an MXFP8 layer (scale tables NULL).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GroupedExperts {
+    pub w13: DevicePtr,
+    pub w13_scale: DevicePtr,
+    pub w2: DevicePtr,
+    pub w2_scale: DevicePtr,
+}
+
 /// One layer's routed experts as stored in the checkpoint.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StackedExperts {
@@ -471,6 +494,7 @@ pub(crate) struct StackedExperts {
     pub w2: DevicePtr,
     pub w2_scale: DevicePtr,
     pub w2_global: DevicePtr,
+    pub grouped: GroupedExperts,
 }
 
 /// Largest hidden / intermediate size the MoE kernels stage in shared memory.
@@ -559,4 +583,159 @@ pub(crate) fn moe_decode(
         .arg_u32(top_k)
         .arg_u32(u32_of(a.out_stride, "out stride")?)
         .launch(stream)
+}
+
+/// Routed experts for many rows (prefill): sort the rows' expert slots by
+/// expert, one grouped GEMM per projection over all experts (each expert's
+/// weights read once per tile of its rows, not once per row), the softcapped
+/// SwiGLU between, then the top-k weighted sum back in row order.
+pub(crate) struct MoePrefill {
+    pub x: DevicePtr,
+    pub experts: StackedExperts,
+    pub expert_ids: DevicePtr,
+    pub weights: DevicePtr,
+    /// `[rows * top_k, 2 * inter]` BF16
+    pub gu: DevicePtr,
+    /// `[rows * top_k, inter]` BF16
+    pub act: DevicePtr,
+    /// `[rows * top_k, hidden]` BF16
+    pub y: DevicePtr,
+    /// `[rows, hidden]` BF16
+    pub out: DevicePtr,
+    /// [`moe_sort_bytes`] of scratch
+    pub sort: DevicePtr,
+    pub rows: usize,
+    pub top_k: usize,
+    pub hidden: usize,
+    pub inter: usize,
+    pub num_experts: usize,
+    pub gate_softcap: f32,
+    pub up_softcap: f32,
+}
+
+/// Rows from which the routed experts run as grouped GEMMs (fewer rows read
+/// each expert once per row through the decode GEMVs).
+pub(crate) const MOE_GROUPED_MIN_ROWS: usize = 16;
+
+/// Sort scratch for `expanded` expert slots: sorted rows, their experts, the
+/// expert offsets and each slot's sorted position.
+pub(crate) fn moe_sort_bytes(expanded: usize, experts: usize) -> usize {
+    (3 * expanded + experts + 1) * 4
+}
+
+pub(crate) fn moe_prefill(
+    gpu: &dyn GpuBackend,
+    k: &Inkling2Kernels,
+    a: &MoePrefill,
+    stream: u64,
+) -> Result<()> {
+    let e = a.experts;
+    let te = a.rows * a.top_k;
+    let (sorted_rows, sorted_experts) = (a.sort, a.sort.offset(te * 4));
+    let offsets = a.sort.offset(te * 8);
+    let to_perm = offsets.offset((a.num_experts + 1) * 4);
+    let (ne, h, i) = (
+        u32_of(a.num_experts, "experts")?,
+        u32_of(a.hidden, "hidden")?,
+        u32_of(a.inter, "inter")?,
+    );
+    super::super::ops::moe_sort_by_expert(
+        gpu,
+        k.moe_sort,
+        a.expert_ids,
+        sorted_rows,
+        sorted_experts,
+        offsets,
+        to_perm,
+        u32_of(te, "slots")?,
+        ne,
+        u32_of(a.top_k, "top_k")?,
+        stream,
+    )?;
+    // an expert takes each row at most once
+    let m_tiles = u32_of(a.rows.div_ceil(64).max(1), "m tiles")?;
+    let gemm = |x: DevicePtr,
+                w: DevicePtr,
+                sc: DevicePtr,
+                g: DevicePtr,
+                y: DevicePtr,
+                gather: DevicePtr,
+                n: u32,
+                kk: u32| {
+        if e.mxfp8 {
+            super::super::ops::moe_bf16_grouped_gemm(
+                gpu,
+                k.moe_gemm_bf16,
+                x,
+                w,
+                y,
+                offsets,
+                gather,
+                ne,
+                n,
+                kk,
+                m_tiles,
+                stream,
+            )
+        } else {
+            super::super::ops::moe_w4a16_grouped_gemm_ptrtable(
+                gpu,
+                k.moe_gemm_nvfp4,
+                x,
+                w,
+                sc,
+                g,
+                y,
+                offsets,
+                gather,
+                ne,
+                n,
+                kk,
+                m_tiles,
+                stream,
+            )
+        }
+    };
+    // gate and up rows stay interleaved in the output, as the checkpoint stores them
+    gemm(
+        a.x,
+        e.grouped.w13,
+        e.grouped.w13_scale,
+        e.w13_global,
+        a.gu,
+        sorted_rows,
+        2 * i,
+        h,
+    )?;
+    KernelLaunch::new(gpu, k.softcap_swiglu)
+        .grid([i.div_ceil(256), u32_of(te, "slots")?, 1])
+        .block([256, 1, 1])
+        .arg_ptr(a.gu)
+        .arg_ptr(a.act)
+        .arg_u32(i)
+        .arg_f32(a.gate_softcap)
+        .arg_f32(a.up_softcap)
+        .launch(stream)?;
+    gemm(
+        a.act,
+        e.grouped.w2,
+        e.grouped.w2_scale,
+        e.w2_global,
+        a.y,
+        DevicePtr::NULL,
+        h,
+        i,
+    )?;
+    super::super::ops::moe_unpermute_reduce_indexed(
+        gpu,
+        k.moe_unpermute,
+        a.y,
+        a.out,
+        to_perm,
+        a.weights,
+        h,
+        u32_of(a.rows, "rows")?,
+        u32_of(a.top_k, "top_k")?,
+        stream,
+    )
 }

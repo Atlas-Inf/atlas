@@ -379,27 +379,53 @@ impl Inkling2Layer {
             p.route_scale,
             stream,
         )?;
-        ops::moe_decode(
-            gpu,
-            &self.k,
-            &MoeDecode {
-                x: s.mlp_normed,
-                experts: w.experts,
-                expert_ids: s.ids,
-                weights: s.weights,
-                act: s.act,
-                y: s.y,
-                out: s.moe_out,
-                rows: n,
-                top_k: d.top_k,
-                hidden: h,
-                inter: d.inter,
-                out_stride: h,
-                gate_softcap: p.gate_softcap,
-                up_softcap: p.up_softcap,
-            },
-            stream,
-        )?;
+        if n >= ops::MOE_GROUPED_MIN_ROWS {
+            ops::moe_prefill(
+                gpu,
+                &self.k,
+                &ops::MoePrefill {
+                    x: s.mlp_normed,
+                    experts: w.experts,
+                    expert_ids: s.ids,
+                    weights: s.weights,
+                    gu: s.gu,
+                    act: s.act,
+                    y: s.y,
+                    out: s.moe_out,
+                    sort: s.moe_sort,
+                    rows: n,
+                    top_k: d.top_k,
+                    hidden: h,
+                    inter: d.inter,
+                    num_experts: d.experts,
+                    gate_softcap: p.gate_softcap,
+                    up_softcap: p.up_softcap,
+                },
+                stream,
+            )?;
+        } else {
+            ops::moe_decode(
+                gpu,
+                &self.k,
+                &MoeDecode {
+                    x: s.mlp_normed,
+                    experts: w.experts,
+                    expert_ids: s.ids,
+                    weights: s.weights,
+                    act: s.act,
+                    y: s.y,
+                    out: s.moe_out,
+                    rows: n,
+                    top_k: d.top_k,
+                    hidden: h,
+                    inter: d.inter,
+                    out_stride: h,
+                    gate_softcap: p.gate_softcap,
+                    up_softcap: p.up_softcap,
+                },
+                stream,
+            )?;
+        }
         self.conv(
             gpu,
             n,
