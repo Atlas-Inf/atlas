@@ -256,6 +256,13 @@ extern "C" __global__ void inkling2_msg_gate_out(
 #define INK_FG_PITCH (INK_FG_K + 8)
 typedef __bf16 ink_fg_v16bf __attribute__((ext_vector_type(16)));
 typedef float ink_fg_v8f __attribute__((ext_vector_type(8)));
+// 16 consecutive BF16 of a 16-byte-aligned shared row as one WMMA operand (two ds_read_b128).
+__device__ __forceinline__ ink_fg_v16bf ink_fg_ld16(const __nv_bfloat16* p) {
+    union { uint4 u[2]; ink_fg_v16bf v; } x;
+    x.u[0] = ((const uint4*)p)[0];
+    x.u[1] = ((const uint4*)p)[1];
+    return x.v;
+}
 
 extern "C" __global__ void __launch_bounds__(256) inkling2_msg_gate_fused(
     const float* h, const float* m,
@@ -319,15 +326,9 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_msg_gate_fused(
             __syncthreads();
             if (warp < RANK / 16) {
 #pragma unroll
-                for (unsigned int kk = 0; kk < INK_FG_K; kk += 16) {
-                    ink_fg_v16bf a, b;
-#pragma unroll
-                    for (int i = 0; i < 16; i++) {
-                        a[i] = (__bf16)__bfloat162float(s_a[l16][kk + i]);
-                        b[i] = (__bf16)__bfloat162float(s_w[16 * warp + l16][kk + i]);
-                    }
-                    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
-                }
+                for (unsigned int kk = 0; kk < INK_FG_K; kk += 16)
+                    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ink_fg_ld16(&s_a[l16][kk]),
+                                                                      ink_fg_ld16(&s_w[16 * warp + l16][kk]), acc);
             }
             __syncthreads();
         }
@@ -353,15 +354,8 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_msg_gate_fused(
             const unsigned int nb = 16 * (warp % 4);
             ink_fg_v8f acc = ink_fg_v8f{0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
-            for (unsigned int kk = 0; kk < RANK; kk += 16) {
-                ink_fg_v16bf a, b;
-#pragma unroll
-                for (int i = 0; i < 16; i++) {
-                    a[i] = (__bf16)__bfloat162float(s_z[g][l16][kk + i]);
-                    b[i] = (__bf16)__bfloat162float(wt[nb + l16][kk + i]);
-                }
-                acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
-            }
+            for (unsigned int kk = 0; kk < RANK; kk += 16)
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ink_fg_ld16(&s_z[g][l16][kk]), ink_fg_ld16(&wt[nb + l16][kk]), acc);
             float (*dst)[INK_FG_CH] = warp < 4 ? s_f[g] : s_g[g];
 #pragma unroll
             for (int e = 0; e < 8; e++) dst[2 * e + lhi][nb + l16] = acc[e];

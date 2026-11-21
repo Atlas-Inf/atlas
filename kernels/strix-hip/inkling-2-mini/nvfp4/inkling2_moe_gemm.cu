@@ -30,6 +30,14 @@ typedef float ink_v8f __attribute__((ext_vector_type(8)));
 __device__ __constant__ float INK_HIP_E2M1[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
                                                   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 
+// 16 consecutive BF16 of a 16-byte-aligned shared row as one WMMA operand (two ds_read_b128).
+__device__ __forceinline__ ink_v16bf ink_ld16(const __nv_bfloat16* p) {
+    union { uint4 u[2]; ink_v16bf v; } x;
+    x.u[0] = ((const uint4*)p)[0];
+    x.u[1] = ((const uint4*)p)[1];
+    return x.v;
+}
+
 __device__ __forceinline__ float ink_hip_e4m3(unsigned int b) {
     const unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u;
     float v;
@@ -98,23 +106,23 @@ __device__ __forceinline__ void ink_hip_gemm_tile(
 #pragma unroll
                 for (int i = 0; i < 16; i++) v[i] = 0.0f;
             }
+            unsigned int pk[8];
 #pragma unroll
-            for (int i = 0; i < 16; i++) Bs[r][h * 16 + i] = __float2bfloat16(v[i]);
+            for (int i = 0; i < 8; i++)
+                pk[i] = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v[2 * i])) |
+                        ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(v[2 * i + 1])) << 16);
+            uint4* dst = (uint4*)&Bs[r][h * 16];
+            dst[0] = make_uint4(pk[0], pk[1], pk[2], pk[3]);
+            dst[1] = make_uint4(pk[4], pk[5], pk[6], pk[7]);
         }
         __syncthreads();
         if (m0 + wm < m_count) {
 #pragma unroll
             for (int kk = 0; kk < INK_GK; kk += 16) {
-                ink_v16bf a;
+                const ink_v16bf a = ink_ld16(&As[wm + (lane & 15)][kk]);
 #pragma unroll
-                for (int i = 0; i < 16; i++) a[i] = (__bf16)__bfloat162float(As[wm + (lane & 15)][kk + i]);
-#pragma unroll
-                for (int j = 0; j < NSUB; j++) {
-                    ink_v16bf b;
-#pragma unroll
-                    for (int i = 0; i < 16; i++) b[i] = (__bf16)__bfloat162float(Bs[wn + j * 16 + (lane & 15)][kk + i]);
-                    acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[j]);
-                }
+                for (int j = 0; j < NSUB; j++)
+                    acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, ink_ld16(&Bs[wn + j * 16 + (lane & 15)][kk]), acc[j]);
             }
         }
         __syncthreads();
