@@ -116,6 +116,28 @@ fn seq_state(state: &mut dyn LayerState) -> Result<&mut Inkling2SeqState> {
         .context("inkling2 layer state")
 }
 
+/// `(first row, rows)` of each of `seqs` sequences in `row_owner`, which must
+/// list every sequence's rows together and in order.
+fn owner_runs(row_owner: &[usize], seqs: usize) -> Result<Vec<(usize, usize)>> {
+    let mut runs: Vec<(usize, usize)> = Vec::with_capacity(seqs);
+    for (r, &o) in row_owner.iter().enumerate() {
+        let seen = runs.len();
+        if seen > 0 && o + 1 == seen {
+            runs[seen - 1].1 += 1;
+        } else if o == seen {
+            runs.push((r, 1));
+        } else {
+            bail!("inkling2: verify row {r} of sequence {o} out of order");
+        }
+    }
+    ensure!(
+        runs.len() == seqs && seqs > 0,
+        "inkling2: verify rows of {} sequences for {seqs} states",
+        runs.len()
+    );
+    Ok(runs)
+}
+
 fn conv_base(state: &mut dyn LayerState) -> Result<DevicePtr> {
     Ok(seq_state(state)?.conv)
 }
@@ -139,7 +161,7 @@ impl Inkling2Layer {
         let mut batch = Batch::one(seq_len, rows, block_table);
         st.journal_rows = 0;
         if rows <= MAX_VERIFY_ROWS {
-            batch.journal = Some(st.journal);
+            batch.journals.push(st.journal);
             st.journal_rows = rows;
         }
         self.forward(hidden, &batch, &[st.conv], kv_cache, ctx, stream)
@@ -263,7 +285,7 @@ impl TransformerLayer for Inkling2Layer {
                 .map(|i| (seq_lens[i], block_tables[i].as_slice()))
                 .collect(),
             rows_per_seq: 1,
-            journal: None,
+            journals: Vec::new(),
         };
         let bases = states[..num_seqs]
             .iter_mut()
@@ -272,9 +294,10 @@ impl TransformerLayer for Inkling2Layer {
         self.forward(hidden, &batch, &bases, kv_cache, ctx, stream)
     }
 
-    /// The verify rows of one sequence run as [`Self::decode_batched`] does
-    /// (the default would give each row a throwaway state, losing the conv
-    /// history). Rows of several sequences are not supported yet.
+    /// Verify rows, journaled like [`Self::decode_batched`] (the default
+    /// would give each row a throwaway state, losing the conv history). Each
+    /// sequence's rows are consecutive tokens, in sequence order; equal row
+    /// counts run as one batch, uneven ones one sequence at a time.
     fn decode_multi_seq_rows<'a, 'b: 'a>(
         &self,
         hidden: DevicePtr,
@@ -288,15 +311,41 @@ impl TransformerLayer for Inkling2Layer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        let runs = owner_runs(&row_owner[..num_rows.min(row_owner.len())], seq_states.len())?;
         ensure!(
-            num_rows > 0 && row_owner.len() >= num_rows && row_owner[..num_rows].iter().all(|&o| o == 0),
-            "inkling2: verify rows of several sequences are not supported yet"
+            runs.iter().map(|r| r.1).sum::<usize>() == num_rows,
+            "inkling2: {num_rows} verify rows but {} owned rows",
+            row_owner.len()
         );
-        let [state] = seq_states else {
-            bail!("inkling2: one sequence's verify rows with {} states", seq_states.len());
-        };
-        // row r sits at seq_lens[0] + r of the first row's block table
-        self.verify_run(hidden, num_rows, &mut **state, kv_cache, seq_lens[0], &block_tables[0], ctx, stream)
+        let k = runs[0].1;
+        if runs.iter().all(|r| r.1 == k) && k <= MAX_VERIFY_ROWS {
+            let mut batch = Batch {
+                seqs: runs.iter().map(|&(first, _)| (seq_lens[first], block_tables[first].as_slice())).collect(),
+                rows_per_seq: k,
+                journals: Vec::with_capacity(runs.len()),
+            };
+            let mut bases = Vec::with_capacity(runs.len());
+            for state in seq_states.iter_mut() {
+                let st = seq_state(&mut **state)?;
+                batch.journals.push(st.journal);
+                st.journal_rows = k;
+                bases.push(st.conv);
+            }
+            return self.forward(hidden, &batch, &bases, kv_cache, ctx, stream);
+        }
+        for (s, &(first, rows)) in runs.iter().enumerate() {
+            self.verify_run(
+                hidden.offset(first * self.dims.hidden * 2),
+                rows,
+                &mut *seq_states[s],
+                kv_cache,
+                seq_lens[first],
+                &block_tables[first],
+                ctx,
+                stream,
+            )?;
+        }
+        Ok(())
     }
 
     /// Bind the decode sequence's conv state into this visit's table before
@@ -388,5 +437,24 @@ impl TransformerLayer for Inkling2Layer {
 
     fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
         Some(self)
+    }
+}
+
+#[cfg(test)]
+mod owner_run_tests {
+    use super::owner_runs;
+
+    #[test]
+    fn rows_group_by_sequence_in_order() {
+        assert_eq!(owner_runs(&[0, 0, 0], 1).unwrap(), vec![(0, 3)]);
+        assert_eq!(owner_runs(&[0, 0, 1, 1, 1], 2).unwrap(), vec![(0, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn out_of_order_or_missing_rows_fail() {
+        assert!(owner_runs(&[0, 1, 0], 2).is_err());
+        assert!(owner_runs(&[1, 1], 2).is_err());
+        assert!(owner_runs(&[0, 0], 2).is_err());
+        assert!(owner_runs(&[], 1).is_err());
     }
 }

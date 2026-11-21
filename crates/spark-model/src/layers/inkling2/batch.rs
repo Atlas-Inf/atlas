@@ -14,10 +14,11 @@ use crate::layer::ForwardContext;
 pub(super) struct Batch<'a> {
     /// Per sequence: the position of its first row, and its block table.
     pub seqs: Vec<(usize, &'a [u32])>,
-    /// Rows of each sequence; more than one only for a single sequence.
+    /// Rows of each sequence (consecutive tokens from its first position).
     pub rows_per_seq: usize,
-    /// A verify run's journal (see `Inkling2SeqState::journal`).
-    pub journal: Option<DevicePtr>,
+    /// A verify run's journals, one per sequence (see
+    /// `Inkling2SeqState::journal`); empty when the run is not journaled.
+    pub journals: Vec<DevicePtr>,
 }
 
 impl<'a> Batch<'a> {
@@ -25,7 +26,7 @@ impl<'a> Batch<'a> {
         Self {
             seqs: vec![(start, table)],
             rows_per_seq: rows,
-            journal: None,
+            journals: Vec::new(),
         }
     }
 
@@ -133,10 +134,6 @@ impl Inkling2Layer {
             "inkling2: {seqs} sequences over the {}-sequence buffers",
             d.max_seqs
         );
-        ensure!(
-            seqs == 1 || batch.rows_per_seq == 1,
-            "inkling2: several sequences of several rows each are not supported"
-        );
         let (mut pos, mut slot) = (Vec::with_capacity(n * 4), Vec::with_capacity(n * 8));
         for &(start, table) in &batch.seqs {
             ensure!(
@@ -151,6 +148,7 @@ impl Inkling2Layer {
                 slot.extend((i64::from(blk) * bs as i64 + (p % bs) as i64).to_le_bytes());
             }
         }
+        // one table per row (each sequence's for its rows), or one shared
         let stride = batch.table_stride();
         let tables: Vec<u8> = if stride == 0 {
             batch.seqs[0]
@@ -162,10 +160,15 @@ impl Inkling2Layer {
             batch
                 .seqs
                 .iter()
-                .flat_map(|(_, t)| t.iter().copied().chain(std::iter::repeat(0)).take(stride))
+                .flat_map(|(_, t)| std::iter::repeat_n(*t, batch.rows_per_seq))
+                .flat_map(|t| t.iter().copied().chain(std::iter::repeat(0)).take(stride))
                 .flat_map(u32::to_le_bytes)
                 .collect()
         };
+        ensure!(
+            tables.len() <= d.max_seqs * super::layer::MAX_VERIFY_ROWS * d.max_blocks_per_seq * 4,
+            "inkling2: {n} rows' block tables over the table buffer"
+        );
         // earlier kernels of this stream may still read the previous forward's metadata
         gpu.synchronize(stream)?;
         gpu.copy_h2d(&pos, s.positions)?;
@@ -224,14 +227,15 @@ impl Inkling2Layer {
         first: usize,
         stream: u64,
     ) -> Result<()> {
-        let Some(journal) = batch.journal else {
-            return Ok(());
-        };
         let layout = self.conv_layout();
-        for (i, x) in xs.into_iter().enumerate() {
-            let (channels, _, off) = layout[first + i];
-            let dst = journal.offset(self.conv_state_bytes() + off);
-            gpu.copy_d2d_async(x, dst, batch.rows() * channels * 2, stream)?;
+        let rows = batch.rows_per_seq;
+        for (s, journal) in batch.journals.iter().enumerate() {
+            for (i, x) in xs.iter().enumerate() {
+                let (channels, _, off) = layout[first + i];
+                let src = x.offset(s * rows * channels * 2);
+                let dst = journal.offset(self.conv_state_bytes() + off);
+                gpu.copy_d2d_async(src, dst, rows * channels * 2, stream)?;
+            }
         }
         Ok(())
     }

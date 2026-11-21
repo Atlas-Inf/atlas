@@ -59,8 +59,8 @@ impl Inkling2Layer {
             debug::dump(gpu, hidden, batch, h, u32::MAX, stream)?;
         }
         let states = self.bind_states(gpu, conv_states, ctx.graph_capture, stream)?;
-        if let Some(j) = batch.journal {
-            gpu.copy_d2d_async(conv_states[0], j, self.conv_state_bytes(), stream)?;
+        for (j, state) in batch.journals.iter().zip(conv_states) {
+            gpu.copy_d2d_async(*state, *j, self.conv_state_bytes(), stream)?;
         }
         if v.restart {
             // the previous pass: its blocks after the prelude's and its own first push,
