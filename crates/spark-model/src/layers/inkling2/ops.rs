@@ -72,7 +72,7 @@ impl Inkling2Kernels {
             moe_combine: gpu.kernel("inkling2_moe_decode", "inkling2_moe_combine")?,
             moe_sort: gpu.kernel("moe", "moe_sort_by_expert")?,
             moe_unpermute: gpu.kernel("moe", "moe_unpermute_reduce_indexed")?,
-            moe_gemm_nvfp4: gpu.kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable")?,
+            moe_gemm_nvfp4: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_gemm_nvfp4")?,
             moe_gemm_bf16: gpu.kernel("moe_bf16_grouped_gemm", "moe_bf16_grouped_gemm")?,
             softcap_swiglu: gpu.kernel("inkling2_moe_prefill", "inkling2_softcap_swiglu")?,
         })

@@ -9,15 +9,12 @@ use spark_runtime::kernel_args::KernelLaunch;
 
 use super::ops::{Inkling2Kernels, u32_of};
 
-/// One layer's per-expert tables for Atlas's grouped prefill GEMMs: device
-/// `u64 [E]` pointers into the stacked NVFP4 tensors (codes, scales), or into
-/// a load-time BF16 copy of an MXFP8 layer (scale tables NULL).
+/// An MXFP8 layer's per-expert tables (device `u64 [E]`) into its load-time
+/// BF16 expert copy, for `moe_bf16_grouped_gemm`; NULL for NVFP4 layers.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GroupedExperts {
     pub w13: DevicePtr,
-    pub w13_scale: DevicePtr,
     pub w2: DevicePtr,
-    pub w2_scale: DevicePtr,
 }
 
 /// One layer's routed experts as stored in the checkpoint.
@@ -150,6 +147,9 @@ pub(crate) struct MoePrefill {
     pub up_softcap: f32,
 }
 
+/// Output columns per CTA of `inkling2_moe_gemm_nvfp4` (its GN).
+const GEMM_N_TILE: u32 = 128;
+
 /// Rows from which the routed experts run as grouped GEMMs (fewer rows read
 /// each expert once per row through the decode GEMVs).
 pub(crate) const MOE_GROUPED_MIN_ROWS: usize = 16;
@@ -215,29 +215,37 @@ pub(crate) fn moe_prefill(
                 stream,
             )
         } else {
-            super::super::ops::moe_w4a16_grouped_gemm_ptrtable(
-                gpu,
-                k.moe_gemm_nvfp4,
-                x,
-                w,
-                sc,
-                g,
-                y,
-                offsets,
-                gather,
-                ne,
-                n,
-                kk,
-                m_tiles,
-                stream,
-            )
+            // the checkpoint's stacked tensors, on this target's tensor-core kernel
+            KernelLaunch::new(gpu, k.moe_gemm_nvfp4)
+                .grid([n.div_ceil(GEMM_N_TILE), m_tiles, ne])
+                .block([256, 1, 1])
+                .arg_ptr(x)
+                .arg_ptr(w)
+                .arg_ptr(sc)
+                .arg_ptr(g)
+                .arg_ptr(y)
+                .arg_ptr(offsets)
+                .arg_ptr(gather)
+                .arg_u32(n)
+                .arg_u32(kk)
+                .launch(stream)
         }
     };
     // gate and up rows stay interleaved in the output, as the checkpoint stores them
+    let (w13, w13_scale, w2, w2_scale) = if e.mxfp8 {
+        (
+            e.grouped.w13,
+            DevicePtr::NULL,
+            e.grouped.w2,
+            DevicePtr::NULL,
+        )
+    } else {
+        (e.w13, e.w13_scale, e.w2, e.w2_scale)
+    };
     gemm(
         a.x,
-        e.grouped.w13,
-        e.grouped.w13_scale,
+        w13,
+        w13_scale,
         e.w13_global,
         a.gu,
         sorted_rows,
@@ -253,16 +261,7 @@ pub(crate) fn moe_prefill(
         .arg_f32(a.gate_softcap)
         .arg_f32(a.up_softcap)
         .launch(stream)?;
-    gemm(
-        a.act,
-        e.grouped.w2,
-        e.grouped.w2_scale,
-        e.w2_global,
-        a.y,
-        DevicePtr::NULL,
-        h,
-        i,
-    )?;
+    gemm(a.act, w2, w2_scale, e.w2_global, a.y, DevicePtr::NULL, h, i)?;
     super::super::ops::moe_unpermute_reduce_indexed(
         gpu,
         k.moe_unpermute,

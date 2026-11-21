@@ -5,9 +5,9 @@
 //! pointers into the weight store (BF16/F32/U8/F8 as the checkpoint stores
 //! them), so every visit of a physical layer copies the same struct. Derived at
 //! load: the experts' per-expert global scales (`amax /
-//! outer_scale_denominator`, F32 `[E]`), the per-expert pointer tables the
-//! grouped prefill GEMMs take, and a BF16 copy of each MXFP8 layer's experts
-//! (exact; no grouped MXFP8 GEMM exists).
+//! outer_scale_denominator`, F32 `[E]`) and, for the MXFP8 layers, an exact
+//! BF16 copy of the experts with per-expert pointer tables for Atlas's grouped
+//! BF16 prefill GEMM.
 
 use anyhow::{Context, Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -151,40 +151,35 @@ fn mxfp8_as_bf16(
     Ok(out)
 }
 
-/// Per-expert tables over `{ex}.w13_weight` / `{ex}.w2_weight` for the grouped GEMMs.
+/// For an MXFP8 layer, per-expert tables over BF16 copies of its experts for
+/// `moe_bf16_grouped_gemm`; NVFP4 layers need none (their prefill kernel reads
+/// the stacked tensors).
 fn grouped_experts(
     store: &WeightStore,
     gpu: &dyn GpuBackend,
     ex: &str,
     mxfp8: bool,
 ) -> Result<GroupedExperts> {
+    if !mxfp8 {
+        return Ok(GroupedExperts {
+            w13: DevicePtr::NULL,
+            w2: DevicePtr::NULL,
+        });
+    }
     let t = |name: String| {
         store
             .get(&name)
             .with_context(|| format!("inkling2 tensor {name}"))
     };
-    let one = |w: &str| -> Result<(DevicePtr, DevicePtr)> {
+    let table = |w: &str| -> Result<DevicePtr> {
         let codes = t(format!("{ex}.{w}"))?;
-        let scales = t(format!("{ex}.{w}_scale"))?;
+        let bf16 = mxfp8_as_bf16(gpu, codes, t(format!("{ex}.{w}_scale"))?.ptr)?;
         let e = codes.shape[0];
-        let per = |x: &WeightTensor| x.num_elements() / e;
-        Ok(if mxfp8 {
-            let bf16 = mxfp8_as_bf16(gpu, codes, scales.ptr)?;
-            (ptr_table(gpu, bf16, e, per(codes) * 2)?, DevicePtr::NULL)
-        } else {
-            (
-                ptr_table(gpu, codes.ptr, e, per(codes))?,
-                ptr_table(gpu, scales.ptr, e, per(scales))?,
-            )
-        })
+        ptr_table(gpu, bf16, e, codes.num_elements() / e * 2)
     };
-    let (w13, w13_scale) = one("w13_weight")?;
-    let (w2, w2_scale) = one("w2_weight")?;
     Ok(GroupedExperts {
-        w13,
-        w13_scale,
-        w2,
-        w2_scale,
+        w13: table("w13_weight")?,
+        w2: table("w2_weight")?,
     })
 }
 
