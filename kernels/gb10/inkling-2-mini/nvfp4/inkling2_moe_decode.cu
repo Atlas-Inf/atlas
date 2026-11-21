@@ -17,19 +17,18 @@
 // inkling2_moe_gate_up_*: A [rows, K] -> act [rows, top_k, I]; grid (ceil(I/8), top_k, rows), 256 threads
 // inkling2_moe_down_*:    act -> y [rows, top_k, H] (BF16);    grid (ceil(H/32), top_k, rows), 256 threads
 // Weight rows are read in 16-byte chunks (code rows and tensor bases 16-byte aligned) against the
-// activation row staged in shared memory, so a lane keeps whole chunks of weights in flight.
+// activation row, which every warp of a block reads (from cache), so a lane keeps whole chunks of
+// weights in flight; E2M1 codes are decoded by cvt.rn.f16x2.e2m1x2 (exact).
 // inkling2_moe_combine:   out[r, h] = BF16(sum_s y[r, s, h] * w[r, s]) in fp32.
 
 #include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
-#define INK_MAX_K 4096   // shared activation row (hidden and intermediate sizes)
 #define INK_GU_WARPS 8   // gate_up: one warp per activation (half-warps on gate and up rows)
 #define INK_DN_ROWS 32   // down: 8 warps x 4 rows, 8 lanes per row
-
-__device__ __constant__ float INK_E2M1[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-                                              -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+#define INK_MAX_SROW 256 // scale bytes of one weight row (K up to 4096 NVFP4 / 8192 MXFP8)
 
 #if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
 // Standard E4M3 (1-4-3, bias 7) by bit math: the AMD compat __nv_fp8_e4m3 -> float
@@ -54,24 +53,62 @@ __device__ __forceinline__ float ink_bf(unsigned int raw, int hi) {
     return __bfloat162float(__ushort_as_bfloat16((unsigned short)(hi ? raw >> 16 : raw & 0xFFFF)));
 }
 
-// Byte -> (E2M1 low nibble, E2M1 high nibble), staged in shared memory: lanes index
-// the table independently, which __constant__ memory would serialize (~14 transactions
-// a read, per the note in common/w4a16_gemv.cu).
-__device__ __forceinline__ void ink_stage_lut(float2* lut) {
-    for (unsigned int b = threadIdx.x; b < 256; b += blockDim.x) lut[b] = make_float2(INK_E2M1[b & 0xF], INK_E2M1[b >> 4]);
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+// AMD (strix-hip): no cvt.rn.f16x2.e2m1x2 / ld.global.nc.L1::no_allocate. E2M1 by bit math
+// (exact: sign, 2-bit exponent, 1-bit mantissa; e = 0 is the 0 / 0.5 subnormal pair) and a
+// plain 16-byte load.
+__device__ __forceinline__ float ink_e2m1(unsigned int n) {
+    const unsigned int e = (n >> 1) & 3u, m = n & 1u;
+    const float v = e == 0u ? 0.5f * (float)m : __uint_as_float(((e + 126u) << 23) | (m << 22));
+    return (n & 8u) ? -v : v;
 }
-
-// sum over 8 NVFP4 values (one code word) times 8 BF16 activations (one uint4)
-__device__ __forceinline__ float ink_fp4x8(const float2* lut, unsigned int w, uint4 av) {
+__device__ __forceinline__ float ink_fp4x8(unsigned int w, uint4 av) {
     const unsigned int a[4] = {av.x, av.y, av.z, av.w};
     float acc = 0.0f;
 #pragma unroll
     for (int b = 0; b < 4; b++) {
-        const float2 v = lut[(w >> (8 * b)) & 0xFF];
+        const unsigned int byte = (w >> (8 * b)) & 0xFFu;
+        acc += ink_e2m1(byte & 0xFu) * ink_bf(a[b], 0) + ink_e2m1(byte >> 4) * ink_bf(a[b], 1);
+    }
+    return acc;
+}
+__device__ __forceinline__ uint4 ink_ld_stream(const unsigned char* p) { return *(const uint4*)p; }
+// hipcc has no __syncwarp (see common/w4a16_gemv_fused.cu); the scale rows are shared by lanes
+// of one wave, so a wave barrier with LDS ordering stands in for it.
+__device__ __forceinline__ void ink_wave_sync() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
+#define __syncwarp() ink_wave_sync()
+#else
+// sum over 8 NVFP4 values (one code word, even element in each byte's low nibble) times
+// 8 BF16 activations (one uint4); the E2M1 values come exact from the hardware converter.
+__device__ __forceinline__ float ink_fp4x8(unsigned int w, uint4 av) {
+    unsigned int h[4];
+    asm("{\n\t.reg .b8 b0, b1, b2, b3;\n\tmov.b32 {b0, b1, b2, b3}, %4;\n\t"
+        "cvt.rn.f16x2.e2m1x2 %0, b0;\n\tcvt.rn.f16x2.e2m1x2 %1, b1;\n\t"
+        "cvt.rn.f16x2.e2m1x2 %2, b2;\n\tcvt.rn.f16x2.e2m1x2 %3, b3;\n\t}"
+        : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3]) : "r"(w));
+    const unsigned int a[4] = {av.x, av.y, av.z, av.w};
+    float acc = 0.0f;
+#pragma unroll
+    for (int b = 0; b < 4; b++) {
+        const float2 v = __half22float2(*(const __half2*)&h[b]);
         acc += v.x * ink_bf(a[b], 0) + v.y * ink_bf(a[b], 1);
     }
     return acc;
 }
+
+// A weight chunk, streamed past L1 (which keeps the activation row every warp re-reads).
+__device__ __forceinline__ uint4 ink_ld_stream(const unsigned char* p) {
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+
+#endif  // AMD
 
 // sum over 4 E4M3 values (one code word) times 4 BF16 activations (two words)
 __device__ __forceinline__ float ink_fp8x4(unsigned int w, unsigned int a0, unsigned int a1) {
@@ -80,25 +117,34 @@ __device__ __forceinline__ float ink_fp8x4(unsigned int w, unsigned int a0, unsi
 }
 
 // This lane's share of dot(a[0:K], W[row, 0:K]): 16-byte code chunks (32 NVFP4 or 16
-// MXFP8 values) strided over the L lanes of its group; `a` is in shared memory.
+// MXFP8 values) strided over the L lanes of its group; `a` in global or shared memory.
+// The row's scales are first copied into the group's `srow` in 4-byte words (one wide
+// request for the row instead of a 2-byte load per chunk, which cost a quarter of the
+// kernel's time); scale rows and bases must be 4-byte aligned.
 template <bool MX, int L>
-__device__ __forceinline__ float ink_dot(const float2* lut, const unsigned char* __restrict__ codes,
+__device__ __forceinline__ float ink_dot(const unsigned char* __restrict__ codes,
                                          const unsigned char* __restrict__ scales, float s2,
-                                         const __nv_bfloat16* a, unsigned int K, unsigned int g) {
+                                         const __nv_bfloat16* a, unsigned int K, unsigned int g,
+                                         unsigned char* srow) {
     constexpr unsigned int V = MX ? 16 : 32;
+    for (unsigned int w = g; w < K / (MX ? 32 : 16) / 4; w += L)
+        ((unsigned int*)srow)[w] = ((const unsigned int*)scales)[w];
+    __syncwarp();
     float acc = 0.0f;
+    // unrolled so a lane's code chunks are in flight together (same summation order)
+#pragma unroll 4
     for (unsigned int c = g; c < K / V; c += L) {
-        const uint4 cv = *(const uint4*)(codes + c * 16);
+        const uint4 cv = ink_ld_stream(codes + c * 16);
         const uint4* ap = (const uint4*)(a + c * V);
         if (MX) {
             const uint4 a0 = ap[0], a1 = ap[1];
             const float p = ink_fp8x4(cv.x, a0.x, a0.y) + ink_fp8x4(cv.y, a0.z, a0.w)
                           + ink_fp8x4(cv.z, a1.x, a1.y) + ink_fp8x4(cv.w, a1.z, a1.w);
-            acc += p * exp2f((float)scales[c / 2] - 127.0f);
+            acc += p * exp2f((float)srow[c / 2] - 127.0f);
         } else {
-            const unsigned short sv = *(const unsigned short*)(scales + c * 2);
-            const float lo = ink_fp4x8(lut, cv.x, ap[0]) + ink_fp4x8(lut, cv.y, ap[1]);
-            const float hi = ink_fp4x8(lut, cv.z, ap[2]) + ink_fp4x8(lut, cv.w, ap[3]);
+            const unsigned short sv = *(const unsigned short*)(srow + c * 2);
+            const float lo = ink_fp4x8(cv.x, ap[0]) + ink_fp4x8(cv.y, ap[1]);
+            const float hi = ink_fp4x8(cv.z, ap[2]) + ink_fp4x8(cv.w, ap[3]);
             acc += lo * (ink_e4m3(sv & 0xFF) * s2) + hi * (ink_e4m3(sv >> 8) * s2);
         }
     }
@@ -107,21 +153,14 @@ __device__ __forceinline__ float ink_dot(const float2* lut, const unsigned char*
     return acc;
 }
 
-__device__ __forceinline__ void ink_stage(const __nv_bfloat16* __restrict__ src, __nv_bfloat16* dst, unsigned int n) {
-    for (unsigned int i = threadIdx.x; i < n / 8; i += blockDim.x) ((uint4*)dst)[i] = ((const uint4*)src)[i];
-    __syncthreads();
-}
-
 template <bool MX>
 __device__ __forceinline__ void ink_gate_up(const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
                                             const unsigned char* __restrict__ scales, const float* __restrict__ s2,
                                             const int* __restrict__ experts, __nv_bfloat16* __restrict__ act,
                                             unsigned int I, unsigned int K, unsigned int top_k, float cg, float cu) {
-    __shared__ __align__(16) __nv_bfloat16 a[INK_MAX_K];
-    __shared__ float2 lut[256];
     const unsigned int slot = blockIdx.y, r = blockIdx.z;
-    if (!MX) ink_stage_lut(lut);
-    ink_stage(A + (unsigned long long)r * K, a, K);
+    // every warp reads the same activation row: the cache serves it
+    const __nv_bfloat16* a = A + (unsigned long long)r * K;
     const unsigned int i = blockIdx.x * INK_GU_WARPS + threadIdx.x / 32;
     const unsigned int lane = threadIdx.x % 32;
     if (i >= I) return;
@@ -130,7 +169,8 @@ __device__ __forceinline__ void ink_gate_up(const __nv_bfloat16* __restrict__ A,
     const unsigned long long row = e * 2ull * I + 2ull * i + lane / 16;
     const unsigned char* c = codes + row * (MX ? K : K / 2);
     const unsigned char* sc = scales + row * (K / (MX ? 32 : 16));
-    const float d = ink_dot<MX, 16>(lut, c, sc, MX ? 1.0f : s2[e], a, K, lane % 16);
+    __shared__ __align__(16) unsigned char srow[2 * INK_GU_WARPS][INK_MAX_SROW];
+    const float d = ink_dot<MX, 16>(c, sc, MX ? 1.0f : s2[e], a, K, lane % 16, srow[threadIdx.x / 16]);
     const float other = __shfl_sync(0xffffffff, d, 16);
     if (lane == 0) {
         const float g = __bfloat162float(__float2bfloat16(d));
@@ -145,18 +185,16 @@ __device__ __forceinline__ void ink_down(const __nv_bfloat16* __restrict__ act, 
                                          const unsigned char* __restrict__ scales, const float* __restrict__ s2,
                                          const int* __restrict__ experts, __nv_bfloat16* __restrict__ y,
                                          unsigned int H, unsigned int I, unsigned int top_k) {
-    __shared__ __align__(16) __nv_bfloat16 a[INK_MAX_K];
-    __shared__ float2 lut[256];
     const unsigned int slot = blockIdx.y, r = blockIdx.z;
-    if (!MX) ink_stage_lut(lut);
-    ink_stage(act + ((unsigned long long)r * top_k + slot) * I, a, I);
+    const __nv_bfloat16* a = act + ((unsigned long long)r * top_k + slot) * I;
     const unsigned int lane = threadIdx.x % 32;
     const unsigned int n = blockIdx.x * INK_DN_ROWS + (threadIdx.x / 32) * 4 + lane / 8;
     const unsigned long long e = (unsigned long long)experts[r * top_k + slot];
     const unsigned long long row = e * H + (n < H ? n : 0);
     const unsigned char* c = codes + row * (MX ? I : I / 2);
     const unsigned char* sc = scales + row * (I / (MX ? 32 : 16));
-    const float d = ink_dot<MX, 8>(lut, c, sc, MX ? 1.0f : s2[e], a, I, lane % 8);
+    __shared__ __align__(16) unsigned char srow[INK_DN_ROWS][INK_MAX_SROW];
+    const float d = ink_dot<MX, 8>(c, sc, MX ? 1.0f : s2[e], a, I, lane % 8, srow[threadIdx.x / 8]);
     if (lane % 8 == 0 && n < H) y[((unsigned long long)r * top_k + slot) * H + n] = __float2bfloat16(d);
 }
 
@@ -213,20 +251,26 @@ extern "C" __global__ void inkling2_moe_combine(const __nv_bfloat16* __restrict_
 
 // R dots of one weight row against R staged activation rows, this lane's share.
 template <bool MX, int L>
-__device__ __forceinline__ void ink_dot_rows(const float2* lut, const unsigned char* __restrict__ codes,
+__device__ __forceinline__ void ink_dot_rows(const unsigned char* __restrict__ codes,
                                              const unsigned char* __restrict__ scales, float s2,
                                              const __nv_bfloat16* a, unsigned int K, unsigned int g, int nr,
-                                             float* acc) {
+                                             float* acc, unsigned char* srow) {
     constexpr unsigned int V = MX ? 16 : 32;
+    // the row's scales into the group's srow, as in ink_dot (the group's previous row is
+    // done with it: its reads came before the reduction's shuffles)
+    __syncwarp();
+    for (unsigned int w = g; w < K / (MX ? 32 : 16) / 4; w += L)
+        ((unsigned int*)srow)[w] = ((const unsigned int*)scales)[w];
+    __syncwarp();
 #pragma unroll
     for (int r = 0; r < INK_GR; r++) acc[r] = 0.0f;
     for (unsigned int c = g; c < K / V; c += L) {
         const uint4 cv = *(const uint4*)(codes + c * 16);
         float sa = 1.0f, sb = 1.0f;
         if (MX) {
-            sa = exp2f((float)scales[c / 2] - 127.0f);
+            sa = exp2f((float)srow[c / 2] - 127.0f);
         } else {
-            const unsigned short sv = *(const unsigned short*)(scales + c * 2);
+            const unsigned short sv = *(const unsigned short*)(srow + c * 2);
             sa = ink_e4m3(sv & 0xFF) * s2;
             sb = ink_e4m3(sv >> 8) * s2;
         }
@@ -239,8 +283,8 @@ __device__ __forceinline__ void ink_dot_rows(const float2* lut, const unsigned c
                 acc[r] += sa * (ink_fp8x4(cv.x, a0.x, a0.y) + ink_fp8x4(cv.y, a0.z, a0.w)
                               + ink_fp8x4(cv.z, a1.x, a1.y) + ink_fp8x4(cv.w, a1.z, a1.w));
             } else {
-                acc[r] += sa * (ink_fp4x8(lut, cv.x, ap[0]) + ink_fp4x8(lut, cv.y, ap[1]))
-                        + sb * (ink_fp4x8(lut, cv.z, ap[2]) + ink_fp4x8(lut, cv.w, ap[3]));
+                acc[r] += sa * (ink_fp4x8(cv.x, ap[0]) + ink_fp4x8(cv.y, ap[1]))
+                        + sb * (ink_fp4x8(cv.z, ap[2]) + ink_fp4x8(cv.w, ap[3]));
             }
         }
     }
@@ -271,8 +315,7 @@ __device__ __forceinline__ void ink_grouped_gate_up(const __nv_bfloat16* __restr
     const int s0 = offsets[e], cnt = offsets[e + 1] - s0;
     if (cnt <= 0) return;
     __shared__ __align__(16) __nv_bfloat16 a[INK_GR * INK_GR_MAX_K];
-    __shared__ float2 lut[256];
-    if (!MX) ink_stage_lut(lut);
+    __shared__ __align__(16) unsigned char srow[2 * INK_GU_WARPS][INK_MAX_SROW];
     const unsigned int lane = threadIdx.x % 32;
     for (int base = 0; base < cnt; base += INK_GR) {
         const int nr = min(INK_GR, cnt - base);
@@ -286,7 +329,7 @@ __device__ __forceinline__ void ink_grouped_gate_up(const __nv_bfloat16* __restr
             const unsigned char* c = codes + row * (MX ? K : K / 2);
             const unsigned char* sc = scales + row * (K / (MX ? 32 : 16));
             float d[INK_GR];
-            ink_dot_rows<MX, 16>(lut, c, sc, MX ? 1.0f : s2[e], a, K, lane % 16, nr, d);
+            ink_dot_rows<MX, 16>(c, sc, MX ? 1.0f : s2[e], a, K, lane % 16, nr, d, srow[threadIdx.x / 16]);
 #pragma unroll
             for (int r = 0; r < INK_GR; r++) {
                 if (r >= nr) break;
@@ -311,8 +354,7 @@ __device__ __forceinline__ void ink_grouped_down(const __nv_bfloat16* __restrict
     const int s0 = offsets[e], cnt = offsets[e + 1] - s0;
     if (cnt <= 0) return;
     __shared__ __align__(16) __nv_bfloat16 a[INK_GR * INK_GR_MAX_K];
-    __shared__ float2 lut[256];
-    if (!MX) ink_stage_lut(lut);
+    __shared__ __align__(16) unsigned char srow[INK_DN_ROWS][INK_MAX_SROW];
     const unsigned int lane = threadIdx.x % 32;
     for (int base = 0; base < cnt; base += INK_GR) {
         const int nr = min(INK_GR, cnt - base);
@@ -326,7 +368,7 @@ __device__ __forceinline__ void ink_grouped_down(const __nv_bfloat16* __restrict
             const unsigned char* c = codes + row * (MX ? I : I / 2);
             const unsigned char* sc = scales + row * (I / (MX ? 32 : 16));
             float d[INK_GR];
-            ink_dot_rows<MX, 8>(lut, c, sc, MX ? 1.0f : s2[e], a, I, lane % 8, nr, d);
+            ink_dot_rows<MX, 8>(c, sc, MX ? 1.0f : s2[e], a, I, lane % 8, nr, d, srow[threadIdx.x / 8]);
             if (lane % 8 == 0 && n < H) {
 #pragma unroll
                 for (int r = 0; r < INK_GR; r++) {

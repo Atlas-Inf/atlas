@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Inkling 2 grouped expert GEMMs and the dense NVFP4 GEMM, strix-hip (gfx1151 WMMA) port of
-// kernels/gb10/inkling-2-mini/nvfp4/inkling2_moe_gemm.cu (same entry points, arguments, grids
-// and numerics for the BF16-activation path): C[m, n] = sum_k A[row(m), k] * W_e[n, k] for the
-// rows m of each expert e (moe_sort_by_expert order), W_e read from the checkpoint's stacked
+// Inkling 2 grouped expert GEMMs for prefill rows, strix-hip (gfx1151 WMMA) port of
+// the BF16-activation grouped GEMM that kernels/gb10/inkling-2-mini/nvfp4/inkling2_moe_gemm.cu
+// carried until #401's cb10558e6 moved gb10 prefill to W4A4 / W8A8 only (same entry points,
+// arguments, grids and numerics): C[m, n] = sum_k A[row(m), k] * W_e[n, k] for the rows m
+// of each expert e (moe_sort_by_expert order), W_e read from the checkpoint's stacked
 // tensors and dequantised per 32-wide K step to BF16 exactly as the gb10 tile does:
 //   NVFP4  BF16(e2m1 * (E4M3(scale) * s2[e]))      codes [E, N, K/2], scales [E, N, K/16]
 //   MXFP8  BF16(E4M3(code) * 2^(E8M0 - 127))       codes [E, N, K],   scales [E, N, K/32]
@@ -166,16 +167,20 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_mxfp8(
     ink_hip_gemm_tile<true, 64>(A, codes + ne * K, scales + ne * (K / 32), 1.0f, C, m_start, m_count, m0, rows, N, K);
 }
 
-// A dense NVFP4 projection (Spark mode's attention): C [M, N] = A [M, K] W^T.
-// grid (N / 128, ceil(M / 128)), block 256.
-extern "C" __global__ void __launch_bounds__(256) inkling2_gemm_nvfp4(
-    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
-    const unsigned char* __restrict__ scales, const float s2, __nv_bfloat16* __restrict__ C,
-    const unsigned int M, const unsigned int N, const unsigned int K
-) {
-    const int m0 = blockIdx.y * 128;
-    if (m0 >= (int)M) return;
-    ink_hip_gemm_tile<false, 128>(A, codes, scales, s2, C, 0, (int)M, m0, nullptr, N, K);
+// The softcapped SwiGLU between the grouped GEMMs (kept here: gb10 dropped its BF16-row
+// prefill path in favour of the block-scaled one): act[r, i] = BF16(tanh(g / cg) * cg * sigmoid(g)
+// * tanh(u / cu) * cu), g = gu[r, 2i], u = gu[r, 2i + 1] (the checkpoint's interleaved w13 rows),
+// as gb10's ink_situ rounds it. grid (rows, ceil(I / 256)), block 256.
+extern "C" __global__ void inkling2_softcap_swiglu(const __nv_bfloat16* __restrict__ gu,
+                                                   __nv_bfloat16* __restrict__ act, const unsigned int I,
+                                                   const float cg, const float cu) {
+    const unsigned int i = blockIdx.y * blockDim.x + threadIdx.x;
+    const unsigned long long r = blockIdx.x;
+    if (i >= I) return;
+    const __nv_bfloat162 p = ((const __nv_bfloat162*)(gu + r * 2 * I))[i];
+    const float g = __low2float(p), u = __high2float(p);
+    const float v = tanhf(g / cg) * cg * (1.0f / (1.0f + __expf(-g))) * tanhf(u / cu) * cu;
+    act[r * I + i] = __float2bfloat16(v);
 }
 
 // Block-scaled W4A4 / W8A8 (gb10 tensor-core formats) and their tile list: not on AMD.

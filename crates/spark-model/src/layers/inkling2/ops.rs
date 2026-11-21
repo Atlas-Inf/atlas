@@ -54,8 +54,6 @@ pub(crate) struct Inkling2Kernels {
     /// weighted unpermute, around this target's softcapped SwiGLU
     pub moe_sort: KernelHandle,
     pub moe_unpermute: KernelHandle,
-    pub moe_gemm_nvfp4: KernelHandle,
-    pub moe_gemm_mxfp8: KernelHandle,
     pub moe_gemm_w4a4: KernelHandle,
     pub moe_gemm_w8a8: KernelHandle,
     pub moe_tiles: KernelHandle,
@@ -63,7 +61,21 @@ pub(crate) struct Inkling2Kernels {
     pub situ_quant_fp4: KernelHandle,
     pub quant_mxfp8: KernelHandle,
     pub situ_quant_mxfp8: KernelHandle,
+    /// AMD (strix-hip) only, from kernels/strix-hip/inkling-2-mini/nvfp4/inkling2_moe_gemm.cu:
+    /// the BF16-row grouped expert GEMMs and the softcapped SwiGLU between them, which prefill
+    /// takes there instead of the gb10 block-scaled W4A4 / W8A8 path (NULL elsewhere)
+    pub moe_gemm_nvfp4: KernelHandle,
+    pub moe_gemm_mxfp8: KernelHandle,
     pub softcap_swiglu: KernelHandle,
+}
+
+/// A strix-hip-only kernel of this target's `inkling2_moe_gemm` module; NULL on other targets.
+fn amd_kernel(gpu: &dyn GpuBackend, name: &str) -> Result<KernelHandle> {
+    if cfg!(atlas_scale) {
+        gpu.kernel("inkling2_moe_gemm", name)
+    } else {
+        Ok(KernelHandle(0))
+    }
 }
 
 impl Inkling2Kernels {
@@ -100,8 +112,6 @@ impl Inkling2Kernels {
             moe_combine: gpu.kernel("inkling2_moe_decode", "inkling2_moe_combine")?,
             moe_sort: gpu.kernel("moe", "moe_sort_by_expert")?,
             moe_unpermute: gpu.kernel("moe", "moe_unpermute_reduce_indexed")?,
-            moe_gemm_nvfp4: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_gemm_nvfp4")?,
-            moe_gemm_mxfp8: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_gemm_mxfp8")?,
             moe_gemm_w4a4: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_gemm_w4a4")?,
             moe_gemm_w8a8: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_gemm_w8a8")?,
             moe_tiles: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_tiles")?,
@@ -109,7 +119,9 @@ impl Inkling2Kernels {
             situ_quant_fp4: gpu.kernel("inkling2_moe_prefill", "inkling2_situ_quant_fp4")?,
             quant_mxfp8: gpu.kernel("inkling2_moe_prefill", "inkling2_quant_mxfp8")?,
             situ_quant_mxfp8: gpu.kernel("inkling2_moe_prefill", "inkling2_situ_quant_mxfp8")?,
-            softcap_swiglu: gpu.kernel("inkling2_moe_prefill", "inkling2_softcap_swiglu")?,
+            moe_gemm_nvfp4: amd_kernel(gpu, "inkling2_moe_gemm_nvfp4")?,
+            moe_gemm_mxfp8: amd_kernel(gpu, "inkling2_moe_gemm_mxfp8")?,
+            softcap_swiglu: amd_kernel(gpu, "inkling2_softcap_swiglu")?,
         })
     }
 }
@@ -155,6 +167,8 @@ pub(crate) fn short_conv(
     );
     ensure!(a.head_dim > 0, "inkling2 conv head_dim");
     let cblocks = u32_of(a.channels.div_ceil(256), "channels")?;
+    // decode rows: the conv kernel rolls its own state (one row a sequence)
+    let roll = a.rows_per_seq == 1;
     KernelLaunch::new(gpu, kernels.sconv)
         .grid([cblocks, u32_of(a.rows, "rows")?, 1])
         .block([256, 1, 1])
@@ -172,7 +186,11 @@ pub(crate) fn short_conv(
         .arg_u32(u32_of(a.out_stride, "out stride")?)
         .arg_u32(u32_of(a.dyn_stride, "dyn stride")?)
         .arg_u32(u32_of(a.head_dim, "head dim")?)
+        .arg_u32(u32::from(roll))
         .launch(stream)?;
+    if roll {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernels.sconv_state)
         .grid([cblocks, u32_of(a.num_seqs, "seqs")?, 1])
         .block([256, 1, 1])

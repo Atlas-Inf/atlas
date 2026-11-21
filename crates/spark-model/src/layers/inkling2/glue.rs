@@ -34,7 +34,6 @@ pub(crate) struct GlueKernels {
     pub w4a16_gemv: KernelHandle,
     pub w4a16_gemv_b8: KernelHandle,
     pub w4a16_gemv_b16: KernelHandle,
-    pub gemm_nvfp4: KernelHandle,
 }
 
 impl GlueKernels {
@@ -58,7 +57,6 @@ impl GlueKernels {
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_b8: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch8")?,
             w4a16_gemv_b16: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch16")?,
-            gemm_nvfp4: gpu.kernel("inkling2_moe_gemm", "inkling2_gemm_nvfp4")?,
         })
     }
 }
@@ -92,9 +90,10 @@ impl GlueKernels {
     }
 
     /// `y[rows, n] = x[rows, k] W[n, k]^T`, BF16 out: a BF16 weight through
-    /// the dense GEMV / BF16 GEMM, a Spark NVFP4 one through `w4a16_gemv` /
-    /// `w4a16_gemv_batch8/16` / `inkling2_gemm_nvfp4` by row count (BF16
-    /// activations throughout).
+    /// the dense GEMV / BF16 GEMM; a Spark NVFP4 one through `w4a16_gemv` /
+    /// `w4a16_gemv_batch8/16` for decode and verify rows, and its checkpoint BF16
+    /// weight for prefill rows (from `MOE_GROUPED_MIN_ROWS`, where the experts
+    /// take the checkpoint's too).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn proj(
         &self,
@@ -124,11 +123,11 @@ impl GlueKernels {
                 .arg_u32(n as u32)
                 .launch(s),
             Linear::Bf16(w) => ops::bf16_gemm(x, w.0, y, rows as u32, n as u32, k as u32, s),
-            Linear::Nvfp4(q) if rows == 1 => {
+            Linear::Nvfp4 { q, .. } if rows == 1 => {
                 ops::w4a16_gemv(gpu, self.w4a16_gemv, x, &q, y, n as u32, k as u32, s)
             }
             // a decode batch: Atlas's batched GEMV reads the weight once for all rows
-            Linear::Nvfp4(q) if rows <= 16 => {
+            Linear::Nvfp4 { q, .. } if rows < super::moe_ops::MOE_GROUPED_MIN_ROWS => {
                 let kernel = if rows <= 8 {
                     self.w4a16_gemv_b8
                 } else {
@@ -136,19 +135,9 @@ impl GlueKernels {
                 };
                 ops::w4a16_gemv_batchm(gpu, kernel, x, &q, y, rows as u32, n as u32, k as u32, s)
             }
-            // this target's tensor-core tile (BF16 activations, weights dequantised to BF16)
-            Linear::Nvfp4(q) => KernelLaunch::new(gpu, self.gemm_nvfp4)
-                .grid([(n as u32).div_ceil(128), (rows as u32).div_ceil(128), 1])
-                .block([256, 1, 1])
-                .arg_ptr(x)
-                .arg_ptr(q.weight)
-                .arg_ptr(q.weight_scale)
-                .arg_f32(q.weight_scale_2)
-                .arg_ptr(y)
-                .arg_u32(rows as u32)
-                .arg_u32(n as u32)
-                .arg_u32(k as u32)
-                .launch(s),
+            Linear::Nvfp4 { prefill, .. } => {
+                ops::bf16_gemm(x, prefill.0, y, rows as u32, n as u32, k as u32, s)
+            }
         }
     }
 

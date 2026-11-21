@@ -28,11 +28,15 @@ fn ptr(store: &WeightStore, name: &str) -> Result<DevicePtr> {
 }
 
 /// A dense projection: the checkpoint's BF16 `[N, K]`, or the Spark overlay's
-/// NVFP4 (ModelOpt codes, E4M3 scales, per-tensor global).
+/// NVFP4 (ModelOpt codes, E4M3 scales, per-tensor global) for decode and verify
+/// rows with the checkpoint's BF16 kept for prefill rows.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Linear {
     Bf16(DevicePtr),
-    Nvfp4(QuantizedWeight),
+    Nvfp4 {
+        q: QuantizedWeight,
+        prefill: DevicePtr,
+    },
 }
 
 /// Static (SWA) or dynamic (full layer) k/v short convolution.
@@ -89,7 +93,12 @@ pub(crate) struct PhysicalWeights {
     pub mlp_norm: DevicePtr,
     pub router: DevicePtr,
     pub router_bias: DevicePtr,
+    /// The routed experts decode and verify rows read: the Spark overlay's where it
+    /// has them, else the checkpoint's
     pub experts: StackedExperts,
+    /// The checkpoint's routed experts, which prefill rows read in both modes (at
+    /// its declared numerics)
+    pub prefill_experts: StackedExperts,
     /// q, k, v, mlp message gates (loop core only)
     pub messages: Option<[MessageGate; 4]>,
     /// Block-residual query for the attention input: `[H]` (SWA) or `[3, H]`
@@ -188,7 +197,6 @@ fn checkpoint_experts(
     let ex = format!("{lp}.mlp.experts");
     Ok(StackedExperts {
         mxfp8,
-        act_quant: true,
         w13: p(&format!("{ex}.w13_weight"))?,
         w13_scale: p(&format!("{ex}.w13_weight_scale"))?,
         w13_global: if mxfp8 {
@@ -246,7 +254,6 @@ fn spark_experts(
     };
     Ok(Some(StackedExperts {
         mxfp8: false,
-        act_quant: false,
         w13: interleave(format!("{ex}.gate_up_proj.weight"))?,
         w13_scale: interleave(format!("{ex}.gate_up_proj.weight_scale"))?,
         w13_global: t(format!("{ex}.gate_up_proj.weight_scale_2"))?.ptr,
@@ -286,16 +293,18 @@ pub(crate) fn physical(
     // the checkpoint's BF16 tensor
     let linear = |ckpt: &str, spark: &str| -> Result<Linear> {
         let q = format!("{SPARK}.layers.{l}.self_attn.{spark}");
+        let bf16 = p(&format!("{a}.{ckpt}.weight"))?;
         Ok(if store.contains(&format!("{q}.weight")) {
-            Linear::Nvfp4(crate::weight_map::quantized(store, &q, gpu)?)
+            Linear::Nvfp4 {
+                q: crate::weight_map::quantized(store, &q, gpu)?,
+                prefill: bf16,
+            }
         } else {
-            Linear::Bf16(p(&format!("{a}.{ckpt}.weight"))?)
+            Linear::Bf16(bf16)
         })
     };
-    let stacked = match spark_experts(store, gpu, l)? {
-        Some(stacked) => stacked,
-        None => checkpoint_experts(store, gpu, &lp, mxfp8, experts)?,
-    };
+    let prefill_experts = checkpoint_experts(store, gpu, &lp, mxfp8, experts)?;
+    let stacked = spark_experts(store, gpu, l)?.unwrap_or(prefill_experts);
     let messages = if looped {
         let gate = |c: &str| -> Result<MessageGate> {
             let cp = format!("{lp}.controllers.{c}");
@@ -338,6 +347,7 @@ pub(crate) fn physical(
         router: p(&format!("{lp}.mlp.gate.weight"))?,
         router_bias: p(&format!("{lp}.mlp.gate.bias"))?,
         experts: stacked,
+        prefill_experts,
         messages,
         // checkpoint index N feeds layer N + 1's attention input
         attn_query: if l == 0 {

@@ -2,8 +2,8 @@
 # Strix Halo (gfx1151). The model, its Rust layer and its kernels are the gb10 target's
 # (kernels/gb10/inkling-2-mini, see its MODEL.toml); this target's `nvfp4/` links those
 # .cu files (inkling2_head_ops.cu carries a WMMA branch of the fused message gates for AMD),
-# except inkling2_moe_gemm.cu: its own WMMA port of the BF16-row grouped expert
-# GEMM and the dense NVFP4 GEMM (same entry points and numerics). The other tensor-core /
+# except inkling2_moe_gemm.cu: its own WMMA BF16-row grouped expert GEMMs and the
+# softcapped SwiGLU between them (the path gb10 carried before #401's cb10558e6). The other tensor-core /
 # block-scaled kernels (flash prefill, the W4A4 / W8A8 expert GEMMs and
 # their activation quantizers) compile to stubs on AMD, and spark-model routes around them
 # under cfg!(atlas_scale): the per-head paged prefill body (strix-hip/common/

@@ -172,9 +172,14 @@ impl Inkling2Layer {
     pub(super) fn routed_experts(&self, gpu: &dyn GpuBackend, n: usize, stream: u64) -> Result<()> {
         let (s, w, d, p, h) = (&self.shared, &self.w, &self.dims, &self.p, self.dims.hidden);
         if n > 1 {
+            let grouped = n >= ops::MOE_GROUPED_MIN_ROWS;
             let args = ops::MoePrefill {
                 x: s.mlp_normed,
-                experts: w.experts,
+                experts: if grouped {
+                    w.prefill_experts
+                } else {
+                    w.experts
+                },
                 expert_ids: s.ids,
                 weights: s.weights,
                 gu: s.gu,
@@ -190,7 +195,7 @@ impl Inkling2Layer {
                 gate_softcap: p.gate_softcap,
                 up_softcap: p.up_softcap,
             };
-            if n >= ops::MOE_GROUPED_MIN_ROWS {
+            if grouped {
                 ops::moe_prefill(gpu, &self.k, &args, stream)?;
             } else {
                 ops::moe_batched(gpu, &self.k, &args, stream)?;
