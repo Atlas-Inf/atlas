@@ -75,8 +75,13 @@ impl Runtime<'_> {
                 let w = &self.multi;
                 let n = tokens.len();
                 let start = data.history.len();
-                let timer = (mode == VERIFY)
-                    .then(|| timing::Token::begin_batch(gpu, stream, s.config.tp_rank, start, n));
+                let timer = Some(timing::Token::begin_batch(
+                    gpu,
+                    stream,
+                    s.config.tp_rank,
+                    start,
+                    n,
+                ));
                 let row_span = timing::span("other", stream)?;
                 let mut history = data.history.clone();
                 history.extend_from_slice(tokens);

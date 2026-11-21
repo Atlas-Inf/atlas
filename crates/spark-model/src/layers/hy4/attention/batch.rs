@@ -30,10 +30,23 @@ pub(super) struct BatchScratch<'a> {
     hw: DevicePtr,
     indices: DevicePtr,
     softmax_parts: DevicePtr,
+    quant: DevicePtr,
+    scales: DevicePtr,
+    scores: DevicePtr,
+    max_groups: usize,
 }
 impl<'a> BatchScratch<'a> {
     fn new(a: &Hy4Attention<'a>) -> Result<Self> {
         let mut m = Owned::new(a.memory.gpu);
+        let max_groups = a.max_context.div_ceil(4);
+        let (quant, scales, scores) = match &a.index {
+            Some(ix) => (
+                m.alloc(CAUSAL_ROWS * ix.heads * 128)?,
+                m.alloc(CAUSAL_ROWS * ix.heads * 4)?,
+                m.alloc(CAUSAL_ROWS * max_groups * 4)?,
+            ),
+            None => (DevicePtr::NULL, DevicePtr::NULL, DevicePtr::NULL),
+        };
         let mut alloc = |n| m.alloc(MAX_ROWS * n * 2);
         Ok(Self {
             shares: alloc(a.qrank + 576)?,
@@ -52,6 +65,10 @@ impl<'a> BatchScratch<'a> {
             softmax_parts: m.alloc(
                 CAUSAL_ROWS * a.heads * a.window.unwrap_or(INDEX_KEYS).div_ceil(128) * 514 * 4,
             )?,
+            quant,
+            scales,
+            scores,
+            max_groups,
             _memory: m,
         })
     }
@@ -324,30 +341,33 @@ impl AttentionCache<'_, '_> {
                 .arg_u32(0)
                 .launch(stream)?;
             }
-            for (row, &position) in positions.iter().enumerate().take(end).skip(first) {
-                if let Some(ix) = &a.index {
-                    self.run_index_projected(
-                        input.offset(row * a.hidden * 2),
-                        position,
-                        Some([
-                            b.key.offset(row * 128 * 2),
-                            b.query.offset(row * ix.heads * 128 * 2),
-                            b.hw.offset(row * ix.heads * 2),
-                        ]),
-                        stream,
-                    )?;
+            if a.index.is_some() {
+                self.run_index_tile(
+                    &positions[first..end],
+                    b.key,
+                    b.query,
+                    b.hw,
+                    b.quant,
+                    b.scales,
+                    b.scores,
+                    b.indices,
+                    b.max_groups,
+                    stream,
+                )?;
+            } else {
+                for row in first..end {
+                    if a.window.is_none() {
+                        let count = (self.len / 4).min(INDEX_KEYS / 4 - 1) * 4 + self.len % 4 + 1;
+                        gpu.copy_d2d_async(
+                            self.scratch.indices,
+                            b.indices.offset((row - first) * INDEX_KEYS * 4),
+                            count * 4,
+                            stream,
+                        )?;
+                    }
+                    self.len += 1;
+                    self.record_prefix(stream)?;
                 }
-                if a.window.is_none() {
-                    let count = (self.len / 4).min(INDEX_KEYS / 4 - 1) * 4 + self.len % 4 + 1;
-                    gpu.copy_d2d_async(
-                        self.scratch.indices,
-                        b.indices.offset((row - first) * INDEX_KEYS * 4),
-                        count * 4,
-                        stream,
-                    )?;
-                }
-                self.len += 1;
-                self.record_prefix(stream)?;
             }
             drop(_causal);
             let count = a.window.map_or_else(

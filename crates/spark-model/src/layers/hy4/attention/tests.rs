@@ -310,7 +310,7 @@ fn dsa_partial_group_survives_chunk_and_prefix_fork_and_uses_all_score_stages() 
             9,
         )
         .unwrap();
-    assert_eq!(gpu.launch_count(), 30);
+    assert_eq!(gpu.launch_count(), 26);
     let copies = gpu.d2d_count();
     let mut fork = cache.fork(9).unwrap();
     assert_eq!(fork.committed_len(), 3);
@@ -322,7 +322,7 @@ fn dsa_partial_group_survives_chunk_and_prefix_fork_and_uses_all_score_stages() 
         .unwrap();
     assert_eq!(fork.committed_len(), 5);
     assert_eq!(cache.committed_len(), 3);
-    assert_eq!(gpu.launch_count(), 30 + 30);
+    assert_eq!(gpu.launch_count(), 26 + 28);
     assert_eq!(fork.first_group_position, Some([4; 3]));
     assert!(fork.fork(0).is_err());
     cache
