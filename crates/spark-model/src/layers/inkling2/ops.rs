@@ -408,6 +408,9 @@ pub(crate) struct StackedExperts {
     pub w2_global: DevicePtr,
 }
 
+/// Largest hidden / intermediate size the MoE kernels stage in shared memory.
+const MAX_MOE_DIM: usize = 4096;
+
 /// Routed experts for `rows` tokens: gate_up + softcapped SwiGLU, down, weighted combine.
 pub(crate) struct MoeDecode {
     pub x: DevicePtr,
@@ -433,10 +436,20 @@ pub(crate) fn moe_decode(
     stream: u64,
 ) -> Result<()> {
     ensure!(
-        a.hidden.is_multiple_of(32) && a.inter.is_multiple_of(32),
-        "inkling2 MoE dims must be multiples of 32"
+        a.hidden.is_multiple_of(32)
+            && a.inter.is_multiple_of(32)
+            && a.hidden.max(a.inter) <= MAX_MOE_DIM,
+        "inkling2 MoE dims must be multiples of 32 up to {MAX_MOE_DIM}"
     );
     let e = a.experts;
+    // the kernels read code rows 16 bytes and NVFP4 scales 2 bytes at a time
+    ensure!(
+        e.w13.0.is_multiple_of(16)
+            && e.w2.0.is_multiple_of(16)
+            && e.w13_scale.0.is_multiple_of(2)
+            && e.w2_scale.0.is_multiple_of(2),
+        "inkling2: expert tensors not aligned for 16-byte loads"
+    );
     let (gate_up, down) = if e.mxfp8 {
         (kernels.moe_gate_up_mxfp8, kernels.moe_down_mxfp8)
     } else {
@@ -444,8 +457,8 @@ pub(crate) fn moe_decode(
     };
     let (rows, top_k) = (u32_of(a.rows, "rows")?, u32_of(a.top_k, "top_k")?);
     KernelLaunch::new(gpu, gate_up)
-        .grid([u32_of(a.inter.div_ceil(4), "inter")?, top_k, rows])
-        .block([128, 1, 1])
+        .grid([u32_of(a.inter.div_ceil(8), "inter")?, top_k, rows])
+        .block([256, 1, 1])
         .arg_ptr(a.x)
         .arg_ptr(e.w13)
         .arg_ptr(e.w13_scale)
@@ -459,8 +472,8 @@ pub(crate) fn moe_decode(
         .arg_f32(a.up_softcap)
         .launch(stream)?;
     KernelLaunch::new(gpu, down)
-        .grid([u32_of(a.hidden.div_ceil(4), "hidden")?, top_k, rows])
-        .block([128, 1, 1])
+        .grid([u32_of(a.hidden.div_ceil(32), "hidden")?, top_k, rows])
+        .block([256, 1, 1])
         .arg_ptr(a.act)
         .arg_ptr(e.w2)
         .arg_ptr(e.w2_scale)
