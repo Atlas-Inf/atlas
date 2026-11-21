@@ -274,13 +274,16 @@ pub trait ModelWeightLoader {
         Ok(None)
     }
     /// Size per-forward activation state the layers share once the arena's
-    /// `max_tokens` is known (Ricursive value residuals). Default: none.
+    /// `max_tokens` and the decode batch's `max_seqs` are known (Ricursive
+    /// value residuals, Inkling 2's per-row stack and per-sequence tables).
+    /// Default: none.
     fn attach_layer_buffers(
         &self,
         _layers: &mut [Box<dyn TransformerLayer>],
         _config: &ModelConfig,
         _gpu: &dyn GpuBackend,
         _max_tokens: usize,
+        _max_seqs: usize,
     ) -> Result<()> {
         Ok(())
     }

@@ -10,11 +10,12 @@
 //            (s [k, C] static taps, current token first; d [rows, heads * k] per-token
 //            taps projected from the layer input, shared within a head of hd channels)
 //
-// No activation (Atlas's causal_conv1d kernels fuse SiLU). Math in fp32; the
-// state is fp32 [num_slots, C, k-1], oldest input first, as transformers caches it.
+// No activation (Atlas's causal_conv1d kernels fuse SiLU). Math in fp32; a
+// sequence's state is fp32 [C, k-1], oldest input first, as transformers caches it,
+// at states[s] + state_off (floats): each sequence keeps its own allocation.
 //
 // Rows are flat [rows, C] (row stride x_stride / out_stride elements). Sequence s
-// owns rows seq_start[s] .. seq_start[s+1] and conv state slot slots[s]. A row reads
+// owns rows seq_start[s] .. seq_start[s+1] and the state at states[s]. A row reads
 // earlier inputs of its own sequence from x, and the ones before the sequence's
 // first row from the state. `inkling2_sconv` writes y only; `inkling2_sconv_state`
 // then rolls each sequence's state forward over its rows (stream order keeps the
@@ -28,10 +29,10 @@
 extern "C" __global__ void inkling2_sconv(
     const __nv_bfloat16* __restrict__ x,        // [rows, x_stride]
     __nv_bfloat16* __restrict__ out,            // [rows, out_stride]
-    const float* __restrict__ state,            // [num_slots, C, k-1]
+    const float* const* __restrict__ states,    // [num_seqs] state bases
+    const unsigned int state_off,               // floats from a base to this conv's [C, k-1]
     const int* __restrict__ row_seq,            // [rows] sequence of each row
     const int* __restrict__ seq_start,          // [num_seqs + 1]
-    const int* __restrict__ slots,              // [num_seqs]
     const __nv_bfloat16* __restrict__ w,        // static: [C, k]; dynamic: [k, C]
     const __nv_bfloat16* __restrict__ dyn,      // dynamic: [rows, dyn_stride]; NULL = static
     const unsigned int rows,
@@ -48,7 +49,7 @@ extern "C" __global__ void inkling2_sconv(
     if (c >= channels || r >= rows) return;
     const int s = row_seq[r];
     const int first = seq_start[s];
-    const float* st = state + ((unsigned long long)slots[s] * channels + c) * (k - 1);
+    const float* st = states[s] + state_off + (unsigned long long)c * (k - 1);
     const float xc = __bfloat162float(x[(unsigned long long)r * x_stride + c]);
 
     float acc = 0.0f;
@@ -73,9 +74,9 @@ extern "C" __global__ void inkling2_sconv(
 // state <- the last k-1 inputs of each sequence (its rows, then older state)
 extern "C" __global__ void inkling2_sconv_state(
     const __nv_bfloat16* __restrict__ x,
-    float* __restrict__ state,
+    float* const* __restrict__ states,
+    const unsigned int state_off,
     const int* __restrict__ seq_start,
-    const int* __restrict__ slots,
     const unsigned int num_seqs,
     const unsigned int channels,
     const unsigned int k,
@@ -86,7 +87,7 @@ extern "C" __global__ void inkling2_sconv_state(
     const unsigned int s = blockIdx.y;
     if (c >= channels || s >= num_seqs) return;
     const int first = seq_start[s], end = seq_start[s + 1];
-    float* st = state + ((unsigned long long)slots[s] * channels + c) * (k - 1);
+    float* st = states[s] + state_off + (unsigned long long)c * (k - 1);
     float old[INK_MAX_K - 1];
     for (unsigned int j = 0; j + 1 < k; j++) old[j] = st[j];
     const int n = end - first;

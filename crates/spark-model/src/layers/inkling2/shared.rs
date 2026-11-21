@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Buffers every Inkling 2 visit shares within one forward of up to
-//! `max_rows` tokens of one sequence (a decode step or a prefill chunk): the
-//! block stack, the prelude's saved output, the previous pass's message
-//! states, per-row scratch, and the rows' metadata visit 0 uploads (positions,
-//! slots, lengths, block table) for the other visits. The model runs prefill
-//! layer-major, so every per-token state here is per row.
+//! `max_rows` rows (a prefill chunk of one sequence, or one decode token each
+//! of up to `max_seqs` sequences): the block stack, the prelude's saved
+//! output, the previous pass's message states, per-row scratch, the rows'
+//! metadata visit 0 uploads for the other visits (positions, slots, lengths,
+//! block tables, row-to-sequence map), and each visit's table of per-sequence
+//! conv-state pointers. The model runs layer-major, so every per-token state
+//! here is per row.
 
 use anyhow::{Context, Result};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -27,6 +29,10 @@ pub(crate) struct Dims {
     pub stack_blocks: usize,
     /// Rows one forward may carry (the prefill chunk).
     pub max_rows: usize,
+    /// Sequences one decode step may carry (the server's batch size).
+    pub max_seqs: usize,
+    /// Visits (layers the engine sees), one state table each.
+    pub visits: usize,
 }
 
 impl Dims {
@@ -81,11 +87,13 @@ pub(crate) struct Shared {
     pub positions: DevicePtr,
     pub slots: DevicePtr,
     pub seq_lens: DevicePtr,
+    /// `[seqs, stride]` block tables (one shared table for a prefill chunk)
     pub block_table: DevicePtr,
-    /// conv bookkeeping for one sequence: row_seq all 0, seq_start [0, rows], slot 0
+    /// `[rows]` sequence of each row, `[seqs + 1]` first row of each
     pub row_seq: DevicePtr,
     pub seq_start: DevicePtr,
-    pub conv_slot: DevicePtr,
+    /// `[visits, max_seqs]` conv-state base pointers, a visit's own row each
+    pub state_tables: DevicePtr,
 }
 
 /// Carves one allocation into 256-byte aligned pieces.
@@ -150,10 +158,10 @@ impl Shared {
             positions: a.take(r * 4),
             slots: a.take(r * 8),
             seq_lens: a.take(r * 4),
-            block_table: a.take(d.max_blocks_per_seq * 4),
+            block_table: a.take(d.max_seqs * d.max_blocks_per_seq * 4),
             row_seq: a.take(r * 4),
-            seq_start: a.take(8),
-            conv_slot: a.take(4),
+            seq_start: a.take((d.max_seqs + 1) * 4),
+            state_tables: a.take(d.visits * d.max_seqs * 8),
         }
     }
 
@@ -172,7 +180,7 @@ impl Shared {
         !self.blocks.is_null()
     }
 
-    /// Zeroed buffers (row_seq and the conv slot stay 0: one sequence, slot 0).
+    /// Zeroed buffers.
     pub(crate) fn alloc(gpu: &dyn GpuBackend, d: &Dims) -> Result<Self> {
         let mut probe = Arena {
             base: DevicePtr::NULL,
@@ -184,9 +192,10 @@ impl Shared {
             .context("allocate inkling2 shared buffers")?;
         gpu.copy_h2d(&vec![0u8; probe.used], base)?;
         tracing::info!(
-            "Inkling2 shared buffers: {:.1} MB for {} rows",
+            "Inkling2 shared buffers: {:.1} MB for {} rows, {} sequences",
             probe.used as f64 / 1e6,
-            d.max_rows
+            d.max_rows,
+            d.max_seqs
         );
         Ok(Self::carve(&mut Arena { base, used: 0 }, d))
     }

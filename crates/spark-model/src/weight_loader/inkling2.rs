@@ -38,7 +38,7 @@ fn header(store: &WeightStore) -> Result<plan::Header> {
         .collect()
 }
 
-fn dims(config: &ModelConfig, stack_blocks: usize, max_rows: usize) -> Dims {
+fn dims(config: &ModelConfig, stack_blocks: usize, max_rows: usize, max_seqs: usize) -> Dims {
     let ink = config.inkling2.as_ref().expect("inkling2 config");
     Dims {
         hidden: config.hidden_size,
@@ -54,6 +54,8 @@ fn dims(config: &ModelConfig, stack_blocks: usize, max_rows: usize) -> Dims {
         max_blocks_per_seq: config.max_position_embeddings.div_ceil(8),
         stack_blocks,
         max_rows,
+        max_seqs,
+        visits: config.num_hidden_layers,
     }
 }
 
@@ -146,7 +148,7 @@ impl ModelWeightLoader for Inkling2WeightLoader {
             route_scale: config.routed_scaling_factor as f32,
         };
         // the real row capacity arrives with attach_layer_buffers
-        let d = dims(config, max_blocks(&visits), 1);
+        let d = dims(config, max_blocks(&visits), 1, 1);
         tracing::info!(
             "Inkling2: {} physical layers, {} visits, block stack {}",
             physical.len(),
@@ -168,6 +170,7 @@ impl ModelWeightLoader for Inkling2WeightLoader {
                     dims: d,
                     p,
                     shared: Shared::unattached(&d),
+                    bound_states: Default::default(),
                 }) as Box<dyn TransformerLayer>
             })
             .collect())
@@ -180,9 +183,15 @@ impl ModelWeightLoader for Inkling2WeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
         max_tokens: usize,
+        max_seqs: usize,
     ) -> Result<()> {
         let ink = config.inkling2.as_ref().context("inkling2 config")?;
-        let d = dims(config, max_blocks(&schedule(ink)), max_tokens.max(1));
+        let d = dims(
+            config,
+            max_blocks(&schedule(ink)),
+            max_tokens.max(1),
+            max_seqs.max(1),
+        );
         let shared = Shared::alloc(gpu, &d)?;
         for (i, layer) in layers.iter_mut().enumerate() {
             let visit = layer

@@ -126,10 +126,12 @@ pub(crate) fn decode_attn(
 pub(crate) struct ShortConv {
     pub x: DevicePtr,
     pub out: DevicePtr,
-    pub state: DevicePtr,
+    /// `[num_seqs]` device pointers, one state base per sequence
+    pub states: DevicePtr,
+    /// fp32 elements from a base to this conv's `[channels, k - 1]` state
+    pub state_offset: usize,
     pub row_seq: DevicePtr,
     pub seq_start: DevicePtr,
-    pub slots: DevicePtr,
     /// static `[C, k]`, or dynamic static taps `[k, C]`
     pub weight: DevicePtr,
     /// dynamic per-token taps `[rows, dyn_stride]`; NULL for a static conv
@@ -162,10 +164,10 @@ pub(crate) fn short_conv(
         .block([256, 1, 1])
         .arg_ptr(a.x)
         .arg_ptr(a.out)
-        .arg_ptr(a.state)
+        .arg_ptr(a.states)
+        .arg_u32(u32_of(a.state_offset, "state offset")?)
         .arg_ptr(a.row_seq)
         .arg_ptr(a.seq_start)
-        .arg_ptr(a.slots)
         .arg_ptr(a.weight)
         .arg_ptr(a.dyn_taps)
         .arg_u32(u32_of(a.rows, "rows")?)
@@ -180,9 +182,9 @@ pub(crate) fn short_conv(
         .grid([cblocks, u32_of(a.num_seqs, "seqs")?, 1])
         .block([256, 1, 1])
         .arg_ptr(a.x)
-        .arg_ptr(a.state)
+        .arg_ptr(a.states)
+        .arg_u32(u32_of(a.state_offset, "state offset")?)
         .arg_ptr(a.seq_start)
-        .arg_ptr(a.slots)
         .arg_u32(u32_of(a.num_seqs, "seqs")?)
         .arg_u32(u32_of(a.channels, "channels")?)
         .arg_u32(u32_of(a.k, "k")?)

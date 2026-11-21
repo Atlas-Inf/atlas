@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Thinking Machines Inkling 2 Mini: the per-visit `Inkling2Layer` (decode),
-//! its kernel launchers, visit schedule, weight handles and shared buffers.
+//! Thinking Machines Inkling 2 Mini: the per-visit `Inkling2Layer` (decode,
+//! prefill and decode batches), its forward, kernel launchers, visit
+//! schedule, weight handles and shared buffers.
 
+mod batch;
+mod calls;
+mod debug;
+mod forward;
 pub(crate) mod glue;
 pub(crate) mod layer;
 pub(crate) mod ops;
