@@ -31,7 +31,7 @@ for e in "$@"; do
     ( export MODE=${e#atlas-} DSPARK=0 PORT MAX_BATCH=8 MAX_SEQ_LEN=40960 DATA_DIR=$HFC/atlas-inkling2; exec scripts/serve-inkling2-strix-linux.sh ) > "$OUT/serve-$e.log" 2>&1 &
     APID=$!; ENGINE_ALIVE() { kill -0 $APID 2>/dev/null; }; ENGINE_DOWN() { cp "$OUT/serve-$e.log" "$1" 2>/dev/null; kill -INT $APID 2>/dev/null; pkill -INT -P $APID 2>/dev/null; for _ in $(seq 1 60); do kill -0 $APID 2>/dev/null || break; sleep 2; done; kill -9 $APID 2>/dev/null; sleep 5; true; }
     legs "$e" ;;
-  ciru|ciru-nospec)
+  ciru|ciru-conc|ciru-orig|ciru-nospec|ciru-st995)
     CR=${RUNNER_TEMP:-/tmp}/ciru; mkdir -p "$CR"
     if [ ! -x "$CR/opt/serve.sh" ]; then
       command -v uv >/dev/null || { curl -LsSf https://astral.sh/uv/install.sh | sh > "$OUT/uv.log" 2>&1; export PATH=$HOME/.local/bin:$PATH; }
@@ -40,15 +40,23 @@ for e in "$@"; do
       ( uv venv -q --clear --python 3.12 "$CR/venv" && uv pip install -q --python "$CR/venv/bin/python" --extra-index-url https://wheels.vllm.ai/rocm/0.34.0/rocm100/ \
           'vllm==0.34.0+rocm100' 'huggingface-hub==2.4.0' 'safetensors==0.8.0' \
         && uv pip install -q --python "$CR/venv/bin/python" --target "$CR/tdeps" --no-deps 'huggingface-hub==1.31.0' 'safetensors==0.8.0' ) > "$OUT/ciru-venv.log" 2>&1 || { log "CIRU VENV FAILED: $(tail -3 "$OUT/ciru-venv.log" | cut -c1-200)"; continue; }
-      CK=$(hf_get thinkingmachines/Inkling-2-Mini "*" ed40e7da625f594fc9c4990f5f66be24873c22d7) || { log "ckpt download failed"; continue; }
       ( cd "$CR/src" && bash scripts/install.sh --venv "$CR/venv" --transformers-deps "$CR/tdeps" --prefix "$CR/opt" ) > "$OUT/ciru-install.log" 2>&1 \
         || { log "CIRU INSTALL FAILED: $(grep -aiE 'error|fail' "$OUT/ciru-install.log" | tail -3 | cut -c1-200)"; continue; }
     fi
-    CK=$(hf_get thinkingmachines/Inkling-2-Mini "*" ed40e7da625f594fc9c4990f5f66be24873c22d7)
-    X=(); [ $e = ciru-nospec ] && X=(--no-spec)
-    "$CR/opt/serve.sh" --model "$CK" --original-weights --mode concurrent --seqs 8 --context 65536 --port $PORT --served-model-name main "${X[@]}" > "$OUT/serve-$e.log" 2>&1 &
+    # Ciru's release bundle: the unmodified checkpoint + DSpark draft, plus its fitted expert / final-layer weights
+    # (its launcher's default). ciru-orig: the same bundle with --original-weights (the checkpoint's own experts).
+    CK=$(hf_get jcbtc/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151 "" edcbab56fedf986ac6d6da5fbe6ede0f163556e5) || { log "ciru bundle download failed: $(tail -2 "$OUT/download.log")"; continue; }
+    X=(--mode single); case $e in ciru-conc) X=(--mode concurrent --seqs 8) ;; ciru-orig) X=(--mode single --original-weights) ;;
+      ciru-nospec) X=(--mode single --no-spec) ;; ciru-st995) X=(--mode concurrent --seqs 4 --tools) ;; esac
+    "$CR/opt/serve.sh" --model "$CK" "${X[@]}" --context 65536 --port $PORT --served-model-name main > "$OUT/serve-$e.log" 2>&1 &
     CPID=$!; ENGINE_ALIVE() { kill -0 $CPID 2>/dev/null; }; ENGINE_DOWN() { cp "$OUT/serve-$e.log" "$1" 2>/dev/null; kill -INT $CPID 2>/dev/null; pkill -INT -P $CPID 2>/dev/null; sleep 10; pkill -9 -P $CPID 2>/dev/null; kill -9 $CPID 2>/dev/null; sleep 5; true; }
-    legs "$e" ;;
+    if [ $e = ciru-st995 ]; then
+      wait_ready $PORT 720 || { log "ciru-st995 SERVE FAILED"; ENGINE_DOWN "$OUT/serve-$e.log"; continue; }
+      SHIM_DIR=$(ls -dt target/release/build/atlas-kernels-*/out 2>/dev/null | while read -r d; do [ -f "$d/libcuda.so" ] && { echo "$d"; break; }; done)
+      LD_LIBRARY_PATH="$SHIM_DIR:/opt/rocm/lib" target/release/spark benchmark run bfcl-subset --url http://127.0.0.1:$PORT --model main --yes --format json --quiet --no-fail-on-verdict > "$OUT/ciru-bfcl.json" 2> "$OUT/ciru-bfcl.stderr" || log "ciru bfcl rc!=0: $(tail -2 "$OUT/ciru-bfcl.stderr" | tr '\n' ' ')"
+      python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('RESULT ciru', d.get('benchmark_id'), d.get('run_id'), [(s['label'], s['value']) for s in d['frame']['summary']])" "$OUT/ciru-bfcl.json" 2>&1 | tail -1 | tee -a "$RES"
+      ENGINE_DOWN "$OUT/serve-$e.log"
+    else legs "$e"; fi ;;
   llamacpp)
     LLAMA_REF=master llama_build || continue
     GD=$(hf_get ggml-org/Inkling-2-Mini-GGUF "Inkling-2-Mini-Q8_0.gguf") || { log "gguf download failed"; continue; }
