@@ -24,8 +24,11 @@ done
 curl -s -m 5 "http://127.0.0.1:$PORT/v1/models" >/dev/null || { log "serve not ready after 60 min"; exit 1; }
 grep -aE "serve-inkling2-strix-linux|KV cache:.*budget|Prefix caching" "$OUT/serve.log" | sed -E 's/\x1b\[[0-9;]*m//g' | cut -c1-240 | tee -a "$RES"
 B=target/release/spark
+# the client binary links the same HIP shims as the server (no rpath)
+SHIM_DIR=$(ls -dt target/release/build/atlas-kernels-*/out 2>/dev/null | while read -r d; do [ -f "$d/libcuda.so" ] && { echo "$d"; break; }; done)
+export LD_LIBRARY_PATH="$SHIM_DIR:/opt/rocm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 bench() { local id=$1; shift
-  "$B" benchmark run "$id" --url "http://127.0.0.1:$PORT" --model inkling-2-mini --yes "$@" --format json --quiet --no-fail-on-verdict > "$OUT/$id.json" 2> "$OUT/$id.stderr" || true
+  "$B" benchmark run "$id" --url "http://127.0.0.1:$PORT" --model inkling-2-mini --yes "$@" --format json --quiet --no-fail-on-verdict > "$OUT/$id.json" 2> "$OUT/$id.stderr" || log "$id exited nonzero; stderr tail: $(tail -3 "$OUT/$id.stderr" | tr "\n" " " | cut -c1-300)"
   python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('RESULT', d.get('benchmark_id'), d.get('run_id'), [(s['label'], s['value']) for s in d['frame']['summary']], (d.get('verdict') or {}).get('kind'))" "$OUT/$id.json" 2>&1 | tee -a "$RES"; }
 for leg in "${LEGS[@]}"; do
   case $leg in
