@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use axum::response::sse::Event;
+use axum::{http::StatusCode, response::sse::Event};
 
 use super::helpers::*;
 
@@ -78,6 +78,7 @@ pub struct AnthropicTranslator {
     completion_tokens: usize,
     prompt_tokens: usize,
     cached_prompt_tokens: usize,
+    refused: bool,
     finished: bool,
 }
 
@@ -93,8 +94,30 @@ impl AnthropicTranslator {
             completion_tokens: 0,
             prompt_tokens: 0,
             cached_prompt_tokens: 0,
+            refused: false,
             finished: false,
         }
+    }
+
+    pub(super) fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    fn stream_error(message: &str) -> SseEvent {
+        let payload = serde_json::from_str::<serde_json::Value>(message).ok();
+        let upstream = payload.as_ref().and_then(|payload| payload.get("error"));
+        let detail = upstream
+            .and_then(|error| error["message"].as_str())
+            .unwrap_or(message);
+        let status = upstream
+            .and_then(|error| error["code"].as_u64())
+            .and_then(|code| u16::try_from(code).ok())
+            .and_then(|code| StatusCode::from_u16(code).ok())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        Self::make_event(
+            "error",
+            anthropic_error_body(anthropic_error_type(status), detail),
+        )
     }
 
     /// Final `message_delta.usage`. Carries `input_tokens` (and cache
@@ -196,6 +219,9 @@ impl AnthropicTranslator {
     /// are just typed now.
     pub(super) fn on_delta(&mut self, d: &crate::ir::StreamDelta, out: &mut Vec<SseEvent>) {
         use crate::ir::StreamDelta;
+        if self.finished {
+            return;
+        }
         match d {
             StreamDelta::Reasoning { text, .. } if !text.is_empty() => {
                 self.ensure_message_start(out);
@@ -310,37 +336,19 @@ impl AnthropicTranslator {
                 ));
             }
             StreamDelta::Finish { reason, usage, .. } => {
-                if self.finished {
-                    return;
-                }
                 self.prompt_tokens = usage.prompt_tokens;
                 self.completion_tokens = usage.completion_tokens;
                 self.cached_prompt_tokens = usage.cached_prompt_tokens;
-                self.ensure_message_start(out);
-                if let Some(stop) = self.close_open_block() {
-                    out.push(stop);
-                }
-                out.push(Self::make_event(
-                    "message_delta",
-                    serde_json::json!({
-                        "type": "message_delta",
-                        "delta": {
-                            "stop_reason": convert_stop_reason(reason.as_wire()),
-                            "stop_sequence": serde_json::Value::Null,
-                        },
-                        "usage": self.final_usage(),
-                    }),
-                ));
-                out.push(Self::make_event(
-                    "message_stop",
-                    serde_json::json!({"type": "message_stop"}),
-                ));
+                self.finish_message(convert_stop_reason(reason.as_wire()), out);
+            }
+            StreamDelta::Refusal { .. } => {
+                // This annotates text already emitted as Content; do not repeat it.
+                self.refused = true;
+            }
+            StreamDelta::Error { message } => {
+                out.push(Self::stream_error(message));
                 self.finished = true;
             }
-            // Refusals have no Anthropic streaming representation (the
-            // old translator ignored `delta.refusal` too); errors abort
-            // upstream and carry no renderable event here.
-            StreamDelta::Refusal { .. } | StreamDelta::Error { .. } => {}
             // Empty text/reasoning fragments.
             StreamDelta::Content { .. } | StreamDelta::Reasoning { .. } => {}
         }
@@ -349,9 +357,13 @@ impl AnthropicTranslator {
     /// Stream ended without an explicit `finish_reason`. Best-effort
     /// flush so the client sees a coherent end of message.
     pub(super) fn finalize(&mut self, out: &mut Vec<SseEvent>) {
-        if self.finished {
-            return;
+        if !self.finished {
+            self.finish_message("end_turn", out);
         }
+    }
+
+    fn finish_message(&mut self, stop_reason: &str, out: &mut Vec<SseEvent>) {
+        let stop_reason = if self.refused { "refusal" } else { stop_reason };
         self.ensure_message_start(out);
         if let Some(stop) = self.close_open_block() {
             out.push(stop);
@@ -361,7 +373,7 @@ impl AnthropicTranslator {
             serde_json::json!({
                 "type": "message_delta",
                 "delta": {
-                    "stop_reason": "end_turn",
+                    "stop_reason": stop_reason,
                     "stop_sequence": serde_json::Value::Null,
                 },
                 "usage": self.final_usage(),

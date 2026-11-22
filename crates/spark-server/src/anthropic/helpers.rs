@@ -8,14 +8,32 @@ use crate::tool_parser;
 use super::types::*;
 
 pub(super) fn anthropic_error(status: StatusCode, error_type: &str, message: String) -> Response {
-    let body = serde_json::json!({
+    (status, Json(anthropic_error_body(error_type, &message))).into_response()
+}
+
+pub(super) fn anthropic_error_body(error_type: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
         "type": "error",
         "error": {
             "type": error_type,
             "message": message,
         }
-    });
-    (status, Json(body)).into_response()
+    })
+}
+
+/// Anthropic's `error.type` for an HTTP status (its documented error kinds).
+/// Enntity/atlas 060199eb.
+pub(super) fn anthropic_error_type(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        503 | 529 => "overloaded_error",
+        400..=499 => "invalid_request_error",
+        _ => "api_error",
+    }
 }
 
 // ── Conversion helpers ──

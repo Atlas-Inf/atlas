@@ -59,11 +59,13 @@ pub(super) fn anthropic_sse_from_deltas(
                 aborted = true;
                 break;
             }
+            if translator.is_finished() {
+                break;
+            }
         }
 
         if !aborted {
-            // Ensure message_stop fires even if the stream ended without
-            // a Finish delta.
+            // Close an unfinalized message on upstream EOF.
             translator.finalize(&mut pending);
             if !flush(&tx, &mut pending, &mut captured).await {
                 tracing::warn!("anthropic stream: final flush failed (receiver dropped)");

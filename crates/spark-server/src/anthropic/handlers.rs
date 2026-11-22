@@ -220,21 +220,6 @@ async fn openai_error_to_anthropic(resp: Response) -> Response {
     resp
 }
 
-/// Anthropic's `error.type` for an HTTP status (its documented error kinds).
-/// Enntity/atlas 060199eb.
-fn anthropic_error_type(status: StatusCode) -> &'static str {
-    match status.as_u16() {
-        401 => "authentication_error",
-        403 => "permission_error",
-        404 => "not_found_error",
-        413 => "request_too_large",
-        429 => "rate_limit_error",
-        503 | 529 => "overloaded_error",
-        400..=499 => "invalid_request_error",
-        _ => "api_error",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
