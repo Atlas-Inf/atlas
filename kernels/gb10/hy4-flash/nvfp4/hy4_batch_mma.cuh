@@ -113,11 +113,14 @@ __device__ __forceinline__ unsigned char pmn_f32_to_e4m3(float v) {
     if (absv == 0.0f) return (unsigned char)(sign << 7);
     int e = (int)((bits >> 23) & 0xFF) - 127;
     unsigned int m = bits & 0x7FFFFF;
-    if (e < -9) return (unsigned char)(sign << 7);
+    if (e < -9) {                       // round to 0 or smallest subnormal
+        return (unsigned char)((sign << 7) | (absv < 0.0009765625f ? 0u : 1u));
+    }
     if (e < -6) {                         // e4m3 subnormal
         int man = (int)(absv * 512.0f + 0.5f);
-        if (man > 7) man = 7;
-        return (unsigned char)((sign << 7) | (unsigned int)man);
+        // man == 8 rounds up to the smallest normal (2^-6) rather than
+        // clamping at 7*2^-9.
+        return (unsigned char)((sign << 7) | (unsigned int)(man > 7 ? 8 : man));
     }
     int be = e + 7;
     unsigned int bm;
