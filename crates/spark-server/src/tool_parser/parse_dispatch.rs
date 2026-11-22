@@ -437,8 +437,8 @@ fn parse_tool_calls_impl(text: &str, promote_bare_names: bool) -> (Option<String
         if !json_calls.is_empty() {
             // Strip the JSON source from content
             let mut clean_content = text.to_string();
-            for pattern in extract_json_code_blocks(text) {
-                clean_content = clean_content.replace(&pattern, "");
+            for (_, pattern) in extract_json_code_blocks(text) {
+                clean_content = clean_content.replace(pattern, "");
             }
             let clean = clean_content.trim().to_string();
             let content = if clean.is_empty() { None } else { Some(clean) };

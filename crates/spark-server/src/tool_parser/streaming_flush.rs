@@ -126,8 +126,8 @@ impl StreamingToolDetector {
                 let mut out = Vec::new();
                 // Strip matched JSON from content
                 let mut clean = text.clone();
-                for pattern in extract_json_code_blocks(&text) {
-                    clean = clean.replace(&pattern, "");
+                for (_, pattern) in extract_json_code_blocks(&text) {
+                    clean = clean.replace(pattern, "");
                 }
                 let clean = clean.trim().to_string();
                 if !clean.is_empty() {

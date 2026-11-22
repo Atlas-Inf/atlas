@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #![allow(unused_imports, dead_code)]
 
+use std::collections::HashSet;
+
 use super::*;
 
 /// Back-compat wrapper around the pipeline for existing callers.
@@ -24,18 +26,20 @@ pub(super) fn parse_bare_function_calls(text: &str) -> (Option<String>, Vec<Tool
 
 // ── JSON fallback tool call parser ──
 
-/// Extract markdown code blocks from text (returns the full ```...``` strings).
-pub(super) fn extract_json_code_blocks(text: &str) -> Vec<String> {
+/// Extract markdown code blocks with their byte offsets and fences intact.
+pub(super) fn extract_json_code_blocks(text: &str) -> Vec<(usize, &str)> {
     let mut blocks = Vec::new();
     let mut rest = text;
+    let mut offset = 0;
     while let Some(start) = rest.find("```") {
         let after_fence = &rest[start + 3..];
         // Skip optional language tag (```json, ```\n, etc.)
         let content_start = after_fence.find('\n').map_or(0, |p| p + 1);
         if let Some(end) = after_fence[content_start..].find("```") {
-            let full_block = &rest[start..start + 3 + content_start + end + 3];
-            blocks.push(full_block.to_string());
-            rest = &rest[start + 3 + content_start + end + 3..];
+            let block_end = start + 3 + content_start + end + 3;
+            blocks.push((offset + start, &rest[start..block_end]));
+            rest = &rest[block_end..];
+            offset += block_end;
         } else {
             break;
         }
@@ -54,8 +58,8 @@ pub(super) fn parse_json_fallback_calls(text: &str) -> Vec<ToolCall> {
     let mut calls = Vec::new();
 
     // Collect candidate JSON strings from code blocks and bare text
-    let mut candidates: Vec<String> = Vec::new();
-    for block in extract_json_code_blocks(text) {
+    let mut candidates = Vec::new();
+    for (start, block) in extract_json_code_blocks(text) {
         // Strip ``` fences and language tag
         let inner = block.trim_start_matches("```");
         let inner = if let Some(pos) = inner.find('\n') {
@@ -63,20 +67,23 @@ pub(super) fn parse_json_fallback_calls(text: &str) -> Vec<ToolCall> {
         } else {
             inner
         };
-        let inner = inner.trim_end_matches("```").trim();
-        if !inner.is_empty() {
-            candidates.push(inner.to_string());
+        let offset = start + block.len() - inner.len();
+        let candidate = inner.trim_end_matches("```").trim();
+        if !candidate.is_empty() {
+            candidates.push((offset, candidate));
         }
     }
 
     // Also scan for bare JSON objects/arrays in the text (outside code blocks)
-    for line in text.lines() {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
         let trimmed = line.trim();
         if (trimmed.starts_with('{') && trimmed.ends_with('}'))
             || (trimmed.starts_with('[') && trimmed.ends_with(']'))
         {
-            candidates.push(trimmed.to_string());
+            candidates.push((offset, trimmed));
         }
+        offset += line.len();
     }
 
     // Also scan for JSON objects embedded in prose. Nemotron-Super outputs
@@ -133,7 +140,7 @@ pub(super) fn parse_json_fallback_calls(text: &str) -> Vec<ToolCall> {
                 if slice.contains("\"arguments\"")
                     && serde_json::from_str::<serde_json::Value>(slice).is_ok()
                 {
-                    candidates.push(slice.to_string());
+                    candidates.push((start, slice));
                 }
                 search_start = end;
             } else {
@@ -143,13 +150,14 @@ pub(super) fn parse_json_fallback_calls(text: &str) -> Vec<ToolCall> {
         }
     }
 
-    // Dedupe — line-based and walk-based scans can both pick up the same
-    // tool-call JSON when the model emits a leading brace + newline before
-    // the proper call (Nemotron-Super: `{\n{"name":"get_weather",...}`).
-    candidates.sort();
-    candidates.dedup();
+    // The scans overlap; deduplicate identical JSON after restoring source order.
+    candidates.sort_by_key(|&(offset, _)| offset);
+    let mut seen = HashSet::new();
 
-    for candidate in &candidates {
+    for (_, candidate) in candidates {
+        if !seen.insert(candidate) {
+            continue;
+        }
         // Try Hermes-style: {"name": "tool", "arguments": {...}}
         if let Ok(obj) = serde_json::from_str::<serde_json::Value>(candidate) {
             if let Some(name) = obj.get("name").and_then(|n| n.as_str()) {

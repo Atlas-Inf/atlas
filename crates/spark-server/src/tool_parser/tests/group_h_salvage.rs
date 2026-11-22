@@ -3,6 +3,40 @@
 
 use super::super::*;
 
+#[test]
+fn json_fallback_preserves_bare_call_order() {
+    let input = concat!(
+        r#"{"name":"zebra","arguments":{"step":1}}"#,
+        "\n",
+        r#"{"name":"ant","arguments":{"step":2}}"#,
+    );
+    let calls = parse_json_fallback_calls(input);
+    let names: Vec<_> = calls
+        .iter()
+        .map(|call| call.function.name.as_str())
+        .collect();
+    assert_eq!(names, ["zebra", "ant"]);
+}
+
+#[test]
+fn json_fallback_preserves_order_across_scans() {
+    let input = concat!(
+        "Étape: ",
+        r#"{"name":"update","arguments":{}}"#,
+        ".\r\n  ",
+        r#"["read", {}]"#,
+        "\r\n```json\r\n",
+        r#"{"name":"check","arguments":{}}"#,
+        "\r\n```",
+    );
+    let calls = parse_json_fallback_calls(input);
+    let names: Vec<_> = calls
+        .iter()
+        .map(|call| call.function.name.as_str())
+        .collect();
+    assert_eq!(names, ["update", "read", "check"]);
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Echo-attractor salvage (2026-07-09). Regression fixtures from the live
 // opencode collapse at 42.5k tokens on Qwen3.6-35B-A3B-FP8: the model
