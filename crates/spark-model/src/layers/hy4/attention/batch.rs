@@ -376,6 +376,40 @@ impl AttentionCache<'_, '_> {
             );
             let splits = count.div_ceil(128);
             let mla = timing::span("latent_attention", stream)?;
+            // ATLAS_HY4_MLA_MMA=1: one CTA per (row, 128-key partition)
+            // gathers K into shared once and runs both attention GEMMs on
+            // tensor cores for all local heads. Requires heads <= 16 and
+            // ~99KB opt-in dynamic shared (sm_120+).
+            let mla_mma = a.heads <= 16
+                && std::env::var("ATLAS_HY4_MLA_MMA").as_deref() == Ok("1");
+            if mla_mma {
+                KernelLaunch::new(
+                    gpu,
+                    gpu.op_cache()
+                        .kernel(gpu, "hy4_mla", "hy4_mla_batch_partial_mma")?,
+                )
+                .grid([splits as u32, (end - first) as u32, 1])
+                .block([256, 1, 1])
+                .shared_mem(100544)
+                .arg_ptr(b.absorbed.offset(first * a.heads * 576 * 2))
+                .arg_ptr(self.latent)
+                .arg_ptr(self.table)
+                .arg_ptr(if a.window.is_some() {
+                    DevicePtr::NULL
+                } else {
+                    b.indices
+                })
+                .arg_ptr(b.softmax_parts)
+                .arg_u32(start_position as u32)
+                .arg_u32(self.layout.page_size as u32)
+                .arg_u32(self.layout.table.len() as u32)
+                .arg_u32(a.window.unwrap_or(0) as u32)
+                .arg_u32(count as u32)
+                .arg_u32(splits as u32)
+                .arg_u32(a.heads as u32)
+                .arg_u32(INDEX_KEYS as u32)
+                .launch(stream)?;
+            } else {
             KernelLaunch::new(
                 gpu,
                 gpu.op_cache()
