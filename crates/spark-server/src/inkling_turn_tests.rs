@@ -197,7 +197,10 @@ fn a_call_opened_as_text_is_still_a_call() {
         assert_eq!(calls.len(), 1, "{out}");
         assert_eq!(calls[0].function.name, "Say");
         assert_eq!(calls[0].function.arguments, r#"{"text":"Hi"}"#);
-        assert!(!rest.unwrap_or_default().contains("Say"), "no name left in the text: {out}");
+        assert!(
+            !rest.unwrap_or_default().contains("Say"),
+            "no name left in the text: {out}"
+        );
     }
 }
 

@@ -206,7 +206,13 @@ __device__ __forceinline__ void dense_gemv_bf16_batchm_body(
         float a = acc[t];
         #pragma unroll
         for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+#if defined(__HIP_PLATFORM_AMD__)
+            // 64-bit mask: a file that #includes this one (inkling2_router_gemv.cu) is not
+            // run through build.rs's warp-mask widening, and ROCm 10.1 asserts on 32 bits.
+            a += __shfl_down_sync(0xFFFFFFFFULL, a, offset);
+#else
             a += __shfl_down_sync(0xFFFFFFFF, a, offset);
+#endif
         }
         acc[t] = a;
     }
