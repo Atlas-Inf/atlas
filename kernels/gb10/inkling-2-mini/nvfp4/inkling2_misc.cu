@@ -29,12 +29,21 @@ __device__ __forceinline__ float rms_block_rstd(float ss, float* red, float* s_r
     return *s_rstd;
 }
 
-// one CTA (256) per row (grid = rows); exactly one of x_f32 / x_bf16 non-NULL
+// one CTA (256) per row and input (grid = rows, inputs <= 3); exactly one of x_f32 /
+// x_bf16 non-NULL. Input g reads x + g * in_plane with weight w0 / w1 / w2 and writes
+// y + g * out_plane: an attention visit's three input norms in one launch.
 extern "C" __global__ void inkling2_rmsnorm(const float* __restrict__ x_f32, const __nv_bfloat16* __restrict__ x_bf16,
-                                            const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y,
-                                            unsigned int H, unsigned int in_stride, unsigned int out_stride, float eps) {
+                                            const __nv_bfloat16* __restrict__ w0, const __nv_bfloat16* __restrict__ w1,
+                                            const __nv_bfloat16* __restrict__ w2, __nv_bfloat16* __restrict__ y,
+                                            unsigned int H, unsigned int in_stride, unsigned int out_stride,
+                                            unsigned long long in_plane, unsigned long long out_plane, float eps) {
     atlas_pdl_enter();
     const unsigned long long r = blockIdx.x;
+    const unsigned int g = blockIdx.y;
+    if (x_f32 != nullptr) x_f32 += g * in_plane;
+    if (x_bf16 != nullptr) x_bf16 += g * in_plane;
+    y += g * out_plane;
+    const __nv_bfloat16* __restrict__ w = g == 0 ? w0 : (g == 1 ? w1 : w2);
     __shared__ float red[8];
     __shared__ float s_rstd;
     float ss = 0.0f;

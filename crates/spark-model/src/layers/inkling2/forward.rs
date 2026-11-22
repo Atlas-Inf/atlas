@@ -128,51 +128,25 @@ impl Inkling2Layer {
         let inputs_split = v.full || gated_inputs;
         let src_f32 = |i: usize| if has_res { res(i) } else { DevicePtr::NULL };
         let src_bf16 = if has_res { DevicePtr::NULL } else { x };
-        match w.input_norms {
-            InputNorms::Shared(nw) if !inputs_split => {
-                gm.rmsnorm(
-                    gpu,
-                    n,
-                    src_f32(0),
-                    src_bf16,
-                    nw,
-                    normed(0),
-                    h,
-                    p.eps,
-                    stream,
-                )?;
-            }
-            InputNorms::Shared(nw) => {
-                for i in 0..3 {
-                    gm.rmsnorm(
-                        gpu,
-                        n,
-                        src_f32(i),
-                        src_bf16,
-                        nw,
-                        normed(i),
-                        h,
-                        p.eps,
-                        stream,
-                    )?;
-                }
-            }
-            InputNorms::Separate { q, k, v: vn } => {
-                for (i, nw) in [q, k, vn].into_iter().enumerate() {
-                    gm.rmsnorm(
-                        gpu,
-                        n,
-                        src_f32(i),
-                        src_bf16,
-                        nw,
-                        normed(i),
-                        h,
-                        p.eps,
-                        stream,
-                    )?;
-                }
-            }
-        }
+        // one launch for the visit's input norms; layer 0 reads x for all three
+        let in_plane = if has_res { n * h } else { 0 };
+        let ws = match w.input_norms {
+            InputNorms::Shared(nw) if !inputs_split => vec![nw],
+            InputNorms::Shared(nw) => vec![nw; 3],
+            InputNorms::Separate { q, k, v: vn } => vec![q, k, vn],
+        };
+        gm.rmsnorms(
+            gpu,
+            n,
+            src_f32(0),
+            src_bf16,
+            in_plane,
+            &ws,
+            normed(0),
+            h,
+            p.eps,
+            stream,
+        )?;
         let (aq, ak, av) = if inputs_split {
             (normed(0), normed(1), normed(2))
         } else {
