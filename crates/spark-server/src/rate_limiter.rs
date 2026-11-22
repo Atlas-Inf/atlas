@@ -115,7 +115,7 @@ pub struct RateDecision {
     pub allowed: bool,
     pub requests: BucketSnapshot,
     pub tokens: BucketSnapshot,
-    /// Seconds client should wait before retrying (Retry-After header).
+    /// Seconds until the denied request would fit (Retry-After header).
     /// Zero when `allowed`.
     pub retry_after_secs: u64,
     /// Which bucket triggered the denial — used for the error message.
@@ -193,6 +193,12 @@ impl Bucket {
     fn refund(&mut self, amount: f64, burst: f64) {
         self.available = (self.available + amount).min(burst);
     }
+}
+
+/// Seconds until `cost` fits in a bucket holding `available` and refilling
+/// at `rate_per_sec`. `None` when it never fits because it exceeds `burst`.
+fn secs_until_fits(cost: f64, available: f64, rate_per_sec: f64, burst: f64) -> Option<u64> {
+    (cost <= burst).then(|| ((cost - available).max(0.0) / rate_per_sec).ceil() as u64)
 }
 
 struct KeyState {
@@ -319,6 +325,24 @@ impl RateLimiter {
         let tok_rate = tpm as f64 / 60.0;
         let req_burst = self.cfg.burst_rpm as f64;
         let tok_burst = self.cfg.burst_tpm as f64;
+        // Seconds until both buckets admit this request, from each bucket's
+        // `(available, reset)` snapshot. A cost above burst never fits, so
+        // that bucket falls back to its full refill.
+        let retry_after = |(req_avail, req_reset): (f64, u64),
+                           (tok_avail, tok_reset): (f64, u64)| {
+            let req_wait = if rpm > 0 {
+                secs_until_fits(1.0, req_avail, req_rate, req_burst).unwrap_or(req_reset)
+            } else {
+                0
+            };
+            let tok_wait = if tpm > 0 {
+                secs_until_fits(estimated_tokens as f64, tok_avail, tok_rate, tok_burst)
+                    .unwrap_or(tok_reset)
+            } else {
+                0
+            };
+            req_wait.max(tok_wait).max(1)
+        };
 
         let mut guard = self.inner.lock();
         let map = &mut *guard;
@@ -363,7 +387,7 @@ impl RateLimiter {
                     remaining: self.cfg.advertised_remaining_tpm(tok_avail.max(0.0) as u64),
                     reset_secs: tok_reset,
                 },
-                retry_after_secs: req_reset.max(1),
+                retry_after_secs: retry_after((req_avail, req_reset), (tok_avail, tok_reset)),
                 denied_by: Some(DenialReason::Requests),
             };
         }
@@ -395,7 +419,7 @@ impl RateLimiter {
                     remaining: self.cfg.advertised_remaining_tpm(tok_avail.max(0.0) as u64),
                     reset_secs: tok_reset,
                 },
-                retry_after_secs: tok_reset.max(1),
+                retry_after_secs: retry_after((req_avail, req_reset), (tok_avail, tok_reset)),
                 denied_by: Some(DenialReason::Tokens),
             };
         }
