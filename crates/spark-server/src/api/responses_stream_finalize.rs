@@ -7,7 +7,7 @@
 //! Hoisted out of `responses_stream.rs` to keep that file under the 500 LoC
 //! cap. The single entry point here, [`finalize_responses_stream`], runs
 //! after the inner chat stream drains: it builds the terminal
-//! `response.completed` payload, persists for `previous_response_id` resume,
+//! `response.completed` / `response.incomplete` payload, persists for `previous_response_id` resume,
 //! appends to a linked conversation, and emits the final SSE events.
 
 use std::sync::Arc;
@@ -304,9 +304,10 @@ pub(super) struct FinalizeCtx {
     pub conv_new_user_items: Vec<serde_json::Value>,
 }
 
-/// Emit `response.completed` (and the optional preceding `response.refusal.done`),
-/// persist the response if `store_flag` is set, and append items to the
-/// linked conversation when `conversation_id` is present.
+/// Emit the terminal `response.completed` or `response.incomplete` (and the
+/// optional preceding `response.refusal.done`), persist the response if
+/// `store_flag` is set, and append items to the linked conversation when
+/// `conversation_id` is present.
 pub(super) async fn finalize_responses_stream(
     tx: &mpsc::Sender<Result<Event, std::convert::Infallible>>,
     state_arc: Arc<AppState>,
@@ -347,17 +348,16 @@ pub(super) async fn finalize_responses_stream(
                 output_tokens_details: None,
                 total_tokens: 0,
             });
-    let final_status: &'static str = if finish_reason == "error" {
-        "failed"
-    } else {
-        "completed"
-    };
+    let (status, incomplete_details) = crate::openai::responses_terminal_status(
+        &crate::ir::FinishReason::from(finish_reason.as_str()),
+    );
     let final_resp = crate::openai::ResponsesResponse {
         id: resp_id.clone(),
         object: "response",
         created_at,
         model: model.clone(),
-        status: final_status,
+        status,
+        incomplete_details,
         error: None,
         output: final_output,
         reasoning: None,
@@ -485,9 +485,6 @@ pub(super) async fn finalize_responses_stream(
         emit(tx, &ev).await;
         seq += 1;
     }
-    let completed = crate::openai::ResponsesStreamEvent::Completed {
-        sequence_number: seq,
-        response: final_resp,
-    };
-    emit(tx, &completed).await;
+    let terminal = crate::openai::ResponsesStreamEvent::terminal(seq, final_resp);
+    emit(tx, &terminal).await;
 }
