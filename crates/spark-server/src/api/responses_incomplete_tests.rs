@@ -124,6 +124,22 @@ async fn blocking_response_cut_at_token_limit_is_incomplete() {
 }
 
 #[tokio::test]
+async fn blocking_response_cut_at_timeout_is_incomplete() {
+    let body = blocking_body(ir::FinishReason::Other(ir::FINISH_REASON_TIMEOUT.into())).await;
+    assert_eq!(body["status"], "incomplete");
+    assert_eq!(body["incomplete_details"]["reason"], "timeout");
+}
+
+#[tokio::test]
+async fn stream_cut_at_timeout_ends_with_response_incomplete() {
+    let (event, data) = stream_terminal(ir::FINISH_REASON_TIMEOUT).await;
+    assert_eq!(event, "response.incomplete");
+    assert_eq!(data["type"], "response.incomplete");
+    assert_eq!(data["response"]["status"], "incomplete");
+    assert_eq!(data["response"]["incomplete_details"]["reason"], "timeout");
+}
+
+#[tokio::test]
 async fn blocking_response_that_stops_is_completed() {
     let body = blocking_body(ir::FinishReason::Stop).await;
     assert_eq!(body["status"], "completed");

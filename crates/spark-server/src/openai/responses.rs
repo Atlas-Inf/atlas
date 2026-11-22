@@ -146,6 +146,12 @@ pub fn responses_terminal_status(
                 reason: "max_output_tokens",
             }),
         ),
+        FinishReason::Other(reason) if reason == crate::ir::FINISH_REASON_TIMEOUT => (
+            "incomplete",
+            Some(ResponsesIncompleteDetails {
+                reason: crate::ir::FINISH_REASON_TIMEOUT,
+            }),
+        ),
         FinishReason::Error => ("failed", None),
         FinishReason::Stop
         | FinishReason::ToolCalls
