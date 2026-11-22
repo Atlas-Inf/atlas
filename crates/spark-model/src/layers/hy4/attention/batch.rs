@@ -382,15 +382,23 @@ impl AttentionCache<'_, '_> {
             // ~99KB opt-in dynamic shared (sm_120+).
             let mla_mma = a.heads <= 16
                 && std::env::var("ATLAS_HY4_MLA_MMA").as_deref() == Ok("1");
-            if mla_mma {
-                KernelLaunch::new(
-                    gpu,
-                    gpu.op_cache()
-                        .kernel(gpu, "hy4_mla", "hy4_mla_batch_partial_mma")?,
+            let (mla_kernel, mla_grid, mla_smem) = if mla_mma {
+                (
+                    "hy4_mla_batch_partial_mma",
+                    [splits as u32, (end - first) as u32, 1],
+                    100544,
                 )
-                .grid([splits as u32, (end - first) as u32, 1])
+            } else {
+                (
+                    "hy4_mla_batch_partial",
+                    [a.heads as u32, splits as u32, (end - first) as u32],
+                    0,
+                )
+            };
+            KernelLaunch::new(gpu, gpu.op_cache().kernel(gpu, "hy4_mla", mla_kernel)?)
+                .grid(mla_grid)
                 .block([256, 1, 1])
-                .shared_mem(100544)
+                .shared_mem(mla_smem)
                 .arg_ptr(b.absorbed.offset(first * a.heads * 576 * 2))
                 .arg_ptr(self.latent)
                 .arg_ptr(self.table)
@@ -409,32 +417,6 @@ impl AttentionCache<'_, '_> {
                 .arg_u32(a.heads as u32)
                 .arg_u32(INDEX_KEYS as u32)
                 .launch(stream)?;
-            } else {
-            KernelLaunch::new(
-                gpu,
-                gpu.op_cache()
-                    .kernel(gpu, "hy4_mla", "hy4_mla_batch_partial")?,
-            )
-            .grid([a.heads as u32, splits as u32, (end - first) as u32])
-            .block([256, 1, 1])
-            .arg_ptr(b.absorbed.offset(first * a.heads * 576 * 2))
-            .arg_ptr(self.latent)
-            .arg_ptr(self.table)
-            .arg_ptr(if a.window.is_some() {
-                DevicePtr::NULL
-            } else {
-                b.indices
-            })
-            .arg_ptr(b.softmax_parts)
-            .arg_u32(start_position as u32)
-            .arg_u32(self.layout.page_size as u32)
-            .arg_u32(self.layout.table.len() as u32)
-            .arg_u32(a.window.unwrap_or(0) as u32)
-            .arg_u32(count as u32)
-            .arg_u32(splits as u32)
-            .arg_u32(a.heads as u32)
-            .arg_u32(INDEX_KEYS as u32)
-            .launch(stream)?;
             KernelLaunch::new(
                 gpu,
                 gpu.op_cache()
