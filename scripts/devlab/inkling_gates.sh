@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # DevLab Strix bench: Inkling 2 Mini quality / agentic gates on the checked-out ref.
 #
-#   scripts/devlab/inkling_gates.sh <strict|spark> <legs...>     legs: st995 agentic poison
+#   scripts/devlab/inkling_gates.sh <strict|spark> <legs...>     legs: st995 agentic poison xcont csweep ttft dfloor
 #
 # Serves through scripts/serve-inkling2-strix-linux.sh (which builds the inkling-2-mini target and
 # downloads through $HF_ENDPOINT), DSPARK=0, prefix caching on, up to 4 sequences, then runs each leg
@@ -34,7 +34,11 @@ for leg in "${LEGS[@]}"; do
   case $leg in
     st995) bench bfcl-subset ;;
     agentic) bench agentic-webserver --param iterations=10 --param wall_budget_s=100000 ;;
-    poison) bench ssm-state-poisoning ;;
+    poison) bench ssm-state-poisoning-gate ;;
+    xcont) bench cross-contamination ;;
+    csweep) bench concurrency-sweep ;;
+    ttft) bench ttft-cold-gate; bench ttft-warm-gate ;;
+    dfloor) bench decode-floor ;;
     *) log "unknown leg $leg" ;;
   esac
 done
