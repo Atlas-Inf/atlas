@@ -324,3 +324,60 @@ async fn completion_top_p_accepts_valid_values_and_server_default() {
         }
     }
 }
+
+async fn unrepresentable_timeout_duration_is_rejected_before_dispatch() {
+    assert_timeout_rejected(1e30).await;
+}
+
+#[tokio::test]
+async fn unrepresentable_timeout_instant_is_rejected_before_dispatch() {
+    assert_timeout_rejected(1e19).await;
+}
+
+async fn assert_timeout_rejected(timeout: f64) {
+    for chat in [false, true] {
+        for stream in [false, true] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let state = Arc::new(AppState {
+                request_tx: tx,
+                ..crate::api::test_app_state::app_state(tokenizer())
+            });
+            let mut body = json!({"model": "fixture", "max_tokens": 1,
+                                      "stream": stream, "timeout": timeout});
+            let response = if chat {
+                body["messages"] = json!([{"role": "user", "content": "prompt"}]);
+                let host = crate::main_modules::model_host::ModelHost::empty();
+                host.publish(state);
+                crate::api::chat_completions(
+                    axum::extract::State(Arc::new(host)),
+                    None,
+                    axum::http::HeaderMap::new(),
+                    serde_json::to_vec(&body).unwrap().into(),
+                )
+                .await
+            } else {
+                body["prompt"] = json!([1]);
+                crate::api::completions::completions(
+                    CurrentModel(state),
+                    Ok(axum::Json(serde_json::from_value(body).unwrap())),
+                )
+                .await
+            };
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(error["error"]["type"], "invalid_request_error");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("timeout")
+            );
+            assert!(rx.try_recv().is_err(), "invalid timeout reached scheduler");
+        }
+    }
+}
+
+#[tokio::test]

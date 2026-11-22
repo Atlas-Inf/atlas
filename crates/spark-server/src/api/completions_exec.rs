@@ -73,6 +73,10 @@ pub(super) async fn run_blocking(
 
     for (prompt_i, prompt_tokens) in prompts.iter().enumerate() {
         for n_i in 0..n {
+            let timeout_at = match state.request_deadline(req.timeout) {
+                Ok(at) => at,
+                Err(msg) => return openai_error_response(StatusCode::BAD_REQUEST, msg.into()),
+            };
             let (tx, rx) = tokio::sync::oneshot::channel();
             let session_hash = crate::session_manager::compute_session_hash(prompt_tokens);
             let request = InferenceRequest::Blocking {
@@ -121,7 +125,7 @@ pub(super) async fn run_blocking(
                 top_logprobs: p.logprobs_k,
                 prompt_logprobs: if req.echo { p.logprobs_k } else { None },
                 echo: req.echo,
-                timeout_at: state.request_deadline(req.timeout),
+                timeout_at,
                 response_tx: tx,
             };
 

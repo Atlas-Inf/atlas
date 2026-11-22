@@ -362,7 +362,9 @@ pub(super) async fn completions_stream(
         top_logprobs: logprobs_k,
         prompt_logprobs: if echo { logprobs_k } else { None },
         echo,
-        timeout_at: state.request_deadline(req.timeout),
+        timeout_at: state
+            .request_deadline(req.timeout)
+            .map_err(|msg| (StatusCode::BAD_REQUEST, msg.into()))?,
         token_tx,
         // /v1/completions has no guard pipeline yet — the flag is
         // created so the scheduler's emit_step type-checks cleanly,

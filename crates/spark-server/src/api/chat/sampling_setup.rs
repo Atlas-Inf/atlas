@@ -411,7 +411,9 @@ pub(super) fn build_sampling(
     };
 
     // Timeout deadline (SSOT: AppState::request_deadline).
-    let timeout_at = state.request_deadline(req.timeout_secs);
+    let timeout_at = state
+        .request_deadline(req.timeout_secs)
+        .map_err(|msg| openai_error_response(StatusCode::BAD_REQUEST, msg.into()))?;
 
     // Pre-resolved from the wire's logprobs/top_logprobs pair at the edge.
     let top_logprobs = req.top_logprobs;

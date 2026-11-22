@@ -193,14 +193,20 @@ pub struct AppState {
 use crate::main_modules::promotion::PromoteReject;
 
 /// Turn a timeout budget in seconds into an absolute deadline. `0` (or a
-/// non-positive value) means "no deadline" and yields `None`. Pure and
-/// `now`-injected so the 0-disables contract is testable without a clock.
-pub fn deadline_from(secs: f32, now: std::time::Instant) -> Option<std::time::Instant> {
-    if secs > 0.0 {
-        Some(now + std::time::Duration::from_secs_f32(secs))
-    } else {
-        None
+/// non-positive value) means "no deadline" and yields `Ok(None)`.
+/// Unrepresentable durations or deadlines return an error.
+pub fn deadline_from(
+    secs: f32,
+    now: std::time::Instant,
+) -> Result<Option<std::time::Instant>, &'static str> {
+    if secs <= 0.0 {
+        return Ok(None);
     }
+    let duration = std::time::Duration::try_from_secs_f32(secs)
+        .map_err(|_| "timeout must be finite and fit in a duration")?;
+    now.checked_add(duration)
+        .map(Some)
+        .ok_or("timeout is too large to represent a deadline")
 }
 
 impl AppState {
@@ -213,7 +219,10 @@ impl AppState {
     /// exist and one of them (`/v1/completions` streaming) silently passed
     /// `None`, so that surface had no deadline at all while every other
     /// surface had a 300 s one.
-    pub fn request_deadline(&self, override_secs: Option<f32>) -> Option<std::time::Instant> {
+    pub fn request_deadline(
+        &self,
+        override_secs: Option<f32>,
+    ) -> Result<Option<std::time::Instant>, &'static str> {
         deadline_from(
             override_secs.unwrap_or(self.request_timeout as f32),
             std::time::Instant::now(),
@@ -418,15 +427,25 @@ mod tests {
         let now = std::time::Instant::now();
         // 0 is the documented "no deadline" value — it must not become an
         // instantly-expired deadline that cuts every request at 0 tokens.
-        assert!(deadline_from(0.0, now).is_none());
-        assert!(deadline_from(-1.0, now).is_none());
+        assert_eq!(deadline_from(0.0, now), Ok(None));
+        assert_eq!(deadline_from(-1.0, now), Ok(None));
     }
 
     #[test]
     fn positive_timeout_yields_that_budget() {
         let now = std::time::Instant::now();
-        let d = deadline_from(5.0, now).expect("5s budget is a deadline");
-        assert_eq!(d.saturating_duration_since(now).as_millis(), 5000);
+        for secs in [0.25, 5.0] {
+            let d = deadline_from(secs, now).unwrap().expect("positive budget");
+            assert_eq!(d.duration_since(now).as_secs_f32(), secs);
+        }
+    }
+
+    #[test]
+    fn non_finite_or_unrepresentable_timeout_is_an_error() {
+        let now = std::time::Instant::now();
+        for secs in [f32::NAN, f32::INFINITY, f32::MAX, 1e30, 1e19] {
+            assert!(deadline_from(secs, now).is_err(), "timeout={secs}");
+        }
     }
 
     #[test]

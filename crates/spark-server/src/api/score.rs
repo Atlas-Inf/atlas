@@ -144,6 +144,12 @@ pub async fn score(
     if let Err(msg) = queue.check_fits(&prefix, &branches) {
         return openai_error_response(StatusCode::UNPROCESSABLE_ENTITY, msg);
     }
+    let timeout_at = match state.request_deadline(None) {
+        Ok(at) => at,
+        Err(msg) => {
+            return openai_error_response(StatusCode::INTERNAL_SERVER_ERROR, msg.into());
+        }
+    };
     let (reply, rx) = tokio::sync::oneshot::channel();
     let job = ScoreJob {
         prefix,
@@ -165,7 +171,7 @@ pub async fn score(
     }
     // Dropping `rx` on timeout closes the reply, and the scheduler drops a
     // job whose reply is closed before running it.
-    let reply = match state.request_deadline(None) {
+    let reply = match timeout_at {
         Some(at) => match tokio::time::timeout_at(at.into(), rx).await {
             Ok(r) => r,
             Err(_) => {
