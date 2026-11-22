@@ -41,7 +41,8 @@ impl TransformerModel {
     /// about to overwrite.
     ///
     /// Pure attention: all (every restored block is a skipped prefill block).
-    /// Hybrid SSM (GLM-5.3's KDA layers): a prefill resumes from an SSM
+    /// Hybrid SSM (GLM-5.3's KDA layers), or per-sequence state carried by aux
+    /// snapshots alone (Inkling 2's short convs): a prefill resumes from a
     /// snapshot anchor.
     ///
     /// * With a usable anchor (resident OR spill-tiered) the pass replays
@@ -71,7 +72,10 @@ impl TransformerModel {
         bs: usize,
     ) -> usize {
         let run = plan.disk.len();
-        if self.config.num_ssm_layers() == 0 {
+        // pure attention: every restored block is a skipped prefill block; a model
+        // with per-sequence state (SSM, or Inkling's aux-only conv states) resumes
+        // from a snapshot anchor
+        if !self.config.snapshot_prefix_state() {
             return run;
         }
         let limit = plan.resident_tokens + run * bs;
