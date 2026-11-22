@@ -464,10 +464,10 @@ pub(super) async fn finalize_responses_stream(
             batch.push(item);
         }
         if !batch.is_empty()
-            && let Err(e) = state_arc.conversation_store.add_items(cid, batch)
+            && let Err(e) = state_arc.conversation_store.append_items(cid, batch)
         {
             tracing::warn!(
-                "responses_stream_finalize: conversation_store.add_items failed for {cid}: {e:?}"
+                "responses_stream_finalize: conversation_store.append_items failed for {cid}: {e:?}"
             );
         }
     }

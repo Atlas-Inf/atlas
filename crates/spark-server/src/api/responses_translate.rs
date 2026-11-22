@@ -244,10 +244,10 @@ pub(super) async fn translate_chat_response_to_responses(
             batch.push(item);
         }
         if !batch.is_empty()
-            && let Err(e) = conv_store.add_items(&conv_id, batch)
+            && let Err(e) = conv_store.append_items(&conv_id, batch)
         {
             tracing::warn!(
-                "responses_translate: conversation_store.add_items failed for {conv_id}: {e:?}"
+                "responses_translate: conversation_store.append_items failed for {conv_id}: {e:?}"
             );
         }
     }

@@ -59,7 +59,7 @@ impl Inner {
     }
 }
 
-/// Maximum items per conversation insert (mirrors OpenAI's spec).
+/// Maximum items per Conversations API create or add-items request.
 pub const MAX_ITEMS_PER_INSERT: usize = 20;
 
 impl ConversationStore {
@@ -199,6 +199,15 @@ impl ConversationStore {
         if new_items.len() > MAX_ITEMS_PER_INSERT {
             return Err(AddItemsError::TooMany(new_items.len()));
         }
+        self.append_items(id, new_items)
+    }
+
+    /// Append an entire Responses turn under one lock, without the public request cap.
+    pub fn append_items(
+        &self,
+        id: &str,
+        new_items: Vec<serde_json::Value>,
+    ) -> Result<Vec<serde_json::Value>, AddItemsError> {
         let mut inner = self.inner.lock();
         let expired = match inner.map.get(id) {
             Some(c) => c.last_access.elapsed() > self.ttl,

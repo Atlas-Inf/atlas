@@ -15,6 +15,7 @@ use super::responses_translate::translate_chat_response_to_responses;
 use crate::api::chat::ChatOutcome;
 use crate::api::test_app_state;
 use crate::ir;
+use crate::openai::{ResponsesContentPart, ResponsesOutputItem};
 
 fn tokenizer() -> crate::tokenizer::ChatTokenizer {
     let dir = tempfile::tempdir().unwrap();
@@ -71,6 +72,88 @@ async fn blocking_body(finish_reason: ir::FinishReason) -> Value {
         .await
         .unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+fn large_turn_items() -> Vec<Value> {
+    (0..21)
+        .map(|i| {
+            serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": format!("message {i}")}],
+            })
+        })
+        .collect()
+}
+
+fn assert_large_turn_persisted(items: &[Value]) {
+    assert_eq!(items.len(), 22);
+    for (i, item) in items[..21].iter().enumerate() {
+        assert_eq!(item["role"], "user");
+        assert_eq!(item["content"][0]["text"], format!("message {i}"));
+    }
+    assert_eq!(items[21]["role"], "assistant");
+    assert_eq!(items[21]["content"][0]["text"], "The answer is");
+}
+
+#[tokio::test]
+async fn blocking_response_persists_large_conversation_turn() {
+    let state = test_app_state::app_state(tokenizer());
+    let store = state.conversation_store;
+    let id = store.create(vec![], Default::default());
+    let req = serde_json::from_value(serde_json::json!({
+        "model": "fixture", "input": large_turn_items(), "conversation": id,
+    }))
+    .unwrap();
+    let input = crate::openai::lower_responses_to_chat(req, |_| None)
+        .unwrap()
+        .messages;
+    let outcome = ChatOutcome::Blocking(Box::new(chat_response(ir::FinishReason::Stop)));
+    let resp = translate_chat_response_to_responses(
+        outcome,
+        None,
+        None,
+        input,
+        false,
+        Some((store.clone(), id.clone())),
+    )
+    .await;
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    assert_large_turn_persisted(&store.get(&id).unwrap().items);
+}
+
+#[tokio::test]
+async fn streaming_response_persists_large_conversation_turn() {
+    let state = Arc::new(test_app_state::app_state(tokenizer()));
+    let id = state.conversation_store.create(vec![], Default::default());
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let ctx = FinalizeCtx {
+        seq: 0,
+        completed_items: vec![ResponsesOutputItem::Message {
+            id: "msg_test".into(),
+            status: "completed",
+            role: "assistant",
+            content: vec![ResponsesContentPart::OutputText {
+                text: "The answer is".into(),
+                annotations: None,
+            }],
+        }],
+        final_usage: None,
+        finish_reason: "stop".into(),
+        refusal_text: None,
+        message_item_id: "msg_test".into(),
+        output_index: 0,
+        resp_id: "resp_test".into(),
+        created_at: 0,
+        model: "fixture".into(),
+        metadata_for_done: None,
+        store_flag: false,
+        input_messages: vec![],
+        conversation_id: Some(id.clone()),
+        conv_new_user_items: large_turn_items(),
+    };
+    finalize_responses_stream(&tx, state.clone(), ctx).await;
+    assert_large_turn_persisted(&state.conversation_store.get(&id).unwrap().items);
 }
 
 /// Runs the stream finalizer and returns the terminal SSE frame as
