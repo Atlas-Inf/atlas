@@ -18,7 +18,8 @@
 #if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
 // AMD (strix-hip): mma.sync / cp.async / ldmatrix PTX. Never launched under
 // cfg!(atlas_scale): inkling2/attn_ops.rs takes inkling2_prefill_attn instead.
-extern "C" __global__ void inkling2_flash_prefill() { __builtin_trap(); }
+#include "../../common/atlas_pdl.cuh"
+extern "C" __global__ void inkling2_flash_prefill() { atlas_pdl_enter(); __builtin_trap(); }
 #else
 #include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>

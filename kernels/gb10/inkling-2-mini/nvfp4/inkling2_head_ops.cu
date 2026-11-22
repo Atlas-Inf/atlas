@@ -278,6 +278,7 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_msg_gate_fused(
     const unsigned long long out_stride,
     const float eps
 ) {
+    atlas_pdl_enter();
     constexpr unsigned int RANK = INK_MAX_RANK;
     __shared__ float s_rstd[INK_MAX_GATES][INK_FG_ROWS][2];
     __shared__ __align__(16) __nv_bfloat16 s_a[INK_FG_ROWS][INK_FG_PITCH];
