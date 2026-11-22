@@ -61,6 +61,21 @@ pub(crate) struct Inkling2Kernels {
     pub situ_quant_fp4: KernelHandle,
     pub quant_mxfp8: KernelHandle,
     pub situ_quant_mxfp8: KernelHandle,
+    /// AMD (strix-hip) only, from kernels/strix-hip/inkling-2-mini/nvfp4/inkling2_moe_gemm.cu:
+    /// the BF16-row grouped expert GEMMs and the softcapped SwiGLU between them, which prefill
+    /// takes there instead of the gb10 block-scaled W4A4 / W8A8 path (NULL elsewhere)
+    pub moe_gemm_nvfp4: KernelHandle,
+    pub moe_gemm_mxfp8: KernelHandle,
+    pub softcap_swiglu: KernelHandle,
+}
+
+/// A strix-hip-only kernel of this target's `inkling2_moe_gemm` module; NULL on other targets.
+fn amd_kernel(gpu: &dyn GpuBackend, name: &str) -> Result<KernelHandle> {
+    if cfg!(atlas_scale) {
+        gpu.kernel("inkling2_moe_gemm", name)
+    } else {
+        Ok(KernelHandle(0))
+    }
 }
 
 impl Inkling2Kernels {
@@ -104,6 +119,9 @@ impl Inkling2Kernels {
             situ_quant_fp4: gpu.kernel("inkling2_moe_prefill", "inkling2_situ_quant_fp4")?,
             quant_mxfp8: gpu.kernel("inkling2_moe_prefill", "inkling2_quant_mxfp8")?,
             situ_quant_mxfp8: gpu.kernel("inkling2_moe_prefill", "inkling2_situ_quant_mxfp8")?,
+            moe_gemm_nvfp4: amd_kernel(gpu, "inkling2_moe_gemm_nvfp4")?,
+            moe_gemm_mxfp8: amd_kernel(gpu, "inkling2_moe_gemm_mxfp8")?,
+            softcap_swiglu: amd_kernel(gpu, "inkling2_softcap_swiglu")?,
         })
     }
 }
