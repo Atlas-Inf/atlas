@@ -4,8 +4,7 @@
 #
 #   scripts/devlab/inkling_h2h.sh <engines...>     engines: atlas-spark atlas-strict ciru ciru-nospec llamacpp halogen
 #
-# Per engine: gufo_bench.py (pp ~2048 / tg128 at depth 0 and 8192, then C 1/2/4/8 aggregate decode, 384 tokens a
-# request) and prefill_h2h.py (cold 8K / 32K prompts), thinking off by request (reasoning_effort none).
+# Per engine: decode_h2h.py (non-streaming C1 decode on prose / code / json, C 1/2/4/8 aggregate) and prefill_h2h.py (cold 8K / 32K prompts), thinking off by request (reasoning_effort none).
 #   atlas-*      scripts/serve-inkling2-strix-linux.sh at this ref, MODE spark|strict, no drafter, 8 sequences
 #   ciru         ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151 v1.2.2 (ROCm vLLM 0.34 + its gfx1151 kernels), the
 #                unmodified checkpoint (--original-weights), its concurrent mode (DSpark K=7) for every leg
@@ -22,7 +21,7 @@ log "ref $(git rev-parse --short=9 HEAD) engines: $*  host $(hostname) $(grep -m
 legs() { # label
   if ! wait_ready $PORT 720; then log "$1 SERVE FAILED"; ENGINE_DOWN "$OUT/serve-$1.log"; grep -aiE "error|fail|unsupported|not support" "$OUT/serve-$1.log" | tail -6 | cut -c1-300 | tee -a "$RES"; return 1; fi
   log "$1 serving (model id $MID)"
-  python3 "$HERE/gufo_bench.py" $PORT "$1" "$OUT/$1.json" --depths 0,8192 --cs 1,2,4,8 --kinds mixed 2>&1 | grep -aE "^\s+\[" | tee -a "$RES"
+  python3 "$HERE/decode_h2h.py" $PORT "$1" 2>&1 | grep -aE "^\s+\[|Error|error" | tee -a "$RES"
   python3 "$HERE/prefill_h2h.py" $PORT "$1" 2>&1 | tail -3 | tee -a "$RES"
   ENGINE_DOWN "$OUT/serve-$1.log"
 }
@@ -38,8 +37,9 @@ for e in "$@"; do
       command -v uv >/dev/null || { curl -LsSf https://astral.sh/uv/install.sh | sh > "$OUT/uv.log" 2>&1; export PATH=$HOME/.local/bin:$PATH; }
       rm -rf "$CR/src"; git clone -q https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151.git "$CR/src" && git -C "$CR/src" checkout -q v1.2.2 || { log "ciru clone failed"; continue; }
       log "ciru $(git -C "$CR/src" rev-parse --short=9 HEAD) (v1.2.2)"
-      ( uv venv -q --python 3.12 "$CR/venv" && uv pip install -q --python "$CR/venv/bin/python" --extra-index-url https://wheels.vllm.ai/rocm/0.34.0/rocm100/ \
-          'vllm==0.34.0+rocm100' 'huggingface-hub==2.4.0' 'safetensors==0.8.0' ) > "$OUT/ciru-venv.log" 2>&1 || { log "CIRU VENV FAILED: $(tail -3 "$OUT/ciru-venv.log" | cut -c1-200)"; continue; }
+      ( uv venv -q --clear --python 3.12 "$CR/venv" && uv pip install -q --python "$CR/venv/bin/python" --extra-index-url https://wheels.vllm.ai/rocm/0.34.0/rocm100/ \
+          'vllm==0.34.0+rocm100' 'huggingface-hub==2.4.0' 'safetensors==0.8.0' \
+        && uv pip install -q --python "$CR/venv/bin/python" --target "$CR/tdeps" --no-deps 'huggingface-hub==1.31.0' 'safetensors==0.8.0' ) > "$OUT/ciru-venv.log" 2>&1 || { log "CIRU VENV FAILED: $(tail -3 "$OUT/ciru-venv.log" | cut -c1-200)"; continue; }
       CK=$(hf_get thinkingmachines/Inkling-2-Mini "*" ed40e7da625f594fc9c4990f5f66be24873c22d7) || { log "ckpt download failed"; continue; }
       ( cd "$CR/src" && bash scripts/install.sh --venv "$CR/venv" --transformers-deps "$CR/tdeps" --prefix "$CR/opt" ) > "$OUT/ciru-install.log" 2>&1 \
         || { log "CIRU INSTALL FAILED: $(grep -aiE 'error|fail' "$OUT/ciru-install.log" | tail -3 | cut -c1-200)"; continue; }
