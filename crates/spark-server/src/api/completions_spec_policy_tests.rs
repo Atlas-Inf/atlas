@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Exercise both completion handlers through the real scheduler request
-//! boundary: the request-level speculation policy.
+//! boundary: request-level speculation policy and streamed logprobs.
 //! Ported from Enntity/atlas f4d95a10 (AGPL-3.0-only).
 
 use super::*;
-use crate::api::inference_types::{InferenceRequest, InferenceResponse};
+use crate::api::inference_types::{
+    InferenceRequest, InferenceResponse, StreamEvent, TokenLogprobs,
+};
 use crate::main_modules::model_host::CurrentModel;
 use serde_json::json;
 
@@ -104,4 +106,147 @@ async fn completion_disable_mtp_reaches_scheduler_for_blocking_and_streaming() {
             scheduler.await.unwrap();
         }
     }
+}
+
+async fn completion_stream_chunks(
+    logprobs: Option<u8>,
+    echo: bool,
+    events: Vec<StreamEvent>,
+) -> Vec<serde_json::Value> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let state = Arc::new(AppState {
+        request_tx: tx,
+        ..crate::api::test_app_state::app_state(tokenizer())
+    });
+    let scheduler = tokio::spawn(async move {
+        let InferenceRequest::Streaming {
+            token_tx,
+            top_logprobs,
+            prompt_logprobs,
+            ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected a streaming inference request");
+        };
+        assert_eq!(top_logprobs, logprobs);
+        assert_eq!(prompt_logprobs, if echo { logprobs } else { None });
+        for event in events {
+            token_tx.send(event).await.unwrap();
+        }
+    });
+    let req = serde_json::from_value(json!({
+        "model": "fixture", "prompt": [6], "max_tokens": 3,
+        "stream": true, "logprobs": logprobs, "echo": echo,
+    }))
+    .unwrap();
+    let response =
+        crate::api::completions::completions(CurrentModel(state), Ok(axum::Json(req))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    scheduler.await.unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(body.ends_with("data: [DONE]\n\n"));
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn completion_stream_preserves_generated_logprobs_and_offsets() {
+    for echo in [false, true] {
+        let mut events = Vec::new();
+        if echo {
+            events.push(StreamEvent::PromptLogprobs(vec![]));
+        }
+        for (token_id, logprob) in [(1, -0.5), (3, -1.0)] {
+            events.push(StreamEvent::TokenWithLogprobs(
+                token_id,
+                TokenLogprobs {
+                    token_id,
+                    logprob,
+                    top: vec![(1, -0.5), (3, -1.0)],
+                },
+            ));
+        }
+        let chunks = completion_stream_chunks(Some(2), echo, events).await;
+        assert_eq!(chunks.len(), 2 + usize::from(echo));
+        let mut offset = 0;
+        if echo {
+            assert_eq!(chunks[0]["choices"][0]["text"], "prompt");
+            assert_eq!(
+                chunks[0]["choices"][0]["logprobs"],
+                json!({"tokens": ["prompt"], "token_logprobs": [null],
+                       "top_logprobs": [null], "text_offset": [0]})
+            );
+            offset = "prompt".len();
+        }
+        for (chunk, (text, logprob)) in chunks[usize::from(echo)..]
+            .iter()
+            .zip([("answer", -0.5), ("secret", -1.0)])
+        {
+            let choice = &chunk["choices"][0];
+            assert_eq!(choice["text"], text);
+            assert_eq!(
+                choice["logprobs"],
+                json!({"tokens": [text], "token_logprobs": [logprob],
+                       "top_logprobs": [{"answer": -0.5, "secret": -1.0}],
+                       "text_offset": [offset]})
+            );
+            offset += text.len();
+        }
+    }
+}
+
+#[tokio::test]
+async fn completion_stream_logprobs_zero_preserves_scores_and_missing_first_score() {
+    let chunks = completion_stream_chunks(
+        Some(0),
+        false,
+        vec![
+            StreamEvent::Token(5),
+            StreamEvent::TokenWithLogprobs(
+                1,
+                TokenLogprobs {
+                    token_id: 1,
+                    logprob: -0.5,
+                    top: vec![],
+                },
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(
+        chunks[0]["choices"][0]["logprobs"],
+        json!({"tokens": ["STOP"], "token_logprobs": [null],
+               "top_logprobs": [null], "text_offset": [0]})
+    );
+    assert_eq!(
+        chunks[1]["choices"][0]["logprobs"],
+        json!({"tokens": ["answer"], "token_logprobs": [-0.5],
+               "top_logprobs": [{}], "text_offset": [4]})
+    );
+}
+
+#[tokio::test]
+async fn completion_stream_omits_logprobs_unless_requested() {
+    let chunks = completion_stream_chunks(
+        None,
+        true,
+        vec![StreamEvent::Token(1), StreamEvent::Token(3)],
+    )
+    .await;
+    let texts: Vec<_> = chunks
+        .iter()
+        .map(|chunk| {
+            let choice = &chunk["choices"][0];
+            assert!(choice.get("logprobs").is_none());
+            choice["text"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(texts, ["prompt", "answer", "secret"]);
 }

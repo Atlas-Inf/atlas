@@ -253,33 +253,14 @@ pub struct CompletionChunkChoice {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
-    /// Present only on the echo chunk (legacy `echo` + `logprobs` while
-    /// streaming: the prompt text + its logprobs precede generation).
+    /// Token scores when requested, for generated text and echoed prompts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<CompletionLogprobs>,
 }
 
 impl CompletionChunk {
-    /// Content text chunk.
-    pub fn text_chunk(model: &str, id: &str, text: String) -> Self {
-        Self {
-            id: id.to_string(),
-            object: "text_completion".to_string(),
-            created: unix_timestamp(),
-            model: model.to_string(),
-            choices: vec![CompletionChunkChoice {
-                index: 0,
-                text,
-                finish_reason: None,
-                logprobs: None,
-            }],
-            usage: None,
-        }
-    }
-
-    /// Echo chunk: the prompt text (plus its logprobs when requested),
-    /// emitted before any generated-token chunk.
-    pub fn echo_chunk(
+    /// Generated or echoed text, plus token logprobs when requested.
+    pub fn text_chunk(
         model: &str,
         id: &str,
         text: String,
