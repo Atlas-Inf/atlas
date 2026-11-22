@@ -34,10 +34,10 @@ __device__ __forceinline__ float ink_situ(const float g, const float u, const fl
 // AMD (strix-hip): the activation quantizers are e2m1 / e4m3 cvt PTX. They feed only
 // the block-scaled W4A4 / W8A8 prefill GEMMs, which spark-model does not take under
 // cfg!(atlas_scale) (the experts take BF16 rows there; kernels/strix-hip/inkling-2-mini).
-extern "C" __global__ void inkling2_quant_fp4() { __builtin_trap(); }
-extern "C" __global__ void inkling2_situ_quant_fp4() { __builtin_trap(); }
-extern "C" __global__ void inkling2_quant_mxfp8() { __builtin_trap(); }
-extern "C" __global__ void inkling2_situ_quant_mxfp8() { __builtin_trap(); }
+extern "C" __global__ void inkling2_quant_fp4() { atlas_pdl_enter(); __builtin_trap(); }
+extern "C" __global__ void inkling2_situ_quant_fp4() { atlas_pdl_enter(); __builtin_trap(); }
+extern "C" __global__ void inkling2_quant_mxfp8() { atlas_pdl_enter(); __builtin_trap(); }
+extern "C" __global__ void inkling2_situ_quant_mxfp8() { atlas_pdl_enter(); __builtin_trap(); }
 #else
 // x's MXFP8 E4M3 code under the scale of its 32-value block (absolute max `amax`):
 // the power of two at or above amax / 448; `e` its UE8M0 exponent.
