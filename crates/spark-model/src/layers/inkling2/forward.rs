@@ -14,7 +14,7 @@ use spark_runtime::kv_cache::PagedKvCache;
 use super::batch::Batch;
 use super::layer::Inkling2Layer;
 use super::ops::{self, DecodeAttn, HeadNorm};
-use super::weights::{InputNorms, KvConv, Linear};
+use super::weights::{InputNorms, KvConv};
 use crate::layer::ForwardContext;
 
 impl Inkling2Layer {
@@ -123,7 +123,7 @@ impl Inkling2Layer {
             )?;
         }
         // input norms -> normed3
-        let inputs_split = v.full || gated_inputs;
+        let inputs_split = self.inputs_split();
         let src_f32 = |i: usize| if has_res { res(i) } else { DevicePtr::NULL };
         let src_bf16 = if has_res { DevicePtr::NULL } else { x };
         // one launch for the visit's input norms; layer 0 reads x for all three
@@ -145,43 +145,7 @@ impl Inkling2Layer {
             p.eps,
             stream,
         )?;
-        let (aq, ak, av) = if inputs_split {
-            (normed(0), normed(1), normed(2))
-        } else {
-            (normed(0), normed(0), normed(0))
-        };
-
-        // projections
-        gm.proj(gpu, n, aq, w.wq, s.q, d.q_dim, h, stream)?;
-        gm.proj(gpu, n, ak, w.wk, s.k_lin, d.kv_dim, h, stream)?;
-        gm.proj(gpu, n, av, w.wv, s.v_lin, d.kv_dim, h, stream)?;
-        gm.proj(gpu, n, aq, w.wr, s.r, d.rel_dim, h, stream)?;
-        gm.proj(gpu, n, aq, w.gate, s.gate, d.q_dim, h, stream)?;
-        gm.proj(gpu, n, aq, Linear::Bf16(w.sink), s.sink, p.heads, h, stream)?;
-        if let KvConv::Dynamic { proj, .. } = w.k_conv {
-            gm.proj(
-                gpu,
-                n,
-                ak,
-                Linear::Bf16(proj),
-                s.dyn_k,
-                d.dyn_dim,
-                h,
-                stream,
-            )?;
-        }
-        if let KvConv::Dynamic { proj, .. } = w.v_conv {
-            gm.proj(
-                gpu,
-                n,
-                av,
-                Linear::Bf16(proj),
-                s.dyn_v,
-                d.dyn_dim,
-                h,
-                stream,
-            )?;
-        }
+        self.project(gpu, n, stream)?;
 
         // k/v convs, then the per-head epilogues
         // each state: k, v, post-attention, post-MLP convs (fp32 elements)

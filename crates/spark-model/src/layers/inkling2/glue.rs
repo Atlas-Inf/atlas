@@ -28,6 +28,8 @@ pub(crate) struct GlueKernels {
     pub dense_gemv_batchm_f32: KernelHandle,
     /// `dense_gemv_bf16_fp32out`: one row of router logits
     pub dense_gemv_f32: KernelHandle,
+    /// `inkling2_proj_gemv`: a visit's BF16 input projections in one launch
+    pub proj_gemv: KernelHandle,
     /// `moe_topk_sigmoid_batched_f32`
     pub topk: KernelHandle,
     /// `reshape_and_cache_flash` (BF16 KV)
@@ -55,6 +57,7 @@ impl GlueKernels {
             dense_gemv_batchm_f32: gpu
                 .kernel("inkling2_router_gemv", "dense_gemv_bf16_batchm_f32out")?,
             dense_gemv_f32: gpu.kernel("gemv", "dense_gemv_bf16_fp32out")?,
+            proj_gemv: gpu.kernel("inkling2_proj_gemv", "inkling2_proj_gemv")?,
             topk: gpu.kernel("moe_topk_sig", "moe_topk_sigmoid_batched_f32")?,
             kv_write: gpu.kernel("reshape_and_cache", "reshape_and_cache_flash")?,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
@@ -74,7 +77,7 @@ impl GlueKernels {
 /// one-row GEMV computes it. cuBLASLt took 2-6x longer on the small projections
 /// (sinks, relative bias, router) at two rows; RigMark short code, Strict, one
 /// Spark: C2 / C4 / C8 49.5 / 79.2 / 120.2 -> 52.6 / 81.7 / 122.1.
-const BATCHM_MAX_ROWS: usize = 8;
+pub(crate) const BATCHM_MAX_ROWS: usize = 8;
 
 fn blocks(n: usize) -> u32 {
     n.div_ceil(256) as u32
