@@ -15,7 +15,7 @@ use crate::ir::ChatRequest;
 use super::compact::{openai_error_response, openai_error_response_with_param};
 
 /// Validate the input contract on the IR envelope: messages length,
-/// max_tokens > 0, temperature/top_p ranges, tool_choice mode/required
+/// max_tokens > 0, temperature/top_p ranges, tool_choice mode/name
 /// compatibility. Returns `Err(Response)` for fail-fast 400 paths so
 /// the caller can `?` directly into a Response.
 #[allow(clippy::result_large_err)]
@@ -92,5 +92,67 @@ pub(super) fn validate_input(req: &ChatRequest) -> Result<(), Response> {
             ));
         }
     }
+    if let Some(crate::tool_parser::ToolChoice::Specific { function }) = &req.tool_choice
+        && !req
+            .tools
+            .iter()
+            .any(|tool| tool.function.name == function.name)
+    {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "tool_choice function '{}' is not among the declared tools",
+                function.name
+            ),
+            Some("tool_choice"),
+            None,
+        ));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn named_tool_request(tools: Option<serde_json::Value>) -> ChatRequest {
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tool_choice": {"type": "function", "function": {"name": "lookup"}}
+        });
+        if let Some(tools) = tools {
+            body["tools"] = tools;
+        }
+        let wire: crate::openai::ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        wire.into()
+    }
+
+    #[tokio::test]
+    async fn named_tool_choice_rejects_undeclared_function() {
+        for tools in [
+            None,
+            Some(json!([])),
+            Some(json!([{"type": "function", "function": {"name": "other"}}])),
+        ] {
+            let req = named_tool_request(tools);
+            let response = validate_input(&req).expect_err("undeclared tool must be rejected");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["param"], "tool_choice");
+        }
+    }
+
+    #[test]
+    fn named_tool_choice_accepts_declared_function() {
+        let req = named_tool_request(Some(json!([
+            {"type": "function", "function": {"name": "other"}},
+            {"type": "function", "function": {"name": "lookup"}}
+        ])));
+        assert!(validate_input(&req).is_ok());
+    }
 }
