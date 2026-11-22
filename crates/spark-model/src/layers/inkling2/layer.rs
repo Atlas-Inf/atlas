@@ -376,21 +376,16 @@ impl TransformerLayer for Inkling2Layer {
             .map(|_| ())
     }
 
-    /// Single-sequence decode reads the model's staged metadata and the
-    /// prestaged state table, so it can be graphed (not with a debug capture).
-    fn decode_graph_unsupported(&self) -> bool {
-        super::debug::enabled()
-    }
-
     /// Verify graphs would bake one batch's state tables, and their keys do
     /// not change with the batch's sequences here.
     fn batched_decode_graph_unsupported(&self) -> bool {
         true
     }
 
-    /// Multi-sequence decode refreshes the tables first (`multi_seq_prestage`).
+    /// Multi-sequence decode refreshes the tables first (`multi_seq_prestage`),
+    /// so it graphs although verify does not.
     fn multi_seq_decode_graph_unsupported(&self) -> bool {
-        super::debug::enabled()
+        false
     }
 
     /// Bind the step's conv states, then the pad state up to `padded_n`.

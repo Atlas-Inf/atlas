@@ -7,7 +7,6 @@
 mod attn_ops;
 mod batch;
 mod calls;
-mod debug;
 mod forward;
 pub(crate) mod glue;
 pub(crate) mod layer;

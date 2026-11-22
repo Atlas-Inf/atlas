@@ -12,7 +12,6 @@ use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::batch::Batch;
-use super::debug;
 use super::layer::Inkling2Layer;
 use super::ops::{self, DecodeAttn, HeadNorm};
 use super::weights::{InputNorms, KvConv, Linear};
@@ -56,7 +55,6 @@ impl Inkling2Layer {
                 p.eps,
                 stream,
             )?;
-            debug::dump(gpu, hidden, batch, h, u32::MAX, stream)?;
         }
         let states = self.bind_states(gpu, conv_states, ctx.graph_capture, stream)?;
         for (j, state) in batch.journals.iter().zip(conv_states) {
@@ -423,10 +421,6 @@ impl Inkling2Layer {
             stream,
         )?;
         gm.layer_out(gpu, s.resid, s.mlp_conv, hidden, n * h, stream)?;
-        debug::dump(gpu, hidden, batch, h, self.visit_idx as u32, stream)?;
-        if debug::tap_visit() == Some(self.visit_idx) {
-            self.debug_taps(gpu, batch, stream)?;
-        }
 
         if v.save_prelude {
             gpu.copy_d2d_async(hidden, s.prelude_h, rb, stream)?;
@@ -445,7 +439,6 @@ impl Inkling2Layer {
                 stream,
             )?;
             gm.cast_bf16(gpu, s.final_out, hidden, n * h, stream)?;
-            debug::dump(gpu, hidden, batch, h, debug::FINAL, stream)?;
         }
         Ok(())
     }
