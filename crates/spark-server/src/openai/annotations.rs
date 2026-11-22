@@ -39,18 +39,19 @@ pub enum Annotation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UrlCitation {
+    /// Character offsets into the assistant content (end exclusive).
     pub start_index: usize,
     pub end_index: usize,
     pub url: String,
     pub title: String,
 }
 
-impl From<crate::citation::Citation> for Annotation {
-    fn from(c: crate::citation::Citation) -> Self {
+impl Annotation {
+    fn from_citation(c: crate::citation::Citation, content: &str) -> Self {
         Annotation::UrlCitation {
             url_citation: UrlCitation {
-                start_index: c.start_index,
-                end_index: c.end_index,
+                start_index: content[..c.start_index].chars().count(),
+                end_index: content[..c.end_index].chars().count(),
                 url: c.url,
                 title: c.title,
             },
@@ -66,13 +67,20 @@ pub fn extract_url_annotations(content: &str) -> Option<Vec<Annotation>> {
     if cits.is_empty() {
         None
     } else {
-        Some(cits.into_iter().map(Annotation::from).collect())
+        Some(
+            cits.into_iter()
+                .map(|c| Annotation::from_citation(c, content))
+                .collect(),
+        )
     }
 }
 
 /// Combined bare + structured citation extraction
 /// (`citation::merged_citations`) in the OpenAI wire shape.
 pub fn merged_annotations(content: &str) -> Option<Vec<Annotation>> {
-    crate::citation::merged_citations(content)
-        .map(|cits| cits.into_iter().map(Annotation::from).collect())
+    crate::citation::merged_citations(content).map(|cits| {
+        cits.into_iter()
+            .map(|c| Annotation::from_citation(c, content))
+            .collect()
+    })
 }
