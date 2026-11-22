@@ -12,6 +12,7 @@ pub(crate) mod glue;
 pub(crate) mod layer;
 mod moe_ops;
 pub(crate) mod ops;
+mod proj;
 pub(crate) mod schedule;
 pub(crate) mod shared;
 pub(crate) mod weights;

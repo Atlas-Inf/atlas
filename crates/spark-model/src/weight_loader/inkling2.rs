@@ -172,6 +172,7 @@ impl ModelWeightLoader for Inkling2WeightLoader {
                     p,
                     shared: Shared::unattached(&d),
                     bound_states: Default::default(),
+                    fused_proj: false,
                 }) as Box<dyn TransformerLayer>
             })
             .collect())
@@ -202,6 +203,7 @@ impl ModelWeightLoader for Inkling2WeightLoader {
                 .with_context(|| format!("inkling2 visit {i} is not an Inkling2Layer"))?;
             visit.shared = shared;
             visit.dims = d;
+            visit.upload_proj_tables(gpu)?;
         }
         Ok(())
     }
