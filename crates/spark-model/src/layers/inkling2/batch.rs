@@ -34,10 +34,6 @@ impl<'a> Batch<'a> {
         self.seqs.len() * self.rows_per_seq
     }
 
-    pub(super) fn position(&self, row: usize) -> usize {
-        self.seqs[row / self.rows_per_seq].0 + row % self.rows_per_seq
-    }
-
     /// Block-table entries between two rows' tables: 0 when every row reads
     /// one sequence's table, else the longest table (one table per row).
     pub(super) fn table_stride(&self) -> usize {
