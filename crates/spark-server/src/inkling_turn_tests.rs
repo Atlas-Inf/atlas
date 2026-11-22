@@ -168,3 +168,77 @@ fn an_argument_quoting_the_envelope_close_stays_inside_the_call() {
     let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
     assert_eq!(args["x"], "a</tool_call>b");
 }
+
+/// At thinking effort 0 the checkpoint opens a call with a text marker before
+/// the name: `<|message_model|><|content_text|>NAME<|content_invoke_tool_json|>{…}`.
+fn effort0_call(name: &str, body: &str) -> Vec<u32> {
+    [
+        vec![M.message, M.text],
+        s(name),
+        vec![M.tool_json],
+        s(body),
+        vec![M.end],
+    ]
+    .concat()
+}
+
+#[test]
+fn a_call_opened_as_text_is_still_a_call() {
+    let ids = [
+        block(M.thinking, "", "t"),
+        effort0_call("Say", r#"{"name":"Say","args":{"text":"Hi"}}"#),
+        vec![EOS],
+    ]
+    .concat();
+    for keep in [true, false] {
+        let out = show(&M.turn(keep).map_all(&ids, &Chars));
+        let body = out.trim_start_matches("t|").trim_end_matches('#');
+        let (rest, calls) = crate::tool_parser::parse_tool_calls(body);
+        assert_eq!(calls.len(), 1, "{out}");
+        assert_eq!(calls[0].function.name, "Say");
+        assert_eq!(calls[0].function.arguments, r#"{"text":"Hi"}"#);
+        assert!(!rest.unwrap_or_default().contains("Say"), "no name left in the text: {out}");
+    }
+}
+
+#[test]
+fn a_call_opened_as_text_streams_as_a_call() {
+    let ids = [
+        block(M.thinking, "", "t"),
+        effort0_call("Say", r#"{"name":"Say","args":{"text":"Hi"}}"#),
+        vec![EOS],
+    ]
+    .concat();
+    let mut turn = M.turn(false);
+    let mut streamed = Vec::new();
+    for &t in &ids {
+        turn.feed(t, &Chars, &mut streamed);
+        // the name is never emitted as answer text ahead of the call
+        assert!(!show(&streamed).starts_with("Say"), "{}", show(&streamed));
+    }
+    turn.finish(&Chars, &mut streamed);
+    assert_eq!(streamed, M.turn(false).map_all(&ids, &Chars));
+}
+
+#[test]
+fn answers_that_start_like_a_name_pass_unchanged() {
+    for body in ["Hello there.", "391", "Paris", "ok_then fine"] {
+        let ids = [
+            block(M.thinking, "", "t"),
+            block(M.text, "", body),
+            vec![EOS],
+        ]
+        .concat();
+        assert_eq!(
+            show(&M.turn(true).map_all(&ids, &Chars)),
+            format!("t|{body}#")
+        );
+        let mut turn = M.turn(true);
+        let mut streamed = Vec::new();
+        for &t in &ids {
+            turn.feed(t, &Chars, &mut streamed);
+        }
+        turn.finish(&Chars, &mut streamed);
+        assert_eq!(show(&streamed), format!("t|{body}#"), "streamed {body}");
+    }
+}

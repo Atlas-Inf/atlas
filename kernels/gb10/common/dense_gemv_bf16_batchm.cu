@@ -45,8 +45,9 @@
 __device__ __forceinline__ void batchm_store(__nv_bfloat16* c, float v) { *c = __float2bfloat16(v); }
 __device__ __forceinline__ void batchm_store(float* c, float v) { *c = v; }
 
-// The body of both entries below: OutT is the output element (BF16, or FP32
-// unrounded for router logits, each row then dense_gemv_bf16_fp32out's).
+// The body of the entry below: OutT is the output element (BF16, or FP32
+// unrounded, each row then dense_gemv_bf16_fp32out's: Inkling 2's router,
+// inkling-2-mini/nvfp4/inkling2_router_gemv.cu).
 template <typename OutT>
 __device__ __forceinline__ void dense_gemv_bf16_batchm_body(
     const __nv_bfloat16* __restrict__ A,  // [M, K]
@@ -229,15 +230,6 @@ __device__ __forceinline__ void dense_gemv_bf16_batchm_body(
 
 extern "C" __global__ void dense_gemv_bf16_batchm(
     const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B, __nv_bfloat16* __restrict__ C,
-    unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride
-) {
-    dense_gemv_bf16_batchm_body(A, B, C, M, N, K, out_stride);
-}
-
-// FP32-output twin: up to MAX_M rows of router logits from one pass over the
-// router weight, each row the chain dense_gemv_bf16_fp32out runs.
-extern "C" __global__ void dense_gemv_bf16_batchm_f32out(
-    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B, float* __restrict__ C,
     unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride
 ) {
     dense_gemv_bf16_batchm_body(A, B, C, M, N, K, out_stride);

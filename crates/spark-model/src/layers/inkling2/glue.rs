@@ -50,7 +50,7 @@ impl GlueKernels {
             dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
             dense_gemv_batchm: gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?,
             dense_gemv_batchm_f32: gpu
-                .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm_f32out")?,
+                .kernel("inkling2_router_gemv", "dense_gemv_bf16_batchm_f32out")?,
             dense_gemv_f32: gpu.kernel("gemv", "dense_gemv_bf16_fp32out")?,
             topk: gpu.kernel("moe_topk_sig", "moe_topk_sigmoid_batched_f32")?,
             kv_write: gpu.kernel("reshape_and_cache", "reshape_and_cache_flash")?,
