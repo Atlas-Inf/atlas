@@ -54,6 +54,20 @@ fn safetensors_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Resolve a `--weight-overlay` specifier to a local directory.
+///
+/// Unlike `resolve_model_dir`, an overlay repo needs no `config.json` — the
+/// Enntity/Inkling-2-Mini-Spark-NVFP4 repo ships only
+/// `spark-nvfp4.safetensors` + reports — so a HuggingFace id resolves straight
+/// to its `refs/main` snapshot and `safetensors_files` does the validation.
+fn resolve_overlay_dir(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
+    let as_path = Path::new(spec);
+    if as_path.is_dir() {
+        return Ok(as_path.to_path_buf());
+    }
+    crate::model_resolver::hf_snapshot_dir(spec, cache_dir)
+}
+
 /// Load `--weight-overlay` (when given) into `store`.
 pub(crate) fn absorb_weight_overlay(
     args: &crate::cli::ServeArgs,
@@ -64,7 +78,7 @@ pub(crate) fn absorb_weight_overlay(
     let Some(id) = args.weight_overlay.as_deref() else {
         return Ok(());
     };
-    let dir = crate::model_resolver::resolve_model_dir(id, args.cache_dir.as_deref())
+    let dir = resolve_overlay_dir(id, args.cache_dir.as_deref())
         .with_context(|| format!("resolve --weight-overlay {id}"))?;
     for file in safetensors_files(&dir)? {
         let mut loader = spark_runtime::weights::SafetensorsLoader::new();
@@ -138,5 +152,28 @@ mod tests {
         // mtp_config without the weights file is not an embedded drafter either
         let cfg = r#"{"mtp_config":{},"text_config":{"unpadded_vocab_size":4}}"#;
         assert!(embedded_drafter(dir.path(), cfg).unwrap().is_none());
+    }
+
+    /// An overlay repo ships weights + reports but no config.json (the
+    /// Enntity/Inkling-2-Mini-Spark-NVFP4 layout), so it resolves through
+    /// `hf_snapshot_dir`, not `resolve_model_dir`.
+    #[test]
+    fn overlay_resolves_config_less_hf_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_cache = tmp.path().join("models--Org--Overlay");
+        let snapshot = model_cache.join("snapshots").join("abc");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::create_dir_all(model_cache.join("refs")).unwrap();
+        std::fs::write(model_cache.join("refs/main"), "abc").unwrap();
+        std::fs::write(snapshot.join("spark-nvfp4.safetensors"), b"w").unwrap();
+
+        let dir = resolve_overlay_dir("Org/Overlay", Some(tmp.path())).unwrap();
+        assert_eq!(dir, snapshot);
+        let files = safetensors_files(&dir).unwrap();
+        assert_eq!(files, vec![snapshot.join("spark-nvfp4.safetensors")]);
+
+        // The model resolver still demands config.json — the reason the
+        // overlay gets its own resolver.
+        assert!(crate::model_resolver::resolve_model_dir("Org/Overlay", Some(tmp.path())).is_err());
     }
 }
