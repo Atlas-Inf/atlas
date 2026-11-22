@@ -299,17 +299,36 @@ impl Model for Hy4Model {
         Ok(u32::from_le_bytes(b))
     }
     fn argmax_batch(&self, ptr: DevicePtr, n: usize, stream: u64) -> Result<Vec<u32>> {
+        let s = self.borrow_owner();
+        let r = self.borrow_dependent();
         ensure!(
-            n <= if ptr == self.borrow_dependent().multi.logits {
-                self.borrow_dependent().multi.capacity
+            n <= if ptr == r.multi.logits {
+                r.multi.capacity
             } else {
-                self.borrow_dependent().max_batch
+                r.max_batch
             },
             "Hy4 argmax batch capacity"
         );
-        (0..n)
-            .map(|i| self.argmax_on_device(ptr.offset(i * self.vocab_size() * 4), stream))
-            .collect()
+        if ptr != r.multi.logits || n == 1 {
+            return (0..n)
+                .map(|i| self.argmax_on_device(ptr.offset(i * self.vocab_size() * 4), stream))
+                .collect();
+        }
+        KernelLaunch::new(s.gpu.as_ref(), r.kernels[4])
+            .grid([n as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(ptr)
+            .arg_ptr(r.multi.post)
+            .arg_u32(self.vocab_size() as u32)
+            .arg_u32(n as u32)
+            .launch(stream)?;
+        s.gpu.synchronize(stream)?;
+        let mut bytes = vec![0u8; n * 4];
+        s.gpu.copy_d2h(r.multi.post, &mut bytes)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().expect("u32 chunk")))
+            .collect())
     }
     fn hidden_after_norm(&self) -> DevicePtr {
         let r = self.borrow_dependent();

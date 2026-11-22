@@ -18,7 +18,7 @@ pub(super) struct Workspace<'a> {
     collapsed: DevicePtr,
     pub normed: DevicePtr,
     output: DevicePtr,
-    post: DevicePtr,
+    pub post: DevicePtr,
     pub logits: DevicePtr,
 }
 impl<'a> Workspace<'a> {
