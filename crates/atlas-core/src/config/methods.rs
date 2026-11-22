@@ -447,6 +447,16 @@ impl ModelConfig {
         self.model_type == "inkling2_loop"
     }
 
+    /// Prompts shorter than this run their last chunk as one pass, without the
+    /// prefix cache's tail-checkpoint split (0: every prompt that crosses the
+    /// cut splits). Inkling 2's extra pass of up to 32 rows still reads nearly
+    /// every expert (about 0.1 s on one GB10), more than recomputing a prompt
+    /// this short on the next turn costs. Depends only on the prompt's length,
+    /// so a prompt runs in the same passes cold and warm.
+    pub fn tail_split_min_tokens(&self) -> usize {
+        if self.aux_prefix_state() { 512 } else { 0 }
+    }
+
     /// Whether a prefix-cache hit must restore a snapshot (SSM or aux state)
     /// rather than reuse KV alone.
     pub fn snapshot_prefix_state(&self) -> bool {

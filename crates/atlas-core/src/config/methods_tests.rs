@@ -42,6 +42,14 @@ fn aux_prefix_state_only_for_inkling2() {
 }
 
 #[test]
+fn only_inkling2_skips_the_tail_split_on_short_prompts() {
+    let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+    assert_eq!(config.tail_split_min_tokens(), 0);
+    config.model_type = "inkling2_loop".to_string();
+    assert_eq!(config.tail_split_min_tokens(), 512);
+}
+
+#[test]
 fn final_norm_identity_only_for_qwen4_exp() {
     let mut config = ModelConfig::qwen3_next_80b_nvfp4();
     assert!(!config.final_norm_is_identity());

@@ -64,6 +64,7 @@ impl TransformerModel {
         }
         if is_last_chunk
             && self.config.snapshot_prefix_state()
+            && total >= self.config.tail_split_min_tokens()
             && self.tail_split_snapshots()
             && self.prefix_cache.is_active()
             && self.pc_key(seq, tokens).is_some()
