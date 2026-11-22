@@ -126,6 +126,10 @@ pub async fn chat_completions(
         }
     };
 
+    if let Err(response) = super::completions_exec::validate_logit_bias(req.logit_bias.as_ref()) {
+        return *response;
+    }
+
     // Unknown reasoning_effort spellings 400 here — the raw string does
     // not survive wire→IR lowering, and a typo must never silently buy a
     // default tier (see `chat_request::validate_reasoning_effort`).

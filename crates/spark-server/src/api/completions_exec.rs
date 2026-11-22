@@ -18,6 +18,24 @@ use super::inference_impl::strip_stop_sequences;
 use super::inference_types::{InferenceRequest, RepetitionDetectionParams};
 use super::strip::strip_thinking_tags;
 
+pub(super) fn validate_logit_bias(
+    bias: Option<&std::collections::HashMap<String, f32>>,
+) -> Result<(), Box<Response>> {
+    if let Some(map) = bias {
+        for key in map.keys() {
+            if key.parse::<u32>().is_err() {
+                return Err(Box::new(super::compact::openai_error_response_with_param(
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid logit_bias token ID key '{key}': expected a u32"),
+                    Some("logit_bias"),
+                    None,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Sampling/request parameters resolved once by the handler and shared
 /// by every choice in the request.
 pub(super) struct CompletionParams {
@@ -262,3 +280,7 @@ mod spec_policy_tests;
 #[cfg(test)]
 #[path = "completions_stream_error_tests.rs"]
 mod stream_error_tests;
+
+#[cfg(test)]
+#[path = "logit_bias_tests.rs"]
+mod logit_bias_tests;

@@ -107,6 +107,9 @@ pub async fn completions(
             );
         }
     };
+    if let Err(response) = super::completions_exec::validate_logit_bias(req.logit_bias.as_ref()) {
+        return *response;
+    }
     if req.return_token_ids && req.stream {
         return openai_error_response(
             StatusCode::BAD_REQUEST,
