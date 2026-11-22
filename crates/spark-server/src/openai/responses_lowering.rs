@@ -58,7 +58,9 @@ pub fn lower_responses_to_chat(
         }
         serde_json::Value::Array(items) => {
             for it in items {
-                if let Some(m) = IncomingMessage::from_responses_input_item(it) {
+                if let Some(m) = IncomingMessage::from_responses_input_item(it)
+                    .map_err(LowerResponsesError::BadRequest)?
+                {
                     messages.push(m);
                 }
             }

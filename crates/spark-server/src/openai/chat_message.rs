@@ -147,10 +147,12 @@ impl IncomingMessage {
     }
 
     /// Translate a Responses-API `input` array item into a chat-completions
-    /// message. Returns `None` for items the adapter doesn't understand (they
-    /// are silently skipped so the request still runs).
-    pub fn from_responses_input_item(v: &serde_json::Value) -> Option<Self> {
-        let obj = v.as_object()?;
+    /// message. Returns `Ok(None)` for reasoning items and known items missing
+    /// required fields; rejects unknown types and non-object items.
+    pub fn from_responses_input_item(v: &serde_json::Value) -> Result<Option<Self>, String> {
+        let obj = v
+            .as_object()
+            .ok_or_else(|| "input items must be objects".to_string())?;
         let kind = obj
             .get("type")
             .and_then(|t| t.as_str())
@@ -167,15 +169,17 @@ impl IncomingMessage {
                     other => other,
                 }
                 .to_string();
-                let content_val = obj.get("content")?;
-                Some(Self {
+                let Some(content_val) = obj.get("content") else {
+                    return Ok(None);
+                };
+                Ok(Some(Self {
                     role,
                     content: ParsedContent::from_responses_content(content_val),
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
                     reasoning_content: None,
-                })
+                }))
             }
             // Replay of a prior assistant function_call in the input chain.
             // Surface as an `assistant`-role message carrying the
@@ -183,7 +187,10 @@ impl IncomingMessage {
             // and the model sees its own prior call when paired with
             // the matching function_call_output below.
             "function_call" => {
-                let name = obj.get("name").and_then(|v| v.as_str())?.to_string();
+                let Some(name) = obj.get("name").and_then(|v| v.as_str()) else {
+                    return Ok(None);
+                };
+                let name = name.to_string();
                 let arguments = obj
                     .get("arguments")
                     .and_then(|v| v.as_str())
@@ -195,7 +202,7 @@ impl IncomingMessage {
                     .or_else(|| obj.get("id").and_then(|v| v.as_str()))
                     .unwrap_or("")
                     .to_string();
-                Some(Self {
+                Ok(Some(Self {
                     role: "assistant".to_string(),
                     content: ParsedContent::default(),
                     tool_calls: Some(vec![crate::tool_parser::IncomingToolCall {
@@ -205,7 +212,7 @@ impl IncomingMessage {
                     tool_call_id: None,
                     name: None,
                     reasoning_content: None,
-                })
+                }))
             }
             // Tool-execution result the client sends back so the model
             // sees what its prior function_call returned. Without this
@@ -242,22 +249,22 @@ impl IncomingMessage {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                Some(Self {
+                Ok(Some(Self {
                     role: "tool".to_string(),
                     content: output,
                     tool_calls: None,
                     tool_call_id: Some(call_id),
                     name: if name.is_empty() { None } else { Some(name) },
                     reasoning_content: None,
-                })
+                }))
             }
             // Reasoning items (Responses-API `type:"reasoning"`) are
             // intentionally NOT re-fed to the model — OpenAI's spec
             // treats `reasoning.encrypted_content` as opaque and
             // re-feeding poisons the next turn with stale internal
             // thoughts. Drop silently.
-            "reasoning" => None,
-            _ => None,
+            "reasoning" => Ok(None),
+            other => Err(format!("unknown input item type '{other}'")),
         }
     }
 }

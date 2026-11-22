@@ -128,7 +128,9 @@ fn responses_api_carries_input_video() {
             {"type": "input_text", "text": "describe"}
         ]
     });
-    let m = IncomingMessage::from_responses_input_item(&item).expect("message item");
+    let m = IncomingMessage::from_responses_input_item(&item)
+        .expect("valid item")
+        .expect("message item");
     assert_eq!(
         media(&m.content),
         vec![(MediaKind::Video, "data:image/gif;base64,RRR")]
@@ -143,7 +145,9 @@ fn responses_api_accepts_the_flat_video_url_string() {
         "role": "user",
         "content": [{"type": "video_url", "video_url": "data:image/gif;base64,SSS"}]
     });
-    let m = IncomingMessage::from_responses_input_item(&item).expect("message item");
+    let m = IncomingMessage::from_responses_input_item(&item)
+        .expect("valid item")
+        .expect("message item");
     assert_eq!(
         media(&m.content),
         vec![(MediaKind::Video, "data:image/gif;base64,SSS")]
@@ -162,7 +166,9 @@ fn responses_api_preserves_media_order() {
             {"type": "input_image", "image_url": "iii"},
         ]
     });
-    let m = IncomingMessage::from_responses_input_item(&item).expect("message item");
+    let m = IncomingMessage::from_responses_input_item(&item)
+        .expect("valid item")
+        .expect("message item");
     assert_eq!(
         media(&m.content),
         vec![(MediaKind::Video, "vvv"), (MediaKind::Image, "iii")]
