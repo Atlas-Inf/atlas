@@ -6,8 +6,8 @@ commands, and the invariants that matter.
 
 ## What Atlas is
 
-Atlas is an AGPL-3.0 inference stack targeting NVIDIA GB10 / DGX Spark. The
-moving parts:
+Atlas is an AGPL-3.0 inference stack targeting NVIDIA GB10 / DGX Spark and
+AMD Strix Halo (HIP), with an experimental Apple Metal backend. The moving parts:
 
 - **`crates/spark-server/`** — OpenAI-compatible HTTP server, request
   scheduling, tool-call parsing, streaming.
@@ -16,9 +16,9 @@ moving parts:
   `src/factory.rs`.
 - **`crates/spark-runtime/`** — GPU backend, KV cache, kernel dispatch,
   process-group comms.
-- **`crates/atlas-kernels/`** — Rust glue over compiled PTX (one artefact
+- **`crates/atlas-kernels/`** — Rust glue over compiled GPU kernels (one artefact
   per `(hw, model, quant)` target).
-- **`kernels/<hw>/<model>/<quant>/`** — CUDA kernels + `MODEL.toml`
+- **`kernels/<hw>/<model>/<quant>/`** — hardware-specific kernels; per-model `MODEL.toml`
   (sampling, behaviour defaults, kernel target registration).
 - **`crates/atlas-*`** — smaller shared primitives (quant, gemm, ssm, norm,
   attention, reduce, activation, embed).
@@ -36,8 +36,8 @@ Architecture decision records live in `docs/adr/`; the benchmark journey in
   confirming compatibility. `deny.toml` controls what dependency licenses
   are allowed.
 - **Don't regress on models already in the support matrix** — Qwen3/Qwen3.5/
-  Qwen3.6/Qwen3-Next/Qwen3-VL, Nemotron-3, Mistral-Small-4, Gemma-4, MiniMax-M2.7.
-  The complete, current model×quant matrix (the SSOT for what's supported) is
+  Qwen3.6/Qwen3.8/Qwen3-Next/Qwen3-VL, Nemotron-3, Mistral-Small-4, Gemma-4, MiniMax-M2.7.
+  A GB10 model×quant selection guide is
   [`docs/GB10_DEPLOYMENT_GUIDE.md`](docs/GB10_DEPLOYMENT_GUIDE.md) §2; the
   per-model kernel registry is `kernels/gb10/<model>/MODEL.toml`.
 
@@ -61,7 +61,7 @@ bash scripts/check-license-headers.sh
 typos  # crate-ci/typos — install once, `cargo install typos-cli`
 ```
 
-A real build + test cycle requires a CUDA-capable host; see
+A real GPU build + test cycle requires the matching hardware and toolchain; see
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## The MLPerf ST leg IS the Atlas bfcl-subset ST leg (62/10/10)
@@ -121,12 +121,15 @@ Concrete recent examples worth reading:
 ## The kernel target system
 
 Three dimensions: **hardware** × **model** × **quantization**. At build
-time, `atlas-kernels/build.rs` enumerates the `ATLAS_TARGET_*` env vars
-(with `*` meaning "all matching") and produces one PTX artefact per
+time, `crates/atlas-kernels/build.rs` enumerates the `ATLAS_TARGET_*` env vars
+(with `*` meaning "all matching") and produces one kernel artefact per
 target. Runtime selects the correct target based on the model's
 `model_type` and loaded config.
 
-- `ATLAS_TARGET_HW=gb10` — currently the only implemented hardware.
+- `ATLAS_TARGET_HW=gb10` — NVIDIA CUDA/PTX. `ATLAS_TARGET_HW=strix-hip`
+  selects AMD Strix Halo HIP (`kernels/strix-hip/`).
+- `ATLAS_TARGET_HW=metal` — experimental Apple Metal (`kernels/metal/`);
+  Rust runtime support is gated by the `metal` feature (without default CUDA).
 - `ATLAS_TARGET_MODEL=*` / `ATLAS_TARGET_QUANT=*` — wildcard compiles all.
 - `ATLAS_SKIP_BUILD=1` — emits a stub so clippy/fmt can run without nvcc.
 

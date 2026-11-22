@@ -31,7 +31,7 @@ recipe wins.** This guide is the *why*; the recipe is the exact *what*.
 | CPU arch | aarch64 |
 | **Min driver** | **580** (CUDA 13.0). The engine embeds PTX and re-JITs to your SM at launch — no `nvcc` at runtime, but the driver floor is hard. |
 | Multi-node | 2× DGX Spark over RoCEv2 (`enp1s0f0np0`) for EP=2 |
-| Image | `azeezish/atlas-gb10:latest` — one **multi-model** binary; the right kernel set is auto-selected at startup from the model's `config.json` |
+| Image | `ghcr.io/atlas-inf/atlas-gb10:latest` — one **multi-model** binary; the right kernel set is auto-selected at startup from the model's `config.json` |
 
 **Prerequisites**, in order:
 1. NVIDIA driver ≥ 580 — verify: `nvidia-smi` shows CUDA 13.0+. (There is no
@@ -50,7 +50,10 @@ recipe wins.** This guide is the *why*; the recipe is the exact *what*.
 
 ## 2. Model × quant compatibility matrix
 
-Every model below runs on the **same** `azeezish/atlas-gb10:latest` image. "Quant"
+Models share the **multi-model** `ghcr.io/atlas-inf/atlas-gb10` image. Follow each
+recipe's tag: some use `:latest`, others pin `:sha-<7>` (the default flagship
+currently pins `:sha-457df04`). Main builds publish immutable SHA tags;
+`:latest` promotion is separate (see `.github/workflows/image.yml`). "Quant"
 is the **weight** format of the HuggingFace checkpoint you point `serve` at; the
 nvfp4 kernel bundle carries native FP8 and BF16 paths too, so an FP8 checkpoint
 serves correctly on the same image (runtime gate:
@@ -60,11 +63,21 @@ serves correctly on the same image (runtime gate:
 catalogue — a feel, not a benchmark. "Ctx" is a **practical** single-Spark ceiling
 at conc=1; it trades against batch size and KV dtype (see §4).
 
+¹ Qwen3.8-27B has two measured figures, taken under different conditions, so
+neither replaces the other. **23.59** is the single-stream figure the default
+`qwen3.8-27b-nvfp4` recipe quotes, from the C=1 rung of the 2026-08-17 vLLM
+comparison in `qwen3.8-27b-nvfp4-concurrency` (ISL 128 / OSL 1024, temp 0,
+FP8 KV, thinking off, MTP K=4). **26.3** is the median server decode rate from the
+decode-floor PR gate (3 runs, one pinned code prompt, `max_tokens = 1500`,
+`reasoning_effort: "none"`), served by the `qwen3.8-27b-nvfp4-agentic` profile
+(BF16 KV + head) at `f3f700ac`, single GB10, 2026-11-12.
+
 ### Single-node (fits one GB10)
 
 | Model | HuggingFace id | Params (total/active) | Weight quant | Architecture | ~tok/s | Practical ctx | Notes |
 |-------|----------------|----------------------|--------------|--------------|--------|---------------|-------|
-| **Qwen3.6-35B-A3B** ⭐ | `Qwen/Qwen3.6-35B-A3B-FP8` | 35B / 3B | FP8 | hybrid SSM (GDN) + attn + MoE | ~157 (nvfp4) | **64K** | **Daily-driver / agentic coding.** MTP K=2, DFlash drafter `z-lab/…-DFlash`, live tool-call streaming |
+| **Qwen3.8-27B** ⭐ | `nvidia/Qwen3.8-27B-NVFP4` | 27B dense | NVFP4 (mixed) | hybrid GDN + attn + dense FFN | ~23.59 (default) / 26.3 (agentic, gate)¹ | 32K recipe window | **Default flagship.** MTP K=4, FP8 KV; agentic profile uses BF16 KV + head. Quality above ~24K is uncharacterized in the agentic recipe |
+| **Qwen3.6-35B-A3B** | `Qwen/Qwen3.6-35B-A3B-FP8` | 35B / 3B | FP8 | hybrid SSM (GDN) + attn + MoE | ~157 (nvfp4) | **64K** | MTP K=2, DFlash drafter `z-lab/…-DFlash`, live tool-call streaming |
 | **Qwen3.6-27B** | `Qwen/Qwen3.6-27B-FP8` | 27B dense | FP8 | hybrid attn + GDN + dense FFN | ~15 | 24K | Dense reasoning; MTP off; DFlash `z-lab/Qwen3.6-27B-DFlash` |
 | **Qwen3.6-27B** (NVFP4) | `nvidia/Qwen3.6-27B-NVFP4` | 27B dense | NVFP4 (mixed) | hybrid attn + GDN + dense FFN | ~14 | 24K | Dense; MTP off; ModelOpt mixed FP8-attn/NVFP4-MLP, requants at load. Avoid `unsloth/Qwen3.6-27B-NVFP4` on current HF main (2026-07-10 re-upload broke the layout, see #327; old pin `890bdef7` still works) |
 | **Qwen3.5-35B-A3B** | `Sehyo/Qwen3.5-35B-A3B-NVFP4` | 35B / 3B | NVFP4 | hybrid GDN + attn + MoE | ~131 | 24K | MTP K=2. (⚠️ HF-id drift — see below) |
@@ -89,7 +102,7 @@ at conc=1; it trades against batch size and KV dtype (see §4).
 
 **"registry-only"** = the kernels are in the multi-model image and it serves fine,
 but there's no turnkey per-model `docker/gb10/<m>/` Dockerfile — run it against
-`azeezish/atlas-gb10:latest` with the recipe flags.
+`ghcr.io/atlas-inf/atlas-gb10` with the recipe's tag and flags.
 
 **⚠️ SSOT drifts to be aware of** (registry `MODEL.toml` vs the deployable recipe
 id; tracked for reconciliation — the recipe id is what to pull):
@@ -109,7 +122,8 @@ id; tracked for reconciliation — the recipe id is what to pull):
 
 **"Practical ctx"** is a conc=1 comfort ceiling — deliberately different from
 [`QUICKSTART.md`](../QUICKSTART.md)'s conservative maxima and from the higher
-`--max-seq-len` some recipes set (the flagship pushes 64K). Gauge headroom with it;
+`--max-seq-len` some recipes set. The Qwen3.8 flagship recipe sets 32K, not a
+verified quality ceiling. Gauge headroom with it;
 launch with the recipe's `max_model_len`; trade context against batch/KV via §4.
 
 ---
@@ -118,7 +132,7 @@ launch with the recipe's `max_model_len`; trade context against batch/KV via §4
 
 | Your goal | Start with | Why |
 |-----------|-----------|-----|
-| **Agentic coding, tool use, daily driver** | `Qwen3.6-35B-A3B-FP8` | 64K ctx, MTP K=2, live tool-call streaming, `qwen3_coder` parser — the tuned flagship |
+| **Agentic coding, tool use, daily driver** | `nvidia/Qwen3.8-27B-NVFP4` | Default flagship: `@atlas/qwen3.8-27b-nvfp4`; use `@atlas/qwen3.8-27b-nvfp4-agentic` for thinking-on, BF16 KV + head, MTP K=4. Its 32K gate window is not a long-context quality guarantee |
 | **Max single-stream throughput** | `Qwen3.6-35B-A3B` (nvfp4, ~157) or `Qwen3.5-35B-A3B-NVFP4` (~131) | NVFP4 weights hit GB10's native FP4 MMA; MTP amplifies |
 | **Vision / image input** | `Qwen3-VL-30B-A3B-Instruct-NVFP4` | The vision model; ~97 tok/s |
 | **Biggest quality you can host** | `Qwen3.5-122B-A10B-NVFP4` on **EP=2** (2 Sparks) | 122B/10B across two nodes, ~51 tok/s |
@@ -137,7 +151,7 @@ the recipe defaults encode gate-passing choices.
 | Weight quant | What it is | Choose when |
 |--------------|-----------|-------------|
 | **NVFP4** | 4-bit (E2M1) weights + FP8 block scales; native GB10 FP4 MMA | Default. Fastest decode; smallest weights. Most models ship NVFP4. |
-| **FP8** | 8-bit weights, native on GB10 | Higher-precision path; the `qwen3.6` flagship line. Slightly larger, very stable. |
+| **FP8** | 8-bit weights, native on GB10 | Higher-precision path, e.g. `Qwen/Qwen3.6-35B-A3B-FP8`. |
 | **NVFP4A16** | 4-bit weights, **16-bit activations** | Only where the checkpoint ships it (Gemma-4-26B). Higher activation precision, a touch slower. |
 | **BF16** | reference | Rarely — largest footprint; a numeric reference, not a deployment target. |
 
@@ -147,13 +161,13 @@ checkpoint** you point `serve` at (the id in §2). The image serves all three.
 ### KV-cache dtype — `--kv-cache-dtype` (independent of weight quant)
 KV precision trades context length / batch against fidelity. The six you will
 actually reach for are below; `KvCacheDtype` accepts **16** values in total —
-these plus `turbo2` and nine asymmetric K/V pairings (`bf16k_turbo3v`,
+these plus `turbo2`, `fp8_g128` and eight asymmetric K/V pairings (`bf16k_turbo3v`,
 `fp8k_turbo4v`, …) documented in [`turboquant-plus.md`](turboquant-plus.md).
 
 | `--kv-cache-dtype` | Bits/elem | Notes |
 |--------------------|-----------|-------|
 | `bf16` | 16 | Reference precision; most KV memory. Bring-up default for new models. |
-| `fp8` | 8 | The workhorse. Pair with `--kv-high-precision-layers auto` to keep the sensitive layers in bf16. Flagship uses this at 64K. |
+| `fp8` | 8 | The workhorse. Pair with `--kv-high-precision-layers auto` to keep the sensitive layers in bf16. Default Qwen3.8 flagship uses FP8 at 32K; its agentic profile uses BF16. |
 | `turbo8` | 8 | FP8 variant with a different scale layout. |
 | `nvfp4` | 4 | Half the memory of fp8 — the throughput recipes (35B) use this. |
 | `turbo4` / `turbo3` | 4 / ~3 | Aggressive low-bit KV; most context per GB, most fidelity risk. |
@@ -196,7 +210,7 @@ The gotchas that cost people an evening, in one place:
    path:
    ```bash
    hf download Sehyo/Qwen3.5-35B-A3B-NVFP4 --local-dir /models/qwen3.5-35b
-   docker run ... -v /models/qwen3.5-35b:/model azeezish/atlas-gb10:latest \
+   docker run ... -v /models/qwen3.5-35b:/model ghcr.io/atlas-inf/atlas-gb10:latest \
      serve --model-from-path /model --speculative --num-drafts 1
    ```
 2. **High-speed swap silently does nothing / permission errors.** `io_uring`
@@ -212,8 +226,8 @@ The gotchas that cost people an evening, in one place:
    (CUDA 13.0) and is built against glibc 2.39 (Ubuntu 24.04). Older distro →
    use the Docker image. There is no bypass env var; `ATLAS_SKIP_DRIVER_CHECK`
    is not read anywhere and setting it does nothing.
-5. **First request hangs for 5–30 s.** That's cold-start CUDA-graph capture +
-   autotuner + prefix-cache init, not a hang. Eliminate it with `--warmup-prompt`.
+5. **Cold first request.** Use `--warmup-prompt /path/to/prompt.txt` (plain text
+   or JSON messages) to prefill the prompt and seed the prefix cache at startup.
 6. **Garbage / incoherent output.** Two usual causes: (a) **tool-parser mismatch** —
    the parser must match the model (`qwen3_coder` for Qwen3.5/3.6, `hermes` for
    some, `gemma4` for Gemma-4); pass `--tool-call-parser` explicitly in production
@@ -246,16 +260,18 @@ Logs go to stdout (`docker logs <container>`); `RUST_LOG` controls verbosity
 Sparks, one OpenAI endpoint on rank 0. Launch via the canonical launcher:
 
 ```bash
+IMAGE=ghcr.io/atlas-inf/atlas-gb10:latest \
 HEAD_IP=10.10.10.1 WORKER_IP=10.10.10.2 \
   bash scripts/start-ep2.sh Sehyo/Qwen3.5-122B-A10B-NVFP4
 ```
 
 What it sets (and you must replicate if you hand-roll `docker run`s):
-- `NCCL_SOCKET_IFNAME=enp1s0f0np0` — the GB10 RoCE NIC. **Change this for
+- `NCCL_SOCKET_IFNAME` — selects `enp1s0f0np0` if it has IPv4, otherwise
+  `enp1s0f1np1`. **Change this for
   non-DGX-Spark hardware** or NCCL binds the wrong interface and hangs.
 - `NCCL_NVLS_ENABLE=0` (no NVLink), `NCCL_NET_GDR_LEVEL=0` / `NCCL_NET_GDR_C2C=0` /
   `NCCL_DMABUF_ENABLE=0` (GB10 has no GDS), `NCCL_PROTO=Simple`, `NCCL_ALGO=Ring`.
-- Rank 0 → `HEAD_IP:8888`, rank 1 → `WORKER_IP:8889`, both `--master-addr HEAD_IP
+- Rank 0 → `HEAD_IP:8888`, rank 1 uses `--port 0` (worker only), both `--master-addr HEAD_IP
   --master-port 29500`.
 
 Failure modes:
@@ -264,8 +280,8 @@ Failure modes:
 | Boot hangs at "waiting for worker" | Passwordless SSH between nodes not set up, or worker container never started. Check `docker logs` on **both** ranks. |
 | NCCL init timeout / `unhandled system error` | `NCCL_SOCKET_IFNAME` wrong for your NIC, or the RoCE fabric down (`ibstat`, `ip link`). Confirm both nodes see `10.10.10.x`. |
 | SSM intermediate-buffer / verify-layer error | Spec-decode flag asymmetry between ranks — see Known Issue #3. |
-| Rank 1 serves nothing on 8889 | Expected — the API is served **only** from rank 0. Point clients at `HEAD_IP:8888`. |
-| Port already in use | A stale container/`spark serve` on 8888/8889/29500. `docker ps`, stop it, retry. |
+| Rank 1 serves no API | Expected — the API is served **only** from rank 0. Point clients at `HEAD_IP:8888`. |
+| Port already in use | A stale container/`spark serve` on 8888/29500. `docker ps`, stop it, retry. |
 
 Topology quick pick: **EP=2** (`--ep-size 2 --tp-size 1`) for MoE expert sharding
 across two nodes — this is what the 122B and MiniMax-M2.7 recipes use. **TP+EP**
@@ -278,23 +294,23 @@ multiplying TP and EP unconditionally. The 397B needs **EP=4** (4 nodes).
 
 ## 8. What "verified" means (so you can trust an image)
 
-An Atlas image is only cut after it passes the **serve matrix** — every model×quant
-in §2 boots, stays coherent, and holds four quality signals. If you're evaluating
-Atlas or reproducing a claim, these are the signals and where they live:
+Main builds publish SHA-tagged images without running GPU quality gates;
+`:latest` is promoted separately after hardware verification
+(`.github/workflows/image.yml`). Do not treat a published SHA tag as proof that
+every model in §2 passed. If you're evaluating Atlas or reproducing a claim,
+these are the signals and where they live:
 
 | Signal | What it proves | How it's checked |
 |--------|----------------|------------------|
 | **Coherence** | No CJK/tag leakage, greedy determinism, tool reliability ≥8/10, valid streaming | `scripts/test_coherence.py`, `scripts/dev/coherence_test.py` |
 | **Agentic** | Real multi-turn tool loops build & pass unit tests | `scripts/dev/agentic_test.py`, `scripts/test_multiturn_agentic.py` |
 | **KL-divergence** | Logits stay faithful to a BF16 reference (argmax agreement, KL nats) | `bench/fp8_dgx2_drift/` + the `/coherence-parity` skill |
-| **ST-subset accuracy** | Tool-calling accuracy on a BFCL single-turn subset | external gorilla / `spark-arena` harness (see note) |
+| **ST-subset accuracy** | Tool-calling accuracy on a BFCL single-turn subset | `spark benchmark run bfcl-subset --url <endpoint> --model <checkpoint>` |
 
 The full gate spec — exactly what each script asserts, and how the release
-pipeline turns it into a pass/fail before an image ships — is in the maintainer
-`atlas-release` skill (`references/verify-matrix.md`). *Note:* the ST-subset /
-BFCL accuracy harness currently runs outside this repo; reproducing that specific
-number needs the external gorilla setup. Everything else in the table runs from a
-clean checkout against a running server.
+process uses it — is in the maintainer
+`atlas-release` skill (`references/verify-matrix.md`). The BFCL subset runner is
+in-tree; use the matching recipe and benchmark config to reproduce a score.
 
 ---
 
