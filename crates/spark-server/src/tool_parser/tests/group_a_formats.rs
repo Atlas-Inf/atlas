@@ -153,6 +153,22 @@ fn parse_qwen3_coder_empty_body_then_backfill() {
 }
 
 #[test]
+fn parse_qwen3_coder_missing_function_delimiter() {
+    for separator in ["\n", ""] {
+        let input = format!(
+            "<tool_call><function=get_weather{separator}<parameter=city>Paris</parameter>\n\
+             <parameter=unit>c</parameter></function></tool_call>"
+        );
+        let (c, calls) = parse_tool_calls(&input);
+        assert!(c.is_none());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, serde_json::json!({"city": "Paris", "unit": "c"}));
+    }
+}
+
+#[test]
 fn parse_qwen3_coder_single_param() {
     let input = "<tool_call>\n\
             <function=get_weather>\n\

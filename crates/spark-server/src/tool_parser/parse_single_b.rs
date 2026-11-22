@@ -32,11 +32,7 @@ pub(super) fn parse_qwen3_coder_call(text: &str, _idx: u32) -> Option<ToolCall> 
     }
 
     let mut args = serde_json::Map::new();
-    let after_name = if name_end < text.len() {
-        &text[name_end + 1..]
-    } else {
-        ""
-    };
+    let after_name = text[name_end..].trim_start_matches(['>', '\n']);
     let mut rest = after_name;
 
     while let Some(p) = rest.find("<parameter=") {
