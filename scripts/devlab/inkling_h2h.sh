@@ -64,6 +64,15 @@ for e in "$@"; do
       SHIM_DIR=$(ls -dt target/release/build/atlas-kernels-*/out 2>/dev/null | while read -r d; do [ -f "$d/libcuda.so" ] && { echo "$d"; break; }; done)
       LD_LIBRARY_PATH="$SHIM_DIR:/opt/rocm/lib" target/release/spark benchmark run bfcl-subset --url http://127.0.0.1:$PORT --model main --yes --format json --quiet --no-fail-on-verdict > "$OUT/ciru-bfcl.json" 2> "$OUT/ciru-bfcl.stderr" || log "ciru bfcl rc!=0: $(tail -2 "$OUT/ciru-bfcl.stderr" | tr '\n' ' ')"
       python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('RESULT ciru', d.get('benchmark_id'), d.get('run_id'), [(s['label'], s['value']) for s in d['frame']['summary']])" "$OUT/ciru-bfcl.json" 2>&1 | tail -1 | tee -a "$RES"
+      python3 - "$OUT/ciru-bfcl.json" > "$OUT/rescore.sh" <<'PY2'
+import json, re, sys
+r = (json.load(open(sys.argv[1]))["frame"].get("verdict") or {}).get("reason", "")
+m = re.search(r"rescored: (\S+/python) (\S+/score\.py) --dataset (\S+) --responses (\S+) failed", r)
+if m:
+    py, sc, ds, rs = m.groups()
+    print(f'"{py}" -m pip install -q soundfile && cp "{rs}" "$OUT/ciru-bfcl-responses.jsonl" && "{py}" "{sc}" --dataset "{ds}" --responses "{rs}"')
+PY2
+      if [ -s "$OUT/rescore.sh" ]; then log "ciru bfcl rescoring"; OUT=$OUT bash "$OUT/rescore.sh" > "$OUT/rescore.out" 2>&1; log "rescore rc=$?"; tail -3 "$OUT/rescore.out" | cut -c1-600 | tee -a "$RES"; fi
       ENGINE_DOWN "$OUT/serve-$e.log"
     else legs "$e"; fi ;;
   llamacpp|llamacpp-agentic)
