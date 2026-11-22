@@ -29,7 +29,7 @@ cmd=(docker run --detach --name "atlas-hy4-r$rank" --restart=no
     "$image" serve /model --kernel-target=hy4-flash
     --world-size=2 --tp-size=2 --ep-size=2 "--rank=$rank"
     --master-addr=192.168.200.1 --master-port=29611 --gpu-ordinal=0
-    --max-seq-len=4096 --max-prefill-tokens=128
+    --max-seq-len="${HY4_MAX_SEQ_LEN:-4096}" --max-prefill-tokens="${HY4_MAX_PREFILL_TOKENS:-128}"
     --max-batch-size=1 --max-num-seqs=1 --block-size=16
     --kv-cache-dtype=bf16 --attn-proj-dtype=bf16 --lm-head-dtype=default
     --gpu-memory-utilization=0.88 --oom-guard-mb=12288

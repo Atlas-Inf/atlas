@@ -239,7 +239,12 @@ impl Runtime<'_> {
                     }
                 }
                 drop(row_span);
-                gpu.synchronize(stream)?;
+                // BATCH chunks produce no logits and the host never reads GPU
+                // state mid-prompt, so they must not drain the pipeline; only
+                // LAST/VERIFY need the sync (logits readback / draft capture).
+                if mode != BATCH {
+                    gpu.synchronize(stream)?;
+                }
                 if let Some(timer) = timer {
                     timer.finish()?;
                 }
