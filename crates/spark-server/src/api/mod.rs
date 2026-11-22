@@ -104,3 +104,5 @@ pub use stubs::{
 mod refusal_content_tests;
 #[cfg(test)]
 mod responses_incomplete_tests;
+#[cfg(test)]
+mod responses_instructions_tests;

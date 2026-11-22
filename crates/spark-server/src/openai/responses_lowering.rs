@@ -47,9 +47,8 @@ pub fn lower_responses_to_chat(
 
     if let Some(instr) = r.instructions.clone() {
         // Per the Responses spec, `instructions` becomes a synthetic
-        // system message at position 0. No scanning, no dropping of
-        // prior synthetic-system messages — the resumed transcript is
-        // attached verbatim.
+        // system message at position 0. The handler excludes this
+        // request-scoped message from the persisted transcript.
         messages.insert(0, IncomingMessage::synthetic_system(instr));
     }
     match &r.input {

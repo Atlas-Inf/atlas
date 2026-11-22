@@ -2,28 +2,21 @@
 //! Conversation-linked user-item capture for `responses_endpoint_stream`
 //! (extracted; identical content).
 
-use super::*;
 use crate::openai::IncomingMessage;
 
 /// Capture the conversation-linked user items (the new turn's user input)
 /// before `chat_req` is handed off. Used to append back to the
 /// conversation after the stream finishes.
 pub(super) fn conv_new_user_items(
-    state_arc: &Arc<AppState>,
-    conversation_id: Option<&String>,
+    conversation_prefix_len: Option<usize>,
     input_messages: &[IncomingMessage],
 ) -> Vec<serde_json::Value> {
-    let Some(cid) = conversation_id else {
+    let Some(prefix_len) = conversation_prefix_len else {
         return Vec::new();
     };
-    let prior = state_arc
-        .conversation_store
-        .get(cid)
-        .map(|s| s.items.len())
-        .unwrap_or(0);
     input_messages
         .iter()
-        .skip(prior)
+        .skip(prefix_len)
         .map(|m| {
             serde_json::json!({
                 "type": "message",

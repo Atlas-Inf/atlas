@@ -89,7 +89,11 @@ pub(super) async fn translate_chat_response_to_responses(
     store: Option<Arc<crate::response_store::ResponseStore>>,
     input_messages: Vec<crate::openai::IncomingMessage>,
     store_flag: bool,
-    conversation: Option<(Arc<crate::conversation_store::ConversationStore>, String)>,
+    conversation: Option<(
+        Arc<crate::conversation_store::ConversationStore>,
+        String,
+        usize,
+    )>,
 ) -> Response {
     let chat = match outcome {
         super::chat::ChatOutcome::Http(r) => return input_param(r).await,
@@ -206,11 +210,10 @@ pub(super) async fn translate_chat_response_to_responses(
     }
 
     // Conversation append: new user items + assistant reply.
-    if let Some((conv_store, conv_id)) = conversation {
-        let prior = conv_store.get(&conv_id).map(|s| s.items.len()).unwrap_or(0);
+    if let Some((conv_store, conv_id, prefix_len)) = conversation {
         let mut batch: Vec<serde_json::Value> = input_messages
             .iter()
-            .skip(prior)
+            .skip(prefix_len)
             .map(|m| {
                 serde_json::json!({
                     "type": "message",
