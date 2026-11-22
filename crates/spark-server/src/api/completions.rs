@@ -146,6 +146,16 @@ pub async fn completions(
             format!("temperature must be between 0 and 2, got {t}"),
         );
     }
+    if let Some(p) = req.top_p
+        && (p <= 0.0 || p > 1.0)
+    {
+        return openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            "top_p must be between 0 (exclusive) and 1".into(),
+            Some("top_p"),
+            None,
+        );
+    }
     if let Some(pp) = req.presence_penalty
         && !(-2.0..=2.0).contains(&pp)
     {

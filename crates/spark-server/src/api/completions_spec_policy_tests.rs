@@ -250,3 +250,77 @@ async fn completion_stream_omits_logprobs_unless_requested() {
         .collect();
     assert_eq!(texts, ["prompt", "answer", "secret"]);
 }
+
+#[tokio::test]
+async fn completion_with_top_p(top_p: Option<f32>, stream: bool) -> (Response, Option<f32>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let state = Arc::new(AppState {
+        request_tx: tx,
+        default_top_p: 0.75,
+        ..crate::api::test_app_state::app_state(tokenizer())
+    });
+    let mut body = json!({"model": "fixture", "prompt": [1], "max_tokens": 1, "stream": stream});
+    if let Some(p) = top_p {
+        body["top_p"] = json!(p);
+    }
+    let scheduler = tokio::spawn(async move {
+        match rx.recv().await? {
+            InferenceRequest::Blocking {
+                top_p, response_tx, ..
+            } => {
+                let result = response_tx.send(Ok(InferenceResponse {
+                    output_tokens: vec![1],
+                    finish_reason: "length".into(),
+                    time_to_first_token_ms: 0.0,
+                    decode_time_ms: 0.0,
+                    logprobs: vec![],
+                    reasoning_tokens: 0,
+                    cached_prompt_tokens: 0,
+                    accepted_prediction_tokens: 0,
+                    prompt_logprobs: vec![],
+                    guard_stop: None,
+                }));
+                assert!(result.is_ok());
+                Some(top_p)
+            }
+            InferenceRequest::Streaming { top_p, .. } => Some(top_p),
+        }
+    });
+    let req = serde_json::from_value(body).unwrap();
+    let response =
+        crate::api::completions::completions(CurrentModel(state), Ok(axum::Json(req))).await;
+    (response, scheduler.await.unwrap())
+}
+
+#[tokio::test]
+async fn completion_top_p_rejects_out_of_range_before_dispatch() {
+    for stream in [true, false] {
+        for top_p in [-0.1, 0.0, 1.1] {
+            let (response, dispatched) = completion_with_top_p(Some(top_p), stream).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "top_p={top_p}, stream={stream}, dispatched={dispatched:?}"
+            );
+            assert_eq!(dispatched, None);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert_eq!(body["error"]["param"], "top_p");
+            assert!(body["error"]["message"].as_str().unwrap().contains("top_p"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn completion_top_p_accepts_valid_values_and_server_default() {
+    for stream in [false, true] {
+        for top_p in [Some(f32::MIN_POSITIVE), Some(0.5), Some(1.0), None] {
+            let (response, dispatched) = completion_with_top_p(top_p, stream).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(dispatched, Some(top_p.unwrap_or(0.75)));
+        }
+    }
+}
