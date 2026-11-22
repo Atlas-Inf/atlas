@@ -159,7 +159,13 @@ pub(crate) fn prefill_attn(
     );
     let q_len = u32_of(a.q_len, "q_len")?;
     let kv_heads = u32_of(a.kv_heads, "kv heads")?;
-    if a.q_len >= FLASH_MIN_ROWS && a.heads == FLASH_GROUP * a.kv_heads && a.d_rel == FLASH_D_REL {
+    // AMD (strix-hip): `inkling2_flash_prefill` is mma.sync / cp.async PTX and builds as a
+    // stub there; every row count takes the per-head body below.
+    if !cfg!(atlas_scale)
+        && a.q_len >= FLASH_MIN_ROWS
+        && a.heads == FLASH_GROUP * a.kv_heads
+        && a.d_rel == FLASH_D_REL
+    {
         // a prefill chunk: one CTA per (KV head, 64 tokens) shares each K/V tile
         // with the group's query heads, computing the bias where it adds it
         return KernelLaunch::new(gpu, k.flash_prefill)
@@ -181,6 +187,33 @@ pub(crate) fn prefill_attn(
             .arg_u32(u32_of(a.sliding_window, "window")?)
             .arg_u32(extent)
             .arg_f32((a.head_dim as f32).powf(-0.5))
+            .launch(stream);
+    }
+    if cfg!(atlas_scale) {
+        // AMD: the bias is computed inside the prefill body (no table); 16 coefficients a head.
+        ensure!(a.d_rel == 16, "inkling2 AMD prefill attention takes d_rel 16, not {}", a.d_rel);
+        return KernelLaunch::new(gpu, k.prefill_attn)
+            .grid([heads, q_len.div_ceil(32), 1])
+            .block([128, 1, 1])
+            .arg_ptr(a.q)
+            .arg_ptr(a.k_cache)
+            .arg_ptr(a.v_cache)
+            .arg_ptr(a.out)
+            .arg_ptr(a.block_table)
+            .arg_u32(q_len)
+            .arg_u32(u32_of(a.q_offset + a.q_len, "kv_len")?)
+            .arg_u32(u32_of(a.q_offset, "q_offset")?)
+            .arg_u32(heads)
+            .arg_u32(kv_heads)
+            .arg_u32(u32_of(a.head_dim, "head dim")?)
+            .arg_u32(u32_of(a.block_size, "block size")?)
+            .arg_u32(u32_of(a.sliding_window, "window")?)
+            .arg_u32(1)
+            .arg_f32((a.head_dim as f32).powf(-0.5))
+            .arg_ptr(a.sinks)
+            .arg_ptr(a.rel)
+            .arg_u32(extent)
+            .arg_ptr(a.rel_proj_t)
             .launch(stream);
     }
     KernelLaunch::new(gpu, k.rel_bias_table)
