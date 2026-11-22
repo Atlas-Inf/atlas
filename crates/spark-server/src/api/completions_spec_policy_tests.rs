@@ -251,7 +251,6 @@ async fn completion_stream_omits_logprobs_unless_requested() {
     assert_eq!(texts, ["prompt", "answer", "secret"]);
 }
 
-#[tokio::test]
 async fn completion_with_top_p(top_p: Option<f32>, stream: bool) -> (Response, Option<f32>) {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let state = Arc::new(AppState {
@@ -325,6 +324,7 @@ async fn completion_top_p_accepts_valid_values_and_server_default() {
     }
 }
 
+#[tokio::test]
 async fn unrepresentable_timeout_duration_is_rejected_before_dispatch() {
     assert_timeout_rejected(1e30).await;
 }
@@ -379,5 +379,3 @@ async fn assert_timeout_rejected(timeout: f64) {
         }
     }
 }
-
-#[tokio::test]
