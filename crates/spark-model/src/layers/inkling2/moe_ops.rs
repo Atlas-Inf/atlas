@@ -217,6 +217,12 @@ fn moe_prefill_bf16(
 ) -> Result<()> {
     let e = a.experts;
     e.ensure_aligned(4)?;
+    ensure!(
+        a.hidden.is_multiple_of(64) && a.inter.is_multiple_of(64),
+        "inkling2 AMD expert GEMM steps K by 64 (hidden {}, inter {})",
+        a.hidden,
+        a.inter
+    );
     let te = a.rows * a.top_k;
     let (ne, h, i) = (
         u32_of(a.num_experts, "experts")?,

@@ -14,7 +14,8 @@
 //   A: lane l -> a[i] = A_s[m + (l & 15)][i];  B (N x K rows): b[k] = B_s[n + (l & 15)][k];
 //   C: lane l, element e -> C[m + 2e + (l >> 4)][n + (l & 15)].
 // Tile TM rows (128 NVFP4, 64 MXFP8, as gb10's GM_FP4 / GM) x 128 outputs, 256 threads:
-// 8 warps as (TM / 16) x (8 / (TM / 16)), K step 32, loads synchronous (no cp.async on HIP).
+// 8 warps as (TM / 16) x (8 / (TM / 16)), K step 64 (K a multiple of 64), loads synchronous
+// (no cp.async on HIP).
 // The W4A4 / W8A8 entries (block-scaled MMA on gb10) and their tile list are trap stubs here:
 // spark-model takes the BF16-row path under cfg!(atlas_scale).
 // grouped grid (N / 128, ceil(max rows of an expert / TM), E), block 256.
@@ -25,7 +26,7 @@ typedef __bf16 ink_v16bf __attribute__((ext_vector_type(16)));
 typedef float ink_v8f __attribute__((ext_vector_type(8)));
 
 #define INK_GN 128
-#define INK_GK 32
+#define INK_GK 64   // K step: two 32-wide dequant sub-steps per barrier pair
 #define INK_PITCH (INK_GK + 8)
 
 __device__ __constant__ float INK_HIP_E2M1[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -74,27 +75,30 @@ __device__ __forceinline__ void ink_hip_gemm_tile(
     for (int j = 0; j < NSUB; j++) acc[j] = ink_v8f{0, 0, 0, 0, 0, 0, 0, 0};
 
     for (unsigned int k0 = 0; k0 < K; k0 += INK_GK) {
-        // activations: TM rows x 32 BF16 = TM * 4 chunks of 16 bytes
-        for (int c = tid; c < TM * 4; c += 256) {
-            const int r = c / 4, col = (c % 4) * 8;
+        // activations: TM rows x 64 BF16 = TM * 8 chunks of 16 bytes
+        for (int c = tid; c < TM * 8; c += 256) {
+            const int r = c / 8, col = (c % 8) * 8;
             uint4 v = make_uint4(0, 0, 0, 0);
             if (src[r] >= 0) v = *(const uint4*)(A + (unsigned long long)src[r] * K + k0 + col);
             *(uint4*)&As[r][col] = v;
         }
-        // weights: thread t dequantises row t / 2, half t % 2 (16 values, one NVFP4 scale)
-        {
+        // weights: per 32-wide sub-step, thread t dequantises row t / 2, half t % 2 (16 values,
+        // one NVFP4 scale)
+#pragma unroll
+        for (unsigned int sub = 0; sub < INK_GK / 32; sub++) {
+            const unsigned int k1 = k0 + 32 * sub;
             const unsigned int r = tid / 2, h = tid % 2, n = n0 + r;
             float v[16];
             if (n < N) {
                 if (MX) {
-                    const float s = exp2f((float)ws[(unsigned long long)n * (K / 32) + k0 / 32] - 127.0f);
-                    const uint4 q = *(const uint4*)(wc + (unsigned long long)n * K + k0 + h * 16);
+                    const float s = exp2f((float)ws[(unsigned long long)n * (K / 32) + k1 / 32] - 127.0f);
+                    const uint4 q = *(const uint4*)(wc + (unsigned long long)n * K + k1 + h * 16);
                     const unsigned int w[4] = {q.x, q.y, q.z, q.w};
 #pragma unroll
                     for (int i = 0; i < 16; i++) v[i] = ink_hip_e4m3((w[i / 4] >> (8 * (i % 4))) & 0xFF) * s;
                 } else {
-                    const float s = ink_hip_e4m3(ws[(unsigned long long)n * (K / 16) + k0 / 16 + h]) * g;
-                    const uint2 q = *(const uint2*)(wc + (unsigned long long)n * (K / 2) + k0 / 2 + h * 8);
+                    const float s = ink_hip_e4m3(ws[(unsigned long long)n * (K / 16) + k1 / 16 + h]) * g;
+                    const uint2 q = *(const uint2*)(wc + (unsigned long long)n * (K / 2) + k1 / 2 + h * 8);
                     const unsigned int w[2] = {q.x, q.y};
 #pragma unroll
                     for (int i = 0; i < 8; i++) {
@@ -112,7 +116,7 @@ __device__ __forceinline__ void ink_hip_gemm_tile(
             for (int i = 0; i < 8; i++)
                 pk[i] = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v[2 * i])) |
                         ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(v[2 * i + 1])) << 16);
-            uint4* dst = (uint4*)&Bs[r][h * 16];
+            uint4* dst = (uint4*)&Bs[r][32 * sub + h * 16];
             dst[0] = make_uint4(pk[0], pk[1], pk[2], pk[3]);
             dst[1] = make_uint4(pk[4], pk[5], pk[6], pk[7]);
         }
