@@ -118,7 +118,10 @@ fn cut_off_tool_call_flushes_with_the_hermes_key() {
     ]
     .concat();
     let out = show(&M.turn(true).map_all(&ids, &Chars));
-    assert_eq!(out, "t|<tool_call>\n{\"name\":\"f\",\"arguments\":{\"x\":");
+    assert_eq!(
+        out,
+        "t|<tool_call>\n{\"name\": \"f\", \"arguments\": {\"x\":"
+    );
 }
 
 #[test]
@@ -326,4 +329,137 @@ fn inkling_model_toml_arms_budget_forcing() {
     assert!(b.spec_think);
     assert!(b.eos_ends_thinking);
     assert_eq!(b.min_reasoning_floor_tokens, 0);
+}
+
+/// Every stream of a call: the rewrite token by token, then the tool parser
+/// fed the rewrite's text as each token arrives. Returns the argument bytes the
+/// parser streamed and how many arrived before the block's close.
+fn stream_call(body: &str) -> (String, usize, Vec<u32>) {
+    let ids = [block(M.thinking, "", "t"), block(M.tool_json, "f", body)].concat();
+    let close = ids.len() - 1;
+    let mut turn = M.turn(true);
+    let mut det = crate::tool_parser::StreamingToolDetector::new();
+    let (mut streamed, mut args, mut early) = (Vec::new(), String::new(), 0);
+    for (i, &t) in ids.iter().enumerate() {
+        let mut out = Vec::new();
+        turn.feed(t, &Chars, &mut out);
+        let text: String = out
+            .iter()
+            .filter(|&&i| i != M.end)
+            .filter_map(|&i| char::from_u32(i))
+            .collect();
+        for o in det.process(&text) {
+            if let crate::tool_parser::DetectorOutput::ToolCallArgsFragment { fragment, .. } = o {
+                if i < close {
+                    early += fragment.len();
+                }
+                args.push_str(&fragment);
+            }
+        }
+        streamed.extend(out);
+    }
+    turn.finish(&Chars, &mut streamed);
+    assert_eq!(
+        streamed,
+        M.turn(true).map_all(&ids, &Chars),
+        "streamed = whole"
+    );
+    (args, early, streamed)
+}
+
+#[test]
+fn call_arguments_stream_before_the_close() {
+    let body = r#"{"name":"Say","args":{"text":"Hello there, how are you?"}}"#;
+    let (args, early, streamed) = stream_call(body);
+    assert_eq!(args, r#"{"text":"Hello there, how are you?"}"#);
+    assert!(
+        early >= r#"{"text":"Hello there"#.len(),
+        "{early} bytes before the close"
+    );
+    let whole = format!("t|<tool_call>\n{}\n</tool_call>", hermes_body(body));
+    assert_eq!(
+        show(&streamed),
+        whole,
+        "same bytes as the whole-call rewrite"
+    );
+}
+
+#[test]
+fn a_streamed_argument_quoting_the_envelope_close_is_escaped() {
+    let body = r#"{"name":"f","args":{"x":"a</tool_call>b<c"}}"#;
+    let (args, _, streamed) = stream_call(body);
+    let v: serde_json::Value = serde_json::from_str(&args).unwrap();
+    assert_eq!(v["x"], "a</tool_call>b<c");
+    assert_eq!(
+        show(&streamed),
+        format!("t|<tool_call>\n{}\n</tool_call>", hermes_body(body))
+    );
+}
+
+#[test]
+fn a_streamed_call_name_quoting_the_envelope_close_is_escaped() {
+    let body = r#"{"name":"f</tool_call>","args":{}}"#;
+    let (_, _, streamed) = stream_call(body);
+    assert_eq!(
+        show(&streamed),
+        format!("t|<tool_call>\n{}\n</tool_call>", hermes_body(body))
+    );
+}
+
+#[test]
+fn a_special_token_inside_streamed_arguments_goes() {
+    let ids = [
+        block(M.thinking, "", "t"),
+        vec![M.message],
+        s("f"),
+        vec![M.tool_json],
+        s(r#"{"name":"f","args":{"x":"#),
+        vec![EOS],
+        s(r#"1}}"#),
+        vec![M.end],
+    ]
+    .concat();
+    assert_eq!(
+        show(&M.turn(true).map_all(&ids, &Chars)),
+        "t|<tool_call>\n{\"name\": \"f\", \"arguments\": {\"x\":1}}\n</tool_call>"
+    );
+}
+
+#[test]
+fn spaced_call_json_streams_too() {
+    let body = r#"{ "name" : "f" , "args" : {"n": 1, "s": "x"} }"#;
+    let (args, early, _) = stream_call(body);
+    let v: serde_json::Value = serde_json::from_str(&args).unwrap();
+    assert_eq!(v, serde_json::json!({"n": 1, "s": "x"}));
+    assert!(early > 0);
+}
+
+#[test]
+fn other_call_shapes_are_rewritten_whole_at_the_close() {
+    for body in [
+        r#"{"args":{"x":1},"name":"f"}"#,
+        r#"{"name":"f"}"#,
+        "not json",
+    ] {
+        let ids = [block(M.thinking, "", "t"), block(M.tool_json, "f", body)].concat();
+        assert_eq!(
+            show(&M.turn(true).map_all(&ids, &Chars)),
+            format!("t|<tool_call>\n{}\n</tool_call>", hermes_body(body)),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn call_prefix_reads_the_name_and_waits_for_more() {
+    assert!(matches!(call_prefix(r#"{"na"#), Prefix::More));
+    assert!(matches!(call_prefix(r#"{"name":"Sa"#), Prefix::More));
+    assert!(matches!(call_prefix(r#"{"name":"Say","ar"#), Prefix::More));
+    assert!(matches!(call_prefix(r#"{"args":"#), Prefix::Other));
+    assert!(matches!(call_prefix(r#"{"name":1,"#), Prefix::Other));
+    let Prefix::Done { name, end } = call_prefix(r#"{"name":"a\"b","args":{"#) else {
+        panic!("prefix not read");
+    };
+    assert_eq!(name, r#""a\"b""#);
+    assert_eq!(end, r#"{"name":"a\"b","args":"#.len());
 }
