@@ -214,3 +214,5 @@ extern "C" __global__ void hy4_batch_rotary(const __nv_bfloat16* x, __nv_bfloat1
     dst[split?i:i*2]=__float2bfloat16_rn(a*c-b*s);
     dst[split?32+i:i*2+1]=__float2bfloat16_rn(a*s+b*c);
 }
+
+#include "hy4_mla_mma.cuh"
