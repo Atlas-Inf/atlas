@@ -4,8 +4,8 @@
 //! two-rank restore-depth agreement.
 
 use super::{
-    Agreed, agree_restore, branch_checkpoint_at, branch_split_at, layer_write_floor, replay_floor,
-    rowinv_tail_unsplit_with, tail_cut,
+    Agreed, agree_restore, branch_checkpoint_at, branch_split_at, exact_replay_cap,
+    layer_write_floor, replay_floor, rowinv_tail_unsplit_with, tail_cut,
 };
 
 const BS: usize = 16;
@@ -28,6 +28,20 @@ fn tail_cut_is_one_block_below_the_last_boundary() {
         assert_eq!(tail_cut(n, BS), floor - BS, "n={n}");
         assert!(n - tail_cut(n, BS) > BS && n - tail_cut(n, BS) <= 2 * BS);
     }
+}
+
+/// An exact replay of a block-aligned prompt matches all of it; the match is
+/// capped one block short, so the tail checkpoint (one block below the last
+/// boundary under the end) anchors it. Any shorter match, a prompt within one
+/// block, or the exact-hit shortcut switched on leaves the match alone.
+#[test]
+fn exact_replay_caps_one_block_short() {
+    assert_eq!(exact_replay_cap(8_192, 8_192, BS, false), Some(8_176));
+    assert!(tail_cut(8_192, BS) <= 8_176);
+    assert_eq!(exact_replay_cap(8_176, 8_192, BS, false), None);
+    assert_eq!(exact_replay_cap(8_192, 8_192, BS, true), None);
+    assert_eq!(exact_replay_cap(16, 16, BS, false), None);
+    assert_eq!(exact_replay_cap(0, 0, BS, false), None);
 }
 
 #[test]

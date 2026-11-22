@@ -439,10 +439,35 @@ impl ModelConfig {
             .count()
     }
 
+    /// Whether a model's only per-sequence state outside the KV cache travels
+    /// as its layers' aux blobs on prefix-cache snapshots, with no SSM layers:
+    /// Inkling 2's short-conv states. Such a model resumes a prefix hit from a
+    /// restored snapshot, as an SSM model does, never from KV alone.
+    pub fn aux_prefix_state(&self) -> bool {
+        self.model_type == "inkling2_loop"
+    }
+
+    /// Prompts shorter than this run their last chunk as one pass, without the
+    /// prefix cache's tail-checkpoint split (0: every prompt that crosses the
+    /// cut splits). Inkling 2's extra pass of up to 32 rows still reads nearly
+    /// every expert (about 0.1 s on one GB10), more than recomputing a prompt
+    /// this short on the next turn costs. Depends only on the prompt's length,
+    /// so a prompt runs in the same passes cold and warm.
+    pub fn tail_split_min_tokens(&self) -> usize {
+        if self.aux_prefix_state() { 512 } else { 0 }
+    }
+
+    /// Whether a prefix-cache hit must restore a snapshot (SSM or aux state)
+    /// rather than reuse KV alone.
+    pub fn snapshot_prefix_state(&self) -> bool {
+        self.num_ssm_layers() > 0 || self.aux_prefix_state()
+    }
+
     /// Whether the radix prefix cache captures every state needed to resume
-    /// this model exactly. DeepSeek V4 compression also carries a prompt-built
-    /// pool and ring that are not represented by KV blocks today, and Inkling 2
-    /// per-sequence short-conv states that no snapshot carries yet.
+    /// this model exactly from KV blocks alone. DeepSeek V4 compression also
+    /// carries a prompt-built pool and ring that are not represented by KV
+    /// blocks today; Inkling 2's short-conv states ride snapshots instead
+    /// ([`Self::aux_prefix_state`]).
     pub fn kv_only_prefix_cache_is_safe(&self) -> bool {
         match self.model_type.as_str() {
             "deepseek_v4" => self.compress_ratios.iter().all(|&ratio| ratio == 0),

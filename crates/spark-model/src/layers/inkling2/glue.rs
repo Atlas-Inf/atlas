@@ -21,9 +21,11 @@ pub(crate) struct GlueKernels {
     pub f32_to_bf16: KernelHandle,
     /// `dense_gemv_bf16`: y[N] = W[N, K] x[K], BF16
     pub dense_gemv: KernelHandle,
-    /// AMD (strix-hip): `dense_gemv_bf16_batchm`, a decode batch / verify block of up to 8
-    /// rows of a BF16 projection reading the weight once (NULL elsewhere)
+    /// `dense_gemv_bf16_batchm`: up to 8 rows from one pass over W, each row
+    /// bit-identical to `dense_gemv_bf16`
     pub dense_gemv_batchm: KernelHandle,
+    /// `dense_gemv_bf16_batchm_f32out`: up to 8 rows of router logits
+    pub dense_gemv_batchm_f32: KernelHandle,
     /// `dense_gemv_bf16_fp32out`: one row of router logits
     pub dense_gemv_f32: KernelHandle,
     /// `moe_topk_sigmoid_batched_f32`
@@ -46,11 +48,9 @@ impl GlueKernels {
             layer_out: m("inkling2_layer_out")?,
             f32_to_bf16: m("inkling2_f32_to_bf16")?,
             dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
-            dense_gemv_batchm: if cfg!(atlas_scale) {
-                gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?
-            } else {
-                KernelHandle(0)
-            },
+            dense_gemv_batchm: gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?,
+            dense_gemv_batchm_f32: gpu
+                .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm_f32out")?,
             dense_gemv_f32: gpu.kernel("gemv", "dense_gemv_bf16_fp32out")?,
             topk: gpu.kernel("moe_topk_sig", "moe_topk_sigmoid_batched_f32")?,
             kv_write: gpu.kernel("reshape_and_cache", "reshape_and_cache_flash")?,
@@ -60,6 +60,13 @@ impl GlueKernels {
         })
     }
 }
+
+/// Rows `dense_gemv_bf16_batchm` takes at once (its MAX_M): a decode batch or a
+/// verify of up to 8 rows reads each BF16 weight once, every row computed as the
+/// one-row GEMV computes it. cuBLASLt took 2-6x longer on the small projections
+/// (sinks, relative bias, router) at two rows; RigMark short code, Strict, one
+/// Spark: C2 / C4 / C8 49.5 / 79.2 / 120.2 -> 52.6 / 81.7 / 122.1.
+const BATCHM_MAX_ROWS: usize = 8;
 
 fn blocks(n: usize) -> u32 {
     n.div_ceil(256) as u32
@@ -89,6 +96,34 @@ impl GlueKernels {
             .launch(s)
     }
 
+    /// A `dense_gemv_bf16_batchm` launch (either output type) over `rows`
+    /// contiguous rows.
+    #[allow(clippy::too_many_arguments)]
+    fn batchm_with(
+        &self,
+        gpu: &dyn GpuBackend,
+        kernel: KernelHandle,
+        rows: usize,
+        x: DevicePtr,
+        w: DevicePtr,
+        y: DevicePtr,
+        n: usize,
+        k: usize,
+        s: u64,
+    ) -> Result<()> {
+        KernelLaunch::new(gpu, kernel)
+            .grid([(n as u32).div_ceil(4), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(x)
+            .arg_ptr(w)
+            .arg_ptr(y)
+            .arg_u32(rows as u32)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .arg_u32(n as u32)
+            .launch(s)
+    }
+
     /// `y[rows, n] = x[rows, k] W[n, k]^T`, BF16 out: a BF16 weight through
     /// the dense GEMV / BF16 GEMM; a Spark NVFP4 one through `w4a16_gemv` /
     /// `w4a16_gemv_batch8/16` for decode and verify rows, and its checkpoint BF16
@@ -108,20 +143,9 @@ impl GlueKernels {
     ) -> Result<()> {
         match w {
             Linear::Bf16(w) if rows == 1 => self.gemv_with(gpu, self.dense_gemv, x, w, y, n, k, s),
-            // AMD (strix-hip): a verify block / decode batch of up to 8 rows reads the BF16
-            // weight once in the row-batched GEMV; hipBLASLt's small-M tile took ~1.75x the
-            // weight-read time there (f352: 81.7 us vs 46.8 us for one row of the same weight).
-            Linear::Bf16(w) if cfg!(atlas_scale) && rows <= 8 => KernelLaunch::new(gpu, self.dense_gemv_batchm)
-                .grid([(n as u32).div_ceil(4), 1, 1])
-                .block([256, 1, 1])
-                .arg_ptr(x)
-                .arg_ptr(w)
-                .arg_ptr(y)
-                .arg_u32(rows as u32)
-                .arg_u32(n as u32)
-                .arg_u32(k as u32)
-                .arg_u32(n as u32)
-                .launch(s),
+            Linear::Bf16(w) if rows <= BATCHM_MAX_ROWS => {
+                self.batchm_with(gpu, self.dense_gemv_batchm, rows, x, w, y, n, k, s)
+            }
             Linear::Bf16(w) => ops::bf16_gemm(x, w.0, y, rows as u32, n as u32, k as u32, s),
             Linear::Nvfp4 { q, .. } if rows == 1 => {
                 ops::w4a16_gemv(gpu, self.w4a16_gemv, x, &q, y, n as u32, k as u32, s)
@@ -156,6 +180,8 @@ impl GlueKernels {
     ) -> Result<()> {
         if rows == 1 {
             self.gemv_with(gpu, self.dense_gemv_f32, x, w, y, n, k, s)
+        } else if rows <= BATCHM_MAX_ROWS {
+            self.batchm_with(gpu, self.dense_gemv_batchm_f32, rows, x, w, y, n, k, s)
         } else {
             ops::bf16_gemm_f32out(x, w.0, y, rows as u32, n as u32, k as u32, s)
         }
@@ -175,16 +201,44 @@ impl GlueKernels {
         eps: f32,
         s: u64,
     ) -> Result<()> {
+        self.rmsnorms(gpu, rows, x_f32, x_bf16, 0, &[w], y, h, eps, s)
+    }
+
+    /// One norm per weight in `ws` (at most 3), in one launch: input `g` at
+    /// `x + g * in_plane` elements, output at `y + g * rows * h`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn rmsnorms(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: usize,
+        x_f32: DevicePtr,
+        x_bf16: DevicePtr,
+        in_plane: usize,
+        ws: &[DevicePtr],
+        y: DevicePtr,
+        h: usize,
+        eps: f32,
+        s: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            (1..=3).contains(&ws.len()),
+            "inkling2 rmsnorm: 1 to 3 inputs"
+        );
+        let w = |g: usize| ws[g.min(ws.len() - 1)];
         KernelLaunch::new(gpu, self.rmsnorm)
-            .grid([rows as u32, 1, 1])
+            .grid([rows as u32, ws.len() as u32, 1])
             .block([256, 1, 1])
             .arg_ptr(x_f32)
             .arg_ptr(x_bf16)
-            .arg_ptr(w)
+            .arg_ptr(w(0))
+            .arg_ptr(w(1))
+            .arg_ptr(w(2))
             .arg_ptr(y)
             .arg_u32(h as u32)
             .arg_u32(h as u32)
             .arg_u32(h as u32)
+            .arg_u64(in_plane as u64)
+            .arg_u64((rows * h) as u64)
             .arg_f32(eps)
             .launch(s)
     }

@@ -91,7 +91,7 @@ pub(super) fn plant_target(
 impl TransformerModel {
     /// Whether prefix checkpoints can be planted for this model at all.
     fn pc_plants_possible(&self) -> bool {
-        self.config.num_ssm_layers() > 0
+        self.config.snapshot_prefix_state()
             && self.ssm_snapshots.is_enabled()
             && self.prefix_cache.is_active()
     }

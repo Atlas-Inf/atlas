@@ -264,8 +264,18 @@ fn a_restored_leaf_is_the_saved_state_byte_for_byte() {
     )
     .unwrap();
     let layers = pool.num_ssm_layers;
-    let snaps =
-        SsmSnapshotPool::new(3, pool.h_bytes, pool.conv_bytes, layers, 0, 0, 8, &gpu).unwrap();
+    let snaps = SsmSnapshotPool::new(
+        3,
+        pool.h_bytes,
+        pool.conv_bytes,
+        layers,
+        0,
+        0,
+        8,
+        false,
+        &gpu,
+    )
+    .unwrap();
     let pattern = |seed: usize, n: usize| -> Vec<u8> {
         (0..n)
             .map(|i| ((i * 131 + seed * 7919) % 251) as u8)
