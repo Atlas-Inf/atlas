@@ -163,3 +163,8 @@ extern "C" __global__ void hy4_norm_add(const __nv_bfloat16* routed,
 }
 
 #include "hy4_batch.cuh"
+
+
+// A3 — tensor-core expert variant (opt-in via ATLAS_HY4_EXPERT_MMA=1).
+// Loaded via the hy4_ffn module; launcher resolves it by name.
+#include "hy4_batch_mma.cuh"
