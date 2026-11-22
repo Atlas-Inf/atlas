@@ -32,7 +32,18 @@ bench() { local id=$1; shift
   python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('RESULT', d.get('benchmark_id'), d.get('run_id'), [(s['label'], s['value']) for s in d['frame']['summary']], (d.get('verdict') or {}).get('kind'))" "$OUT/$id.json" 2>&1 | tee -a "$RES"; }
 for leg in "${LEGS[@]}"; do
   case $leg in
-    st995) bench bfcl-subset ;;
+    st995) bench bfcl-subset
+       # bfcl-eval's qwen-agent imports soundfile, which the pinned venv lacks on this image: generation finishes and
+       # scoring dies (run 44992539775). Keep the responses, add soundfile, and re-run the scorer command it printed.
+       python3 - "$OUT/bfcl-subset.json" > "$OUT/rescore.sh" <<'PY2'
+import json, re, sys
+r = (json.load(open(sys.argv[1]))["frame"].get("verdict") or {}).get("reason", "")
+m = re.search(r"rescored: (\S+/python) (\S+/score\.py) --dataset (\S+) --responses (\S+) failed", r)
+if m:
+    py, sc, ds, rs = m.groups()
+    print(f'"{py}" -m pip install -q soundfile && cp "{rs}" "$OUT/bfcl-responses.jsonl" && "{py}" "{sc}" --dataset "{ds}" --responses "{rs}"')
+PY2
+       if [ -s "$OUT/rescore.sh" ]; then log "bfcl scoring failed in-run; rescoring the kept responses"; OUT=$OUT bash "$OUT/rescore.sh" > "$OUT/rescore.out" 2>&1; log "rescore rc=$?"; tail -25 "$OUT/rescore.out" | tee -a "$RES"; fi ;;
     agentic) bench agentic-webserver --param iterations=10 --param wall_budget_s=100000 ;;
     poison) bench ssm-state-poisoning-gate ;;
     xcont) bench cross-contamination ;;
