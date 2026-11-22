@@ -24,10 +24,21 @@ fn kv_complete_models_can_use_the_prefix_cache() {
 }
 
 #[test]
-fn inkling2_conv_state_keeps_the_prefix_cache_off() {
+fn inkling2_conv_state_rides_snapshots() {
     let mut config = ModelConfig::qwen3_next_80b_nvfp4();
     config.model_type = "inkling2_loop".to_string();
+    config.layer_types.clear();
+    // KV alone cannot resume it: its short-conv states ride aux snapshots
     assert!(!config.kv_only_prefix_cache_is_safe());
+    assert!(config.aux_prefix_state());
+    assert!(config.snapshot_prefix_state());
+}
+
+#[test]
+fn aux_prefix_state_only_for_inkling2() {
+    let config = ModelConfig::qwen3_next_80b_nvfp4();
+    assert!(!config.aux_prefix_state());
+    assert_eq!(config.snapshot_prefix_state(), config.num_ssm_layers() > 0);
 }
 
 #[test]

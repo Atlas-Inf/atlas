@@ -133,7 +133,10 @@ impl SsmSnapshotPool {
     /// `decode_max_seqs` sizes the Phase-C decode-rollback region. A
     /// pool with `num_slots == 0` but `decode_ring_slots > 0` is valid
     /// (decode rollback enabled, Marconi caching disabled) and vice
-    /// versa — the two regions are independent.
+    /// versa — the two regions are independent. `aux_only` enables the
+    /// Marconi region for a model with no SSM layers whose per-sequence state
+    /// rides each snapshot's aux blobs alone (`ModelConfig::aux_prefix_state`).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         num_slots: usize,
         h_bytes: usize,
@@ -142,10 +145,11 @@ impl SsmSnapshotPool {
         decode_ring_slots: usize,
         decode_max_seqs: usize,
         hidden_bytes: usize,
+        aux_only: bool,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
         let decode_enabled = num_ssm_layers > 0 && decode_ring_slots > 0 && decode_max_seqs > 0;
-        let marconi_enabled = num_ssm_layers > 0 && num_slots > 0;
+        let marconi_enabled = (num_ssm_layers > 0 || aux_only) && num_slots > 0;
 
         if !marconi_enabled && !decode_enabled {
             return Ok(Self {
@@ -179,7 +183,7 @@ impl SsmSnapshotPool {
         let mut hidden_snapshot = DevicePtr::NULL;
         let mut h_blob_base = DevicePtr::NULL;
         let mut conv_blob_base = DevicePtr::NULL;
-        if marconi_enabled {
+        if marconi_enabled && num_ssm_layers > 0 {
             // One contiguous blob per kind, per-layer views via offset. The
             // per-layer loop is the fallback: if the blob doesn't fit the
             // current map, scatter as before rather than fail the build.
@@ -210,6 +214,8 @@ impl SsmSnapshotPool {
                     }
                 }
             }
+        }
+        if marconi_enabled {
             hidden_snapshot = gpu.alloc(num_slots * hidden_bytes)?;
         }
 

@@ -210,7 +210,7 @@ impl TransformerModel {
                 false
             }
         } else {
-            let has_ssm_layers = self.config.num_ssm_layers() > 0;
+            let has_ssm_layers = self.config.snapshot_prefix_state();
             if kv_write_start > 0 && has_ssm_layers {
                 // SSM models: can't reuse KV without SSM snapshot — the SSM state
                 // is recomputed from scratch, producing different hidden states than

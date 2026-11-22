@@ -346,7 +346,8 @@ impl TransformerModel {
                      for {matched}-token full hit — recomputing all KV+SSM"
                 );
             }
-            let has_ssm = self.config.num_ssm_layers() > 0;
+            // SSM layers, or per-sequence state that rides aux snapshots alone
+            let has_ssm = self.config.snapshot_prefix_state();
             if matched > 0 && !skip && has_ssm {
                 tracing::info!(
                     "Prefix cache hit: {} tokens ({} blocks) but no SSM snapshot — recomputing all KV",

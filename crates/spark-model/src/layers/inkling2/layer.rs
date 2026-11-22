@@ -424,6 +424,55 @@ impl TransformerLayer for Inkling2Layer {
         }))
     }
 
+    /// Prefix-cache snapshots carry each visit's conv state (its only
+    /// per-sequence state besides KV) as an aux blob: copied out at a
+    /// snapshot, back in on a hit before the remaining prefill runs.
+    fn has_aux_state(&self) -> bool {
+        true
+    }
+
+    fn snapshot_aux_into(
+        &self,
+        state: &dyn LayerState,
+        buf: &mut Vec<u8>,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<bool> {
+        let st = state
+            .as_any()
+            .downcast_ref::<Inkling2SeqState>()
+            .context("inkling2: foreign layer state")?;
+        if st.pad {
+            return Ok(false);
+        }
+        buf.resize(self.conv_state_bytes(), 0);
+        crate::layers::aux_d2h::copy(gpu, st.conv, buf, stream)?;
+        Ok(true)
+    }
+
+    fn restore_aux(
+        &self,
+        state: &mut dyn LayerState,
+        blob: &[u8],
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let bytes = self.conv_state_bytes();
+        let st = state
+            .as_any_mut()
+            .downcast_mut::<Inkling2SeqState>()
+            .context("inkling2: foreign layer state")?;
+        ensure!(
+            !st.pad && blob.len() == bytes,
+            "inkling2: conv-state blob of {} bytes for a {bytes}-byte state",
+            blob.len()
+        );
+        gpu.copy_h2d_async(blob, st.conv, stream)?;
+        // a restored state has no verify behind it to roll back
+        st.journal_rows = 0;
+        Ok(())
+    }
+
     /// Every padding row writes the one shared pad state.
     fn padding_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
         ensure!(

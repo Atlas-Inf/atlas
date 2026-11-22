@@ -61,8 +61,10 @@ impl TransformerModel {
         // same state as the cache-inactive admission above, which has always
         // admitted hybrid models. Warm hybrid batches keep falling back to
         // the per-stream path, whose restore logic is established.
-        if !batch_kernel::batched_reserve_hybrid_ssm_ok(&matches, self.config.num_ssm_layers() != 0)
-        {
+        if !batch_kernel::batched_reserve_hybrid_ssm_ok(
+            &matches,
+            self.config.snapshot_prefix_state(),
+        ) {
             tracing::info!(
                 target: "atlas::q12",
                 "batched prefix reservation declined: hybrid-SSM model with a \
