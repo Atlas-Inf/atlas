@@ -472,7 +472,9 @@ pub(super) async fn completions_stream(
                 }
             }
             StreamEvent::Error(msg) | StreamEvent::InvalidRequest(msg) => {
-                vec![Ok(Event::default().data(format!(r#"{{"error":"{msg}"}}"#)))]
+                vec![Ok(
+                    Event::default().data(serde_json::json!({ "error": msg }).to_string())
+                )]
             }
         };
         futures::stream::iter(events)
