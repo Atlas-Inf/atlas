@@ -252,6 +252,20 @@ pub(in crate::model) fn tail_cut(total: usize, bs: usize) -> usize {
     crate::model::warm_turn::tail_cut_at(total, bs, crate::model::warm_turn::tail_cut_deep())
 }
 
+/// The match to look up again when a prompt's whole length matched (`matched
+/// == total`): one block short. The deepest snapshot of such a match is the
+/// leaf at the prompt's end, which `marconi_restorable` declines as an exact
+/// hit unless `exact` (`ATLAS_MARCONI_EXACT=1`); without the cap the request
+/// recomputes everything although the tail checkpoint below it is cached.
+pub(in crate::model) fn exact_replay_cap(
+    matched: usize,
+    total: usize,
+    bs: usize,
+    exact: bool,
+) -> Option<usize> {
+    (!exact && matched == total && total > bs).then(|| total - bs)
+}
+
 /// Where to save a branch checkpoint, if anywhere: at the radix match
 /// `matched` when it lies at least `min` tokens above the restore depth
 /// `skip_to` (0 when nothing was restored) and below the tail cut (which
