@@ -30,16 +30,57 @@
 #define INK_DN_ROWS 32   // down: 8 warps x 4 rows, 8 lanes per row
 #define INK_MAX_SROW 256 // scale bytes of one weight row (K up to 4096 NVFP4 / 8192 MXFP8)
 
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+// Standard E4M3 (1-4-3, bias 7) by bit math: the AMD compat __nv_fp8_e4m3 -> float
+// decode is not the standard format (see common/dense_gemv_fp8w.cu scl_fp8).
+__device__ __forceinline__ float ink_e4m3(unsigned char b) {
+    const unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u;
+    float v;
+    if (e == 0u) v = (float)m * 0.001953125f;
+    else if (e == 15u && m == 7u) v = 0.0f;
+    else v = __uint_as_float(((e + 120u) << 23) | (m << 20));
+    return s ? -v : v;
+}
+#else
 __device__ __forceinline__ float ink_e4m3(unsigned char b) {
     __nv_fp8_e4m3 f;
     *(unsigned char*)&f = b;
     return (float)f;
 }
+#endif
 
 __device__ __forceinline__ float ink_bf(unsigned int raw, int hi) {
     return __bfloat162float(__ushort_as_bfloat16((unsigned short)(hi ? raw >> 16 : raw & 0xFFFF)));
 }
 
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+// AMD (strix-hip): no cvt.rn.f16x2.e2m1x2 / ld.global.nc.L1::no_allocate. E2M1 decode, exact and
+// branch-free: a code's sign and 3 magnitude bits placed at FP16 bits 15 and 9..11 read as an FP16
+// of 2^(e-15) (1 + m/2) (e > 0) or m 2^-15 (e = 0, subnormal); times 2^14 that is E2M1's
+// 2^(e-1) (1 + m/2) or m / 2 exactly. Two codes a half2. A plain 16-byte load.
+__device__ __forceinline__ float ink_fp4x8(unsigned int w, uint4 av) {
+    const unsigned int a[4] = {av.x, av.y, av.z, av.w};
+    const __half2 k = __float2half2_rn(16384.0f);
+    float acc = 0.0f;
+#pragma unroll
+    for (int b = 0; b < 4; b++) {
+        const unsigned int byte = (w >> (8 * b)) & 0xFFu;
+        const unsigned int hw = ((byte & 0x7u) << 9) | ((byte & 0x8u) << 12) | ((byte & 0x70u) << 21) | ((byte & 0x80u) << 24);
+        const float2 v = __half22float2(__hmul2(*(const __half2*)&hw, k));
+        acc += v.x * ink_bf(a[b], 0) + v.y * ink_bf(a[b], 1);
+    }
+    return acc;
+}
+__device__ __forceinline__ uint4 ink_ld_stream(const unsigned char* p) { return *(const uint4*)p; }
+// hipcc has no __syncwarp (see common/w4a16_gemv_fused.cu); the scale rows are shared by lanes
+// of one wave, so a wave barrier with LDS ordering stands in for it.
+__device__ __forceinline__ void ink_wave_sync() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
+#define __syncwarp() ink_wave_sync()
+#else
 // sum over 8 NVFP4 values (one code word, even element in each byte's low nibble) times
 // 8 BF16 activations (one uint4); the E2M1 values come exact from the hardware converter.
 __device__ __forceinline__ float ink_fp4x8(unsigned int w, uint4 av) {
@@ -65,6 +106,8 @@ __device__ __forceinline__ uint4 ink_ld_stream(const unsigned char* p) {
                  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
     return v;
 }
+
+#endif  // AMD
 
 // sum over 4 E4M3 values (one code word) times 4 BF16 activations (two words)
 __device__ __forceinline__ float ink_fp8x4(unsigned int w, unsigned int a0, unsigned int a1) {
