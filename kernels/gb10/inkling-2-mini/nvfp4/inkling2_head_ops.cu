@@ -241,6 +241,11 @@ extern "C" __global__ void inkling2_msg_gate_out(
     }
 }
 
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+// AMD (strix-hip): mma.sync PTX. Never launched under cfg!(atlas_scale): inkling2/ops.rs
+// takes inkling2_msg_gate_z + inkling2_msg_gate_out there.
+extern "C" __global__ void inkling2_msg_gate_fused() { __builtin_trap(); }
+#else
 // The same message gates for prefill rows, fused on the tensor cores: a CTA takes 16 rows
 // and every gate of the launch. Per gate, the rms of its h and m rows, then
 // z = BF16(D BF16([rms0(h); rms0(m)])) (mma.sync m16n8k16, the BF16 inputs staged 64
@@ -392,3 +397,4 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_msg_gate_fused(
         }
     }
 }
+#endif  // AMD

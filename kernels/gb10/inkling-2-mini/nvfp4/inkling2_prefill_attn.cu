@@ -50,13 +50,24 @@ extern "C" __global__ void inkling2_rel_bias_table(const __nv_bfloat16* __restri
 
 #define ATLAS_ATTN_SINKS
 #define INKLING2_ROW_SINKS
-#define INKLING2_PREFILL_BIAS
 #define HDIM 128
 #define KERNEL_NAME inkling2_prefill_attn
 #define K_CACHE_TYPE const __nv_bfloat16* __restrict__
 #define V_CACHE_TYPE const __nv_bfloat16* __restrict__
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+// AMD (strix-hip) takes this kernel for every prefill row count (no flash prefill there), so
+// the bias is computed where it is added (strix-hip/common/prefill_paged_compute.cuh,
+// INKLING2_PREFILL_BIAS_INLINE) instead of a [rows, heads, rel_extent] table written and read
+// every visit; same fp32 sum over j and BF16 rounding as inkling2_rel_bias_table.
+// rel [rows, heads, 16] BF16, rel_proj_t [rel_extent, 16] F32.
+#define INKLING2_PREFILL_BIAS_INLINE
+#define KERNEL_EXTRA_PARAMS , const float inv_sqrt_d, const __nv_bfloat16* __restrict__ sinks, \
+    const __nv_bfloat16* __restrict__ ink_rel, const unsigned int rel_extent, const float* __restrict__ ink_rel_proj_t
+#else
+#define INKLING2_PREFILL_BIAS
 #define KERNEL_EXTRA_PARAMS , const float inv_sqrt_d, const __nv_bfloat16* __restrict__ sinks, \
     const __nv_bfloat16* __restrict__ rel_bias, const unsigned int rel_extent
+#endif
 #define KERNEL_PREAMBLE /* nothing */
 
 #include "../../common/prefill_paged_compute.cuh"
