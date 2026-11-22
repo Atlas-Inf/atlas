@@ -1,0 +1,5 @@
+# Inkling 2 Mini on strix-hip: the gb10 target's kernels (symlinked) over strix-hip/common.
+[build]
+# head_dim 128: the inherited paged decode / prefill bodies size per-lane vectors from HDIM
+# (default 256), which would read past each 128-wide head silently.
+extra_nvcc_flags = ["-DHDIM=128"]
