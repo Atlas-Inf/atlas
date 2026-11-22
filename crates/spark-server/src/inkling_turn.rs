@@ -25,7 +25,12 @@
 //!  * each tool block becomes a Hermes `<tool_call>` envelope with
 //!    `"arguments"`, re-encoded once its close arrives (its arguments are not
 //!    streamed piecewise);
-//!  * a thinking block after the answer started goes (it has no channel).
+//!  * a thinking block after the answer started goes (it has no channel);
+//!  * a text block whose body is only a name followed by
+//!    `<|content_invoke_tool_json|>` is a call: at thinking effort 0 the
+//!    checkpoint opens calls as `<|content_text|>NAME<|content_invoke_tool_json|>`,
+//!    so a text block's first tokens are held while they still read as a
+//!    name (at most [`NAME_HOLD`] tokens) and flushed as text otherwise.
 //!
 //! Reference: the checkpoint's `response_template` in `tokenizer_config.json`
 //! (thinking blocks are reasoning; text, tool-error and tool-text blocks are
@@ -87,6 +92,7 @@ impl InklingMarkers {
             block: Block::Between,
             think_closed: false,
             tool: Vec::new(),
+            held: None,
         }
     }
 }
@@ -108,12 +114,41 @@ pub(crate) struct InklingTurn {
     block: Block,
     think_closed: bool,
     tool: Vec<u32>,
+    /// A text block's opening tokens while they may still be a call's name.
+    held: Option<Vec<u32>>,
+}
+
+/// Tokens a text block's opening may hold while it reads as a call's name.
+const NAME_HOLD: usize = 16;
+
+fn name_like(text: &str) -> bool {
+    text.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "_.:-".contains(c))
 }
 
 impl InklingTurn {
     /// Push the ids the chat paths see for one generated id onto `out`.
     pub(crate) fn feed(&mut self, tok: u32, codec: &dyn TurnCodec, out: &mut Vec<u32>) {
         let m = self.m;
+        if let Some(held) = self.held.as_mut() {
+            if tok == m.tool_json {
+                // NAME<|content_invoke_tool_json|>: the block was a call
+                self.held = None;
+                self.block = Block::Tool;
+                return;
+            }
+            if tok != m.message && tok != m.end {
+                held.push(tok);
+                let text = codec.decode_ids(held);
+                if held.len() <= NAME_HOLD && name_like(&text) {
+                    return;
+                }
+            }
+            self.flush_held(out);
+            if tok != m.message && tok != m.end {
+                return;
+            }
+        }
         if tok == m.message {
             self.block = Block::Header;
             return;
@@ -142,6 +177,9 @@ impl InklingTurn {
                 if next != Block::Thinking {
                     self.close_thinking(out);
                 }
+                if tok == m.text {
+                    self.held = Some(Vec::new());
+                }
                 self.block = next;
             }
             Block::Thinking => {
@@ -156,6 +194,7 @@ impl InklingTurn {
 
     /// Flush what an unclosed block still holds (a length-cut tool call).
     pub(crate) fn finish(&mut self, codec: &dyn TurnCodec, out: &mut Vec<u32>) {
+        self.flush_held(out);
         if self.block == Block::Tool {
             self.emit_call(codec, out, false);
             self.block = Block::Between;
@@ -170,6 +209,13 @@ impl InklingTurn {
         }
         self.finish(codec, &mut out);
         out
+    }
+
+    /// A held text opening that turned out to be text.
+    fn flush_held(&mut self, out: &mut Vec<u32>) {
+        if let Some(held) = self.held.take() {
+            out.extend(held);
+        }
     }
 
     fn close_thinking(&mut self, out: &mut Vec<u32>) {
