@@ -43,7 +43,7 @@ pub(crate) fn strip_stop_sequences_matched(
     // don't truncate at the shorter (wrong) match boundary. strip_suffix
     // is end-anchored, so usually only one of the two end-matches at a
     // time, but defensive ordering handles the cases where it doesn't.
-    let mut sorted: Vec<&String> = stops.iter().collect();
+    let mut sorted: Vec<&String> = stops.iter().filter(|s| !s.is_empty()).collect();
     sorted.sort_by_key(|s| std::cmp::Reverse(s.len()));
     for s in sorted {
         if let Some(stripped) = text.strip_suffix(s.as_str()) {
@@ -80,4 +80,30 @@ pub(crate) fn extract_thinking(
         return (reasoning, r);
     }
     (reasoning, content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_stop_sequences_never_match() {
+        for (text, stops, expected_text, expected_stop) in [
+            ("hello", vec![""], "hello", None),
+            ("", vec![""], "", None),
+            ("hello", vec!["", "STOP"], "hello", None),
+            ("helloSTOP", vec!["", "STOP"], "hello", Some("STOP")),
+            ("helloSTOP", vec!["STOP", ""], "hello", Some("STOP")),
+            ("helloSTOP", vec!["", "TOP", "STOP"], "hello", Some("STOP")),
+            ("hello", vec![], "hello", None),
+        ] {
+            let stops: Vec<String> = stops.into_iter().map(String::from).collect();
+            assert_eq!(
+                strip_stop_sequences_matched(text.into(), &stops),
+                (expected_text.into(), expected_stop.map(String::from)),
+                "text={text:?}, stops={stops:?}"
+            );
+            assert_eq!(strip_stop_sequences(text.into(), &stops), expected_text);
+        }
+    }
 }

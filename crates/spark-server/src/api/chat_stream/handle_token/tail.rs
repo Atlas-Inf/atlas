@@ -153,6 +153,7 @@ pub(crate) fn apply_stop_string_holdback(
     };
     let matched_pos = stop_strings
         .iter()
+        .filter(|s| !s.is_empty())
         .filter_map(|s| accumulated_content[search_start..].find(s.as_str()))
         .min()
         .map(|rel| rel + search_start);
@@ -177,6 +178,10 @@ pub(crate) fn apply_stop_string_holdback(
     *emitted_len = emit_end;
     out
 }
+
+#[cfg(test)]
+#[path = "empty_stop_tests.rs"]
+mod empty_stop_tests;
 
 #[cfg(test)]
 mod stop_string_holdback_tests {
