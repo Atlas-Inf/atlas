@@ -66,7 +66,8 @@ for e in "$@"; do
       python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('RESULT ciru', d.get('benchmark_id'), d.get('run_id'), [(s['label'], s['value']) for s in d['frame']['summary']])" "$OUT/ciru-bfcl.json" 2>&1 | tail -1 | tee -a "$RES"
       ENGINE_DOWN "$OUT/serve-$e.log"
     else legs "$e"; fi ;;
-  llamacpp)
+  llamacpp|llamacpp-agentic)
+    [ $e = llamacpp-agentic ] && LLAMA_AGENTIC=1
     LLAMA_REF=master llama_build || continue
     GD=$(hf_get ggml-org/Inkling-2-Mini-GGUF "Inkling-2-Mini-Q8_0.gguf") || { log "gguf download failed"; continue; }
     llama_up $PORT 8 40960 "$GD/Inkling-2-Mini-Q8_0.gguf"
