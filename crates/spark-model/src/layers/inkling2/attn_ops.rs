@@ -191,7 +191,11 @@ pub(crate) fn prefill_attn(
     }
     if cfg!(atlas_scale) {
         // AMD: the bias is computed inside the prefill body (no table); 16 coefficients a head.
-        ensure!(a.d_rel == 16, "inkling2 AMD prefill attention takes d_rel 16, not {}", a.d_rel);
+        ensure!(
+            a.d_rel == 16,
+            "inkling2 AMD prefill attention takes d_rel 16, not {}",
+            a.d_rel
+        );
         return KernelLaunch::new(gpu, k.prefill_attn)
             .grid([heads, q_len.div_ceil(32), 1])
             .block([128, 1, 1])

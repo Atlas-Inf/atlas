@@ -242,12 +242,19 @@ fn moe_prefill_bf16(
                 gather: DevicePtr,
                 n: u32,
                 kk: u32| {
-        let l = KernelLaunch::new(gpu, if e.mxfp8 { k.moe_gemm_mxfp8 } else { k.moe_gemm_nvfp4 })
-            .grid([n.div_ceil(GEMM_N_TILE), m_tiles, ne])
-            .block([256, 1, 1])
-            .arg_ptr(x)
-            .arg_ptr(w)
-            .arg_ptr(sc);
+        let l = KernelLaunch::new(
+            gpu,
+            if e.mxfp8 {
+                k.moe_gemm_mxfp8
+            } else {
+                k.moe_gemm_nvfp4
+            },
+        )
+        .grid([n.div_ceil(GEMM_N_TILE), m_tiles, ne])
+        .block([256, 1, 1])
+        .arg_ptr(x)
+        .arg_ptr(w)
+        .arg_ptr(sc);
         let l = if e.mxfp8 { l } else { l.arg_ptr(g) };
         l.arg_ptr(y)
             .arg_ptr(offsets)
@@ -256,7 +263,16 @@ fn moe_prefill_bf16(
             .arg_u32(kk)
             .launch(stream)
     };
-    gemm(a.x, e.w13, e.w13_scale, e.w13_global, a.gu, sorted_rows, 2 * i, h)?;
+    gemm(
+        a.x,
+        e.w13,
+        e.w13_scale,
+        e.w13_global,
+        a.gu,
+        sorted_rows,
+        2 * i,
+        h,
+    )?;
     KernelLaunch::new(gpu, k.softcap_swiglu)
         .grid([u32_of(te, "slots")?, i.div_ceil(256), 1])
         .block([256, 1, 1])
@@ -266,7 +282,16 @@ fn moe_prefill_bf16(
         .arg_f32(a.gate_softcap)
         .arg_f32(a.up_softcap)
         .launch(stream)?;
-    gemm(a.act, e.w2, e.w2_scale, e.w2_global, a.y, DevicePtr::NULL, h, i)?;
+    gemm(
+        a.act,
+        e.w2,
+        e.w2_scale,
+        e.w2_global,
+        a.y,
+        DevicePtr::NULL,
+        h,
+        i,
+    )?;
     super::super::ops::moe_unpermute_reduce_indexed(
         gpu,
         k.moe_unpermute,
