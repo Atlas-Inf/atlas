@@ -17,6 +17,18 @@ use crate::main_modules::middleware::{
     require_auth_middleware,
 };
 
+fn cors_layer() -> tower_http::cors::CorsLayer {
+    tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::DELETE,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers(tower_http::cors::Any)
+}
+
 pub(crate) async fn build_and_serve(
     host: Arc<crate::main_modules::model_host::ModelHost>,
     bind: &str,
@@ -24,14 +36,6 @@ pub(crate) async fn build_and_serve(
 ) -> Result<()> {
     spark_runtime::progress::phase(10, "router");
     host.set_bound(bind.to_string(), port);
-    let cors = tower_http::cors::CorsLayer::new()
-        .allow_origin(tower_http::cors::Any)
-        .allow_methods([
-            axum::http::Method::GET,
-            axum::http::Method::POST,
-            axum::http::Method::OPTIONS,
-        ])
-        .allow_headers(tower_http::cors::Any);
 
     // Catch any panic in a handler and convert it to a 500 instead of
     // hanging the connection. With ~500 production unwraps still in the
@@ -140,7 +144,7 @@ pub(crate) async fn build_and_serve(
         .layer(axum::middleware::from_fn(
             crate::main_modules::byte_count::byte_count_middleware,
         ))
-        .layer(cors)
+        .layer(cors_layer())
         .layer(catch_panic)
         .with_state(host.clone());
 

@@ -11,11 +11,48 @@
 
 use std::sync::mpsc::{Sender, channel};
 
+use axum::Router;
+use axum::body::Body;
+use axum::http::{Method, Request, StatusCode, header};
+use axum::routing::delete;
+use tower::ServiceExt as _;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::SubscriberExt as _;
 
-use super::{bind_and_announce, ready_line};
+use super::{bind_and_announce, cors_layer, ready_line};
 use crate::main_modules::model_host::ModelHost;
+
+#[tokio::test]
+async fn cors_preflight_allows_delete() {
+    let app = Router::new()
+        .route(
+            "/v1/conversations/{id}",
+            delete(|| async { StatusCode::NO_CONTENT }),
+        )
+        .layer(cors_layer());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/v1/conversations/abc")
+                .header(header::ORIGIN, "http://example.com")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "DELETE")
+                .body(Body::empty())
+                .expect("preflight request"),
+        )
+        .await
+        .expect("preflight response");
+
+    assert!(response.status().is_success());
+    assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+    let methods = response.headers()[header::ACCESS_CONTROL_ALLOW_METHODS]
+        .to_str()
+        .expect("allowed methods are ASCII");
+    assert!(
+        methods.split(',').any(|method| method.trim() == "DELETE"),
+        "DELETE missing from access-control-allow-methods: {methods}"
+    );
+}
 
 /// Collect every event's `message` text. Local to this file rather than
 /// reusing `log_ring`, because the ring is process-global — a test reading it
