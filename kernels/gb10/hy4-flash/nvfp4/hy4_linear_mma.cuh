@@ -104,14 +104,11 @@ extern "C" __global__ void __launch_bounds__(256) hy4_batch_linear_mma(
                 xh_p + (size_t)(row0 + r_) * xr + (kb_) + (q_ >> 1), live_); \
         } \
         { \
-            _Pragma("unroll") \
-            for (int i_ = 0; i_ < 2; ++i_) { \
-                const unsigned j_ = t + i_ * 256; \
-                const unsigned c_ = j_ & 127u, q_ = (j_ >> 7) << 4; \
-                const unsigned gc_ = cta_n + c_; \
-                plm_cp16(&sW[(buf_)][c_][q_], \
-                    wbase + (size_t)gc_ * wr + (kb_) + q_, gc_ < n); \
-            } \
+            /* 128 cols x 32 e4m3 bytes = 256 16B lines, one per thread. */ \
+            const unsigned c_ = t & 127u, q_ = (t >> 7) << 4; \
+            const unsigned gc_ = cta_n + c_; \
+            plm_cp16(&sW[(buf_)][c_][q_], \
+                wbase + (size_t)gc_ * wr + (kb_) + q_, gc_ < n); \
         } \
     } while(0)
 
