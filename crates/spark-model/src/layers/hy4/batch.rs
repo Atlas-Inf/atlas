@@ -20,9 +20,12 @@ pub(crate) fn gemm(
     // Tensor-core path for fp8-e4m3 weights, gated by
     // ATLAS_HY4_LINEAR_MMA=1: bf16 mma with in-kernel e4m3->bf16 decode,
     // numerics identical to the GEMV. Requires K%32 and bf16 output.
+    // Crossover vs the GEMV is rows≈32 on GB10 (kernel bench); decode
+    // stays on the GEMV.
     let mma = kind == 1
         && float_out == 0
         && k % 32 == 0
+        && rows >= 32
         && std::env::var("ATLAS_HY4_LINEAR_MMA").ok().as_deref() == Some("1");
     if mma {
         let mut launch = KernelLaunch::new(
