@@ -222,7 +222,7 @@ pub async fn add_conversation_items(
     }
 }
 
-/// GET /v1/conversations/{id}/items — list items with `limit` + `order`
+/// GET /v1/conversations/{id}/items — list items with `after`, `limit` + `order`
 /// query parameters (OpenAI spec: default 20, max 100, order=asc).
 pub async fn list_conversation_items(
     ProcessState(process): ProcessState,
@@ -242,14 +242,27 @@ pub async fn list_conversation_items(
     if order == "desc" {
         items.reverse();
     }
+    if let Some(after) = q.get("after") {
+        let Some(index) = items
+            .iter()
+            .position(|item| item.get("id").and_then(|id| id.as_str()) == Some(after.as_str()))
+        else {
+            return openai_error_response_with_param(
+                StatusCode::BAD_REQUEST,
+                format!("Item '{after}' not found in conversation '{id}'."),
+                Some("after"),
+                Some("item_not_found"),
+            );
+        };
+        items.drain(..=index);
+    }
     let limit: usize = q
         .get("limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(20)
         .min(100);
-    if items.len() > limit {
-        items.truncate(limit);
-    }
+    let has_more = items.len() > limit;
+    items.truncate(limit);
     let first_id = items
         .first()
         .and_then(|v| v.get("id").and_then(|v| v.as_str()))
@@ -265,7 +278,7 @@ pub async fn list_conversation_items(
         "data": items,
         "first_id": first_id,
         "last_id": last_id,
-        "has_more": false,
+        "has_more": has_more,
     }))
     .into_response()
 }

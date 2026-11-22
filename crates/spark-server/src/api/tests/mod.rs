@@ -14,6 +14,7 @@
 //! in the request path counts duplicate writes or appends stall
 //! reminders any more.
 
+mod conversation_items_pagination;
 mod envelope;
 mod force_nonempty_tests;
 mod harness;
