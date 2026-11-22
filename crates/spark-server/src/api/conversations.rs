@@ -3,8 +3,10 @@
 #![allow(unused_imports, dead_code)]
 
 use crate::main_modules::model_host::ProcessState;
-use axum::extract::State;
+use axum::RequestExt;
+use axum::body::{Body, to_bytes};
 use axum::extract::rejection::JsonRejection;
+use axum::extract::{FromRequest, Request, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Json, Response, Sse};
@@ -45,7 +47,7 @@ use super::strip::strip_thinking_tags;
 use super::inference_types::*;
 use super::sanitizer::*;
 
-#[derive(serde::Deserialize)]
+#[derive(Default, serde::Deserialize)]
 pub struct CreateConversationRequest {
     #[serde(default)]
     pub items: Option<Vec<serde_json::Value>>,
@@ -80,16 +82,31 @@ pub(super) fn conversation_body(
 /// initial items + metadata.
 pub async fn create_conversation(
     ProcessState(process): ProcessState,
-    req: Result<Json<CreateConversationRequest>, JsonRejection>,
+    request: Request,
 ) -> Response {
-    let Json(req) = match req {
-        Ok(r) => r,
-        Err(_) => {
-            // Body is optional per the OpenAI spec — empty body is OK.
-            Json(CreateConversationRequest {
-                items: None,
-                metadata: None,
-            })
+    // Enforce the route's body limit before checking whether the body is empty.
+    let (parts, body) = request.with_limited_body().into_parts();
+    let bytes = match to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return openai_error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Unable to read request body: {e}"),
+            );
+        }
+    };
+    let req = if bytes.is_empty() {
+        CreateConversationRequest::default()
+    } else {
+        let request = Request::from_parts(parts, Body::from(bytes));
+        match Json::<CreateConversationRequest>::from_request(request, &()).await {
+            Ok(Json(req)) => req,
+            Err(e) => {
+                return openai_error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid request JSON: {e}"),
+                );
+            }
         }
     };
     let items = req.items.unwrap_or_default();
@@ -328,5 +345,101 @@ pub async fn delete_conversation_item(
             Some("item_id"),
             Some("item_not_found"),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_conversation;
+    use crate::conversation_store::ConversationStore;
+    use crate::main_modules::{model_host::ModelHost, serve_load::Carried};
+    use axum::body::{Body, to_bytes};
+    use axum::extract::DefaultBodyLimit;
+    use axum::http::{Request, StatusCode, header::CONTENT_TYPE};
+    use axum::{Router, routing::post};
+    use serde_json::{Value, json};
+    use std::{sync::Arc, time::Duration};
+    use tower::ServiceExt;
+
+    fn app() -> (Router, Arc<ConversationStore>) {
+        let ttl = Duration::from_secs(60);
+        let store = ConversationStore::with_config(10, ttl);
+        let host = ModelHost::empty();
+        host.set_process(Carried {
+            response_store: crate::response_store::ResponseStore::with_config(10, ttl),
+            rate_limiter: crate::rate_limiter::RateLimiter::from_env(),
+            conversation_store: store.clone(),
+        });
+        let app = Router::new()
+            .route("/v1/conversations", post(create_conversation))
+            .layer(DefaultBodyLimit::max(128))
+            .with_state(Arc::new(host));
+        (app, store)
+    }
+
+    async fn create(app: Router, content_type: Option<&str>, body: Body) -> (StatusCode, Value) {
+        let mut request = Request::post("/v1/conversations");
+        if let Some(content_type) = content_type {
+            request = request.header(CONTENT_TYPE, content_type);
+        }
+        let response = app.oneshot(request.body(body).unwrap()).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn assert_rejected(content_type: Option<&str>, body: Body) {
+        let (app, store) = app();
+        let (status, response) = create(app, content_type, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"]["type"], "invalid_request_error");
+        assert_eq!(store.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_invalid_json_syntax() {
+        assert_rejected(Some("application/json"), Body::from(r#"{"items":"#)).await;
+    }
+
+    #[tokio::test]
+    async fn create_rejects_invalid_items_type() {
+        assert_rejected(Some("application/json"), Body::from(r#"{"items":"x"}"#)).await;
+    }
+
+    #[tokio::test]
+    async fn create_rejects_nonempty_body_without_json_content_type() {
+        for content_type in [None, Some("text/plain")] {
+            assert_rejected(content_type, Body::from("{}")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_body_over_route_limit() {
+        let body = format!(r#"{{"metadata":{{"key":"{}"}}}}"#, "x".repeat(128));
+        assert_rejected(Some("application/json"), Body::from(body)).await;
+    }
+
+    #[tokio::test]
+    async fn create_allows_empty_body_with_or_without_json_content_type() {
+        let (app, store) = app();
+        for content_type in [None, Some("application/json")] {
+            let (status, response) = create(app.clone(), content_type, Body::empty()).await;
+            assert_eq!(status, StatusCode::OK);
+            let saved = store.get(response["id"].as_str().unwrap()).unwrap();
+            assert!(saved.items.is_empty());
+            assert!(saved.metadata.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn create_persists_valid_items_and_metadata() {
+        let (app, store) = app();
+        let body = Body::from(r#"{"items":[{"type":"message"}],"metadata":{"key":"value"}}"#);
+        let (status, response) = create(app, Some("application/json"), body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["metadata"], json!({"key": "value"}));
+        let saved = store.get(response["id"].as_str().unwrap()).unwrap();
+        assert_eq!(saved.items.len(), 1);
+        assert_eq!(saved.items[0]["type"], "message");
     }
 }
