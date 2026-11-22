@@ -444,12 +444,8 @@ pub(crate) fn msg_gate(
     );
     let pick = |f: fn(&MessageGate) -> DevicePtr, i: usize| f(&a.gates[i.min(n - 1)]);
     let rows = u32_of(a.rows, "rows")?;
-    // AMD (strix-hip): the fused gate is mma.sync PTX (a stub there); the two-kernel path runs.
-    if !cfg!(atlas_scale)
-        && a.rows >= FUSED_ROWS
-        && a.rank == MAX_GATE_RANK
-        && a.hidden.is_multiple_of(64)
-    {
+    // (on AMD the fused gate is the WMMA port in inkling2_head_ops.cu's AMD branch)
+    if a.rows >= FUSED_ROWS && a.rank == MAX_GATE_RANK && a.hidden.is_multiple_of(64) {
         let mut f = KernelLaunch::new(gpu, kernels.msg_gate_fused)
             .grid([rows.div_ceil(FUSED_ROWS as u32), 1, 1])
             .block([256, 1, 1])
