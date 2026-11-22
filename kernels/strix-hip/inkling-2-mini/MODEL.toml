@@ -11,6 +11,10 @@
 # BF16 expert rows in prefill (gb10 quantizes them to the checkpoint's declared NVFP4 / MXFP8
 # inputs; decode keeps BF16 rows on both). No kernel_source: the rest is strix-hip/common.
 
+# QUICKSTART: scripts/serve-inkling2-strix-linux.sh downloads the checkpoint (and the Spark
+# overlay / DSpark drafter as asked), builds this target and serves it:
+#   MODE=spark DSPARK=0 PORT=8391 scripts/serve-inkling2-strix-linux.sh     (MODE=strict, DSPARK=1, --check)
+
 [model]
 name = "inkling-2-mini"
 hf_id = "thinkingmachines/Inkling-2-Mini"
