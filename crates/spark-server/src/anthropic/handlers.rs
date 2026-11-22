@@ -43,7 +43,7 @@ pub async fn messages(
         req.max_tokens,
         req.thinking
             .as_ref()
-            .map(|t| format!("type={} budget={:?}", t.thinking_type, t.budget_tokens)),
+            .map(|t| format!("type={:?} budget={:?}", t.thinking_type, t.budget_tokens)),
         req.tools.as_ref().map_or(0, |t| t.len()),
         req.model,
         req.stream,

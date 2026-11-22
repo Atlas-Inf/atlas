@@ -13,7 +13,7 @@ use crate::ir::message::{ImageSource, Reasoning, ToolCall};
 use crate::ir::{ContentPart, ImageData, Message, Role, ThinkingDirective};
 
 use super::types::{
-    AnthropicContent, ContentBlock, MessagesRequest, SystemContent, ToolResultContent,
+    AnthropicContent, ContentBlock, MessagesRequest, SystemContent, ThinkingType, ToolResultContent,
 };
 
 impl From<MessagesRequest> for ir::ChatRequest {
@@ -208,12 +208,13 @@ impl From<MessagesRequest> for ir::ChatRequest {
         // (think as long as needed — defer to the per-model cap).
         let thinking = match &req.thinking {
             None => ThinkingDirective::Unspecified,
-            Some(tc) if tc.thinking_type == "disabled" => ThinkingDirective::Off,
-            Some(tc) => match tc.budget_tokens {
-                Some(b) => ThinkingDirective::On {
-                    budget: Some(u32::try_from(b).unwrap_or(u32::MAX)),
+            Some(tc) => match tc.thinking_type {
+                ThinkingType::Disabled => ThinkingDirective::Off,
+                ThinkingType::Enabled | ThinkingType::Adaptive => ThinkingDirective::On {
+                    budget: tc
+                        .budget_tokens
+                        .map(|budget| u32::try_from(budget).unwrap_or(u32::MAX)),
                 },
-                None => ThinkingDirective::On { budget: None },
             },
         };
 

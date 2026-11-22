@@ -192,9 +192,17 @@ pub struct AnthropicToolChoice {
 #[derive(Debug, Deserialize)]
 pub struct ThinkingConfig {
     #[serde(rename = "type")]
-    pub thinking_type: String,
+    pub thinking_type: ThinkingType,
     #[serde(default)]
     pub budget_tokens: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingType {
+    Disabled,
+    Enabled,
+    Adaptive,
 }
 
 // ── Anthropic response types ──

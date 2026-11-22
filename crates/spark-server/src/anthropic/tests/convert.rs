@@ -12,7 +12,7 @@ use crate::tool_parser;
 
 use super::super::helpers::convert_stop_reason;
 use super::super::types::{
-    AnthropicTool, AnthropicToolChoice, ContentBlock, MessagesRequest, SystemContent,
+    AnthropicTool, AnthropicToolChoice, ContentBlock, MessagesRequest, SystemContent, ThinkingType,
 };
 
 // ── finish reason → Anthropic stop_reason ──
@@ -178,8 +178,20 @@ fn thinking_config_deserializes_type_and_budget() {
     }))
     .expect("MessagesRequest");
     let t = req.thinking.expect("thinking config");
-    assert_eq!(t.thinking_type, "enabled");
+    assert_eq!(t.thinking_type, ThinkingType::Enabled);
     assert_eq!(t.budget_tokens, Some(4096));
+}
+
+#[test]
+fn rejects_unknown_thinking_type() {
+    let error = serde_json::from_value::<MessagesRequest>(serde_json::json!({
+        "model": "qwen3-80b",
+        "max_tokens": 1024,
+        "thinking": {"type": "bogus", "budget_tokens": 512},
+        "messages": [{"role": "user", "content": "Think hard."}],
+    }))
+    .expect_err("an unknown thinking type should be rejected");
+    assert!(error.to_string().contains("bogus"));
 }
 
 #[test]
