@@ -200,10 +200,58 @@ struct KeyState {
     tokens: Bucket,
 }
 
+impl KeyState {
+    fn new(cfg: &RateLimitConfig) -> Self {
+        Self {
+            requests: Bucket::new(cfg.burst_rpm),
+            tokens: Bucket::new(cfg.burst_tpm),
+        }
+    }
+
+    fn last_active(&self) -> Instant {
+        self.requests.last_refill.max(self.tokens.last_refill)
+    }
+}
+
+/// Per-identity state, bounded at `MAX_KEYS` entries.
+struct KeyMap {
+    keys: HashMap<String, KeyState>,
+    /// Shared by every new identity that arrives while `keys` is full of
+    /// active entries: the map stays bounded and those identities are still
+    /// limited, as one.
+    overflow: KeyState,
+    /// No entry in `keys` can go idle before this, so sweeping earlier
+    /// would free nothing.
+    next_evictable: Instant,
+}
+
+impl KeyMap {
+    fn new(cfg: &RateLimitConfig) -> Self {
+        Self {
+            keys: HashMap::new(),
+            overflow: KeyState::new(cfg),
+            next_evictable: Instant::now(),
+        }
+    }
+
+    fn evict_idle(&mut self, now: Instant) {
+        let mut oldest_kept = now;
+        self.keys.retain(|_, state| {
+            let last = state.last_active();
+            let keep = now.saturating_duration_since(last) < IDLE_EVICT;
+            if keep {
+                oldest_kept = oldest_kept.min(last);
+            }
+            keep
+        });
+        self.next_evictable = oldest_kept + IDLE_EVICT;
+    }
+}
+
 /// Shared concurrent rate-limiter state.
 pub struct RateLimiter {
     cfg: RateLimitConfig,
-    inner: Mutex<HashMap<String, KeyState>>,
+    inner: Mutex<KeyMap>,
     /// Last-scrubbed timestamp for idle-entry cleanup. We sweep once per
     /// `SCRUB_INTERVAL` on the admission hot path.
     last_scrub: Mutex<Instant>,
@@ -215,23 +263,19 @@ const IDLE_EVICT: Duration = Duration::from_secs(600);
 /// Cap the per-key map at this size. Prevents OOM under a DoS where a
 /// malicious client rotates the Bearer header every request to balloon
 /// the map past `SCRUB_INTERVAL`. When the cap is hit, force an
-/// out-of-band scrub regardless of the timer.
+/// out-of-band scrub regardless of the timer; identities that still do not
+/// fit share `KeyMap::overflow`.
 const MAX_KEYS: usize = 100_000;
 
 impl RateLimiter {
     pub fn from_env() -> Arc<Self> {
-        Arc::new(Self {
-            cfg: RateLimitConfig::from_env(),
-            inner: Mutex::new(HashMap::new()),
-            last_scrub: Mutex::new(Instant::now()),
-        })
+        Self::with_config(RateLimitConfig::from_env())
     }
 
-    #[cfg(test)]
     pub fn with_config(cfg: RateLimitConfig) -> Arc<Self> {
         Arc::new(Self {
             cfg,
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(KeyMap::new(&cfg)),
             last_scrub: Mutex::new(Instant::now()),
         })
     }
@@ -276,24 +320,27 @@ impl RateLimiter {
         let req_burst = self.cfg.burst_rpm as f64;
         let tok_burst = self.cfg.burst_tpm as f64;
 
-        let mut map = self.inner.lock();
-        // DoS guard: if the map has grown past MAX_KEYS without natural
-        // scrubbing kicking in, force-evict every idle entry now. The
-        // periodic scrub still runs every SCRUB_INTERVAL on its own.
-        if map.len() >= MAX_KEYS && !map.contains_key(key) {
-            map.retain(|_, state| {
-                state.requests.last_refill.elapsed() < IDLE_EVICT
-                    || state.tokens.last_refill.elapsed() < IDLE_EVICT
-            });
-            // If the cap is still hit (every key is genuinely active),
-            // fail-open for the new key — better to admit than to OOM.
-            // Real production with this many distinct identities should
-            // have an upstream gateway shaping traffic.
+        let mut guard = self.inner.lock();
+        let map = &mut *guard;
+        // DoS guard: if the map has grown to MAX_KEYS without natural
+        // scrubbing kicking in, force-evict every idle entry now, unless the
+        // last sweep proved none can be idle yet. The periodic scrub still
+        // runs every SCRUB_INTERVAL on its own.
+        let tracked = map.keys.contains_key(key);
+        if !tracked && map.keys.len() >= MAX_KEYS && now >= map.next_evictable {
+            map.evict_idle(now);
         }
-        let state = map.entry(key.to_string()).or_insert_with(|| KeyState {
-            requests: Bucket::new(self.cfg.burst_rpm),
-            tokens: Bucket::new(self.cfg.burst_tpm),
-        });
+        // If every key is genuinely active, the new identity shares the
+        // overflow buckets rather than growing the map. Real production with
+        // this many distinct identities should have an upstream gateway
+        // shaping traffic.
+        let state = if tracked || map.keys.len() < MAX_KEYS {
+            map.keys
+                .entry(key.to_string())
+                .or_insert_with(|| KeyState::new(&self.cfg))
+        } else {
+            &mut map.overflow
+        };
 
         // Request bucket.
         let req_allowed = if rpm > 0 {
@@ -379,7 +426,7 @@ impl RateLimiter {
             return;
         }
         let mut map = self.inner.lock();
-        if let Some(state) = map.get_mut(key) {
+        if let Some(state) = map.keys.get_mut(key) {
             state
                 .tokens
                 .refund(amount as f64, self.cfg.burst_tpm as f64);
@@ -393,11 +440,7 @@ impl RateLimiter {
         }
         *last = now;
         drop(last);
-        let mut map = self.inner.lock();
-        map.retain(|_, state| {
-            state.requests.last_refill.elapsed() < IDLE_EVICT
-                || state.tokens.last_refill.elapsed() < IDLE_EVICT
-        });
+        self.inner.lock().evict_idle(now);
     }
 }
 
