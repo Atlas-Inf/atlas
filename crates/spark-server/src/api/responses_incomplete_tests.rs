@@ -115,7 +115,7 @@ async fn blocking_response_persists_large_conversation_turn() {
         None,
         input,
         false,
-        Some((store.clone(), id.clone())),
+        Some((store.clone(), id.clone(), 0)),
     )
     .await;
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
