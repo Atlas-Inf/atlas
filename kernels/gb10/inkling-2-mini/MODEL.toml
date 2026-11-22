@@ -88,7 +88,22 @@ min_p = 0.0
 top_n_sigma = 0.0
 
 [behavior]
-enable_think_loop_watchdog = false
+# Budget forcing: the scheduler tracks the reasoning block by Inkling's
+# markers (`SchedLimits::message_open`) and closes it with `<|end_message|>`
+# at a sentence boundary once it runs past its budget or loops (the card
+# warns of "let me reconsider" cycles at high effort; vLLM loops on the same
+# prompts). The ceiling anchors the effort ladder: minimal 2K, low 4K,
+# medium (and effort-silent) 8K, high 16K, xhigh 32K reasoning tokens.
+max_thinking_budget = 8192
+enable_think_loop_watchdog = true
+# The model's own close is never held back (no A4 `</think>` floor): at low
+# effort its reasoning is short.
+min_reasoning_floor_tokens = 0
+# Its reasoning was always speculated (the blocks gave the scheduler no
+# thinking span before budget forcing); keep it so.
+spec_think = true
+# An end token ends the turn wherever it comes, as before reasoning was tracked.
+eos_ends_thinking = true
 honor_eos_inside_thinking = true
 confidence_early_stop = false
 rollback_resteer = false

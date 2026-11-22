@@ -289,3 +289,202 @@ fn spontaneous_thinking_keeps_nonzero_ceiling_decay_and_floor() {
         }
     }
 }
+
+/// Inkling 2: every block opens with `<|message_model|>` and closes with
+/// `<|end_message|>`; the reasoning is the block the header opens with
+/// `<|content_thinking|>` (`SchedLimits::message_open`).
+mod inkling_blocks {
+    use super::*;
+    use crate::scheduler::test_support::inkling::{self, END, MESSAGE, TEXT, THINKING, TOOL_JSON};
+
+    fn commit(a: &mut ActiveSeq, toks: &[u32], sched: &SchedCtx) {
+        for &t in toks {
+            emit_token(a, t, None, sched);
+        }
+    }
+
+    #[test]
+    fn reasoning_opens_on_the_header_and_think_start_and_both_are_recorded() {
+        let s = inkling::sched();
+        let (mut a, _rx) = inkling::seq(true, Some(64));
+        commit(&mut a, &[THINKING, 5, 6], &s);
+        assert!(a.inside_thinking && !a.think_ended);
+        // Nothing consumed: the chat paths' rewrite reads every marker.
+        assert_eq!(a.output_tokens, [MESSAGE, THINKING, 5, 6]);
+        assert_eq!(a.thinking_budget, Some(64), "the request's own budget");
+        // The think start is the block's first token.
+        assert_eq!(a.thinking_tokens, 3);
+        commit(&mut a, &[END], &s);
+        assert!(!a.inside_thinking && a.think_ended && a.think_just_ended);
+        assert!(!a.think_force_closed, "the model closed it");
+        assert_eq!(a.output_tokens.last(), Some(&END));
+    }
+
+    #[test]
+    fn a_think_start_without_a_header_is_content() {
+        let s = inkling::sched();
+        let (mut a, _rx) = inkling::seq(true, Some(64));
+        a.output_tokens = vec![5];
+        commit(&mut a, &[THINKING, 6], &s);
+        assert!(!a.inside_thinking);
+        assert_eq!(a.output_tokens, [5, THINKING, 6]);
+    }
+
+    #[test]
+    fn an_answer_first_turn_never_counts_as_thinking() {
+        // At effort 0 the first block may be the answer; a thinking block
+        // after it is not the turn's reasoning (the chat paths drop it).
+        let s = inkling::sched();
+        let (mut a, _rx) = inkling::seq(true, Some(4));
+        let toks = [
+            TEXT, 5, 6, 7, 8, 9, END, MESSAGE, THINKING, 5, 6, 7, 8, 9, END,
+        ];
+        commit(&mut a, &toks, &s);
+        assert!(!a.inside_thinking && !a.force_end_thinking);
+        assert_eq!(a.thinking_tokens, 0);
+        assert!(a.think_ended, "the answer began");
+        assert_eq!(a.output_tokens.len(), 1 + toks.len(), "every id recorded");
+        assert!(!a.finished);
+    }
+
+    #[test]
+    fn a_block_close_outside_thinking_is_not_a_stray() {
+        let s = inkling::sched();
+        let (mut a, _rx) = inkling::seq(true, None);
+        let toks = [
+            THINKING, 5, END, MESSAGE, TEXT, 6, END, MESSAGE, 7, TOOL_JSON, 8, END,
+        ];
+        commit(&mut a, &toks, &s);
+        assert_eq!(a.think_skip_count, 0);
+        assert_eq!(
+            a.output_tokens.len(),
+            1 + toks.len(),
+            "every close recorded"
+        );
+        assert!(!a.finished && a.guard_stop.is_none());
+    }
+
+    #[test]
+    fn the_budget_arms_the_close_and_end_message_is_it() {
+        let s = inkling::sched();
+        let (mut a, _rx) = inkling::seq(true, Some(4));
+        commit(&mut a, &[THINKING, 5, 6], &s);
+        assert!(!a.force_end_thinking);
+        commit(&mut a, &[7], &s);
+        assert!(
+            a.force_end_thinking,
+            "4 thinking tokens of a 4-token budget"
+        );
+        commit(&mut a, &[END], &s);
+        assert!(!a.inside_thinking && a.think_ended && a.think_force_closed);
+        // The model then opens its own next block, the answer.
+        commit(&mut a, &[MESSAGE, TEXT, 9], &s);
+        assert!(!a.inside_thinking && !a.finished);
+        assert_eq!(a.thinking_tokens, 4);
+    }
+
+    #[test]
+    fn thinking_off_bounds_the_reasoning_by_the_server_ceiling() {
+        // Inkling's template reasons whatever the request says; with
+        // thinking off the chat paths hide it, and the server ceiling (its
+        // MODEL.toml `max_thinking_budget`) bounds it.
+        let s = inkling::sched();
+        let (mut a, _rx) = inkling::seq(false, None);
+        commit(&mut a, &[THINKING], &s);
+        assert!(a.inside_thinking);
+        assert_eq!(a.thinking_budget, Some(8192));
+    }
+
+    #[test]
+    fn the_thinking_loop_watchdog_arms_the_close() {
+        let mut s = inkling::sched();
+        s.watchdog.enable_think_loop_watchdog = true;
+        let (mut a, _rx) = inkling::seq(true, None);
+        commit(&mut a, &[THINKING], &s);
+        let period: Vec<u32> = (20..28).collect();
+        for _ in 0..40 {
+            commit(&mut a, &period, &s);
+            if a.force_end_thinking {
+                break;
+            }
+        }
+        assert!(a.force_end_thinking && a.think_watchdog_fires == 1);
+        assert!(a.inside_thinking, "armed, not yet closed");
+    }
+
+    #[test]
+    fn greedy_reasoning_keeps_the_gpu_argmax() {
+        use crate::scheduler::fast_greedy::{
+            raw_argmax_is_pick, raw_pick_masked, thinking_raw_pick,
+        };
+        let mut s = inkling::sched();
+        s.watchdog.confidence_early_stop = false; // as Inkling's MODEL.toml
+        let (mut a, _rx) = inkling::seq(true, Some(64));
+        emit_token(&mut a, THINKING, None, &s);
+        let raw = thinking_raw_pick(&s.limits, &s.watchdog);
+        assert!(raw_argmax_is_pick(&a, raw));
+        // What the pipeline masks or biases in there is redone on the host.
+        a.tool_call_start_token = Some(1200);
+        assert!(raw_pick_masked(&a, END) && raw_pick_masked(&a, 1200));
+        assert!(!raw_pick_masked(&a, 5));
+        // An armed close is the pipeline's to inject.
+        a.force_end_thinking = true;
+        assert!(!raw_argmax_is_pick(&a, raw));
+        a.force_end_thinking = false;
+        // F2 reads the logits.
+        s.watchdog.confidence_early_stop = true;
+        assert!(!raw_argmax_is_pick(
+            &a,
+            thinking_raw_pick(&s.limits, &s.watchdog)
+        ));
+        // Every other model's thinking rows stay on the host.
+        let other = SchedCtx::for_test();
+        s.watchdog.confidence_early_stop = false;
+        assert!(!thinking_raw_pick(&other.limits, &s.watchdog));
+        assert!(!raw_argmax_is_pick(&a, false));
+    }
+
+    #[test]
+    fn serial_decode_commits_the_blocks_as_emit_does() {
+        // The plain-decode commit (`process_decode_logits`) runs the same
+        // gate: a header-opened thinking block, its close, then the answer.
+        let s = inkling::sched();
+        let toks = [THINKING, 5, END, MESSAGE, TEXT, 6];
+        let (serial, _rx) = inkling::seq(true, Some(64));
+        let mut batch = vec![serial];
+        let mut states = Vec::new();
+        for &t in &toks {
+            let mut r = vec![0.0f32; 2048];
+            r[t as usize] = 9.0;
+            SCRIPT.with(|sc| {
+                *sc.borrow_mut() = Some(Script {
+                    rows: vec![r],
+                    cursor: 0,
+                })
+            });
+            process_decode_logits(
+                &model(),
+                &mut batch,
+                DevicePtr::NULL,
+                std::time::Instant::now(),
+                Some(END),
+                Some(THINKING),
+                None,
+                None,
+                false,
+                &s,
+            );
+            states.push(ThinkState::of(&batch[0]).picks_only());
+        }
+        SCRIPT.with(|sc| *sc.borrow_mut() = None);
+        let (mut emitted, _rx2) = inkling::seq(true, Some(64));
+        let mut want = Vec::new();
+        for &t in &toks {
+            emit_token(&mut emitted, t, None, &s);
+            want.push(ThinkState::of(&emitted).picks_only());
+        }
+        assert_eq!(batch[0].output_tokens, emitted.output_tokens);
+        assert_eq!(states, want);
+        assert!(states[1] != states[3], "the span crosses the close");
+    }
+}

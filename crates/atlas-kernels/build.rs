@@ -150,6 +150,7 @@ struct Target {
     behavior_tool_call_steering: bool,
     behavior_verbatim_reasoning_effort: bool,
     behavior_ban_tool_call_without_tools: bool,
+    behavior_spec_think: bool,
     /// Which `(model_type, hidden_size)` pairs this kernel target supports.
     /// Parsed from `[[model_types]]` in MODEL.toml.
     model_type_matches: Vec<ModelTypeMatch>,
@@ -1378,6 +1379,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_tool_call_steering: pb.tool_call_steering,
                 behavior_verbatim_reasoning_effort: pb.verbatim_reasoning_effort,
                 behavior_ban_tool_call_without_tools: pb.ban_tool_call_without_tools,
+                behavior_spec_think: pb.spec_think,
                 model_type_matches,
                 match_names,
                 dflash,

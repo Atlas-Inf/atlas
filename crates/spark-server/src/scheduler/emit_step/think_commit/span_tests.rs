@@ -167,3 +167,27 @@ fn the_commit_path_checks_each_row_at_its_own_position() {
     assert_eq!(a.output_tokens, [5, 6, 7, 8]);
     assert!(a.finished, "the last row meets the ceiling");
 }
+
+#[test]
+fn an_inkling_span_across_its_blocks_replays_serial_think_state() {
+    // Inkling 2 (`SchedLimits::message_open`): a span that opens reasoning
+    // with the header and think start, closes it, and starts the answer.
+    // The replay must open the block only where serial commits would (the
+    // header is in the output by then) and record every marker.
+    use crate::scheduler::test_support::inkling::{self, END, MESSAGE, TEXT, THINKING};
+    let s = inkling::sched();
+    let toks = [THINKING, 5, 6, END, MESSAGE, TEXT, 7];
+    let fresh = || {
+        let (a, rx) = inkling::seq(true, Some(64));
+        std::mem::forget(rx);
+        a
+    };
+    let want = serial(fresh(), &toks, 40, &s);
+    let got = replayed(fresh(), &toks, 40, &s);
+    assert_eq!(got, want);
+    assert!(
+        want[0].0 != want[3].0,
+        "the span opens and closes reasoning"
+    );
+    assert_eq!(want.last().unwrap().1.len(), 1 + toks.len());
+}

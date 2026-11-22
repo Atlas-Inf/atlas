@@ -245,3 +245,85 @@ fn answers_that_start_like_a_name_pass_unchanged() {
         assert_eq!(show(&streamed), format!("t|{body}#"), "streamed {body}");
     }
 }
+
+/// The engine's budget/loop close is a bare `<|end_message|>` inside the
+/// thinking body (`SchedLimits::message_open`); the model then opens its own
+/// next block. Either way the rewrite closes the reasoning there, once.
+fn forced_close(body: &str) -> Vec<u32> {
+    [vec![M.message, M.thinking], s(body), vec![M.end]].concat()
+}
+
+#[test]
+fn a_forced_close_then_an_answer_block() {
+    let ids = [
+        forced_close("let me reconsider"),
+        block(M.text, "", "391"),
+        vec![EOS],
+    ]
+    .concat();
+    for keep in [true, false] {
+        let want = if keep {
+            "let me reconsider|391#"
+        } else {
+            "391#"
+        };
+        assert_eq!(show(&M.turn(keep).map_all(&ids, &Chars)), want);
+    }
+}
+
+#[test]
+fn a_forced_close_then_a_tool_block() {
+    let ids = [
+        forced_close("t"),
+        block(M.tool_json, "f", r#"{"name":"f","args":{"x":1}}"#),
+        vec![EOS],
+    ]
+    .concat();
+    let out = show(&M.turn(true).map_all(&ids, &Chars));
+    assert!(out.starts_with("t|<tool_call>"), "{out}");
+    let (_, calls) = crate::tool_parser::parse_tool_calls(out[2..].trim_end_matches('#'));
+    assert_eq!(calls.len(), 1, "{out}");
+    assert_eq!(calls[0].function.arguments, r#"{"x":1}"#);
+}
+
+#[test]
+fn a_forced_close_then_headerless_text_is_the_answer() {
+    // Should the model write on without a header, that text is the answer.
+    let ids = [forced_close("t"), s("391"), vec![EOS]].concat();
+    assert_eq!(show(&M.turn(true).map_all(&ids, &Chars)), "t|391#");
+}
+
+/// With thinking off the scheduler does not stream the reasoning body (the
+/// header before it and its close are streamed); the rewrite reads the same
+/// answer as from the whole turn.
+#[test]
+fn a_suppressed_thinking_body_streams_the_same_answer() {
+    let whole = [forced_close("t"), block(M.text, "", "391"), vec![EOS]].concat();
+    let streamed = [vec![M.message, M.end], block(M.text, "", "391"), vec![EOS]].concat();
+    let mut turn = M.turn(false);
+    let mut out = Vec::new();
+    for &t in &streamed {
+        turn.feed(t, &Chars, &mut out);
+    }
+    turn.finish(&Chars, &mut out);
+    assert_eq!(out, M.turn(false).map_all(&whole, &Chars));
+    assert_eq!(show(&out), "391#");
+}
+
+/// Budget forcing for Inkling, as its MODEL.toml arms it: a server ceiling
+/// the effort ladder scales (2K/4K/8K/16K/32K), the thinking-loop watchdog,
+/// speculation inside the reasoning it always speculated, an end token that
+/// ends the turn wherever it comes (as before reasoning was tracked), and no
+/// A4 floor holding back the model's own close.
+#[test]
+fn inkling_model_toml_arms_budget_forcing() {
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/gb10/inkling-2-mini");
+    let b = crate::api::test_app_state::build_behavior::parse_behavior(&dir);
+    assert!(b.thinking_default, "actual Inkling metadata read");
+    assert_eq!(b.max_thinking_budget, 8192);
+    assert!(b.enable_think_loop_watchdog);
+    assert!(b.spec_think);
+    assert!(b.eos_ends_thinking);
+    assert_eq!(b.min_reasoning_floor_tokens, 0);
+}

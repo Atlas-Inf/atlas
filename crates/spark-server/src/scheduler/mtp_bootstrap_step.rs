@@ -219,7 +219,13 @@ pub(super) fn step_mtp_bootstrap_batched(
                 && verify_ctx.sampling.fast_greedy_grammar
                 && (a.temperature == 0.0 || verify_ctx.sampling.force_temp_zero)
                 && a.grammar_state.is_none()
-                && crate::scheduler::fast_greedy::raw_argmax_is_pick(a)
+                && crate::scheduler::fast_greedy::raw_argmax_is_pick(
+                    a,
+                    crate::scheduler::fast_greedy::thinking_raw_pick(
+                        &verify_ctx.limits,
+                        &verify_ctx.watchdog,
+                    ),
+                )
         })
         .collect();
     let n_greedy = greedy.iter().filter(|&&g| g).count();

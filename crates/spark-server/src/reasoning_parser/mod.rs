@@ -67,8 +67,9 @@ pub trait ReasoningParser: Send + Sync {
     /// Whether the end tag closes only the reasoning block. `false` when the
     /// same token closes every block of the turn (Inkling 2's
     /// `<|end_message|>`): the chat paths still split reasoning on it, but the
-    /// scheduler gets no think-end token, since its think masks and budgets
-    /// would forbid the closes the answer needs.
+    /// scheduler's think masks and budgets would forbid the closes the answer
+    /// needs, so it tracks that end only with the model's block opener
+    /// (`SchedLimits::message_open`, Inkling 2), and otherwise not at all.
     fn end_tag_closes_only_reasoning(&self) -> bool {
         true
     }
