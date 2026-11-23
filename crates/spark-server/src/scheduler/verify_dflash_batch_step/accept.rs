@@ -27,7 +27,7 @@ pub(in crate::scheduler) fn apply_dflash_accept(
         }
     }
     if crate::scheduler::adaptive_spec::judges_block(drafts.len()) {
-        crate::scheduler::adaptive_spec::record_verify(a, num_accepted, sched);
+        crate::scheduler::adaptive_spec::record_verify(a, num_accepted, drafts.len(), sched);
     } else {
         crate::scheduler::adaptive_spec::note_narrow(a, num_accepted, drafts.len(), sched);
     }

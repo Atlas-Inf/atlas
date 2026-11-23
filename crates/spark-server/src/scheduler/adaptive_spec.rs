@@ -38,8 +38,14 @@ pub(crate) struct AdaptState {
     /// `ATLAS_QWEN_COPY_DRAFTS`).
     pub(crate) copy: super::copy_drafts::CopyState,
     window: Vec<u32>,
+    /// What the steps in `window` had to accept to pay ([`step_share`] of
+    /// the block threshold each), summed as the window is.
+    window_share: Vec<f32>,
     suspended: bool,
     serial_tokens: u32,
+    /// Probes in a row that ended in a suspension: each doubles the wait
+    /// before the next ([`hold_tokens`]); a window that pays clears it.
+    failed_probes: u32,
     /// Accepts of the last narrow steps (fewer drafts offered than a block:
     /// two or more live sequences on a depth table), and the width they
     /// were offered at.
@@ -169,11 +175,26 @@ pub(crate) fn plain_hold_step(active: &mut [ActiveSeq]) -> bool {
     held
 }
 
-/// Record one K=γ verify step's accept count; may trip suspension.
-/// Call after `num_accepted` is known (verify_dflash_step).
+/// The share of the block threshold a step that offered `offered` drafts
+/// must accept to pay for itself. The threshold is what a whole block
+/// (`MAX_DRAFTS` or more) must accept; a step cut shorter (the verify width
+/// rules, `dflash_width` and `dflash_conf_width`) verifies fewer rows but
+/// still pays for its propose, about a quarter of a block's extra cost over
+/// a plain step (Inkling 2 on one GB10: 13.6 ms of propose and bookkeeping
+/// against 5.6-6.5 ms a verify row).
+fn step_share(offered: usize) -> f32 {
+    const FIXED: f32 = 0.25;
+    let block = super::dflash_width::MAX_DRAFTS;
+    FIXED + (1.0 - FIXED) * offered.min(block) as f32 / block as f32
+}
+
+/// Record one verify step's accept count of the `offered` drafts it
+/// verified; may trip suspension. Call after `num_accepted` is known
+/// (verify_dflash_step).
 pub(crate) fn record_verify(
     a: &mut ActiveSeq,
     num_accepted: usize,
+    offered: usize,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
 ) {
     if !sched.levers.dflash_adaptive {
@@ -181,22 +202,39 @@ pub(crate) fn record_verify(
     }
     let st = &mut a.spec_adapt;
     st.window.push(num_accepted as u32);
+    st.window_share.push(step_share(offered));
     if st.window.len() > WINDOW {
         st.window.remove(0);
+        st.window_share.remove(0);
     }
     if st.window.len() == WINDOW {
         let mean = st.window.iter().sum::<u32>() as f32 / WINDOW as f32;
-        if mean < sched.levers.dflash_adaptive_min {
+        let floor =
+            sched.levers.dflash_adaptive_min * st.window_share.iter().sum::<f32>() / WINDOW as f32;
+        if mean < floor {
+            let hold = hold_tokens(sched.levers.dflash_adaptive_reprobe, st.failed_probes);
             st.suspended = true;
             st.serial_tokens = 0;
+            st.failed_probes = st.failed_probes.saturating_add(1);
             st.window.clear();
+            st.window_share.clear();
             tracing::info!(
-                "adaptive spec: SUSPENDED (mean accepted {mean:.2} < {} over {WINDOW} steps) — \
-                 serial decode until re-probe",
-                sched.levers.dflash_adaptive_min,
+                "adaptive spec: SUSPENDED (mean accepted {mean:.2} < {floor:.2} over {WINDOW} \
+                 steps) — serial decode for {hold} tokens"
             );
+        } else {
+            st.failed_probes = 0;
         }
     }
+}
+
+/// Serial tokens before the re-probe after the `failed`-th failed probe in
+/// a row: an eighth of the interval `reprobe` first, doubling to four times
+/// it. Text that drafts well again soon (a comment inside code) is back in
+/// a few dozen tokens; text that keeps failing (prose) is probed less often
+/// than the fixed interval probed it.
+fn hold_tokens(reprobe: u32, failed: u32) -> u32 {
+    (reprobe / 8).max(1).saturating_mul(1 << failed.min(5))
 }
 
 /// May this sequence propose/speculate right now? Un-suspends (re-probe)
@@ -212,14 +250,17 @@ pub(crate) fn spec_allowed(
     if !st.suspended {
         return true;
     }
-    if st.serial_tokens >= sched.levers.dflash_adaptive_reprobe {
+    // `failed_probes` already counts the suspension being waited out.
+    let hold = hold_tokens(
+        sched.levers.dflash_adaptive_reprobe,
+        st.failed_probes.saturating_sub(1),
+    );
+    if st.serial_tokens >= hold {
         st.suspended = false;
         st.serial_tokens = 0;
         st.window.clear();
-        tracing::info!(
-            "adaptive spec: RE-PROBING after {} serial tokens",
-            sched.levers.dflash_adaptive_reprobe
-        );
+        st.window_share.clear();
+        tracing::info!("adaptive spec: RE-PROBING after {hold} serial tokens");
         return true;
     }
     false
@@ -247,6 +288,23 @@ pub(crate) fn tick_serial(a: &mut ActiveSeq, sched: &crate::scheduler::sched_ctx
 #[cfg(test)]
 mod tests {
     use super::{WINDOW, narrow_pays};
+
+    #[test]
+    fn a_shorter_step_owes_less_but_never_under_its_propose() {
+        // a whole block, or a deeper drafter's, owes the whole threshold
+        assert_eq!(super::step_share(7), 1.0);
+        assert_eq!(super::step_share(15), 1.0);
+        // two drafts: a quarter for the propose plus two rows of seven
+        assert!((super::step_share(2) - (0.25 + 0.75 * 2.0 / 7.0)).abs() < 1e-6);
+        assert_eq!(super::step_share(0), 0.25);
+    }
+
+    #[test]
+    fn the_wait_starts_short_and_doubles_to_four_intervals() {
+        let waits: Vec<u32> = (0..7).map(|f| super::hold_tokens(256, f)).collect();
+        assert_eq!(waits, [32, 64, 128, 256, 512, 1024, 1024]);
+        assert_eq!(super::hold_tokens(2, 0), 1);
+    }
 
     #[test]
     fn only_whole_blocks_feed_the_window() {
