@@ -75,7 +75,7 @@ fn test_store() -> WeightStore {
     put_dense(
         &mut store,
         "dt_bias",
-        &[LING_KDA_HEADS, LING_KDA_HEAD_DIM],
+        &[LING_KDA_PROJECTION_SIZE],
         WeightDtype::FP32,
         0xc000,
     );
@@ -100,6 +100,20 @@ fn test_scratch() -> LingKdaScratch {
         DevicePtr(0x16_0000),
         DevicePtr(0x17_0000),
     )
+}
+
+fn prefill_scratch() -> LingKdaPrefillScratch {
+    LingKdaPrefillScratch {
+        qkv_planes: DevicePtr(0x18_0000),
+        qkv: DevicePtr(0x19_0000),
+        conv_planes: DevicePtr(0x1a_0000),
+        raw_gate: DevicePtr(0x1b_0000),
+        raw_beta: DevicePtr(0x1c_0000),
+        gate: DevicePtr(0x1d_0000),
+        recurrent: DevicePtr(0x1e_0000),
+        gated: DevicePtr(0x1f_0000),
+        output: DevicePtr(0x20_0000),
+    }
 }
 
 #[test]
@@ -145,6 +159,36 @@ fn mock_decode_dispatches_direct_kda_chain_and_separate_residual() {
     layer
         .add_residual(&gpu, DevicePtr(0x25_0000), output, 7)
         .unwrap();
+    assert_eq!(gpu.launch_count(), 13);
+}
+
+#[test]
+fn mock_prefill_dispatches_one_batched_kda_chain() {
+    let gpu = MockGpuBackend::new();
+    let weights = LingKdaWeights::load(&test_store(), "").unwrap();
+    let layer = LingKdaLayer::new(weights, LingKdaConfig::pinned(), &gpu).unwrap();
+    let state = LingKdaState {
+        q_conv: DevicePtr(0x21_0000),
+        k_conv: DevicePtr(0x22_0000),
+        v_conv: DevicePtr(0x23_0000),
+        h: DevicePtr(0x24_0000),
+    };
+    let projection_scratch = LingProjectionScratch::new(DevicePtr::NULL, 0, DevicePtr::NULL, 0);
+
+    let output = layer
+        .forward_prefill(
+            &gpu,
+            DevicePtr(0x25_0000),
+            2,
+            state,
+            prefill_scratch(),
+            projection_scratch,
+            9,
+        )
+        .unwrap();
+    assert_eq!(output, DevicePtr(0x20_0000));
+    // Six batched projections, three token-parallel convolutions, then pack,
+    // recurrent, gated norm, and output projection. No per-token loop.
     assert_eq!(gpu.launch_count(), 13);
 }
 

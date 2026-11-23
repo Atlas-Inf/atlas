@@ -90,7 +90,8 @@ impl LingKdaWeights {
             let full = name(local);
             let tensor = store.get(&full)?;
             ensure!(
-                tensor.shape == shape,
+                tensor.shape == shape
+                    || (local == "dt_bias" && tensor.shape == [LING_KDA_PROJECTION_SIZE]),
                 "Ling tensor {full} has shape {:?}; expected {shape:?}",
                 tensor.shape
             );

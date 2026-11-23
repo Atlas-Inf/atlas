@@ -36,6 +36,24 @@ fn bf16_ptr(store: &WeightStore, name: &str, shape: &[usize]) -> Result<DevicePt
     Ok(tensor.ptr)
 }
 
+/// The checkpoint stores Conv3d patch weights in their native five-dimensional
+/// layout. The existing ViT patch GEMM consumes the same contiguous values as
+/// `[out, in * temporal * height * width]`, so no device reshape is needed.
+fn patch_embed_ptr(store: &WeightStore, name: &str) -> Result<DevicePtr> {
+    let tensor = store.get(name)?;
+    ensure!(
+        tensor.dtype == WeightDtype::BF16,
+        "{name} must be BF16, got {:?}",
+        tensor.dtype
+    );
+    ensure!(
+        tensor.shape == [1152, 3, 2, 16, 16] || tensor.shape == [1152, 1536],
+        "{name} must have Conv3d shape [1152, 3, 2, 16, 16] (or its contiguous flattened form), got {:?}",
+        tensor.shape
+    );
+    Ok(tensor.ptr)
+}
+
 fn block(store: &WeightStore, prefix: &str) -> Result<ViTBlock> {
     let h = 1152;
     let qkv = 3 * h;
@@ -196,11 +214,7 @@ impl LingVisionTower {
         );
 
         let vp = "model.visual";
-        let patch_embed_w = bf16_ptr(
-            store,
-            &format!("{vp}.patch_embed.proj.weight"),
-            &[1152, 1536],
-        )?;
+        let patch_embed_w = patch_embed_ptr(store, &format!("{vp}.patch_embed.proj.weight"))?;
         let patch_embed_b = bf16_ptr(store, &format!("{vp}.patch_embed.proj.bias"), &[1152])?;
         let pos_name = format!("{vp}.pos_embed.weight");
         let pos_embed = bf16_ptr(store, &pos_name, &[2304, 1152])?;

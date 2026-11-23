@@ -524,11 +524,13 @@ def routed_shared_swiglu(
                 values.float() * weights.index_select(0, rows).unsqueeze(-1),
             )
 
+    # HF's moe_infer narrows the routed accumulation back to the module
+    # boundary dtype before adding the unweighted shared expert. Keeping the
+    # weighted sum in FP32 through `y + shared` subtly changes BF16 outputs.
+    output = output.to(dtype=x.dtype)
     if cfg.num_shared_experts:
         shared_limit = cfg.shared_swiglu_limit(layer_idx)
         shared_prefix = _name(prefix, "shared_experts")
-        output = output + swiglu(x, shared_prefix, linear, shared_limit).float()
-    # The router accumulation is FP32.  The surrounding module decides its
-    # declared boundary dtype (BF16 in the deployable path); a float32 input
-    # keeps the CPU oracle lossless for reference comparisons.
-    return output.to(dtype=x.dtype)
+        shared = swiglu(x, shared_prefix, linear, shared_limit).to(dtype=x.dtype)
+        output = output + shared
+    return output
