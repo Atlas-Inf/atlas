@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Native one-token MLA for Ling 3.2 air.
+//! Native causal MLA for Ling 3.2 air.
 //!
 //! Ling's full-attention layers are the direct (q_lora-free) Bailing MLA:
 //! q_proj, kv_a_proj_with_mqa + RMSNorm, kv_b_proj, interleaved RoPE,
@@ -159,12 +159,16 @@ impl LingMlaWeights {
     }
 }
 
-/// Scratch layout for a single decode token. All pointers are BF16 except
+/// Maximum rows per MLA projection tile. Decode uses the first row.
+pub(super) const MLA_TILE_ROWS: usize = 128;
+
+/// Scratch layout for a projection tile. All pointers are BF16 except causal lengths and
 /// projection activation/scales, whose sizes are described by the nested
 /// LingProjectionScratch. The caller owns and reuses this storage.
 #[derive(Clone, Copy)]
 pub struct LingMlaScratch {
     pub projection: LingProjectionScratch,
+    pub causal_lengths: DevicePtr,
     pub q_full: DevicePtr,
     pub kv_a: DevicePtr,
     pub kv_norm: DevicePtr,
@@ -244,6 +248,7 @@ fn rope_ling_mrope(
     positions: DevicePtr,
     positions_h: DevicePtr,
     positions_w: DevicePtr,
+    rows: u32,
     q_heads: u32,
     head_dim: u32,
     rotary_dim: u32,
@@ -251,7 +256,7 @@ fn rope_ling_mrope(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([q_heads + 1, 1, 1])
+        .grid([q_heads + 1, rows, 1])
         .block([128, 1, 1])
         .arg_ptr(q)
         .arg_ptr(k)
@@ -269,14 +274,11 @@ fn rope_ling_mrope(
 }
 
 impl LingMlaWeights {
-    /// Run one causal decode token and optionally append its K/V to the shared
-    /// paged cache. `write_kv=false` is used when replaying a prefix row whose
-    /// K/V already exists in the cache: the query still attends through the
-    /// caller-provided causal metadata, but the replay must not overwrite the
-    /// cached slot. The cache layer must be BF16 with dimensions
-    /// (num_heads, qk_head_dim).
+    /// Process a tile of causal queries from one sequence. Each query supplies
+    /// its own length against a shared block table. Prefix hits precede the
+    /// write floor and already occupy their physical cache slots.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_decode(
+    pub fn forward_rows(
         &self,
         config: LingMlaConfig,
         kernels: LingMlaKernels,
@@ -287,19 +289,22 @@ impl LingMlaWeights {
         input: DevicePtr,
         output: DevicePtr,
         scratch: LingMlaScratch,
-        write_kv: bool,
+        rows: u32,
+        write_floor: u32,
         stream: u64,
     ) -> Result<()> {
         config.validate()?;
         ensure!(
-            metadata.num_seqs == 1,
-            "Ling MLA decode expects one sequence"
+            metadata.num_seqs == 1
+                && (1..=MLA_TILE_ROWS as u32).contains(&rows)
+                && write_floor <= rows,
+            "Ling MLA expects one sequence and a valid causal tile"
         );
         ensure!(
             !metadata.block_table.is_null()
                 && metadata.max_blocks_per_seq > 0
                 && !metadata.seq_len.is_null()
-                && (!write_kv || !metadata.slot.is_null()),
+                && (write_floor == rows || !metadata.slot.is_null()),
             "Ling MLA requires live paged KV metadata from the first prompt token"
         );
         ensure!(
@@ -326,16 +331,39 @@ impl LingMlaWeights {
         let qdim = config.q_proj_rows() as u32;
 
         self.q_proj
-            .forward(gpu, input, scratch.q_full, 1, scratch.projection, stream)?;
-        self.kv_a_proj_with_mqa
-            .forward(gpu, input, scratch.kv_a, 1, scratch.projection, stream)?;
+            .forward(gpu, input, scratch.q_full, rows, scratch.projection, stream)?;
+        self.kv_a_proj_with_mqa.forward(
+            gpu,
+            input,
+            scratch.kv_a,
+            rows,
+            scratch.projection,
+            stream,
+        )?;
+        let rank_bytes = config.kv_lora_rank * 2;
+        let rope_bytes = config.qk_rope_head_dim * 2;
+        let latent = if rows == 1 {
+            scratch.kv_a
+        } else {
+            // kv_a interleaves the latent and RoPE channels in each row.
+            gpu.copy_d2d_2d_async(
+                scratch.kv_a,
+                rank_bytes + rope_bytes,
+                scratch.q_rope,
+                rank_bytes,
+                rank_bytes,
+                rows as usize,
+                stream,
+            )?;
+            scratch.q_rope
+        };
         ops::rms_norm(
             gpu,
             kernels.rms_norm,
-            scratch.kv_a,
+            latent,
             &self.kv_a_layernorm,
             scratch.kv_norm,
-            1,
+            rows,
             config.kv_lora_rank as u32,
             config.rms_eps,
             stream,
@@ -348,7 +376,7 @@ impl LingMlaWeights {
             kernels.q_rope_extract,
             scratch.q_full,
             scratch.q_rope,
-            1,
+            rows,
             heads,
             qk,
             nope,
@@ -356,10 +384,13 @@ impl LingMlaWeights {
             qdim,
             stream,
         )?;
-        gpu.copy_d2d_async(
-            scratch.kv_a.offset(config.kv_lora_rank * 2),
+        gpu.copy_d2d_2d_async(
+            scratch.kv_a.offset(rank_bytes),
+            rank_bytes + rope_bytes,
             scratch.k_rope,
-            config.qk_rope_head_dim * 2,
+            rope_bytes,
+            rope_bytes,
+            rows as usize,
             stream,
         )?;
         rope_ling_mrope(
@@ -370,6 +401,7 @@ impl LingMlaWeights {
             metadata.positions,
             metadata.positions_h,
             metadata.positions_w,
+            rows,
             heads,
             rope,
             rope,
@@ -381,7 +413,7 @@ impl LingMlaWeights {
             kernels.q_rope_writeback,
             scratch.q_rope,
             scratch.q_full,
-            1,
+            rows,
             heads,
             qk,
             nope,
@@ -394,7 +426,7 @@ impl LingMlaWeights {
             gpu,
             scratch.kv_norm,
             scratch.kv_b,
-            1,
+            rows,
             scratch.projection,
             stream,
         )?;
@@ -405,7 +437,7 @@ impl LingMlaWeights {
             scratch.k_rope,
             scratch.k_token,
             scratch.v_compact,
-            1,
+            rows,
             heads,
             nope,
             vdim,
@@ -419,26 +451,32 @@ impl LingMlaWeights {
         // true 128 channels and zero-pad each head to the 192-wide cache row.
         let k_row_bytes = config.qk_head_dim() * 2;
         let v_row_bytes = config.v_head_dim * 2;
-        gpu.memset_async(scratch.v_padded, 0, config.num_heads * k_row_bytes, stream)?;
+        gpu.memset_async(
+            scratch.v_padded,
+            0,
+            rows as usize * config.num_heads * k_row_bytes,
+            stream,
+        )?;
         gpu.copy_d2d_2d_async(
             scratch.v_compact,
             v_row_bytes,
             scratch.v_padded,
             k_row_bytes,
             v_row_bytes,
-            config.num_heads,
+            rows as usize * config.num_heads,
             stream,
         )?;
-        if write_kv {
+        if write_floor < rows {
+            let offset = write_floor as usize * config.num_heads * k_row_bytes;
             ops::reshape_and_cache(
                 gpu,
                 kernels.reshape_cache,
-                scratch.k_token,
-                scratch.v_padded,
+                scratch.k_token.offset(offset),
+                scratch.v_padded.offset(offset),
                 kv_cache.k_pool_ptr(layer_idx),
                 kv_cache.v_pool_ptr(layer_idx),
-                metadata.slot,
-                1,
+                metadata.slot.offset(write_floor as usize * 8),
+                rows - write_floor,
                 heads,
                 qk,
                 kv_cache.block_size() as u32,
@@ -458,8 +496,8 @@ impl LingMlaWeights {
             scratch.attn_padded,
             metadata.block_table,
             metadata.seq_len,
-            metadata.max_blocks_per_seq,
-            1,
+            0, // All queries use the same physical block table.
+            rows,
             heads,
             heads,
             qk,
@@ -478,11 +516,11 @@ impl LingMlaWeights {
             scratch.attn_compact,
             v_row_bytes,
             v_row_bytes,
-            config.num_heads,
+            rows as usize * config.num_heads,
             stream,
         )?;
         self.g_proj
-            .forward(gpu, input, scratch.gate, 1, scratch.projection, stream)?;
+            .forward(gpu, input, scratch.gate, rows, scratch.projection, stream)?;
         ops::sigmoid_gate_mul_head_broadcast(
             gpu,
             kernels.sigmoid_gate,
@@ -491,14 +529,14 @@ impl LingMlaWeights {
             scratch.attn_gated,
             heads,
             vdim,
-            1,
+            rows,
             stream,
         )?;
         self.dense.forward(
             gpu,
             scratch.attn_gated,
             output,
-            1,
+            rows,
             scratch.projection,
             stream,
         )

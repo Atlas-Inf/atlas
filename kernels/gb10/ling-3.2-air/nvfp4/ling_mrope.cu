@@ -29,10 +29,11 @@ extern "C" __global__ void ling_mrope_rope_bf16(
     const unsigned int pairs = rotary_dim / 2;
     if (pair_idx >= pairs || 2 * pair_idx + 1 >= head_dim) return;
 
+    const unsigned int row = blockIdx.y;
     const unsigned int hw_pairs = h_section + w_section;
-    const int pos_t = static_cast<int>(*pos_t_bits);
-    const int pos_h = static_cast<int>(*pos_h_bits);
-    const int pos_w = static_cast<int>(*pos_w_bits);
+    const int pos_t = static_cast<int>(pos_t_bits[row]);
+    const int pos_h = static_cast<int>(pos_h_bits[row]);
+    const int pos_w = static_cast<int>(pos_w_bits[row]);
     int position;
     if (pair_idx < hw_pairs) {
         position = (pair_idx & 1u) == 0u ? pos_h : pos_w;
@@ -52,8 +53,8 @@ extern "C" __global__ void ling_mrope_rope_bf16(
     for (unsigned int head = blockIdx.x; head < num_q_heads + 1;
          head += gridDim.x) {
         __nv_bfloat16* ptr = head < num_q_heads
-            ? Q + static_cast<size_t>(head) * head_dim
-            : K;
+            ? Q + (static_cast<size_t>(row) * num_q_heads + head) * head_dim
+            : K + static_cast<size_t>(row) * head_dim;
         const float x0 = static_cast<float>(ptr[d0]);
         const float x1 = static_cast<float>(ptr[d1]);
         ptr[d0] = __float2bfloat16(x0 * c - x1 * s);

@@ -66,7 +66,6 @@ impl TransformerLayer for LingDecoderLayer {
                 hidden,
                 residual,
                 num_tokens,
-                state,
                 kv_cache,
                 seq_len_start,
                 kv_write_start,

@@ -13,7 +13,9 @@ use crate::layers::ling_kda::{
     LING_KDA_HEADS, LING_KDA_HIDDEN_SIZE, LING_KDA_PROJECTION_SIZE, LingKdaLayer,
     LingKdaPrefillScratch, LingKdaScratch, LingKdaState,
 };
-use crate::layers::ling_mla::{LingMlaConfig, LingMlaKernels, LingMlaScratch, LingMlaWeights};
+use crate::layers::ling_mla::{
+    LingMlaConfig, LingMlaKernels, LingMlaScratch, LingMlaWeights, MLA_TILE_ROWS,
+};
 use crate::layers::ling_projection::{LingProjection, LingProjectionScratch};
 use crate::layers::ops;
 
@@ -204,7 +206,7 @@ impl LingDecoderLayer {
         config: LingMlaConfig,
         projection: LingProjectionScratch,
     ) -> Result<LingMlaScratch> {
-        let bf16 = |elements: usize| gpu.alloc(elements * 2);
+        let bf16 = |elements: usize| gpu.alloc(MLA_TILE_ROWS * elements * 2);
         let qk = config.qk_head_dim();
         let q = config.q_proj_rows();
         let kv_a = config.kv_lora_rank + config.qk_rope_head_dim;
@@ -213,6 +215,7 @@ impl LingDecoderLayer {
         let padded = config.num_heads * qk;
         Ok(LingMlaScratch {
             projection,
+            causal_lengths: gpu.alloc(4 * MLA_TILE_ROWS)?,
             q_full: bf16(q)?,
             kv_a: bf16(kv_a)?,
             kv_norm: bf16(config.kv_lora_rank)?,
@@ -370,7 +373,7 @@ impl LingDecoderLayer {
                 let metadata = metadata.ok_or_else(|| {
                     anyhow::anyhow!("Ling MLA decode requires uploaded AttnMetadataDev")
                 })?;
-                weights.forward_decode(
+                weights.forward_rows(
                     *config,
                     *kernels,
                     ctx.gpu,
@@ -381,7 +384,8 @@ impl LingDecoderLayer {
                     normed,
                     ctx.buffers.attn_output(),
                     *scratch,
-                    write_kv,
+                    1,
+                    u32::from(!write_kv),
                     stream,
                 )?;
                 ctx.buffers.attn_output()
@@ -469,6 +473,18 @@ impl LingDecoderLayer {
             )?,
             LingAttention::Mla { .. } => unreachable!("KDA prefill called on MLA layer"),
         };
+        self.finish_prefill_ffn(hidden, residual, attn, num_tokens, ctx, stream)
+    }
+
+    fn finish_prefill_ffn(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        attn: DevicePtr,
+        num_tokens: usize,
+        ctx: &ForwardContext<'_>,
+        stream: u64,
+    ) -> Result<()> {
         let h_bytes = self.hidden_size * 2;
         // The attention result is complete before the post-attention norm, so
         // the whole token matrix can be normalized in one launch.  This also
@@ -539,7 +555,6 @@ impl LingDecoderLayer {
         hidden: DevicePtr,
         residual: DevicePtr,
         num_tokens: usize,
-        state: &mut dyn LayerState,
         kv_cache: &mut PagedKvCache,
         seq_len_start: usize,
         kv_write_start: usize,
@@ -554,40 +569,73 @@ impl LingDecoderLayer {
             kv_write_start <= num_tokens,
             "Ling MLA prefill write floor {kv_write_start} exceeds {num_tokens} rows"
         );
-        ensure!(
-            ctx.buffers.scratch_bytes() >= 4,
-            "Ling MLA prefill needs a scalar scratch word"
+        let LingAttention::Mla {
+            weights,
+            config,
+            kernels,
+            scratch,
+            ..
+        } = &self.attention
+        else {
+            unreachable!("MLA prefill called on KDA layer");
+        };
+        let mut scratch = *scratch;
+        scratch.projection = LingProjectionScratch::new(
+            ctx.buffers.fp8_act(),
+            ctx.buffers.fp8_act_bytes(),
+            ctx.buffers.fp8_act_scale(),
+            ctx.buffers.sizes().fp8_act_scale,
         );
-        let seq_len_word = ctx.buffers.scratch();
+        let normed = ctx.buffers.norm_output();
+        let attn = ctx.buffers.attn_output();
         let h_bytes = self.hidden_size * 2;
-        for token in 0..num_tokens {
-            let seq_len = (seq_len_start + token + 1) as u32;
+        ensure!(
+            num_tokens * h_bytes <= ctx.buffers.sizes().attn_output,
+            "Ling MLA prefill exceeds attention arena"
+        );
+        ops::rms_norm_residual(
+            ctx.gpu,
+            self.rms_norm_residual_k,
+            hidden,
+            &self.input_norm,
+            normed,
+            residual,
+            num_tokens as u32,
+            self.hidden_size as u32,
+            ctx.config.rms_norm_eps as f32,
+            stream,
+        )?;
+        for first in (0..num_tokens).step_by(MLA_TILE_ROWS) {
+            let rows = MLA_TILE_ROWS.min(num_tokens - first);
+            let lengths: Vec<u8> = (first..first + rows)
+                .flat_map(|i| ((seq_len_start + i + 1) as u32).to_ne_bytes())
+                .collect();
             ctx.gpu
-                .copy_h2d_async(&seq_len.to_ne_bytes(), seq_len_word, stream)?;
-            let token_meta = AttnMetadataDev {
-                positions: meta.positions.offset(token * 4),
-                positions_h: meta.positions_h.offset(token * 4),
-                positions_w: meta.positions_w.offset(token * 4),
-                slot: meta.slot.offset(token * 8),
-                seq_len: seq_len_word,
-                block_table: meta.block_table,
-                max_blocks_per_seq: meta.max_blocks_per_seq,
-                num_seqs: 1,
-                seq_slot: DevicePtr::NULL,
-                moe_row_adapter: DevicePtr::NULL,
+                .copy_h2d_async_retained(&lengths, scratch.causal_lengths, stream)?;
+            let metadata = AttnMetadataDev {
+                positions: meta.positions.offset(first * 4),
+                positions_h: meta.positions_h.offset(first * 4),
+                positions_w: meta.positions_w.offset(first * 4),
+                slot: meta.slot.offset(first * 8),
+                seq_len: scratch.causal_lengths,
+                ..meta
             };
-            self.run_one(
-                hidden.offset(token * h_bytes),
-                residual.offset(token * h_bytes),
-                state,
+            weights.forward_rows(
+                *config,
+                *kernels,
+                ctx.gpu,
                 kv_cache,
-                token >= kv_write_start,
-                Some(token_meta),
-                ctx,
+                self.attention_layer_idx.expect("Ling MLA needs a KV layer"),
+                metadata,
+                normed.offset(first * h_bytes),
+                attn.offset(first * h_bytes),
+                scratch,
+                rows as u32,
+                kv_write_start.saturating_sub(first).min(rows) as u32,
                 stream,
             )?;
         }
-        Ok(())
+        self.finish_prefill_ffn(hidden, residual, attn, num_tokens, ctx, stream)
     }
 }
 
