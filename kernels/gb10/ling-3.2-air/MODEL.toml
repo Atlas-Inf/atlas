@@ -16,12 +16,16 @@ moe_topk = 8
 moe_intermediate = 768
 vocab_size = 157184
 max_position_embeddings = 262144
+vision = true
+mtp_layers = 1
 
 [[model_types]]
 model_type = "bailing_moe_v3_vl"
 hidden_size = 2560
 
 [behavior]
+# The published envelope uses an unquoted tool name and arg_key/arg_value tags.
+tool_call_parser = "poolside_v1"
 thinking_default = true
 thinking_in_tools = true
 disable_cwd_hint_injection = true
@@ -31,3 +35,39 @@ max_thinking_budget = 0
 enable_stream_loop_guards = false
 enable_loop_watchdog = false
 confidence_early_stop = false
+
+[sampling.thinking_text]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.thinking_coding]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.non_thinking]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.tools]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0

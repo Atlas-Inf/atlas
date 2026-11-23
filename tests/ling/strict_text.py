@@ -81,6 +81,10 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, local_files_only=True, trust_remote_code=True)
     token_ids = tokenizer.apply_chat_template([{'role':'user', 'content':args.prompt}],
         tokenize=True, add_generation_prompt=True, enable_thinking=args.thinking, return_dict=False)
+    from pathlib import Path
+    generation = json.loads((Path(args.checkpoint) / 'generation_config.json').read_text())
+    eos = generation['eos_token_id']
+    stop_ids = set(eos if isinstance(eos, list) else [eos])
     with StrictWeights(args.checkpoint, 'cuda') as w:
         model = TextProbe(w)
         ids = torch.tensor(token_ids, device=w.device).reshape(-1)
@@ -92,7 +96,7 @@ def main():
             token = int(logits.argmax())
             generated.append(token)
             print(json.dumps({'token_id': token, 'text': tokenizer.decode(generated)}), flush=True)
-            if token == w.config['text_config']['eos_token_id']:
+            if token in stop_ids:
                 break
             ids = ids.new_tensor([token])
 
