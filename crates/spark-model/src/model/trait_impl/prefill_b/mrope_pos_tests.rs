@@ -379,7 +379,7 @@ fn ling_video_advances_t_by_two_and_preserves_signed_center_offsets() {
     // Two 3x3 groups: T=0 then 2; H/W are body-diagonal coordinates with
     // offset -(3-1)//2=-1. The final text position is last(T)+1=3.
     assert_eq!(t[0..9], [0; 9]);
-    assert_eq!(&t[9..], &[2; 9]);
+    assert_eq!(&t[9..18], &[2; 9]);
     assert_eq!(t.last(), Some(&3));
     let hi: Vec<i32> = h.iter().map(|&v| v as i32).collect();
     let wi: Vec<i32> = w.iter().map(|&v| v as i32).collect();

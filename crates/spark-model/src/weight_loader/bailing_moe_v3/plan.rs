@@ -333,10 +333,10 @@ mod tests {
             "q_proj.weight",
             "q_proj.weight_scale_inv",
         ] {
-            if !mtp && suffix == "g_proj.weight_scale_inv" {
-                continue;
-            }
             header.insert(format!("{p}.{suffix}"));
+        }
+        if mtp {
+            header.insert(format!("{p}.g_proj.weight_scale_inv"));
         }
     }
 

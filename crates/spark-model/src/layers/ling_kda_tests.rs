@@ -39,10 +39,15 @@ fn test_store() -> WeightStore {
         ("v_proj", 0x3000),
         ("f_proj", 0x4000),
         ("g_proj", 0x5000),
-        ("o_proj", 0x6000),
     ] {
         put_projection(&mut store, name, &proj, ptr);
     }
+    put_projection(
+        &mut store,
+        "o_proj",
+        &[LING_KDA_HIDDEN_SIZE, LING_KDA_PROJECTION_SIZE],
+        0x6000,
+    );
     put_projection(
         &mut store,
         "b_proj",
