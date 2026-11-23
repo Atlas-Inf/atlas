@@ -35,8 +35,10 @@ pub(crate) fn gemm(
     if (mma_fp8 || mma_bf16) && k % 32 == 0 && rows >= 32 {
         let name = if mma_fp8 {
             "hy4_batch_linear_mma"
-        } else {
+        } else if buffers[2].is_null() {
             "hy4_batch_linear_bf16_mma"
+        } else {
+            "hy4_batch_linear_bf16_mma_bias"
         };
         let mut launch = KernelLaunch::new(gpu, gpu.op_cache().kernel(gpu, "hy4_ffn", name)?)
             .grid([

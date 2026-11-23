@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Tensor-core variant of hy4_batch_linear for bf16 weights (kind==0),
-// covering the FFN latent down/up projections and the FP32 router GEMM.
+// covering the FFN latent down/up projections and the Engram projections.
 // Opt-in via ATLAS_HY4_LINEAR_MMA=1 together with the fp8 path; decode
-// (rows < 32) stays on the scalar GEMV.
+// (rows < 32) stays on the scalar GEMV. A per-column bf16 bias (Engram)
+// is supported through a separate entry point (hy4_batch_linear_bf16_mma_bias)
+// so the no-bias kernel contains no bias load at all — ptxas hoists
+// conditionally-guarded param loads out of their guard and traps on NULL.
 //
 //   mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
 //
@@ -47,8 +50,9 @@ __device__ __forceinline__ void pbm_mma(
          "f"(acc[0]),"f"(acc[1]),"f"(acc[2]),"f"(acc[3]));
 }
 
-extern "C" __global__ void __launch_bounds__(256) hy4_batch_linear_bf16_mma(
-    const __nv_bfloat16* x, const __nv_bfloat16* weights, const float* scales,
+template<bool HAS_BIAS>
+__device__ __forceinline__ void hy4_pbm_impl(
+    const __nv_bfloat16* x, const __nv_bfloat16* weights, const __nv_bfloat16* bias,
     void* out,
     unsigned n, unsigned k, unsigned rows, unsigned heads, unsigned xh,
     unsigned yh, unsigned xr, unsigned yr, unsigned wr, unsigned float_out)
@@ -149,32 +153,58 @@ extern "C" __global__ void __launch_bounds__(256) hy4_batch_linear_bf16_mma(
 
     // Epilogue: acc[0..1] -> row warp_m+gid, acc[2..3] -> row +8; columns
     // cta_n+warp_n+nt*8+tid4*2 (+1). bf16 weights need no per-column scale.
-    #pragma unroll
-    for (int nt = 0; nt < 8; ++nt) {
-        const unsigned c0 = cta_n + warp_n + nt * 8 + tid4 * 2;
-        const unsigned r0 = row0 + warp_m + gid, r1 = r0 + 8;
-        if (r0 < rows) {
-            if (c0 < n) {
-                if (float_out) ((float*)yh_p)[(size_t)r0 * yr + c0] = acc[nt][0];
-                else ((__nv_bfloat16*)yh_p)[(size_t)r0 * yr + c0] = __float2bfloat16_rn(acc[nt][0]);
-            }
-            if (c0 + 1 < n) {
-                if (float_out) ((float*)yh_p)[(size_t)r0 * yr + c0 + 1] = acc[nt][1];
-                else ((__nv_bfloat16*)yh_p)[(size_t)r0 * yr + c0 + 1] = __float2bfloat16_rn(acc[nt][1]);
-            }
-        }
-        if (r1 < rows) {
-            if (c0 < n) {
-                if (float_out) ((float*)yh_p)[(size_t)r1 * yr + c0] = acc[nt][2];
-                else ((__nv_bfloat16*)yh_p)[(size_t)r1 * yr + c0] = __float2bfloat16_rn(acc[nt][2]);
-            }
-            if (c0 + 1 < n) {
-                if (float_out) ((float*)yh_p)[(size_t)r1 * yr + c0 + 1] = acc[nt][3];
-                else ((__nv_bfloat16*)yh_p)[(size_t)r1 * yr + c0 + 1] = __float2bfloat16_rn(acc[nt][3]);
-            }
-        }
-    }
+    // HAS_BIAS is a compile-time literal: the bias load exists only in the
+    // _bias instantiation.
+    #define PBM_EPILOGUE(HAS_BIAS) do { \
+        _Pragma("unroll") \
+        for (int nt = 0; nt < 8; ++nt) { \
+            const unsigned c0 = cta_n + warp_n + nt * 8 + tid4 * 2; \
+            const unsigned r0 = row0 + warp_m + gid, r1 = r0 + 8; \
+            float b0 = 0.f, b1 = 0.f; \
+            if (HAS_BIAS) { \
+                if (c0 < n) b0 = __bfloat162float(bias[c0]); \
+                if (c0 + 1 < n) b1 = __bfloat162float(bias[c0 + 1]); \
+            } \
+            if (r0 < rows) { \
+                if (c0 < n) { \
+                    if (float_out) ((float*)yh_p)[(size_t)r0 * yr + c0] = acc[nt][0] + b0; \
+                    else ((__nv_bfloat16*)yh_p)[(size_t)r0 * yr + c0] = __float2bfloat16_rn(acc[nt][0] + b0); \
+                } \
+                if (c0 + 1 < n) { \
+                    if (float_out) ((float*)yh_p)[(size_t)r0 * yr + c0 + 1] = acc[nt][1] + b1; \
+                    else ((__nv_bfloat16*)yh_p)[(size_t)r0 * yr + c0 + 1] = __float2bfloat16_rn(acc[nt][1] + b1); \
+                } \
+            } \
+            if (r1 < rows) { \
+                if (c0 < n) { \
+                    if (float_out) ((float*)yh_p)[(size_t)r1 * yr + c0] = acc[nt][2] + b0; \
+                    else ((__nv_bfloat16*)yh_p)[(size_t)r1 * yr + c0] = __float2bfloat16_rn(acc[nt][2] + b0); \
+                } \
+                if (c0 + 1 < n) { \
+                    if (float_out) ((float*)yh_p)[(size_t)r1 * yr + c0 + 1] = acc[nt][3] + b1; \
+                    else ((__nv_bfloat16*)yh_p)[(size_t)r1 * yr + c0 + 1] = __float2bfloat16_rn(acc[nt][3] + b1); \
+                } \
+            } \
+        } \
+    } while (0)
+    PBM_EPILOGUE(HAS_BIAS);
+    #undef PBM_EPILOGUE
     #undef PBM_ISSUE
     #undef PBM_COMPUTE
     #undef PBM_BFRAG
+}
+
+extern "C" __global__ void __launch_bounds__(256) hy4_batch_linear_bf16_mma(
+    const __nv_bfloat16* x, const __nv_bfloat16* weights, const __nv_bfloat16* bias,
+    void* out,
+    unsigned n, unsigned k, unsigned rows, unsigned heads, unsigned xh,
+    unsigned yh, unsigned xr, unsigned yr, unsigned wr, unsigned float_out) {
+    hy4_pbm_impl<false>(x, weights, bias, out, n, k, rows, heads, xh, yh, xr, yr, wr, float_out);
+}
+extern "C" __global__ void __launch_bounds__(256) hy4_batch_linear_bf16_mma_bias(
+    const __nv_bfloat16* x, const __nv_bfloat16* weights, const __nv_bfloat16* bias,
+    void* out,
+    unsigned n, unsigned k, unsigned rows, unsigned heads, unsigned xh,
+    unsigned yh, unsigned xr, unsigned yr, unsigned wr, unsigned float_out) {
+    hy4_pbm_impl<true>(x, weights, bias, out, n, k, rows, heads, xh, yh, xr, yr, wr, float_out);
 }

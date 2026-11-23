@@ -135,6 +135,12 @@ impl<'a> Hy4Engram<'a> {
                 .arg_u32(rows as u32)
                 .launch(stream)?;
         }
+        // Tensor-core path for the projections (same GEMM as the scalar
+        // kernel: bias iff topology[0]==0, weight column window starting at
+        // heads.start*dim) when the shared linear-mma flag is on.
+        let mma = std::env::var("ATLAS_HY4_LINEAR_MMA").ok().as_deref() == Some("1")
+            && local.is_multiple_of(32)
+            && rows >= 32;
         for i in 0..5 {
             let _project = super::super::timing::span("engram_project", stream)?;
             let (out, stride) = if i == 4 {
@@ -142,6 +148,35 @@ impl<'a> Hy4Engram<'a> {
             } else {
                 (b.keys.offset(i * self.h * 2), 4 * self.h)
             };
+            if mma {
+                batch::gemm(
+                    gpu,
+                    [
+                        b.lookup,
+                        self.projections[i].offset(self.heads.start * self.dim * 2),
+                        if self.topology[0] == 0 {
+                            self.biases[i]
+                        } else {
+                            DevicePtr::NULL
+                        },
+                        out,
+                    ],
+                    [
+                        self.h,
+                        local,
+                        rows,
+                        1,
+                        0,
+                        0,
+                        local,
+                        stride,
+                        heads * self.dim,
+                    ],
+                    [0, 0],
+                    stream,
+                )?;
+                continue;
+            }
             KernelLaunch::new(
                 gpu,
                 gpu.op_cache()
