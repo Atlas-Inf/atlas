@@ -16,6 +16,11 @@ pub struct VisionConfig {
     /// its MRoPE gives every group its own t=1 plane. Resolved at serve
     /// time from the checkpoint's preprocessor config, not config.json.
     pub is_qwen3vl_video: bool,
+    /// Inkling 2's tower: a CLS-token ViT over 20-pixel patches with learned
+    /// and rotary positions and layer scale, merged 2x2 by a bias-free
+    /// projector. Images are not resized: each 40x40 tile is one token.
+    /// `rms_norm_eps` holds its LayerNorm epsilon.
+    pub is_inkling2: bool,
     /// Input channel count for the visual patch embed (GLM uses 3).
     pub in_channels: usize,
     /// Number of ViT transformer blocks (depth=27).

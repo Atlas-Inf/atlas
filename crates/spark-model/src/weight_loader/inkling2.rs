@@ -208,17 +208,59 @@ impl ModelWeightLoader for Inkling2WeightLoader {
         Ok(())
     }
 
-    /// The vision tower is not ported yet; text serving leaves it on disk.
-    fn dead_namespaces(&self, _config: &ModelConfig) -> Vec<String> {
+    /// Without a vision tower (a target with no `vision_encoder` module),
+    /// text serving leaves its weights on disk.
+    fn dead_namespaces(&self, config: &ModelConfig) -> Vec<String> {
+        if config.vision.is_some() {
+            return Vec::new();
+        }
         vec!["model.visual.".to_string()]
+    }
+
+    fn load_vision_encoder(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Option<crate::layers::VisionTower>> {
+        if config.vision.as_ref().is_none_or(|v| !v.is_inkling2) {
+            return Ok(None);
+        }
+        let tower = crate::inkling2_vision::Inkling2VisionTower::new(store, config, gpu)?;
+        Ok(Some(crate::layers::VisionTower::Inkling2(Box::new(tower))))
     }
 
     fn load_embedding(
         &self,
         store: &WeightStore,
-        _config: &ModelConfig,
-        _gpu: &dyn GpuBackend,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
+        // The reference norms token embeddings inside the embedding
+        // (`Inkling2NormedEmbedding`) and adds image features after it, so
+        // the norm cannot run over a prompt's rows in the first visit. Norm
+        // the table once instead, in place, with the kernel and epsilon the
+        // first visit used: every looked-up row is bit-identical to what
+        // that visit computed, and no forward norms its input.
+        let table = store.get("model.llm.embed.weight")?;
+        let norm = store.get("model.llm.embed_norm.weight")?.ptr;
+        ensure!(
+            table.shape.len() == 2 && table.shape[1] == config.hidden_size,
+            "inkling2 embedding table shape {:?}",
+            table.shape
+        );
+        GlueKernels::resolve(gpu)?.rmsnorm(
+            gpu,
+            table.shape[0],
+            DevicePtr::NULL,
+            table.ptr,
+            norm,
+            table.ptr,
+            config.hidden_size,
+            config.rms_norm_eps as f32,
+            0,
+        )?;
+        gpu.synchronize(0)?;
         dense(store, "model.llm.embed.weight")
     }
 

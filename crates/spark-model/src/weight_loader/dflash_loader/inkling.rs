@@ -221,10 +221,10 @@ pub fn load_inkling2_dspark(
 }
 
 impl Inkling2DsparkWeights {
-    /// The target's embedding norm (the anchor row's input) and final norm
-    /// (applied to the last tap, captured before it), from the target store.
+    /// The target's final norm (applied to the last tap, captured before
+    /// it), from the target store. The anchor row needs no norm: the target's
+    /// embedding table is normed at load, so `target_embed_norm` stays NULL.
     pub fn attach_target(&mut self, target: &WeightStore, eps: f32) -> Result<()> {
-        self.target_embed_norm = ptr(target, "model.llm.embed_norm.weight")?;
         self.target_final_norm = ptr(target, "model.llm.norm.weight")?;
         self.target_eps = eps;
         Ok(())

@@ -132,3 +132,22 @@ fn rejects_layouts_the_port_does_not_implement() {
         assert!(parse_config(&json).is_err(), "{name} must be refused");
     }
 }
+
+#[test]
+fn mini_declares_its_vision_tower() {
+    let config = parse_config(MINI).expect("parse inkling2_loop");
+    let v = config.vision.as_ref().expect("vision tower");
+    assert!(v.is_inkling2 && !v.is_glm5_next && v.omni.is_none());
+    assert_eq!((v.depth, v.hidden_size, v.num_heads), (23, 1024, 16));
+    assert_eq!(
+        (v.patch_size, v.spatial_merge_size, v.temporal_patch_size),
+        (20, 2, 1)
+    );
+    assert_eq!(
+        (v.intermediate_size, v.projection_intermediate_size),
+        (4096, 4096)
+    );
+    assert_eq!(v.out_hidden_size, config.hidden_size);
+    assert_eq!(v.rms_norm_eps, 1e-5);
+    assert_eq!(v.image_pad_token_id, 200_054);
+}

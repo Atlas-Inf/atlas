@@ -43,19 +43,8 @@ impl Inkling2Layer {
         let gm = &self.gk;
         let meta = self.meta(gpu, batch, ctx, bs, v.first, stream)?;
 
-        if v.first {
-            gm.rmsnorm(
-                gpu,
-                n,
-                DevicePtr::NULL,
-                hidden,
-                self.g.embed_norm,
-                hidden,
-                h,
-                p.eps,
-                stream,
-            )?;
-        }
+        // `hidden` arrives normed: the embedding table is (`load_embedding`),
+        // and image rows never pass through `embed_norm`.
         let states = self.bind_states(gpu, conv_states, ctx.graph_capture, stream)?;
         for (j, state) in batch.journals.iter().zip(conv_states) {
             gpu.copy_d2d_async(*state, *j, self.conv_state_bytes(), stream)?;
