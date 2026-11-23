@@ -30,6 +30,9 @@ pub(crate) struct GlueKernels {
     pub dense_gemv_f32: KernelHandle,
     /// `inkling2_proj_gemv`: a visit's BF16 input projections in one launch
     pub proj_gemv: KernelHandle,
+    /// `inkling2_proj_gemv_mixed`: the same for one decode row with NVFP4
+    /// projections among them (0 where the target does not ship it)
+    pub proj_gemv_mixed: KernelHandle,
     /// `moe_topk_sigmoid_batched_f32`
     pub topk: KernelHandle,
     /// `reshape_and_cache_flash` (BF16 KV)
@@ -58,6 +61,11 @@ impl GlueKernels {
                 .kernel("inkling2_router_gemv", "dense_gemv_bf16_batchm_f32out")?,
             dense_gemv_f32: gpu.kernel("gemv", "dense_gemv_bf16_fp32out")?,
             proj_gemv: gpu.kernel("inkling2_proj_gemv", "inkling2_proj_gemv")?,
+            proj_gemv_mixed: crate::layers::try_kernel(
+                gpu,
+                "inkling2_proj_gemv",
+                "inkling2_proj_gemv_mixed",
+            ),
             topk: gpu.kernel("moe_topk_sig", "moe_topk_sigmoid_batched_f32")?,
             kv_write: gpu.kernel("reshape_and_cache", "reshape_and_cache_flash")?,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,

@@ -173,6 +173,7 @@ impl ModelWeightLoader for Inkling2WeightLoader {
                     shared: Shared::unattached(&d),
                     bound_states: Default::default(),
                     fused_proj: false,
+                    fused_mixed: false,
                 }) as Box<dyn TransformerLayer>
             })
             .collect())

@@ -3,7 +3,10 @@
 //! A visit's input projections: one list, which decode and verify batches of up
 //! to [`BATCHM_MAX_ROWS`] rows run as one `inkling2_proj_gemv` launch when every
 //! projection is BF16 (the checkpoint's weights, Strict), each output row
-//! computed as the one-projection GEMV computes it; otherwise one launch each.
+//! computed as the one-projection GEMV computes it. With NVFP4 projections
+//! among them (the Spark overlay) one decode row runs as one
+//! `inkling2_proj_gemv_mixed` launch, each output computed as `w4a16_gemv` or
+//! `dense_gemv_bf16` computes it; more rows take one launch a projection.
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -25,9 +28,42 @@ pub(super) struct Proj {
 /// Segments a visit has at most: q, k, v, relative bias, gate, sinks and the
 /// two dynamic convs' taps.
 const MAX_SEGS: usize = 8;
+/// The mixed kernel's table entry (`MixSeg`): input, weight, block scales and
+/// output pointers, outputs, first block, the weight's global scale, padding.
+const MIX_SEG_BYTES: usize = 48;
 /// One visit's table for one row count: `MAX_SEGS` of the kernel's 32-byte
-/// `ProjSeg` (input, weight and output pointers, outputs, first block).
-pub(crate) const TABLE_BYTES: usize = MAX_SEGS * 32;
+/// `ProjSeg` (input, weight and output pointers, outputs, first block), or
+/// for one row with NVFP4 projections `MAX_SEGS` of `MixSeg`.
+pub(crate) const TABLE_BYTES: usize = MAX_SEGS * MIX_SEG_BYTES;
+
+/// One projection of a mixed table: `scale` is the NVFP4 block scales, or
+/// null for a BF16 weight.
+#[derive(Clone, Copy)]
+struct MixEntry {
+    a: u64,
+    w: u64,
+    scale: u64,
+    c: u64,
+    n: u32,
+    scale2: f32,
+}
+
+/// The mixed kernel's table for `entries` and the blocks its launch needs.
+fn mixed_table(entries: &[MixEntry]) -> (Vec<u8>, u32) {
+    let mut table = Vec::with_capacity(entries.len() * MIX_SEG_BYTES);
+    let mut block0 = 0u32;
+    for e in entries {
+        for ptr in [e.a, e.w, e.scale, e.c] {
+            table.extend(ptr.to_le_bytes());
+        }
+        table.extend(e.n.to_le_bytes());
+        table.extend(block0.to_le_bytes());
+        table.extend(e.scale2.to_le_bytes());
+        table.extend(0u32.to_le_bytes());
+        block0 += e.n.div_ceil(OUTPUTS_PER_BLOCK as u32);
+    }
+    (table, block0)
+}
 /// Outputs a GEMV block computes (the kernels' `N_PER_BLOCK`).
 const OUTPUTS_PER_BLOCK: usize = 4;
 
@@ -108,12 +144,13 @@ impl Inkling2Layer {
     /// one launch a projection.
     pub(crate) fn upload_proj_tables(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
         self.fused_proj = false;
+        self.fused_mixed = false;
         if !self
             .projections(1)
             .iter()
             .all(|p| matches!(p.w, Linear::Bf16(_)))
         {
-            return Ok(());
+            return self.upload_mixed_table(gpu);
         }
         for rows in 1..=BATCHM_MAX_ROWS {
             let mut table = Vec::with_capacity(TABLE_BYTES);
@@ -133,10 +170,50 @@ impl Inkling2Layer {
         Ok(())
     }
 
+    /// One decode row's table for a visit with NVFP4 projections, where the
+    /// target ships the mixed kernel and every NVFP4 weight has one global
+    /// scale (the kernel reads no per-row scales).
+    fn upload_mixed_table(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
+        if self.gk.proj_gemv_mixed.0 == 0 {
+            return Ok(());
+        }
+        let mut entries = Vec::new();
+        for p in self.projections(1) {
+            let (w, scale, scale2) = match p.w {
+                Linear::Bf16(w) => (w.0, 0, 0.0),
+                Linear::Nvfp4 { q, .. } if q.weight_scale_2_vec.is_null() => {
+                    (q.weight.0, q.weight_scale.0, q.weight_scale_2)
+                }
+                Linear::Nvfp4 { .. } => return Ok(()),
+            };
+            entries.push(MixEntry {
+                a: p.x.0,
+                w,
+                scale,
+                c: p.y.0,
+                n: p.n as u32,
+                scale2,
+            });
+        }
+        gpu.copy_h2d(&mixed_table(&entries).0, self.proj_table(1))?;
+        self.fused_mixed = true;
+        Ok(())
+    }
+
     /// The visit's input projections over `rows` rows.
     pub(super) fn project(&self, gpu: &dyn GpuBackend, rows: usize, stream: u64) -> Result<()> {
         let projs = self.projections(rows);
         let k = self.dims.hidden;
+        if self.fused_mixed && rows == 1 {
+            let blocks: usize = projs.iter().map(|p| p.n.div_ceil(OUTPUTS_PER_BLOCK)).sum();
+            return KernelLaunch::new(gpu, self.gk.proj_gemv_mixed)
+                .grid([blocks as u32, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(self.proj_table(1))
+                .arg_u32(projs.len() as u32)
+                .arg_u32(k as u32)
+                .launch(stream);
+        }
         if self.fused_proj && rows <= BATCHM_MAX_ROWS {
             let blocks: usize = projs.iter().map(|p| p.n.div_ceil(OUTPUTS_PER_BLOCK)).sum();
             return KernelLaunch::new(gpu, self.gk.proj_gemv)
@@ -154,3 +231,56 @@ impl Inkling2Layer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{MIX_SEG_BYTES, MixEntry, mixed_table};
+
+    #[test]
+    fn a_mixed_table_lays_out_the_kernels_entries() {
+        let entries = [
+            // NVFP4, 3,072 outputs: 768 blocks
+            MixEntry {
+                a: 0x10,
+                w: 0x20,
+                scale: 0x30,
+                c: 0x40,
+                n: 3072,
+                scale2: 0.5,
+            },
+            // BF16 (no block scales), 24 outputs: 6 blocks
+            MixEntry {
+                a: 0x10,
+                w: 0x50,
+                scale: 0,
+                c: 0x60,
+                n: 24,
+                scale2: 0.0,
+            },
+            // 6 outputs: 2 blocks, the second partly filled
+            MixEntry {
+                a: 0x10,
+                w: 0x70,
+                scale: 0x80,
+                c: 0x90,
+                n: 6,
+                scale2: 2.0,
+            },
+        ];
+        let (table, blocks) = mixed_table(&entries);
+        assert_eq!(table.len(), 3 * MIX_SEG_BYTES);
+        assert_eq!(blocks, 768 + 6 + 2);
+        let u64_at = |o: usize| u64::from_le_bytes(table[o..o + 8].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(table[o..o + 4].try_into().unwrap());
+        // entry 0: a, w, scale, c, n, block0, scale2
+        assert_eq!([u64_at(0), u64_at(8), u64_at(16), u64_at(24)], [0x10, 0x20, 0x30, 0x40]);
+        assert_eq!([u32_at(32), u32_at(36)], [3072, 0]);
+        assert_eq!(f32::from_le_bytes(table[40..44].try_into().unwrap()), 0.5);
+        // entry 1 starts where entry 0's blocks end, and is BF16
+        let e1 = MIX_SEG_BYTES;
+        assert_eq!(u64_at(e1 + 16), 0);
+        assert_eq!([u32_at(e1 + 32), u32_at(e1 + 36)], [24, 768]);
+        assert_eq!(u32_at(2 * MIX_SEG_BYTES + 36), 774);
+    }
+}
+
