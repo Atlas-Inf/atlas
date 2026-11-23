@@ -56,6 +56,16 @@ pub(super) fn validate_input(req: &ChatRequest) -> Result<(), Response> {
             None,
         ));
     }
+    if let Some(p) = req.sampling.min_p
+        && !(0.0..=1.0).contains(&p)
+    {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            "min_p must be between 0 and 1".into(),
+            Some("min_p"),
+            None,
+        ));
+    }
     for (param, value) in [
         ("presence_penalty", req.sampling.presence_penalty),
         ("frequency_penalty", req.sampling.frequency_penalty),
@@ -155,6 +165,32 @@ mod tests {
                     let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                     assert_eq!(error["error"]["param"], param);
                 }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sampling_min_p_range() {
+        for (value, valid) in [(0.0, true), (1.0, true), (1.5, false), (-0.1, false)] {
+            let wire: crate::openai::ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "hello"}],
+                "min_p": value,
+            }))
+            .unwrap();
+            let result = validate_input(&wire.into());
+            if valid {
+                assert!(result.is_ok(), "min_p={value} should be accepted");
+            } else {
+                let response = result
+                    .err()
+                    .unwrap_or_else(|| panic!("min_p={value} should be rejected"));
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(error["error"]["param"], "min_p");
             }
         }
     }
