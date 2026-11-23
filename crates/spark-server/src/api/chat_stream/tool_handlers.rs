@@ -24,7 +24,7 @@ type DeltaVec = Vec<StreamDelta>;
 /// an unregistered name (rejected at validation) or an envelope the response
 /// cuts off before `</tool_call>` (never validated, so never flushed).
 fn holds_tool_deltas(state: &StreamState, ctx: &StreamCtx) -> bool {
-    (ctx.state.tool_guard.enabled && !ctx.state.tool_guard.stream)
+    (ctx.state.tool_guard.enabled && !ctx.streams_tool_calls())
         || ctx.tool_retry_enabled
         || state
             .detector
