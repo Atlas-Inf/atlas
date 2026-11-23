@@ -18,6 +18,7 @@ pub struct IndependentHc<'a> {
     weights: [DevicePtr; 3],
     pre_kernel: KernelHandle,
     post_kernel: KernelHandle,
+    norm_kernel: KernelHandle,
     is_head: bool,
 }
 
@@ -71,6 +72,14 @@ impl<'a> IndependentHc<'a> {
             weights: [DevicePtr::NULL; 3],
             pre_kernel: gpu.kernel("hy4_hc", if head { "hy4_hc_head" } else { "hy4_hc_pre" })?,
             post_kernel: gpu.kernel("hy4_hc", "hy4_hc_post")?,
+            norm_kernel: gpu.kernel(
+                "hy4_hc",
+                if head {
+                    "hy4_hc_head_norm"
+                } else {
+                    "hy4_hc_pre_norm"
+                },
+            )?,
             is_head: head,
         };
         for (i, (name, _)) in specs.iter().enumerate() {
@@ -138,6 +147,59 @@ impl<'a> IndependentHc<'a> {
             launch.arg_f32(p.magnitude)
         };
         launch.launch(stream)
+    }
+
+    /// `[T,4,H]` BF16 -> RMSNorm(`[T,H]`); post `[T,4]` FP32 unless head.
+    pub fn collapse_norm(
+        &self,
+        gpu: &dyn GpuBackend,
+        x: DevicePtr,
+        weight: DevicePtr,
+        out: DevicePtr,
+        post: DevicePtr,
+        tokens: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if tokens == 0 {
+            return Ok(());
+        }
+        ensure!(
+            self.weights.iter().all(|p| !p.is_null()),
+            "Hy4 iHC already released"
+        );
+        ensure!(
+            !x.is_null()
+                && !weight.is_null()
+                && !out.is_null()
+                && (self.is_head || !post.is_null()),
+            "Hy4 iHC null buffer"
+        );
+        let p = self.params;
+        ensure!(p.hidden <= 8192, "Hy4 iHC fused norm hidden bound");
+        let launch = KernelLaunch::new(gpu, self.norm_kernel)
+            .grid([tokens, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(x)
+            .arg_ptr(self.weights[0])
+            .arg_ptr(self.weights[1])
+            .arg_ptr(self.weights[2])
+            .arg_ptr(out)
+            .arg_ptr(weight);
+        let launch = if self.is_head {
+            launch
+        } else {
+            launch.arg_ptr(post)
+        };
+        let launch = launch
+            .arg_u32(u32::try_from(p.hidden)?)
+            .arg_f32(p.norm_eps)
+            .arg_f32(p.gate_eps);
+        let launch = if self.is_head {
+            launch
+        } else {
+            launch.arg_f32(p.magnitude)
+        };
+        launch.arg_f32(p.norm_eps).launch(stream)
     }
 
     /// Residual and out may alias. Scatter rounds the BF16 highway each site.

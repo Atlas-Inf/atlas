@@ -46,10 +46,77 @@ __device__ void hy4_collapse(const __nv_bfloat16* streams, const float* fn,
     }
 }
 
+template<bool HEAD>
+__device__ void hy4_collapse_norm(const __nv_bfloat16* streams, const float* fn,
+    const float* scale, const float* base, __nv_bfloat16* normed,
+    const __nv_bfloat16* weight, float* post,
+    unsigned h, float norm_eps, float gate_eps, float magnitude, float rms_eps) {
+    const unsigned t=blockIdx.x, tid=threadIdx.x, dim=4*h;
+    const __nv_bfloat16* x=streams+(size_t)t*dim;
+    __shared__ float red[256], r, gates[8];
+    float ss=0.f;
+    for (unsigned k=tid;k<dim;k+=256) {float v=(float)x[k]; ss+=v*v;}
+    red[tid]=ss;
+    __syncthreads();
+    float total=hy4_sum(red);
+    if (tid==0) r=rsqrtf(total/dim+norm_eps);
+    __syncthreads();
+    for (unsigned m=0;m<(HEAD?4u:8u);++m) {
+        float dot=0.f;
+        for (unsigned k=tid;k<dim;k+=256) dot+=fn[(size_t)m*dim+k]*(float)x[k];
+        red[tid]=dot;
+        __syncthreads();
+        total=hy4_sum(red);
+        if (tid==0) {
+            bool is_post=!HEAD && m>=4;
+            float z=total*r*scale[is_post?1:0]+base[m];
+            gates[m]=(is_post?magnitude:1.f)/(1.f+expf(-z))+gate_eps;
+            if (is_post) post[(size_t)t*4+m-4]=gates[m];
+        }
+        __syncthreads();
+    }
+    __nv_bfloat16 vals[32];
+    const unsigned dcount=(h+255)/256;
+    float nss=0.f;
+    for (unsigned d=tid;d<h;d+=256) {
+        float sum=0.f;
+        for (unsigned i=0;i<4;++i) sum+=gates[i]*(float)x[i*h+d];
+        __nv_bfloat16 v=__float2bfloat16_rn(sum);
+        vals[(d-tid)/256]=v;
+        float f=(float)v;
+        nss+=f*f;
+    }
+    red[tid]=nss;
+    __syncthreads();
+    for(int n=128;n;n>>=1) {
+        if(tid<n) red[tid]+=red[tid+n];
+        __syncthreads();
+    }
+    float inv=rsqrtf(red[0]/h+rms_eps);
+    for (unsigned j=0;j<dcount;++j) {
+        unsigned d=tid+j*256;
+        if(d<h) normed[(size_t)t*h+d]=__float2bfloat16_rn((float)vals[j]*inv*(float)weight[d]);
+    }
+}
+
 extern "C" __global__ void hy4_hc_pre(const __nv_bfloat16* x, const float* fn,
     const float* scale, const float* base, __nv_bfloat16* y, float* post,
     unsigned h, float norm_eps, float gate_eps, float magnitude) {
     hy4_collapse<false>(x,fn,scale,base,y,post,h,norm_eps,gate_eps,magnitude);
+}
+
+extern "C" __global__ void hy4_hc_pre_norm(const __nv_bfloat16* x, const float* fn,
+    const float* scale, const float* base, __nv_bfloat16* normed,
+    const __nv_bfloat16* weight, float* post,
+    unsigned h, float norm_eps, float gate_eps, float magnitude, float rms_eps) {
+    hy4_collapse_norm<false>(x,fn,scale,base,normed,weight,post,h,norm_eps,gate_eps,magnitude,rms_eps);
+}
+
+extern "C" __global__ void hy4_hc_head_norm(const __nv_bfloat16* x, const float* fn,
+    const float* scale, const float* base, __nv_bfloat16* normed,
+    const __nv_bfloat16* weight,
+    unsigned h, float norm_eps, float gate_eps, float rms_eps) {
+    hy4_collapse_norm<true>(x,fn,scale,base,normed,weight,nullptr,h,norm_eps,gate_eps,1.f,rms_eps);
 }
 
 extern "C" __global__ void hy4_hc_head(const __nv_bfloat16* x, const float* fn,

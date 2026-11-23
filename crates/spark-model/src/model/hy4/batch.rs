@@ -15,7 +15,6 @@ pub(super) struct Workspace<'a> {
     pub capacity: usize,
     pub tokens: DevicePtr,
     highway: DevicePtr,
-    collapsed: DevicePtr,
     pub normed: DevicePtr,
     output: DevicePtr,
     pub post: DevicePtr,
@@ -30,7 +29,6 @@ impl<'a> Workspace<'a> {
             capacity,
             tokens: m.alloc(capacity * 4)?,
             highway: m.alloc(capacity * 4 * h * 2)?,
-            collapsed: m.alloc(capacity * h * 2)?,
             normed: m.alloc(capacity * h * 2)?,
             output: m.alloc(capacity * h * 2)?,
             post: m.alloc(capacity * 4 * 4)?,
@@ -114,9 +112,15 @@ impl Runtime<'_> {
                         )?;
                     }
                     let hc = timing::span("ihc_norms", stream)?;
-                    b.hc_attn
-                        .collapse(gpu, w.highway, w.collapsed, w.post, n as u32, stream)?;
-                    self.batch_norm(s, w.collapsed, b.input_norm, w.normed, n, stream)?;
+                    b.hc_attn.collapse_norm(
+                        gpu,
+                        w.highway,
+                        b.input_norm,
+                        w.normed,
+                        w.post,
+                        n as u32,
+                        stream,
+                    )?;
                     drop(hc);
                     let attn = timing::span("attention", stream)?;
                     if mode == VERIFY && data.checkpoint.is_some() {
@@ -137,9 +141,9 @@ impl Runtime<'_> {
                         n as u32,
                         stream,
                     )?;
-                    b.hc_mlp
-                        .collapse(gpu, w.highway, w.collapsed, w.post, n as u32, stream)?;
-                    self.batch_norm(s, w.collapsed, b.mlp_norm, w.normed, n, stream)?;
+                    b.hc_mlp.collapse_norm(
+                        gpu, w.highway, b.mlp_norm, w.normed, w.post, n as u32, stream,
+                    )?;
                     drop(hc);
                     b.ffn.forward(
                         w.normed,
@@ -166,15 +170,15 @@ impl Runtime<'_> {
                         (w.highway, n)
                     };
                     let hc = timing::span("ihc_norms", stream)?;
-                    self.head.collapse(
+                    self.head.collapse_norm(
                         gpu,
                         input,
-                        w.collapsed,
+                        self.final_norm,
+                        w.normed,
                         DevicePtr::NULL,
                         rows as u32,
                         stream,
                     )?;
-                    self.batch_norm(s, w.collapsed, self.final_norm, w.normed, rows, stream)?;
                     drop(hc);
                     if mode == LAST {
                         let head = timing::span("lm_head", stream)?;
@@ -220,15 +224,15 @@ impl Runtime<'_> {
                 };
                 if data.draft.is_some() {
                     if mode == BATCH {
-                        self.head.collapse(
+                        self.head.collapse_norm(
                             gpu,
                             w.highway.offset((n - 1) * 4 * h * 2),
-                            w.collapsed,
+                            self.final_norm,
+                            w.normed,
                             DevicePtr::NULL,
                             1,
                             stream,
                         )?;
-                        self.batch_norm(s, w.collapsed, self.final_norm, w.normed, 1, stream)?;
                     }
                     let hidden = w
                         .normed
@@ -263,27 +267,6 @@ impl Runtime<'_> {
             }
             result
         })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn batch_norm(
-        &self,
-        s: &Shared,
-        x: DevicePtr,
-        weight: DevicePtr,
-        out: DevicePtr,
-        rows: usize,
-        stream: u64,
-    ) -> Result<()> {
-        KernelLaunch::new(s.gpu.as_ref(), self.kernels[1])
-            .grid([rows as u32, 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(x)
-            .arg_ptr(weight)
-            .arg_ptr(out)
-            .arg_u32(s.config.hidden_size as u32)
-            .arg_f32(s.config.rms_norm_eps as f32)
-            .launch(stream)
     }
 }
 
