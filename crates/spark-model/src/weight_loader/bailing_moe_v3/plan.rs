@@ -176,7 +176,7 @@ pub(crate) fn plan(header: &Header, config: &ModelConfig) -> Result<Plan> {
         config.model_type
     );
     ensure!(
-        config.weight_prefix.is_empty(),
+        matches!(config.weight_prefix.as_str(), "" | "model"),
         "bailing_moe_v3_vl expects flat model.layers.* tensor names"
     );
     ensure!(
@@ -418,7 +418,8 @@ mod tests {
 
     #[test]
     fn accepts_the_hybrid_text_and_mtp_layout() {
-        let config = config();
+        let mut config = config();
+        config.weight_prefix = "model".into();
         let plan = plan(&valid_header(&config), &config).expect("valid layout");
         assert_eq!(
             plan.layers[0],

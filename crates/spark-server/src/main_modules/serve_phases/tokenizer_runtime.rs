@@ -37,15 +37,7 @@ pub(crate) fn resolve_tokenizer_runtime(
 
     let mut vocab_masks = crate::scheduler::vocab_masks::VocabMasks::default();
 
-    let tokenizer_vocab = tokenizer.inner().get_vocab_size(true);
-    if tokenizer_vocab > 0 && tokenizer_vocab < config.vocab_size {
-        tracing::info!(
-            "Capping vocab_size from {} (config) to {} (tokenizer incl. special tokens)",
-            config.vocab_size,
-            tokenizer_vocab,
-        );
-        config.vocab_size = tokenizer_vocab;
-    }
+    super::config::cap_vocab_size(config, tokenizer.inner().get_vocab_size(true));
 
     let reasoning_parser_box: Option<Box<dyn reasoning_parser::ReasoningParser>> = {
         let defaults_toml = include_str!("../../../tool_defaults.toml");
