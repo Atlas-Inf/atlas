@@ -66,6 +66,16 @@ pub(super) fn validate_input(req: &ChatRequest) -> Result<(), Response> {
             None,
         ));
     }
+    if let Some(value) = req.sampling.repetition_penalty
+        && !(value.is_finite() && value > 0.0)
+    {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            format!("repetition_penalty must be a finite positive number, got {value}"),
+            Some("repetition_penalty"),
+            None,
+        ));
+    }
     for (param, value) in [
         ("presence_penalty", req.sampling.presence_penalty),
         ("frequency_penalty", req.sampling.frequency_penalty),
@@ -140,6 +150,35 @@ pub(super) fn validate_input(req: &ChatRequest) -> Result<(), Response> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn repetition_penalty_rejects_non_positive() {
+        for (value, valid) in [(-0.1, false), (0.0, false), (0.1, true), (1.0, true)] {
+            let wire: crate::openai::ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "hello"}],
+                "repetition_penalty": value,
+            }))
+            .unwrap();
+            let result = validate_input(&wire.into());
+            if valid {
+                assert!(
+                    result.is_ok(),
+                    "repetition_penalty={value} should be accepted"
+                );
+            } else {
+                let response = result
+                    .err()
+                    .unwrap_or_else(|| panic!("repetition_penalty={value} should be rejected"));
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(error["error"]["param"], "repetition_penalty");
+            }
+        }
+    }
 
     #[tokio::test]
     async fn sampling_penalty_ranges() {
