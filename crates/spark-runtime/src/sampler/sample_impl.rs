@@ -80,8 +80,6 @@ fn sample_core(
     if params.temperature <= 0.0 {
         return Some(argmax_first_wins_f32(&raw_logits));
     }
-    let temperature = params.temperature;
-
     // ── 1. Top-n-sigma: filter noise in logit space (temperature-invariant) ──
     // Keep tokens with logit >= mean - n*sigma. Filters NVFP4 quantization noise.
     if top_n_sigma > 0.0 {
@@ -99,12 +97,11 @@ fn sample_core(
         }
     }
 
-    // ── 2. Temperature scaling ──
     let logits: Vec<(u32, f32)> = raw_logits
         .iter()
         .enumerate()
         .filter(|(_, v)| v.is_finite()) // Skip -inf tokens from top-n-sigma
-        .map(|(i, v)| (i as u32, v / temperature))
+        .map(|(i, &v)| (i as u32, v))
         .collect();
 
     if logits.is_empty() {
@@ -114,7 +111,18 @@ fn sample_core(
     draw(logits, params, seed, None)
 }
 
-/// Steps 3 on of the sampler over the scaled, finite `logits`. With
+#[inline]
+pub(super) fn softmax_weight(logit: f32, max: f32, temperature: f32) -> f32 {
+    let delta = logit - max;
+    let scaled = if delta.is_finite() {
+        delta / temperature
+    } else {
+        ((f64::from(logit) - f64::from(max)) / f64::from(temperature)) as f32
+    };
+    scaled.exp()
+}
+
+/// Rank and draw from finite, unscaled `logits`. With
 /// `absent` (and top-n-sigma's guaranteed keep, when its filter ran on the
 /// full row), `None` when the present tokens do not decide the pick.
 pub(super) fn draw(
@@ -126,15 +134,10 @@ pub(super) fn draw(
     let (top_k, top_p, min_p) = (params.top_k as usize, params.top_p, params.min_p);
     let sigma_kept = absent.and_then(|(_, kept)| kept);
     let absent = absent.map(|(a, _)| a);
-    // Every absent token's scaled logit is at most `bound_scaled` (division
-    // by a positive temperature is monotone; it keeps distinct BF16 logits
-    // distinct, so the order is the raw one).
-    let bound_scaled = absent.map(|a| a.bound / params.temperature);
-    let beats_absent = |logit: f32, id: u32| {
-        absent.is_none_or(|a| a.beaten_by(bound_scaled.unwrap_or(a.bound), logit, id))
-    };
+    let temperature = params.temperature;
+    let beats_absent = |logit: f32, id: u32| absent.is_none_or(|a| a.beaten_by(logit, id));
 
-    // ── 3. Rank-dependent filtering (top-k / min-p / top-p) ──
+    // ── 2. Rank-dependent filtering (top-k / min-p / top-p) ──
     // These need descending order — but a full O(n·log n) sort of the whole
     // ~248K vocab every token is wasteful when top_k caps survivors at a small
     // k (the model default here is top_k=20; a full sort was ~2.3ms/tok). Use
@@ -183,7 +186,9 @@ pub(super) fn draw(
         false
     };
 
-    // ── 4. Softmax ──
+    // ── 3. Temperature-scaled softmax ──
+    // Center first so the largest logit always has weight 1, even when
+    // dividing the original logits by a tiny temperature would overflow.
     // `sorted` ⇒ logits[0] is the max; otherwise reduce for it. min_p/top_p
     // below are only reachable when `sorted` is true, so their reliance on
     // descending order still holds.
@@ -197,12 +202,10 @@ pub(super) fn draw(
     };
     let mut probs: Vec<(u32, f32)> = logits
         .iter()
-        .map(|&(idx, logit)| (idx, (logit - max_val).exp()))
+        .map(|&(idx, logit)| (idx, softmax_weight(logit, max_val, temperature)))
         .collect();
-    // An absent token's probability is at most this.
-    let absent_prob = bound_scaled.map(|b| (b - max_val).exp());
 
-    // ── 4b. Entropy: H = -Σ p·ln(p) over the post-softmax distribution ──
+    // ── 3b. Entropy: H = -Σ p·ln(p) over the post-softmax distribution ──
     // (a row with absent tokens has no whole distribution to report)
     if absent.is_none() {
         let sum: f32 = probs.iter().map(|p| p.1).sum();
@@ -219,13 +222,13 @@ pub(super) fn draw(
         }
     }
 
-    // ── 5. Min-p: keep tokens with prob >= min_p * max_prob ──
+    // ── 4. Min-p: keep tokens with prob >= min_p * max_prob ──
     if min_p > 0.0 {
         let max_prob = probs[0].1; // Already sorted descending
         let threshold = min_p * max_prob;
         if open {
             // Every absent token must fall below the floor.
-            if absent_prob.is_some_and(|p| p >= threshold) {
+            if absent.is_some_and(|a| softmax_weight(a.bound, max_val, temperature) >= threshold) {
                 return None;
             }
             open = false;
@@ -238,10 +241,22 @@ pub(super) fn draw(
         return None;
     }
 
-    // ── 6. Top-p (nucleus) ──
+    // ── 5. Top-p (nucleus) ──
     if top_p < 1.0 {
         let tail = match absent {
-            Some(a) if open => (a.log_mass - max_val).exp(),
+            Some(a) if open => {
+                // The split summary uses an absolute log mass and is built
+                // with an f32 reciprocal temperature. Require a whole row
+                // when the summary or its scale cannot be trusted.
+                let scaled_max = max_val / temperature;
+                if temperature < f32::MIN_POSITIVE
+                    || !scaled_max.is_finite()
+                    || (a.log_mass != f32::NEG_INFINITY && !a.log_mass.is_finite())
+                {
+                    return None;
+                }
+                (a.log_mass - scaled_max).exp()
+            }
             _ => 0.0,
         };
         let sum: f32 = probs.iter().map(|p| p.1).sum::<f32>() + tail;
@@ -278,7 +293,7 @@ pub(super) fn draw(
     let mut cumsum = 0.0f32;
     for &(idx, prob) in &probs {
         cumsum += prob;
-        if cumsum >= threshold {
+        if prob > 0.0 && cumsum >= threshold {
             return Some(idx);
         }
     }

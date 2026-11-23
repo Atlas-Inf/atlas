@@ -20,11 +20,9 @@ pub struct Absent {
 }
 
 impl Absent {
-    /// Whether token `id` at `logit` precedes every absent token. On a scaled
-    /// row (logit / temperature, BF16 logits keep their order) `bound` is
-    /// scaled the same way.
-    pub(super) fn beaten_by(&self, bound: f32, logit: f32, id: u32) -> bool {
-        logit > bound || (logit == bound && id <= self.bound_id)
+    /// Whether token `id` at `logit` precedes every absent token.
+    pub(super) fn beaten_by(&self, logit: f32, id: u32) -> bool {
+        logit > self.bound || (logit == self.bound && id <= self.bound_id)
     }
 }
 
@@ -46,7 +44,7 @@ pub fn sample_with_absent(
     let first = |a: &(u32, f32), b: &(u32, f32)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
     if params.temperature <= 0.0 {
         let &(id, v) = present.iter().min_by(|a, b| first(a, b))?;
-        return absent.beaten_by(absent.bound, v, id).then_some(id);
+        return absent.beaten_by(v, id).then_some(id);
     }
     // The full row's top-n-sigma filter ran unless a mask made its sum -inf
     // (absent tokens are finite there); by Cantelli it keeps at least the
@@ -60,8 +58,8 @@ pub fn sample_with_absent(
     });
     let logits: Vec<(u32, f32)> = present
         .iter()
+        .copied()
         .filter(|(_, v)| v.is_finite())
-        .map(|&(i, v)| (i, v / params.temperature))
         .collect();
     if logits.is_empty() {
         return None;

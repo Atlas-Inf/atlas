@@ -361,6 +361,57 @@ fn present(view: &[f32]) -> Vec<(u32, f32)> {
         .collect()
 }
 
+#[test]
+fn tiny_positive_temperature() {
+    let mut params = SamplingParams::greedy(1);
+    params.temperature = 1e-40;
+    let logits = f32_bytes(&[2.0, 1.0]);
+
+    assert_eq!(sample_with_params_seeded(&logits, &params, &[], Some(0)), 0);
+
+    let weights = [2.0, 1.0].map(|v| sample_impl::softmax_weight(v, 2.0, params.temperature));
+    assert_eq!(weights, [1.0, 0.0]);
+
+    let reversed = f32_bytes(&[1.0, 2.0]);
+    for (top_k, top_p, min_p) in [(1, 1.0, 0.0), (0, 0.9, 0.0), (0, 1.0, 0.1)] {
+        (params.top_k, params.top_p, params.min_p) = (top_k, top_p, min_p);
+        assert_eq!(
+            sample_with_params_seeded(&reversed, &params, &[], Some(0)),
+            1
+        );
+    }
+}
+
+#[test]
+fn tiny_positive_temperature_with_absent_tokens() {
+    let mut params = SamplingParams::greedy(1);
+    params.temperature = 1e-40;
+    let present = [(0, 1.0), (1, 2.0)];
+    let absent = Absent {
+        bound: 1.0,
+        bound_id: 0,
+        log_mass: f32::INFINITY,
+    };
+
+    params.top_k = 1;
+    assert_eq!(
+        sample_with_absent(&present, 3, &params, Some(0), absent),
+        Some(1)
+    );
+    params.top_k = 0;
+    params.min_p = 0.1;
+    assert_eq!(
+        sample_with_absent(&present, 3, &params, Some(0), absent),
+        Some(1)
+    );
+    params.min_p = 0.0;
+    params.top_p = 0.9;
+    assert_eq!(
+        sample_with_absent(&present, 3, &params, Some(0), absent),
+        None
+    );
+}
+
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
