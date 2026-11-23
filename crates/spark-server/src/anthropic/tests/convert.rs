@@ -13,7 +13,7 @@ use crate::tool_parser;
 use super::super::helpers::convert_stop_reason;
 use super::super::types::{
     AnthropicRole, AnthropicTool, AnthropicToolChoice, ContentBlock, MessagesRequest,
-    SystemContent, ThinkingType,
+    SystemContent, ThinkingType, ToolChoiceType,
 };
 
 // ── finish reason → Anthropic stop_reason ──
@@ -63,27 +63,31 @@ fn stop_reason_covers_every_finish_reason_wire_string() {
 
 // ── tool_choice ──
 
-fn choice(kind: &str, name: Option<&str>) -> AnthropicToolChoice {
+fn choice(kind: ToolChoiceType, name: Option<&str>) -> AnthropicToolChoice {
     AnthropicToolChoice {
-        choice_type: kind.to_string(),
+        choice_type: kind,
         name: name.map(str::to_string),
     }
 }
 
 #[test]
 fn tool_choice_modes_map_to_openai_vocabulary() {
-    let cases = [("any", "required"), ("auto", "auto"), ("none", "none")];
+    let cases = [
+        (ToolChoiceType::Any, "required"),
+        (ToolChoiceType::Auto, "auto"),
+        (ToolChoiceType::None, "none"),
+    ];
     for (anthropic, openai) in cases {
         match tool_parser::ToolChoice::from(&choice(anthropic, None)) {
-            tool_parser::ToolChoice::Mode(m) => assert_eq!(m, openai, "{anthropic}"),
-            other => panic!("{anthropic}: expected Mode, got {other:?}"),
+            tool_parser::ToolChoice::Mode(m) => assert_eq!(m, openai, "{anthropic:?}"),
+            other => panic!("{anthropic:?}: expected Mode, got {other:?}"),
         }
     }
 }
 
 #[test]
 fn tool_choice_specific_tool_carries_the_name() {
-    match tool_parser::ToolChoice::from(&choice("tool", Some("get_weather"))) {
+    match tool_parser::ToolChoice::from(&choice(ToolChoiceType::Tool, Some("get_weather"))) {
         tool_parser::ToolChoice::Specific { function } => {
             assert_eq!(function.name, "get_weather");
         }
@@ -96,14 +100,28 @@ fn tool_choice_tool_without_a_name_degrades_to_auto() {
     // `{"type":"tool"}` with no `name` is malformed. Falling back to
     // "auto" keeps the request servable; forcing a nameless tool would
     // hand the grammar an empty name and fail the whole turn.
-    match tool_parser::ToolChoice::from(&choice("tool", None)) {
+    match tool_parser::ToolChoice::from(&choice(ToolChoiceType::Tool, None)) {
         tool_parser::ToolChoice::Mode(m) => assert_eq!(m, "auto"),
         other => panic!("expected Mode(auto), got {other:?}"),
     }
-    // Unknown types take the same path.
-    match tool_parser::ToolChoice::from(&choice("wat", None)) {
-        tool_parser::ToolChoice::Mode(m) => assert_eq!(m, "auto"),
-        other => panic!("expected Mode(auto), got {other:?}"),
+}
+
+#[test]
+fn rejects_unknown_tool_choice_type() {
+    // `tool_choice.type` is a closed wire vocabulary (auto/any/none/tool).
+    // An unknown type must not silently degrade to "auto": the client
+    // asked for a specific tool policy and would get unconstrained
+    // decoding instead. Reject at the wire boundary (400), like an
+    // unknown thinking type.
+    for kind in ["bogus", "AUTO", "required"] {
+        let error = serde_json::from_value::<MessagesRequest>(serde_json::json!({
+            "model": "qwen3-80b",
+            "max_tokens": 1024,
+            "tool_choice": {"type": kind},
+            "messages": [{"role": "user", "content": "Hi"}],
+        }))
+        .expect_err("an unknown tool_choice type should be rejected");
+        assert!(error.to_string().contains(kind), "{kind}: {error}");
     }
 }
 

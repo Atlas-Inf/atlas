@@ -238,10 +238,22 @@ pub struct AnthropicTool {
 #[derive(Debug, Deserialize)]
 pub struct AnthropicToolChoice {
     #[serde(rename = "type")]
-    pub choice_type: String,
+    pub choice_type: ToolChoiceType,
     /// Only present when type = "tool".
     #[serde(default)]
     pub name: Option<String>,
+}
+
+/// Anthropic `tool_choice.type`. A closed wire vocabulary: an unknown
+/// variant is rejected at deserialization (the handlers turn that into a
+/// 400) instead of silently degrading to `auto`.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoiceType {
+    Auto,
+    Any,
+    None,
+    Tool,
 }
 
 #[derive(Debug, Deserialize)]

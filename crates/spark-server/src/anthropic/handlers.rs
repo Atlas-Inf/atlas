@@ -363,6 +363,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn messages_rejects_an_unknown_tool_choice_type_with_400() {
+        let (_dir, host) = fixture_host();
+        let app = Router::new()
+            .route("/v1/messages", post(messages))
+            .with_state(host);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"fixture","max_tokens":16,"tool_choice":{"type":"bogus"},"messages":[{"role":"user","content":"Hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(
+            body["error"]["message"].as_str().unwrap().contains("bogus"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_client_error_forwards_as_an_invalid_request_error() {
         let openai = serde_json::json!({"error": {"message": "too many images", "type": "invalid_request_error"}});
         let resp = (StatusCode::BAD_REQUEST, Json(openai)).into_response();

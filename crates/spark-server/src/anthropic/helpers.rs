@@ -55,11 +55,11 @@ impl From<&AnthropicTool> for tool_parser::ToolDefinition {
 impl From<&AnthropicToolChoice> for tool_parser::ToolChoice {
     /// Convert an Anthropic tool_choice to an OpenAI-compatible tool_choice.
     fn from(tc: &AnthropicToolChoice) -> Self {
-        match tc.choice_type.as_str() {
-            "any" => tool_parser::ToolChoice::Mode("required".to_string()),
-            "auto" => tool_parser::ToolChoice::Mode("auto".to_string()),
-            "none" => tool_parser::ToolChoice::Mode("none".to_string()),
-            "tool" => {
+        match tc.choice_type {
+            ToolChoiceType::Any => tool_parser::ToolChoice::Mode("required".to_string()),
+            ToolChoiceType::Auto => tool_parser::ToolChoice::Mode("auto".to_string()),
+            ToolChoiceType::None => tool_parser::ToolChoice::Mode("none".to_string()),
+            ToolChoiceType::Tool => {
                 if let Some(ref name) = tc.name {
                     tool_parser::ToolChoice::Specific {
                         function: tool_parser::ToolChoiceFunction { name: name.clone() },
@@ -68,7 +68,6 @@ impl From<&AnthropicToolChoice> for tool_parser::ToolChoice {
                     tool_parser::ToolChoice::Mode("auto".to_string())
                 }
             }
-            _ => tool_parser::ToolChoice::Mode("auto".to_string()),
         }
     }
 }
