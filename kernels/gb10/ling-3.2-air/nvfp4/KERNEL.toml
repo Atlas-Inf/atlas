@@ -6,3 +6,4 @@ extra_nvcc_flags = ["--fmad=false"]
 # Keep this separate from the borrowed glm-5.3-flash paged-decode module:
 # Ling's MLA cache rows are 192 BF16 values wide.
 paged_decode_attn_ling = "paged_decode_ling"
+ling_vision = "ling_vision"

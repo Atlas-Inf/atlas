@@ -6,7 +6,7 @@
 //! `vision_config.disable_merger_proj=true`.  The 2×2 spatial merge therefore
 //! emits 4608-wide rows directly after the merger's per-patch LayerNorm; the
 //! text model's `linear_proj` then applies
-//! `Linear(4608, 2560) -> GELU -> Linear(2560, 2560)`.  This module reuses the
+//! `Linear(4608, 2560) -> GELU(exact erf) -> Linear(2560, 2560)`.  This module reuses the
 //! existing BF16 Qwen [`VisionEncoder`] and only owns that final projector.
 
 use anyhow::{Context, Result, ensure};
@@ -115,7 +115,9 @@ impl LingVisionProjector {
             fc2_w: bf16_ptr(store, "linear_proj.2.weight", &[TEXT_HIDDEN, TEXT_HIDDEN])?,
             fc2_b: bf16_ptr(store, "linear_proj.2.bias", &[TEXT_HIDDEN])?,
             k_gemm: gpu.kernel("vision_encoder", "vision_gemm_bias")?,
-            k_gelu: gpu.kernel("vision_encoder", "vision_gelu")?,
+            // The visual tower's blocks use gelu_pytorch_tanh, but HF's
+            // top-level linear_proj is plain nn.GELU(approximate="none").
+            k_gelu: gpu.kernel("ling_vision", "ling_projector_gelu_exact")?,
             buf_fc1: gpu.alloc(max_rows * PROJECTOR_HIDDEN * 2)?,
             buf_out: gpu.alloc(max_rows * PROJECTOR_HIDDEN * 2)?,
             max_rows,
