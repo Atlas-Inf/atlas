@@ -35,8 +35,7 @@ use image::RgbImage;
 mod types;
 
 use crate::vision_preprocess::{
-    MEAN, STD, decode_data_uri_bytes, glm_resize_or_pad, glm_target_size, normalize_channel,
-    patch_coordinates, target_size_for,
+    MEAN, STD, decode_data_uri_bytes, normalize_channel, patch_coordinates, target_size_for,
 };
 
 mod gif_access;
@@ -273,55 +272,20 @@ pub fn preprocess_video(
     // The decoder has already sampled the clip: its frames ARE the plan, at
     // the operator's rate and spanning the whole clip. Re-sampling here would
     // be a second, lossy pass over positions the decoder chose deliberately.
-    // Qwen's patchify duplicates the final frame when a clip has an odd count;
-    // GLM keeps its historical whole-group rule and drops a remainder.
-    let keep = if vcfg.is_glm5_next {
-        group_indices(frames.len(), tp)
-    } else {
-        (0..frames.len()).collect()
-    };
-    ensure!(!keep.is_empty(), "frame sampling selected no frames");
-    if vcfg.is_glm5_next {
-        ensure!(
-            keep.len() >= tp,
-            "video has {} usable frame(s) but temporal_patch_size is {tp}; a clip must carry at \
-             least one full temporal group",
-            keep.len()
-        );
-    }
+    // Qwen's patchify duplicates the final frame when a clip has an odd count.
+    ensure!(!frames.is_empty(), "frame sampling selected no frames");
+    let frame_count = frames.len();
 
-    // Geometry is decided ONCE, from the first kept frame, and applied to all
+    // Geometry is decided ONCE, from the first frame, and applied to all
     // of them. Per-frame sizing would be a correctness bug rather than a
     // refinement: every temporal group and its pad range must share a grid.
-    let first = &frames[keep[0]];
+    let first = &frames[0];
     let grid_unit = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
-    let (th, tw) = if vcfg.is_glm5_next {
-        glm_target_size(
-            vcfg,
-            first.height(),
-            first.width(),
-            keep.len(),
-            max_pixels,
-            true,
-        )?
-    } else {
-        target_size_for(first.height(), first.width(), grid_unit, max_pixels)
-    };
-    let glm_min_pixels = 16usize
-        * tp
-        * (vcfg.patch_size * vcfg.spatial_merge_size)
-            .saturating_mul(vcfg.patch_size * vcfg.spatial_merge_size);
-    let glm_allow_upscale = vcfg.is_glm5_next
-        && keep.len() * first.height() as usize * (first.width() as usize) < glm_min_pixels;
-
+    let (th, tw) = target_size_for(first.height(), first.width(), grid_unit, max_pixels);
     let ps = vcfg.patch_size;
     let grid_h = (th as usize) / ps;
     let grid_w = (tw as usize) / ps;
-    let grid_t = if vcfg.is_glm5_next {
-        keep.len() / tp
-    } else {
-        keep.len().div_ceil(tp)
-    };
+    let grid_t = frame_count.div_ceil(tp);
     if let Some(budget) = ffmpeg.max_total_decoded_pixels {
         let volume = grid_t
             .saturating_mul(tp)
@@ -343,13 +307,8 @@ pub fn preprocess_video(
         // the work `patch²` times.
         let resized: Vec<RgbImage> = (0..tp)
             .map(|k| {
-                let frame_index = (g * tp + k).min(keep.len() - 1);
-                let f = &frames[keep[frame_index]];
-                if vcfg.is_glm5_next {
-                    glm_resize_or_pad(f, th, tw, glm_allow_upscale)
-                } else {
-                    image::imageops::resize(f, tw, th, image::imageops::FilterType::CatmullRom)
-                }
+                let frame = &frames[(g * tp + k).min(frame_count - 1)];
+                image::imageops::resize(frame, tw, th, image::imageops::FilterType::CatmullRom)
             })
             .collect();
 
@@ -366,16 +325,7 @@ pub fn preprocess_video(
                                 [c] as f32
                                 / 255.0;
                             let off = c * (tp * ps * ps) + t * (ps * ps) + py * ps + px;
-                            pixels[patch_idx * patch_dim + off] = if vcfg.is_glm5_next {
-                                normalize_channel(
-                                    vcfg,
-                                    c,
-                                    frame.get_pixel((pw * ps + px) as u32, (ph * ps + py) as u32)
-                                        [c],
-                                )
-                            } else {
-                                (raw - MEAN[c]) / STD[c]
-                            };
+                            pixels[patch_idx * patch_dim + off] = (raw - MEAN[c]) / STD[c];
                         }
                     }
                 }
@@ -391,17 +341,12 @@ pub fn preprocess_video(
         grid_h,
         grid_w,
         // Qwen's processor averages the source times at the two ends of each
-        // temporal merge. GLM keeps its historical per-group floor, because
-        // its own prompt updater formats that metadata differently.
+        // temporal merge.
         timestamps: (0..grid_t)
             .map(|g| {
-                let first = frame_times[keep[g * tp]];
-                if vcfg.is_glm5_next {
-                    first.floor()
-                } else {
-                    let last = frame_times[keep[(g * tp + tp - 1).min(keep.len() - 1)]];
-                    (first + last) / 2.0
-                }
+                let first = frame_times[g * tp];
+                let last = frame_times[(g * tp + tp - 1).min(frame_count - 1)];
+                (first + last) / 2.0
             })
             .collect(),
     })
