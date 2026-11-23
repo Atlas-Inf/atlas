@@ -74,6 +74,18 @@ pub struct InklingScratch {
     bias: DevicePtr,
     /// `[ctx rows, 2 * kv_dim]` one layer's context K/V before the scatter.
     kv_tmp: DevicePtr,
+    /// Draft steps the next tail runs; 0 is the whole block. A step that
+    /// verifies fewer drafts than the block holds (two or more live
+    /// sequences) sets it, so the tail stops there: each step is a pass over
+    /// the folded head (about 0.4 ms on one GB10).
+    tail_steps: std::sync::atomic::AtomicUsize,
+}
+
+/// The stored step count for a tail of `drafts` drafts in a `gamma`-row
+/// block: 0 for the whole block (`gamma - 1` drafts or more), else the
+/// drafts, at least one.
+fn tail_steps_for(drafts: usize, gamma: usize) -> usize {
+    if drafts + 1 < gamma { drafts.max(1) } else { 0 }
 }
 
 impl InklingScratch {
@@ -99,7 +111,24 @@ impl InklingScratch {
             latent: a(FOLD_K * bf16)?,
             bias: a(vocab * bf16)?,
             kv_tmp: a(ctx_rows.max(1) * 2 * kv_dim * bf16)?,
+            tail_steps: Default::default(),
         })
+    }
+
+    /// Run the next tail for `drafts` drafts of a `gamma`-row block.
+    pub(super) fn set_tail_steps(&self, drafts: usize, gamma: usize) {
+        self.tail_steps.store(
+            tail_steps_for(drafts, gamma),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// The next tail's step count, if shorter than the block's.
+    pub(super) fn short_tail(&self) -> Option<usize> {
+        match self.tail_steps.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            steps => Some(steps),
+        }
     }
 }
 
@@ -339,7 +368,10 @@ impl BlockDiffusionDraftHead {
             .as_ref()
             .context("Inkling 2 DSpark lane scratch")?;
         let (h, v) = (self.hidden_size as u32, self.vocab_size);
-        let steps = self.gamma - 1;
+        let steps = sc
+            .short_tail()
+            .unwrap_or(self.gamma - 1)
+            .min(self.gamma - 1);
         let bf16 = 2usize;
         let row = |i: usize| scratch.logits.offset(i * v * bf16);
         ops::argmax_bf16(
@@ -416,5 +448,21 @@ impl BlockDiffusionDraftHead {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tail_steps_tests {
+    use super::tail_steps_for;
+
+    #[test]
+    fn a_tail_runs_the_steps_its_verify_will_read() {
+        // γ = 8: seven drafts is the whole block (the captured graph).
+        assert_eq!(tail_steps_for(7, 8), 0);
+        assert_eq!(tail_steps_for(9, 8), 0);
+        // Fewer drafts stop the tail early, never before the first.
+        assert_eq!(tail_steps_for(3, 8), 3);
+        assert_eq!(tail_steps_for(1, 8), 1);
+        assert_eq!(tail_steps_for(0, 8), 1);
     }
 }

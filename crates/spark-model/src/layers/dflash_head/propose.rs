@@ -616,6 +616,9 @@ impl BlockDiffusionDraftHead {
         // Live pos+1 grammar bitmask for this seq (#102); None = legacy.
         grammar_bitmask: Option<&[i32]>,
     ) -> Result<Vec<u32>> {
+        if let Some(s) = scratch.inkling.as_ref() {
+            s.set_tail_steps(self.draft_cap(_num_drafts), self.gamma);
+        }
         let drafts = self
             .forward_block(
                 last_token,

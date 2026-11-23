@@ -967,8 +967,12 @@ impl BlockDiffusionDraftHead {
                     }
                 }
 
+                // The tail graph holds the whole block's draft steps; a
+                // shorter tail (Inkling 2, `InklingScratch::set_tail_steps`)
+                // runs eagerly.
                 let tail_handle = graphs[tail_slot];
-                if tail_handle.0 != 0 {
+                let short = scratch.inkling.as_ref().and_then(|s| s.short_tail());
+                if tail_handle.0 != 0 && short.is_none() {
                     gpu.launch_graph(tail_handle, stream)?;
                 } else {
                     run_tail()?;
@@ -1039,7 +1043,10 @@ impl BlockDiffusionDraftHead {
                         }
                     }
 
-                    // tail subgraph
+                    // tail subgraph, always the whole block's steps
+                    if let Some(s) = scratch.inkling.as_ref() {
+                        s.set_tail_steps(self.gamma, self.gamma);
+                    }
                     gpu.begin_capture(stream)?;
                     run_tail()?;
                     let tail_graph = gpu.end_capture(stream)?;
