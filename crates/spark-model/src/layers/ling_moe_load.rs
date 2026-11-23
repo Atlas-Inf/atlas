@@ -218,6 +218,15 @@ impl LingMoeFfn {
             } else {
                 None
             },
+            grouped_a16: if a16 {
+                Some([
+                    gpu.kernel("moe", "moe_sort_by_expert")?,
+                    gpu.kernel("ling_a16_grouped", "ling_a16_grouped")?,
+                    gpu.kernel("moe", "moe_unpermute_reduce_indexed")?,
+                ])
+            } else {
+                None
+            },
             moe_wide: if a16 {
                 let kernel =
                     crate::layers::try_kernel(gpu, "moe_expert_gemv_wide", "moe_expert_gemv_wide");

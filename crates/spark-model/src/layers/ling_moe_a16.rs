@@ -7,8 +7,10 @@
 //! tensors NVFP4.  Keep this path separate from the original FP8 pager so a
 //! format mismatch cannot silently reinterpret a packed tensor.
 
+use crate::layers::moe::ExpertPtrTable;
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::DevicePtr;
+use spark_runtime::kernel_args::KernelLaunch;
 
 use super::{EXPERTS, LingMoeFfn, TOP_K, ops, routed_swiglu_limit, shared_swiglu_limit};
 use crate::layer::ForwardContext;
@@ -190,6 +192,9 @@ impl LingMoeFfn {
             stream,
         )?;
 
+        if rows >= 128 {
+            return self.grouped_a16_prefill(input, ids, weights, rows, ctx, stream);
+        }
         // The common pointer-table expert GEMV already supports a token grid
         // in z.  Gate/up share the input row; down consumes each routed row
         // with input_stride=intermediate.
@@ -276,6 +281,120 @@ impl LingMoeFfn {
             stream,
         )?;
         Ok(())
+    }
+
+    fn grouped_a16_prefill(
+        &self,
+        input: DevicePtr,
+        ids: DevicePtr,
+        weights: DevicePtr,
+        rows: u32,
+        ctx: &ForwardContext<'_>,
+        stream: u64,
+    ) -> Result<()> {
+        let [sort, gemm, unpermute] = self
+            .kernels
+            .grouped_a16
+            .expect("A16 grouped kernels loaded");
+        let tables = self.a16_tables.as_ref().expect("A16 expert tables loaded");
+        let expanded = rows as usize * TOP_K;
+        // Routing has consumed the FP32 logits. Reuse that allocation for the
+        // permutation, while retaining the chosen ids and weights in gate_logits.
+        ensure!(
+            (expanded * 3 + EXPERTS + 1) * 4 <= ctx.buffers.sizes().gate_logits_f32,
+            "Ling A16 sort workspace too small"
+        );
+        let sorted = ctx.buffers.gate_logits_f32();
+        let expert_ids = sorted.offset(expanded * 4);
+        let offsets = expert_ids.offset(expanded * 4);
+        let inverse = offsets.offset((EXPERTS + 1) * 4);
+        ops::moe_sort_by_expert(
+            ctx.gpu,
+            sort,
+            ids,
+            sorted,
+            expert_ids,
+            offsets,
+            inverse,
+            expanded as u32,
+            EXPERTS as u32,
+            TOP_K as u32,
+            stream,
+        )?;
+        let chunks = expanded.div_ceil(EXPERTS * 16).clamp(1, 4) as u32;
+        let project = |x, table: &ExpertPtrTable, permutation, output, n: usize, k: usize| {
+            KernelLaunch::new(ctx.gpu, gemm)
+                .grid([n.div_ceil(32) as u32, chunks, EXPERTS as u32])
+                .block([128, 1, 1])
+                .arg_ptr(x)
+                .arg_ptr(table.packed_ptrs)
+                .arg_ptr(table.scale_ptrs)
+                .arg_ptr(table.scale2_vals)
+                .arg_ptr(permutation)
+                .arg_ptr(offsets)
+                .arg_ptr(output)
+                .arg_u32(n as u32)
+                .arg_u32(k as u32)
+                .launch(stream)
+        };
+        let gate = ctx.buffers.expert_gate_out();
+        let up = ctx.buffers.expert_up_out();
+        project(
+            input,
+            &tables.gate,
+            sorted,
+            gate,
+            self.intermediate,
+            self.hidden,
+        )?;
+        project(
+            input,
+            &tables.up,
+            sorted,
+            up,
+            self.intermediate,
+            self.hidden,
+        )?;
+        ops::ling_silu_mul_bf16(
+            ctx.gpu,
+            self.kernels.silu_bf16.expect("A16 SwiGLU"),
+            gate,
+            up,
+            gate,
+            expanded as u32,
+            self.intermediate as u32,
+            routed_swiglu_limit(self.layer_idx),
+            stream,
+        )?;
+        let routed = ctx.buffers.expert_down_out();
+        project(
+            gate,
+            &tables.down,
+            DevicePtr::NULL,
+            routed,
+            self.hidden,
+            self.intermediate,
+        )?;
+        ops::moe_unpermute_reduce_indexed(
+            ctx.gpu,
+            unpermute,
+            routed,
+            ctx.buffers.moe_output(),
+            inverse,
+            weights,
+            self.hidden as u32,
+            rows,
+            TOP_K as u32,
+            stream,
+        )?;
+        ops::residual_add(
+            ctx.gpu,
+            self.kernels.residual_add,
+            ctx.buffers.moe_output(),
+            ctx.buffers.attn_output(),
+            self.hidden as u32 * rows,
+            stream,
+        )
     }
 
     pub(super) fn forward_a16(

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// nvcc -std=c++17 -O2 -arch=sm_121 tests/ling/experts_a16.cu -o /tmp/ling-a16
+// nvcc -std=c++17 -O2 -gencode arch=compute_121a,code=sm_121a tests/ling/experts_a16.cu -o /tmp/ling-a16
 #include "../../kernels/gb10/common/moe_expert_gemv.cu"
 #undef BLOCK_SIZE
 #include "../../kernels/gb10/common/moe_expert_gemv_wide.cu"
+
+#include "../../kernels/gb10/ling-3.2-air/nvfp4/ling_a16_grouped.cu"
 
 #include <algorithm>
 #include <cstdio>
@@ -67,6 +69,36 @@ int main() {
             }
         }
     }
+    // Tensor-core prefill gathers prompt rows and reads sorted activations
+    // directly for down. Exercise an incomplete 32-column tile in both cases.
+    auto sorted_tokens = allocate<int>(tokens * routes);
+    auto original_slots = allocate<unsigned>(tokens * routes);
+    auto offsets = allocate<int>(experts + 1);
+    unsigned next = 0;
+    for (unsigned expert = 0; expert < experts; ++expert) {
+        offsets[expert] = next;
+        for (unsigned slot = 0; slot < tokens * routes; ++slot) {
+            if (ids[slot] == expert) {
+                sorted_tokens[next] = slot / routes;
+                original_slots[next++] = slot;
+            }
+        }
+    }
+    offsets[experts] = next;
+    for (bool gather : {false, true}) {
+        ling_a16_grouped<<<dim3((rows + 31) / 32, 1, experts), 128>>>(
+            input, packed, scales, global, gather ? sorted_tokens : nullptr,
+            offsets, output, rows, cols);
+        check(cudaDeviceSynchronize());
+        for (unsigned idx = 0; idx < next; ++idx) {
+            unsigned source = gather ? static_cast<unsigned>(sorted_tokens[idx]) : idx;
+            auto expected = __float2bfloat16((source + 1) * cols * global[ids[original_slots[idx]]]);
+            for (unsigned col = 0; col < rows; ++col) {
+                if (__bfloat162float(output[idx * rows + col]) != __bfloat162float(expected)) return 1;
+            }
+        }
+    }
+    std::printf("A16 grouped gate/down: %u sorted BF16 outputs matched\n", 2 * next * rows);
     std::printf("A16 narrow/wide, shared and per-route inputs: %u BF16 outputs matched\n",
                 4 * tokens * routes * rows);
 }
