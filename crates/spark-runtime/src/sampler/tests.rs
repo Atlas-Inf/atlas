@@ -194,6 +194,16 @@ fn test_sample_with_params_seeded_temperature_zero_returns_argmax() {
 }
 
 #[test]
+fn test_dry_penalizes_token_after_earlier_suffix_match() {
+    let [a, b, c, d] = [0, 1, 2, 3];
+    let mut logits = [0.0; 4];
+
+    apply_dry_penalty(&mut logits, &[a, b, c, d, a, b, c], 0.5, 2.0, 2, &[]);
+
+    assert_eq!(logits, [0.0, 0.0, 0.0, -1.0]);
+}
+
+#[test]
 fn test_greedy_applies_repetition_penalty_before_argmax() {
     // Regression for 2026-05-01 Gemma-4-31B greedy creative collapse.
     // At temperature=0, repetition_penalty MUST shift argmax when the

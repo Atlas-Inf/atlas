@@ -328,9 +328,7 @@ pub fn apply_dry_penalty(
     let hist_len = history.len();
     let allowed = allowed_length as usize;
 
-    // Build suffix match table: for each position i in history, find the length
-    // of the longest suffix of history[..hist_len] that matches starting at i.
-    // This is a simplified Z-function approach.
+    // For each earlier end position, find how much of the current suffix matches.
     let mut match_lengths = vec![0usize; hist_len];
     for i in (0..hist_len.saturating_sub(1)).rev() {
         // Check if history[i] is a sequence breaker — reset match length
@@ -338,7 +336,6 @@ pub fn apply_dry_penalty(
             match_lengths[i] = 0;
             continue;
         }
-        // Match history[i..] against history[hist_len - 1 - k..] for increasing k
         let mut len = 0;
         let mut j = i;
         let mut k = hist_len - 1;
@@ -353,27 +350,16 @@ pub fn apply_dry_penalty(
             j -= 1;
             k -= 1;
         }
-        // Correction: we want the match starting at position (i) comparing with the suffix
-        // This gives us: if we see history[i..i+len] == history[hist_len-len..hist_len],
-        // then the token at history[i+len] (if it existed) would extend the repeat.
         match_lengths[i] = len;
     }
 
-    // For each position where a match of length > allowed was found, the token
-    // that FOLLOWS the match in history (history[i - 1] looking backward from the match start)
-    // would extend a repeat if generated next. Penalize it.
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..hist_len.saturating_sub(1) {
-        let len = match_lengths[i];
+    // The token after the earlier match would extend the repeat.
+    for (match_end, &len) in match_lengths[..hist_len - 1].iter().enumerate() {
         if len > allowed {
-            // The token at history[i + len] (one past the match) would extend the repeat
-            let extend_pos = i + len;
-            if extend_pos < hist_len {
-                let token = history[extend_pos] as usize;
-                if token < n {
-                    let penalty = multiplier * base.powi((len - allowed) as i32);
-                    logits[token] -= penalty;
-                }
+            let token = history[match_end + 1] as usize;
+            if token < n {
+                let penalty = multiplier * base.powi((len - allowed) as i32);
+                logits[token] -= penalty;
             }
         }
     }
