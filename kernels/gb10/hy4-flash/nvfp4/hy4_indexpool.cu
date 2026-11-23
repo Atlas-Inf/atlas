@@ -90,6 +90,109 @@ extern "C" __global__ void hy4_index_scores(const uint8_t* query,
     }
 }
 
+// Batched key norm for one index tile: block r RMSNorms key row r into the
+// rolling tail slot ((len_base+r)%4) and into the per-tile snapshot
+// tile_tail[(r+3)*H] (three-row headroom preloaded from the tail) consumed by
+// hy4_pool_fwht_batch. Math identical to the per-row hy4_norm_add(NULL,
+// key+r*H, w, tail+slot*H, H, eps) launches it replaces.
+extern "C" __global__ void hy4_tail_norm_batch(const __nv_bfloat16* shared,
+    const __nv_bfloat16* norm, __nv_bfloat16* tail, __nv_bfloat16* tile_tail,
+    unsigned len_base, unsigned H, float eps) {
+    unsigned t=blockIdx.x, tid=threadIdx.x;
+    __shared__ float red[256], r;
+    float ss=0.f;
+    for (unsigned d=tid;d<H;d+=256) {
+        float v=(float)shared[(size_t)t*H+d];
+        ss+=v*v;
+    }
+    red[tid]=ss; __syncthreads();
+    for (unsigned s=128;s;s>>=1) {
+        if (tid<s) red[tid]+=red[tid+s];
+        __syncthreads();
+    }
+    if (tid==0) r=rsqrtf(red[0]/H+eps);
+    __syncthreads();
+    unsigned slot=(len_base+t)%4;
+    for (unsigned d=tid;d<H;d+=256) {
+        float v=(float)shared[(size_t)t*H+d];
+        __nv_bfloat16 o=__float2bfloat16_rn(v*r*(float)norm[d]);
+        tail[(size_t)slot*H+d]=o;
+        tile_tail[(size_t)(t+3)*H+d]=o;
+    }
+}
+
+// Batched pool + rotary + FWHT for one index tile: block g handles the group
+// ending at tile row r = r0 + 4*g, where (len_base+r)%4==3. Fuses the three
+// per-group launches (hy4_pool, hy4_rotary on the pooled vector with layout
+// [128,128,64,64] and split=1, hy4_fwht into the pool page). tile_tail holds
+// the normalized keys of rows r-3..r at tile_tail[(r+j)*128]. Position of the
+// group is [base0+r-3; 3] because positions are [p; 3] per row.
+extern "C" __global__ void hy4_pool_fwht_batch(const __nv_bfloat16* tile_tail,
+    const float* wv, const float* wg, const float* ape, const __nv_bfloat16* norm,
+    uint8_t* pool, unsigned len_base, unsigned r0, unsigned rows,
+    unsigned long long base0, float theta, float eps) {
+    unsigned d=threadIdx.x;
+    unsigned r=r0+4*blockIdx.x;
+    if (r>=rows) return;
+    __shared__ float values[128],squares[128],x[128],maximum[128],inv,scale;
+    __shared__ __nv_bfloat16 pooled[128];
+    float v[4]={},g[4]={},mx=-INFINITY;
+    for (unsigned j=0;j<4;++j) {
+        for (unsigned k=0;k<128;++k) {
+            float t=(float)tile_tail[(size_t)(r+j)*128+k];
+            v[j]+=wv[d*128+k]*t;g[j]+=wg[d*128+k]*t;
+        }
+        g[j]+=ape[j*128+d];mx=fmaxf(mx,g[j]);
+    }
+    float sum=0.f,result=0.f;
+    for (unsigned j=0;j<4;++j) {float p=expf(g[j]-mx);sum+=p;result+=p*v[j];}
+    result/=sum;values[d]=result;squares[d]=result*result;
+    __syncthreads();
+    for (unsigned s=64;s;s>>=1) {
+        if (d<s) squares[d]+=squares[d+s];
+        __syncthreads();
+    }
+    if (d==0) inv=rsqrtf(squares[0]/128.f+eps);
+    __syncthreads();
+    pooled[d]=__float2bfloat16_rn(values[d]*inv*(float)norm[d]);
+    __syncthreads();
+    // RoPE on the rope half [64,128), in place, identical to hy4_rotary with
+    // head 0, strides/offsets [128,128,64,64], split=1 and pt=ph=pw=p.
+    float a=0.f,b=0.f,s=0.f,c=0.f;
+    if (d<32) {
+        float p=(float)((long long)base0+(long long)r-3);
+        float angle=p*powf(theta,-(float)d/32.f);
+        sincosf(angle,&s,&c);
+        a=(float)pooled[64+d*2];b=(float)pooled[64+d*2+1];
+    }
+    __syncthreads();
+    if (d<32) {
+        pooled[64+d]=__float2bfloat16_rn(a*c-b*s);
+        pooled[96+d]=__float2bfloat16_rn(a*s+b*c);
+    }
+    __syncthreads();
+    // FWHT + FP8 quantize into the pool page, identical to hy4_fwht head 0.
+    x[d]=(float)pooled[d];__syncthreads();
+    for (unsigned st=1;st<128;st*=2) {
+        float ta=x[d],tb=x[d^st];__syncthreads();
+        x[d]=(d&st)?tb-ta:ta+tb;__syncthreads();
+    }
+    float value=x[d]*rsqrtf(128.f);
+    maximum[d]=fabsf(value);__syncthreads();
+    for (unsigned st=64;st;st>>=1) {
+        if (d<st) maximum[d]=fmaxf(maximum[d],maximum[d+st]);
+        __syncthreads();
+    }
+    unsigned group=(len_base+r)/4,page=group/64,rowg=group%64;
+    if (d==0) {
+        scale=exp2f(ceilf(log2f(fmaxf(maximum[0],1e-4f)/448.f)));
+        *(float*)(pool+(size_t)page*8448+8192+rowg*4)=scale;
+    }
+    __syncthreads();
+    __nv_fp8_e4m3 q(fminf(448.f,fmaxf(-448.f,value/scale)));
+    pool[(size_t)page*8448+rowg*128+d]=q.__x;
+}
+
 // The trained budget is 511 historical groups plus the current four-token tail.
 extern "C" __global__ void hy4_index_select(const float* scores, int* output,
     unsigned groups, unsigned position) {

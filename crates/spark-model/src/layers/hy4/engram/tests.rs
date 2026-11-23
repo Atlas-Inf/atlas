@@ -193,7 +193,14 @@ fn batched_keys_respect_n_by_h_collective_capacity_and_reject_empty_batches() {
     let launches = gpu.launch_count();
     assert!(
         block
-            .forward_batch(hidden, &vec![1; 257], 0, &mut scratch, Some(&comm), 0)
+            .forward_batch(
+                hidden,
+                &vec![1; crate::layers::hy4::batch::PREFILL_ROWS + 1],
+                0,
+                &mut scratch,
+                Some(&comm),
+                0,
+            )
             .is_err()
     );
     assert_eq!(gpu.launch_count(), launches);

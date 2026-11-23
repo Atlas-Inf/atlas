@@ -171,3 +171,6 @@ extern "C" __global__ void hy4_norm_add(const __nv_bfloat16* routed,
 // A3 — tensor-core dense-projection variant for fp8 weights (opt-in via
 // ATLAS_HY4_LINEAR_MMA=1). Same module, resolved by name.
 #include "hy4_linear_mma.cuh"
+// Tensor-core dense-projection variant for bf16 weights (kind==0), same
+// opt-in flag. Covers the FFN latent down/up and the fp32 router GEMM.
+#include "hy4_linear_bf16_mma.cuh"

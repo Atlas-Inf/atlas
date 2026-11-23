@@ -104,6 +104,7 @@ struct Runtime<'a> {
     kernels: [KernelHandle; 5],
     max_batch: usize,
     multi: batch::Workspace<'a>,
+    prefill: batch::Workspace<'a>,
     verify_logits: std::sync::atomic::AtomicBool,
     head_rows: std::sync::atomic::AtomicUsize,
     benchmark: bool,
@@ -279,7 +280,14 @@ impl Hy4Model {
                 batch_logits,
                 command,
                 max_batch,
-                multi: batch::Workspace::new(s)?,
+                multi: batch::Workspace::new(
+                    s,
+                    crate::layers::hy4::batch::MAX_ROWS.min(s.max_seq),
+                )?,
+                prefill: batch::Workspace::new(
+                    s,
+                    crate::layers::hy4::batch::PREFILL_ROWS.min(s.max_seq),
+                )?,
                 verify_logits: std::sync::atomic::AtomicBool::new(false),
                 head_rows: std::sync::atomic::AtomicUsize::new(0),
                 benchmark: benchmark::enabled()?,
@@ -340,7 +348,10 @@ impl Runtime<'_> {
                             owner.shared.max_seq,
                             owner.shared.page_size,
                         )?,
-                        ffn: Hy4FfnScratch::new(&b.ffn, self.multi.capacity)?,
+                        ffn: Hy4FfnScratch::new(
+                            &b.ffn,
+                            crate::layers::hy4::batch::PREFILL_ROWS.min(s.max_seq),
+                        )?,
                         engram: b.engram.as_ref().map(Hy4Engram::scratch).transpose()?,
                     });
                 }

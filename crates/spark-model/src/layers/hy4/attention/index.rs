@@ -135,13 +135,13 @@ impl AttentionCache<'_, '_> {
     }
 
     /// Batched IndexPool step for one causal tile (prefill/verify batch path).
-    /// Per row this performs the same state updates as `run_index_projected`
-    /// (key norm into the tail, pool group write every fourth row, query
-    /// rotary), but the FWHT, score and select kernels are launched once for
-    /// the whole tile: `hy4_fwht_batch`, `hy4_index_scores_batch` and
-    /// `hy4_index_select_batch` are grid-parallel across rows and the select
-    /// is O(groups log groups) instead of O(groups^2). Selection output is
-    /// identical to the serial path, so attention accumulation order and the
+    /// Every stage is launched once for the whole tile instead of once per row
+    /// or per pool group: `hy4_tail_norm_batch` (key norm into the rolling
+    /// tail plus a per-tile snapshot), `hy4_pool_fwht_batch` (pool + rotary +
+    /// FWHT fused per group), `hy4_batch_rotary` (query rotary, grid-parallel
+    /// over rows), then `hy4_fwht_batch`, `hy4_index_scores_batch` and
+    /// `hy4_index_select_batch` as before. The math per row is identical to
+    /// the serial launches, so selection output, accumulation order and the
     /// recorded prefixes are unchanged.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_index_tile(
@@ -166,57 +166,104 @@ impl AttentionCache<'_, '_> {
             "Hy4 index tile rows"
         );
         let len_base = self.len;
-        for (r, &position) in positions.iter().enumerate() {
-            let len = len_base + r;
-            if len.is_multiple_of(4) {
-                self.first_group_position = Some(position);
-            }
-            a.norm(
-                key.offset(r * 128 * 2),
-                ix.key_norm,
-                self.tail.offset((len % 4) * 128 * 2),
-                128,
-                stream,
-            )?;
-            if len % 4 == 3 {
-                let phase = timing::span("dsa_pool", stream)?;
-                KernelLaunch::new(gpu, a.kernels.pool)
-                    .grid([1, 1, 1])
-                    .block([128, 1, 1])
-                    .arg_ptr(self.tail)
-                    .arg_ptr(ix.value)
-                    .arg_ptr(ix.gates)
-                    .arg_ptr(ix.ape)
-                    .arg_ptr(ix.norm)
-                    .arg_ptr(self.scratch.pooled)
-                    .arg_f32(a.eps)
-                    .launch(stream)?;
-                drop(phase);
-                a.rotary(
-                    self.scratch.pooled,
-                    self.scratch.pooled,
-                    1,
-                    [128, 128, 64, 64],
-                    self.first_group_position
-                        .context("Hy4 missing partial-group position")?,
-                    true,
+        let base = positions[0];
+        // Per-tile snapshot of the normalized keys (three-row headroom for
+        // groups that start before this tile), consumed by hy4_pool_fwht_batch
+        // in the same stream-ordered region it is written in.
+        let tail_tile = gpu.op_cache().scratch(
+            gpu,
+            "hy4_index_tile_tail",
+            (crate::layers::hy4::batch::MAX_ROWS + 3) * 128 * 2,
+        )?;
+        // Preload the rolling tail's three pre-tile members into the snapshot
+        // headroom so fused pool groups that start before this tile read the
+        // same values the serial per-row path left in the tail slots.
+        if !len_base.is_multiple_of(4) {
+            for k in 1..=3usize {
+                let slot = (len_base as i64 - k as i64).rem_euclid(4) as usize;
+                gpu.copy_d2d_async(
+                    self.tail.offset(slot * 128 * 2),
+                    tail_tile.offset((3 - k) * 128 * 2),
+                    128 * 2,
                     stream,
                 )?;
-                let group = len / 4;
-                let page = group / 64;
-                let rowg = group % 64;
-                let phase = timing::span("dsa_pool_fwht", stream)?;
-                KernelLaunch::new(gpu, a.kernels.fwht)
-                    .grid([1, 1, 1])
-                    .block([128, 1, 1])
-                    .arg_ptr(self.scratch.pooled)
-                    .arg_ptr(self.pool.offset(page * 8448 + rowg * 128))
-                    .arg_ptr(self.pool.offset(page * 8448 + 8192 + rowg * 4))
-                    .launch(stream)?;
-                drop(phase);
             }
-            let q = query.offset(r * ix.heads * 128 * 2);
-            a.rotary(q, q, ix.heads, [128, 128, 64, 64], position, true, stream)?;
+        }
+        {
+            let _norm = timing::span("attn_norm", stream)?;
+            KernelLaunch::new(gpu, a.kernels.tail_norm_batch)
+                .grid([rows as u32, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(key)
+                .arg_ptr(ix.key_norm)
+                .arg_ptr(self.tail)
+                .arg_ptr(tail_tile)
+                .arg_u32(len_base as u32)
+                .arg_u32(128)
+                .arg_f32(a.eps)
+                .launch(stream)?;
+        }
+        let r0 = (7 - len_base % 4) % 4;
+        let groups = if rows > r0 {
+            (rows - r0).div_ceil(4)
+        } else {
+            0
+        };
+        if groups > 0 {
+            let _pool = timing::span("dsa_pool", stream)?;
+            KernelLaunch::new(gpu, a.kernels.pool_fwht_batch)
+                .grid([groups as u32, 1, 1])
+                .block([128, 1, 1])
+                .arg_ptr(tail_tile)
+                .arg_ptr(ix.value)
+                .arg_ptr(ix.gates)
+                .arg_ptr(ix.ape)
+                .arg_ptr(ix.norm)
+                .arg_ptr(self.pool)
+                .arg_u32(len_base as u32)
+                .arg_u32(r0 as u32)
+                .arg_u32(rows as u32)
+                .arg_u64(base[0] as u64)
+                .arg_f32(a.rope.rope_theta as f32)
+                .arg_f32(a.eps)
+                .launch(stream)?;
+        }
+        {
+            let _rope = timing::span("attn_rope", stream)?;
+            KernelLaunch::new(
+                gpu,
+                gpu.op_cache().kernel(gpu, "hy4_mla", "hy4_batch_rotary")?,
+            )
+            .grid([ix.heads as u32, rows as u32, 1])
+            .block([32, 1, 1])
+            .arg_ptr(query)
+            .arg_ptr(query)
+            .arg_u32(128)
+            .arg_u32(128)
+            .arg_u32(64)
+            .arg_u32(64)
+            .arg_u32(ix.heads as u32 * 128)
+            .arg_u32(ix.heads as u32 * 128)
+            .arg_ptr(DevicePtr::NULL)
+            .arg_u32(0)
+            .arg_u32(1)
+            .arg_u32(1)
+            .arg_u32(0)
+            .arg_u32(0)
+            .arg_u64(base[0] as u64)
+            .arg_u64(base[1] as u64)
+            .arg_u64(base[2] as u64)
+            .arg_f32(a.rope.rope_theta as f32)
+            .arg_u32(a.rope.mrope_section[1] as u32)
+            .arg_u32(a.rope.mrope_section[2] as u32)
+            .arg_u32(u32::from(a.rope.mrope_interleaved))
+            .arg_u32(1)
+            .launch(stream)?;
+        }
+        for (r, &position) in positions.iter().enumerate() {
+            if (len_base + r).is_multiple_of(4) {
+                self.first_group_position = Some(position);
+            }
         }
         {
             let _phase = timing::span("dsa_query_fwht", stream)?;
@@ -261,8 +308,12 @@ impl AttentionCache<'_, '_> {
                 .arg_u32(rows as u32)
                 .launch(stream)?;
         }
+        // Per-row state copies are only needed while prefix capture is active
+        // (speculative VERIFY); otherwise the cache scratch keeps the last
+        // row's selection, which is all the DFly target reads.
+        let capturing = self.prefix_capturing();
         for r in 0..rows {
-            if a.window.is_none() {
+            if capturing && a.window.is_none() {
                 gpu.copy_d2d_async(
                     indices.offset(r * 2048 * 4),
                     self.scratch.indices,
@@ -272,6 +323,14 @@ impl AttentionCache<'_, '_> {
             }
             self.len += 1;
             self.record_prefix(stream)?;
+        }
+        if !capturing && a.window.is_none() {
+            gpu.copy_d2d_async(
+                indices.offset((rows - 1) * 2048 * 4),
+                self.scratch.indices,
+                2048 * 4,
+                stream,
+            )?;
         }
         Ok(())
     }

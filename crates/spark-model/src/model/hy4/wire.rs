@@ -86,8 +86,15 @@ impl Hy4Model {
             }
             batch::BATCH | batch::LAST | batch::VERIFY => {
                 let count = words[2] as usize;
+                // VERIFY reads the decode-sized workspace, BATCH/LAST the wide
+                // prefill workspace; both ranks must agree on the buffer.
+                let ws = if words[0] == batch::VERIFY {
+                    &r.multi
+                } else {
+                    &r.prefill
+                };
                 ensure!(
-                    count > 0 && count <= r.multi.capacity,
+                    count > 0 && count <= ws.capacity,
                     "Hy4 worker batch geometry"
                 );
                 {
@@ -100,9 +107,9 @@ impl Hy4Model {
                         "Hy4 worker batch position mismatch"
                     );
                 }
-                c.broadcast(r.multi.tokens.0, count * 4, 0)?;
+                c.broadcast(ws.tokens.0, count * 4, 0)?;
                 let mut bytes = vec![0; count * 4];
-                s.gpu.copy_d2h(r.multi.tokens, &mut bytes)?;
+                s.gpu.copy_d2h(ws.tokens, &mut bytes)?;
                 let tokens = bytes
                     .chunks_exact(4)
                     .map(|b| u32::from_le_bytes(b.try_into().unwrap()))

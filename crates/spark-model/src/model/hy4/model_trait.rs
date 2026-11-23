@@ -184,7 +184,7 @@ impl Model for Hy4Model {
             self.maybe_verify_benchmark(tokens, seq, stream)?;
         }
         let mut logits = DevicePtr::NULL;
-        for chunk in tokens[start..end].chunks(self.borrow_dependent().multi.capacity) {
+        for chunk in tokens[start..end].chunks(self.borrow_dependent().prefill.capacity) {
             let mode = if last && seq.seq_len + chunk.len() == end {
                 super::batch::LAST
             } else {

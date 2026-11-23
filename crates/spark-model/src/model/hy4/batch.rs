@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
-use crate::layers::hy4::batch::{self, MAX_ROWS};
+use crate::layers::hy4::batch::{self, MAX_ROWS, PREFILL_ROWS};
 use crate::layers::hy4::timing;
 use spark_runtime::kernel_args::KernelLaunch;
 use std::sync::atomic::Ordering;
@@ -21,8 +21,7 @@ pub(super) struct Workspace<'a> {
     pub logits: DevicePtr,
 }
 impl<'a> Workspace<'a> {
-    pub fn new(s: &'a Shared) -> Result<Self> {
-        let capacity = MAX_ROWS.min(s.max_seq);
+    pub fn new(s: &'a Shared, capacity: usize) -> Result<Self> {
         let h = s.config.hidden_size;
         let mut m = Owned::new(s.gpu.as_ref());
         Ok(Self {
@@ -32,7 +31,9 @@ impl<'a> Workspace<'a> {
             normed: m.alloc(capacity * h * 2)?,
             output: m.alloc(capacity * h * 2)?,
             post: m.alloc(capacity * 4 * 4)?,
-            logits: m.alloc(capacity * s.config.vocab_size * 4)?,
+            // Logits are written only by LAST (1 row) and VERIFY (draft rows),
+            // so they keep the decode-sized MAX_ROWS width.
+            logits: m.alloc(MAX_ROWS.min(capacity) * s.config.vocab_size * 4)?,
             _memory: m,
         })
     }
@@ -46,10 +47,17 @@ impl Runtime<'_> {
         mode: u32,
         stream: u64,
     ) -> Result<DevicePtr> {
+        // VERIFY (speculative decode) keeps the decode-sized workspace so its
+        // buffer footprint stays identical to the MAX_ROWS control; BATCH and
+        // LAST use the wide prefill workspace.
+        let multi = &self.multi;
+        let prefill = &self.prefill;
+        let w = if mode == VERIFY { multi } else { prefill };
         ensure!(
             !tokens.is_empty()
-                && tokens.len() <= self.multi.capacity
-                && matches!(mode, BATCH | LAST | VERIFY),
+                && tokens.len() <= w.capacity
+                && matches!(mode, BATCH | LAST | VERIFY)
+                && (mode != VERIFY || tokens.len() <= MAX_ROWS),
             "Hy4 invalid batch geometry/logit mode"
         );
         let mut requests = self.requests.lock();
@@ -70,7 +78,6 @@ impl Runtime<'_> {
             let result = (|| {
                 let gpu = s.gpu.as_ref();
                 let h = s.config.hidden_size;
-                let w = &self.multi;
                 let n = tokens.len();
                 let start = data.history.len();
                 let timer = Some(timing::Token::begin_batch(
@@ -293,9 +300,19 @@ impl Hy4Model {
         let s = self.borrow_owner();
         let r = self.borrow_dependent();
         let stream = self.eager_stream(stream)?;
+        let tokens_buf = if mode == VERIFY {
+            r.multi.tokens
+        } else {
+            r.prefill.tokens
+        };
+        let capacity = if mode == VERIFY {
+            r.multi.capacity
+        } else {
+            r.prefill.capacity
+        };
         ensure!(
             !tokens.is_empty()
-                && tokens.len() <= r.multi.capacity
+                && tokens.len() <= capacity
                 && matches!(mode, BATCH | LAST | VERIFY)
                 && seq
                     .seq_len
@@ -320,7 +337,7 @@ impl Hy4Model {
                 .iter()
                 .flat_map(|t| t.to_le_bytes())
                 .collect::<Vec<_>>(),
-            r.multi.tokens,
+            tokens_buf,
         )?;
         self.send([
             mode,
@@ -329,7 +346,7 @@ impl Hy4Model {
             u32::try_from(seq.seq_len)?,
         ])?;
         if let Some(c) = s.comm.as_deref().filter(|c| c.world_size() > 1) {
-            c.broadcast(r.multi.tokens.0, tokens.len() * 4, 0)?;
+            c.broadcast(tokens_buf.0, tokens.len() * 4, 0)?;
         }
         let ptr = r.rows(s, seq.slot_idx, tokens, mode, stream)?;
         seq.tokens.extend_from_slice(tokens);

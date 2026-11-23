@@ -216,7 +216,7 @@ impl Hy4Ffn<'_> {
         stream: u64,
     ) -> Result<()> {
         let [h, i, slots, group] = dims;
-        if rows > 1 && rows as usize <= super::batch::MAX_ROWS {
+        if rows > 1 && rows as usize <= super::batch::PREFILL_ROWS {
             return self.batch_mlp(
                 x, activated, out, ids, weights, dims, limit, rows, batch, stream,
             );

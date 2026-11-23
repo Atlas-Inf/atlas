@@ -17,7 +17,7 @@ mod forward;
 mod tests;
 pub struct Hy4Engram<'a> {
     mem: Owned<'a>,
-    kernels: [KernelHandle; 5],
+    kernels: [KernelHandle; 9],
     layout: HashLayout,
     topology: [usize; 2],
     heads: std::ops::Range<usize>,
@@ -219,8 +219,12 @@ impl<'a> Hy4Engram<'a> {
             "hy4_engram_project",
             "hy4_engram_norm",
             "hy4_engram_inject",
+            "hy4_engram_hash_batch",
+            "hy4_engram_lookup_batch",
+            "hy4_engram_norm_batch",
+            "hy4_engram_inject_batch",
         ];
-        let mut kernels = [KernelHandle(0); 5];
+        let mut kernels = [KernelHandle(0); 9];
         for (i, name) in names.iter().enumerate() {
             kernels[i] = gpu.kernel("hy4_engram", name)?;
         }

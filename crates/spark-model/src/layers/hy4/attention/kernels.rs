@@ -24,6 +24,8 @@ pub(super) struct Kernels {
     pub fwht_batch: KernelHandle,
     pub score_batch: KernelHandle,
     pub select_batch: KernelHandle,
+    pub tail_norm_batch: KernelHandle,
+    pub pool_fwht_batch: KernelHandle,
 }
 impl Kernels {
     pub fn load(gpu: &dyn GpuBackend) -> Result<Self> {
@@ -44,6 +46,8 @@ impl Kernels {
             fwht_batch: gpu.kernel("hy4_indexpool", "hy4_fwht_batch")?,
             score_batch: gpu.kernel("hy4_indexpool", "hy4_index_scores_batch")?,
             select_batch: gpu.kernel("hy4_indexpool", "hy4_index_select_batch")?,
+            tail_norm_batch: gpu.kernel("hy4_indexpool", "hy4_tail_norm_batch")?,
+            pool_fwht_batch: gpu.kernel("hy4_indexpool", "hy4_pool_fwht_batch")?,
         })
     }
 }
