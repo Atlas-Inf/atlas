@@ -165,7 +165,9 @@ impl TransformerModel {
         // aliasing: all streams' first token collapsed to one). Verify/decode
         // callers pass `self.buffers.logits()` (base) — unchanged behaviour.
         let logits = logits_dst;
-        if let Some(ref fp8) = self.lm_head_fp8 {
+        if self.inkling_head_passes(hidden, logits, num_tokens as usize, stream)? {
+            // Inkling 2's verify rows past 8: passes of the batch GEMV tiers.
+        } else if let Some(ref fp8) = self.lm_head_fp8 {
             // FP8 E4M3 LM head. The dual-GEMV (batch=2) reads the FP8 weight
             // once for both K=2 verify tokens — bit-identical to two M=1 GEMVs
             // but halves the full-vocab weight bandwidth. Falls back to the

@@ -200,8 +200,14 @@ impl Inkling2Layer {
         Ok(())
     }
 
-    /// The visit's input projections over `rows` rows.
-    pub(super) fn project(&self, gpu: &dyn GpuBackend, rows: usize, stream: u64) -> Result<()> {
+    /// The visit's input projections over `rows` rows (`exact`: a verify run).
+    pub(super) fn project(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: usize,
+        exact: bool,
+        stream: u64,
+    ) -> Result<()> {
         let projs = self.projections(rows);
         let k = self.dims.hidden;
         if self.fused_mixed && rows == 1 {
@@ -226,7 +232,8 @@ impl Inkling2Layer {
                 .launch(stream);
         }
         for p in projs {
-            self.gk.proj(gpu, rows, p.x, p.w, p.y, p.n, k, stream)?;
+            self.gk
+                .proj(gpu, (rows, exact), p.x, p.w, p.y, p.n, k, stream)?;
         }
         Ok(())
     }

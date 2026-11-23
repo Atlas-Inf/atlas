@@ -80,6 +80,13 @@ impl GlueKernels {
     }
 }
 
+/// `(first row, rows)` passes of at most `width` rows over `rows`.
+pub(crate) fn passes(rows: usize, width: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..rows)
+        .step_by(width)
+        .map(move |first| (first, (rows - first).min(width)))
+}
+
 /// Rows `dense_gemv_bf16_batchm` takes at once (its MAX_M): a decode batch or a
 /// verify of up to 8 rows reads each BF16 weight once, every row computed as the
 /// one-row GEMV computes it. cuBLASLt took 2-6x longer on the small projections
@@ -147,12 +154,13 @@ impl GlueKernels {
     /// the dense GEMV / BF16 GEMM; a Spark NVFP4 one through `w4a16_gemv` /
     /// `w4a16_gemv_batch8/16` for decode and verify rows, and its checkpoint BF16
     /// weight for prefill rows (from `MOE_GROUPED_MIN_ROWS`, where the experts
-    /// take the checkpoint's too).
+    /// take the checkpoint's too). `exact` (a verify run): every row through
+    /// the decode GEMVs at any row count, in passes of their widest batch.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn proj(
         &self,
         gpu: &dyn GpuBackend,
-        rows: usize,
+        (rows, exact): (usize, bool),
         x: DevicePtr,
         w: Linear,
         y: DevicePtr,
@@ -160,6 +168,17 @@ impl GlueKernels {
         k: usize,
         s: u64,
     ) -> Result<()> {
+        let pass = match w {
+            Linear::Bf16(_) => BATCHM_MAX_ROWS,
+            Linear::Nvfp4 { .. } => super::moe_ops::MOE_GROUPED_MIN_ROWS - 1,
+        };
+        if exact && rows > pass {
+            for (first, part) in passes(rows, pass) {
+                let (xo, yo) = (x.offset(first * k * 2), y.offset(first * n * 2));
+                self.proj(gpu, (part, true), xo, w, yo, n, k, s)?;
+            }
+            return Ok(());
+        }
         match w {
             Linear::Bf16(w) if rows == 1 => self.gemv_with(gpu, self.dense_gemv, x, w, y, n, k, s),
             Linear::Bf16(w) if rows <= BATCHM_MAX_ROWS => {
@@ -194,7 +213,7 @@ impl GlueKernels {
     pub(crate) fn proj_f32(
         &self,
         gpu: &dyn GpuBackend,
-        rows: usize,
+        (rows, exact): (usize, bool),
         x: DevicePtr,
         w: DevicePtr,
         y: DevicePtr,
@@ -202,6 +221,13 @@ impl GlueKernels {
         k: usize,
         s: u64,
     ) -> Result<()> {
+        if exact && rows > BATCHM_MAX_ROWS {
+            for (first, part) in passes(rows, BATCHM_MAX_ROWS) {
+                let (xo, yo) = (x.offset(first * k * 2), y.offset(first * n * 4));
+                self.proj_f32(gpu, (part, true), xo, w, yo, n, k, s)?;
+            }
+            return Ok(());
+        }
         if rows == 1 {
             self.gemv_with(gpu, self.dense_gemv_f32, x, w, y, n, k, s)
         } else if rows <= BATCHM_MAX_ROWS {
