@@ -65,6 +65,46 @@ fn chat_response(finish_reason: ir::FinishReason) -> ir::ChatResponse {
     }
 }
 
+#[tokio::test]
+async fn conversation_tool_call_replay_blocking_persistence() {
+    let store = crate::conversation_store::ConversationStore::with_config(
+        10,
+        std::time::Duration::from_secs(60),
+    );
+    let id = store.create(vec![], Default::default());
+    let mut chat = chat_response(ir::FinishReason::ToolCalls);
+    chat.choices[0].content = None;
+    chat.choices[0].tool_calls.push(ir::message::ToolCall {
+        id: "call_1".into(),
+        name: "lookup".into(),
+        arguments: serde_json::json!({}),
+    });
+    let output =
+        serde_json::json!({"type":"function_call_output", "call_id":"earlier", "output":"found"});
+    let input = crate::openai::IncomingMessage::from_responses_input_item(&output)
+        .unwrap()
+        .unwrap();
+    translate_chat_response_to_responses(
+        ChatOutcome::Blocking(Box::new(chat)),
+        None,
+        None,
+        vec![input],
+        false,
+        Some((store.clone(), id.clone(), 0)),
+    )
+    .await;
+    let stored = store.get(&id).unwrap();
+    assert_eq!(
+        stored.items.len(),
+        2,
+        "store both tool result and assistant call"
+    );
+    assert_eq!(stored.items[0]["type"], "function_call_output");
+    assert_eq!(stored.items[0]["call_id"], "earlier");
+    let replay = crate::openai::IncomingMessage::from_conversation_item(&stored.items[1]).unwrap();
+    assert_eq!(replay.tool_calls.unwrap()[0].id.as_deref(), Some("call_1"));
+}
+
 async fn blocking_body(finish_reason: ir::FinishReason) -> Value {
     let outcome = ChatOutcome::Blocking(Box::new(chat_response(finish_reason)));
     let resp = translate_chat_response_to_responses(outcome, None, None, vec![], false, None).await;
@@ -156,6 +196,37 @@ async fn streaming_response_persists_large_conversation_turn() {
     assert_large_turn_persisted(&state.conversation_store.get(&id).unwrap().items);
 }
 
+#[tokio::test]
+async fn conversation_merged_prefix_keeps_new_input() {
+    let store = crate::conversation_store::ConversationStore::with_config(
+        10,
+        std::time::Duration::from_secs(60),
+    );
+    let prior = vec![
+        serde_json::json!({"role":"assistant", "content":"Checking"}),
+        serde_json::json!({"type":"function_call", "call_id":"a", "name":"lookup"}),
+        serde_json::json!({"type":"function_call", "call_id":"b", "name":"lookup"}),
+    ];
+    let id = store.create(prior.clone(), Default::default());
+    let mut input = crate::openai::IncomingMessage::from_conversation_items(&prior);
+    let prefix_len = input.len();
+    input.push(crate::openai::IncomingMessage::synthetic_user_text(
+        "new turn".into(),
+    ));
+    translate_chat_response_to_responses(
+        ChatOutcome::Blocking(Box::new(chat_response(ir::FinishReason::Stop))),
+        None,
+        None,
+        input,
+        false,
+        Some((store.clone(), id.clone(), prefix_len)),
+    )
+    .await;
+    let stored = store.get(&id).unwrap();
+    assert_eq!(stored.items.len(), 5);
+    assert_eq!(stored.items[3]["content"][0]["text"], "new turn");
+}
+
 /// Runs the stream finalizer and returns the terminal SSE frame as
 /// `(event name, data)`.
 async fn stream_terminal(finish_reason: &str) -> (String, Value) {
@@ -197,6 +268,41 @@ async fn stream_terminal(finish_reason: &str) -> (String, Value) {
         field("event: "),
         serde_json::from_str(&field("data: ")).unwrap(),
     )
+}
+
+#[tokio::test]
+async fn conversation_tool_call_replay_stream_persistence() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(32);
+    let state = Arc::new(test_app_state::app_state(tokenizer()));
+    let id = state.conversation_store.create(vec![], Default::default());
+    let ctx = FinalizeCtx {
+        seq: 0,
+        completed_items: vec![crate::openai::ResponsesOutputItem::FunctionCall {
+            id: "fc_1".into(),
+            call_id: "call_1".into(),
+            name: "lookup".into(),
+            arguments: "{}".into(),
+            status: "completed",
+        }],
+        final_usage: None,
+        finish_reason: "tool_calls".into(),
+        refusal_text: None,
+        message_item_id: "msg_test".into(),
+        output_index: 1,
+        resp_id: "resp_test".into(),
+        created_at: 0,
+        model: "fixture".into(),
+        metadata_for_done: None,
+        store_flag: false,
+        input_messages: vec![],
+        conversation_id: Some(id.clone()),
+        conv_new_user_items: vec![],
+    };
+    finalize_responses_stream(&tx, state.clone(), ctx).await;
+    let stored = state.conversation_store.get(&id).unwrap();
+    assert_eq!(stored.items.len(), 1);
+    let replay = crate::openai::IncomingMessage::from_conversation_item(&stored.items[0]).unwrap();
+    assert_eq!(replay.tool_calls.unwrap()[0].id.as_deref(), Some("call_1"));
 }
 
 #[tokio::test]

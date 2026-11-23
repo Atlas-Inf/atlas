@@ -111,12 +111,17 @@ impl IncomingMessage {
     }
 
     /// Convert a stored conversation item into a message for pipeline
-    /// replay. Items we don't recognize (tool outputs in exotic shapes)
-    /// are silently dropped — they wouldn't contribute to the text
-    /// context anyway. `reasoning_content` (written by the Responses
+    /// replay. Unknown items are silently dropped.
+    /// `reasoning_content` (written by the Responses
     /// surfaces alongside the assistant text) is rehydrated so the
     /// template can restore the prior turn's think block (F1).
     pub fn from_conversation_item(item: &serde_json::Value) -> Option<Self> {
+        if matches!(
+            item["type"].as_str(),
+            Some("function_call" | "function_call_output")
+        ) {
+            return Self::from_responses_input_item(item).ok().flatten();
+        }
         let role = item.get("role").and_then(|v| v.as_str())?;
         let content = item.get("content");
         let text = match content {
@@ -268,6 +273,9 @@ impl IncomingMessage {
         }
     }
 }
+
+#[path = "chat_message_conversation.rs"]
+mod conversation;
 
 impl ParsedContent {
     /// Flatten a Responses-API content value (string, or array of

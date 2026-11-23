@@ -60,7 +60,7 @@ pub fn lower_responses_to_chat(
                 if let Some(m) = IncomingMessage::from_responses_input_item(it)
                     .map_err(LowerResponsesError::BadRequest)?
                 {
-                    messages.push(m);
+                    IncomingMessage::push_responses_message(&mut messages, m);
                 }
             }
         }

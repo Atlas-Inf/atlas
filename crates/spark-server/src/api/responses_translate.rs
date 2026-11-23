@@ -214,13 +214,7 @@ pub(super) async fn translate_chat_response_to_responses(
         let mut batch: Vec<serde_json::Value> = input_messages
             .iter()
             .skip(prefix_len)
-            .map(|m| {
-                serde_json::json!({
-                    "type": "message",
-                    "role": m.role,
-                    "content": [{"type": "input_text", "text": m.content.text}],
-                })
-            })
+            .flat_map(crate::openai::IncomingMessage::to_conversation_items)
             .collect();
         let assistant_text = chat
             .choices
@@ -243,6 +237,12 @@ pub(super) async fn translate_chat_response_to_responses(
             }
             batch.push(item);
         }
+        batch.extend(resp.output.iter().filter_map(|item| match item {
+            crate::openai::ResponsesOutputItem::FunctionCall { .. } => {
+                serde_json::to_value(item).ok()
+            }
+            _ => None,
+        }));
         if !batch.is_empty()
             && let Err(e) = conv_store.append_items(&conv_id, batch)
         {

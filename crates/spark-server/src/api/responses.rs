@@ -85,11 +85,7 @@ pub async fn responses_endpoint(
     let conversation_prefix: Vec<crate::openai::IncomingMessage> = match &conversation_id {
         None => Vec::new(),
         Some(cid) => match state.conversation_store.get(cid) {
-            Some(snap) => snap
-                .items
-                .iter()
-                .filter_map(crate::openai::IncomingMessage::from_conversation_item)
-                .collect(),
+            Some(snap) => crate::openai::IncomingMessage::from_conversation_items(&snap.items),
             None => {
                 return openai_error_response_with_param(
                     StatusCode::NOT_FOUND,

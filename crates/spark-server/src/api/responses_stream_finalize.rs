@@ -463,6 +463,12 @@ pub(super) async fn finalize_responses_stream(
             }
             batch.push(item);
         }
+        batch.extend(final_resp.output.iter().filter_map(|item| match item {
+            crate::openai::ResponsesOutputItem::FunctionCall { .. } => {
+                serde_json::to_value(item).ok()
+            }
+            _ => None,
+        }));
         if !batch.is_empty()
             && let Err(e) = state_arc.conversation_store.append_items(cid, batch)
         {

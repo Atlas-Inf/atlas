@@ -17,12 +17,6 @@ pub(super) fn conv_new_user_items(
     input_messages
         .iter()
         .skip(prefix_len)
-        .map(|m| {
-            serde_json::json!({
-                "type": "message",
-                "role": m.role,
-                "content": [{"type": "input_text", "text": m.content.text}],
-            })
-        })
+        .flat_map(IncomingMessage::to_conversation_items)
         .collect()
 }
