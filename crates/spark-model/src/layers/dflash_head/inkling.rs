@@ -66,6 +66,8 @@ pub struct InklingDspark {
     k: Kernels,
     /// A step's shared head pass (`inkling_group.rs`).
     group: group::TailGroup,
+    /// The staged batch's per-sequence tail buffers (`inkling_batch.rs`).
+    batch: batch::BatchScratch,
     /// Report each draft's confidence after the block's tokens
     /// (`draft_conf.rs`): the log-probability of the pick under the
     /// softcapped logits, for the scheduler's verify width.
@@ -171,6 +173,7 @@ impl InklingDspark {
         vocab: usize,
         hidden: usize,
         gamma: usize,
+        batch_capacity: usize,
         dense_gemm: KernelHandle,
         conf: bool,
         gpu: &dyn GpuBackend,
@@ -226,6 +229,7 @@ impl InklingDspark {
             fold: DenseWeight { weight: fold },
             k: Kernels::resolve(gpu)?,
             group: group::TailGroup::alloc(gpu, hidden, gamma, vocab)?,
+            batch: batch::BatchScratch::alloc(gpu, batch_capacity.max(1), hidden, gamma, vocab)?,
             conf,
         })
     }
@@ -385,6 +389,49 @@ impl BlockDiffusionDraftHead {
     }
 }
 
+/// One `inkling2_dspark_pick` launch's rows (`sequences` of them, each at
+/// its index times the strides; a null `bias` or `conf` is none).
+pub(super) struct Pick {
+    logits: DevicePtr,
+    /// BF16 elements between two sequences' rows.
+    logits_stride: u64,
+    bias: DevicePtr,
+    bias_stride: u32,
+    token: DevicePtr,
+    /// `u32` words between two sequences' tokens (and confidences).
+    token_stride: u32,
+    conf: DevicePtr,
+    conf_stride: u32,
+    vocab: usize,
+}
+
+/// The pick and, with `p.conf`, the drafter's confidence in it, for
+/// `sequences` rows (see the kernel).
+pub(super) fn pick(
+    gpu: &dyn GpuBackend,
+    ink: &InklingDspark,
+    p: &Pick,
+    sequences: usize,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, ink.k.pick)
+        .grid([sequences as u32, 1, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(p.logits)
+        .arg_u64(p.logits_stride)
+        .arg_ptr(p.bias)
+        .arg_u32(p.bias_stride)
+        .arg_ptr(p.token)
+        .arg_u32(p.token_stride)
+        .arg_ptr(p.conf)
+        .arg_u32(p.conf_stride)
+        .arg_u32(p.vocab as u32)
+        .arg_f32(LOGIT_SOFTCAP)
+        .launch(stream)
+}
+
+#[path = "inkling_batch.rs"]
+mod batch;
 #[path = "inkling_group.rs"]
 mod group;
 #[path = "inkling_tail.rs"]

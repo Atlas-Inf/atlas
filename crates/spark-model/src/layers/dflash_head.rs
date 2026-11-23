@@ -1354,10 +1354,6 @@ impl DraftProposer for BlockDiffusionDraftHead {
         _buffers: &spark_runtime::buffers::BufferArena,
         _config: &atlas_core::config::ModelConfig,
     ) -> usize {
-        // Inkling 2 DSpark proposes one sequence at a time for now.
-        if self.inkling.is_some() {
-            return 1;
-        }
         batch_plan::propose_batch_width(
             self.startup.native_batch_authoritative,
             self.startup.diagnostics.batch_parity,

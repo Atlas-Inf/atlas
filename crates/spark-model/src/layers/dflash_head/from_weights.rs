@@ -1040,6 +1040,7 @@ impl BlockDiffusionDraftHead {
                 head.vocab_size,
                 head.hidden_size,
                 head.gamma,
+                head.batch_capacity,
                 head.kernels.dense_gemm,
                 head.startup.diagnostics.draft_conf,
                 gpu,

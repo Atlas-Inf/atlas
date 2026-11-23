@@ -66,14 +66,14 @@ extern "C" __global__ void __launch_bounds__(MIX_THREADS) inkling2_dspark_mix(
 // The block input in place over `rows` rows of `hidden`: row 0 holds the anchor's target
 // embedding and stays (the target's table is normed at load; a non-NULL `embed_norm`
 // norms a raw row here instead: BF16(rms(row 0) * embed_norm)); rows 1.. = mask_embed.
-// grid (rows), block 256.
+// grid (rows, sequences): sequence y's block starts at row y * rows. block 256.
 extern "C" __global__ void __launch_bounds__(MIX_THREADS) inkling2_dspark_block_input(
     __nv_bfloat16* __restrict__ block, const __nv_bfloat16* __restrict__ embed_norm,
     const __nv_bfloat16* __restrict__ mask_embed, const float eps, const unsigned int hidden
 ) {
     atlas_pdl_enter();
     __shared__ float red[MIX_THREADS / 32];
-    __nv_bfloat16* row = block + (unsigned long long)blockIdx.x * hidden;
+    __nv_bfloat16* row = block + ((unsigned long long)blockIdx.y * gridDim.x + blockIdx.x) * hidden;
     if (blockIdx.x > 0) {
         for (unsigned int i = threadIdx.x; i < hidden; i += blockDim.x) row[i] = mask_embed[i];
         return;
@@ -91,13 +91,18 @@ extern "C" __global__ void __launch_bounds__(MIX_THREADS) inkling2_dspark_block_
 
 // The recurrent head's per-propose context: ctx[s, o] = b[o] + W[o, 2R:] . [h_s ; f] in fp32,
 // for draft steps s < steps (h_s = the drafter's final-normed block row s + 1, f = f_rnn).
-// W [3R, 2R + 2H] row-major. One warp per output o; grid (3R / 8), block 256.
+// W [3R, 2R + 2H] row-major. One warp per output o; grid (3R / 8, sequences), block 256:
+// sequence y reads h + y * h_stride and f + y * f_stride, writes ctx + y * ctx_stride.
 extern "C" __global__ void __launch_bounds__(256) inkling2_dspark_rnn_ctx(
     const __nv_bfloat16* __restrict__ W, const __nv_bfloat16* __restrict__ bias,
     const __nv_bfloat16* __restrict__ h, const __nv_bfloat16* __restrict__ f,
-    float* __restrict__ ctx, const unsigned int steps, const unsigned int hidden
+    float* __restrict__ ctx, const unsigned int steps, const unsigned int hidden,
+    const unsigned int h_stride, const unsigned int f_stride, const unsigned int ctx_stride
 ) {
     atlas_pdl_enter();
+    h += (unsigned long long)blockIdx.y * h_stride;
+    f += (unsigned long long)blockIdx.y * f_stride;
+    ctx += (unsigned long long)blockIdx.y * ctx_stride;
     const unsigned int lane = threadIdx.x % 32;
     const unsigned int o = blockIdx.x * 8 + threadIdx.x / 32;
     const unsigned int outs = 3 * RNN_RANK, width = 2 * RNN_RANK + 2 * hidden;
@@ -116,13 +121,20 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_dspark_rnn_ctx(
 }
 
 // One recurrence step's raw gates: raw[o] = ctx[o] + W[o, :R] . state + W[o, R:2R] . w1[prev]
-// (fp32). `prev` is a device token id. One warp per output; grid (3R / 8), block 256.
+// (fp32). `prev` is a device token id. One warp per output; grid (3R / 8, sequences), block
+// 256: sequence y's ctx, state, prev and raw are its own, at y times their strides.
 extern "C" __global__ void __launch_bounds__(256) inkling2_dspark_rnn_raw(
     const __nv_bfloat16* __restrict__ W, const float* __restrict__ ctx,
     const __nv_bfloat16* __restrict__ state, const __nv_bfloat16* __restrict__ w1,
-    const unsigned int* __restrict__ prev, float* __restrict__ raw, const unsigned int hidden
+    const unsigned int* __restrict__ prev, float* __restrict__ raw, const unsigned int hidden,
+    const unsigned int ctx_stride, const unsigned int state_stride, const unsigned int prev_stride,
+    const unsigned int raw_stride
 ) {
     atlas_pdl_enter();
+    ctx += (unsigned long long)blockIdx.y * ctx_stride;
+    state += (unsigned long long)blockIdx.y * state_stride;
+    prev += (unsigned long long)blockIdx.y * prev_stride;
+    raw += (unsigned long long)blockIdx.y * raw_stride;
     const unsigned int lane = threadIdx.x % 32;
     const unsigned int o = blockIdx.x * 8 + threadIdx.x / 32;
     if (o >= 3 * RNN_RANK) return;
@@ -139,12 +151,16 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_dspark_rnn_raw(
 // The gating, as the reference's BF16 torch ops (each op rounds): g = sigmoid(bf16(raw_g)),
 // state = bf16(g * state) + bf16(bf16(1 - g) * tanh(bf16(raw_c))), latent = tanh(bf16(raw_o)).
 // `latent` gets [tanh(o) (R), 1.0, 0 ...] up to `latent_len`: the fold table's bias column.
-// grid (1), block R.
+// grid (sequences), block R: sequence x's raw, state and latent at x times their strides.
 extern "C" __global__ void __launch_bounds__(RNN_RANK) inkling2_dspark_rnn_gate(
     const float* __restrict__ raw, __nv_bfloat16* __restrict__ state,
-    __nv_bfloat16* __restrict__ latent, const unsigned int latent_len
+    __nv_bfloat16* __restrict__ latent, const unsigned int latent_len,
+    const unsigned int raw_stride, const unsigned int state_stride, const unsigned int latent_stride
 ) {
     atlas_pdl_enter();
+    raw += (unsigned long long)blockIdx.x * raw_stride;
+    state += (unsigned long long)blockIdx.x * state_stride;
+    latent += (unsigned long long)blockIdx.x * latent_stride;
     const unsigned int c = threadIdx.x;
     const float g = ink_round_bf16(raw[c]);
     const float cand = ink_round_bf16(raw[RNN_RANK + c]);
@@ -158,21 +174,32 @@ extern "C" __global__ void __launch_bounds__(RNN_RANK) inkling2_dspark_rnn_gate(
     for (unsigned int i = RNN_RANK + c; i < latent_len; i += RNN_RANK) latent[i] = __float2bfloat16(i == RNN_RANK ? 1.0f : 0.0f);
 }
 
-// A draft row's pick and the drafter's confidence in it: token = argmax(logits) (the lowest
-// index among equal maxima, as `argmax_bf16`), conf = log softmax(softcap(logits))[token] with
-// softcap(x) = cap * tanh(x / cap) (cap 0: none), the reference's `markov_logits`. NaN reads as
-// the lowest value. grid (1), block 1024.
+// A draft row's pick and the drafter's confidence in it: token = argmax(x) (the lowest index
+// among equal maxima, as `argmax_bf16`) of x = logits, or with `bias` of x = BF16(logits + bias)
+// (as `bf16_residual_add` would leave the row); conf = log softmax(softcap(x))[token] with
+// softcap(x) = cap * tanh(x / cap) (cap 0: none), the reference's `markov_logits`, written only
+// with `conf`. NaN reads as the lowest value. grid (sequences), block 1024: sequence s reads
+// logits + s * logits_stride and bias + s * bias_stride, writes token + s * token_stride and
+// conf + s * conf_stride.
 extern "C" __global__ void __launch_bounds__(1024) inkling2_dspark_pick(
-    const __nv_bfloat16* __restrict__ logits, unsigned int* __restrict__ token,
-    float* __restrict__ conf, const unsigned int n, const float cap
+    const __nv_bfloat16* __restrict__ logits, const unsigned long long logits_stride,
+    const __nv_bfloat16* __restrict__ bias, const unsigned int bias_stride,
+    unsigned int* __restrict__ token, const unsigned int token_stride,
+    float* __restrict__ conf, const unsigned int conf_stride, const unsigned int n, const float cap
 ) {
     __shared__ float s_val[1024];
     __shared__ unsigned int s_idx[1024];
-    const unsigned int tid = threadIdx.x, stride = blockDim.x;
+    const unsigned int tid = threadIdx.x, stride = blockDim.x, seq = blockIdx.x;
+    logits += seq * logits_stride;
+    if (bias != nullptr) bias += (unsigned long long)seq * bias_stride;
+    auto value = [&](unsigned int i) {
+        const float l = __bfloat162float(logits[i]);
+        return bias == nullptr ? l : ink_round_bf16(l + __bfloat162float(bias[i]));
+    };
     float best = -1e30f;
     unsigned int at = 0;
     for (unsigned int i = tid; i < n; i += stride) {
-        const float v = __bfloat162float(logits[i]);
+        const float v = value(i);
         if (v > best) { best = v; at = i; }
     }
     s_val[tid] = best;
@@ -186,13 +213,18 @@ extern "C" __global__ void __launch_bounds__(1024) inkling2_dspark_pick(
         }
         __syncthreads();
     }
-    const float top = cap > 0.0f ? cap * tanhf(s_val[0] / cap) : s_val[0];
+    const float top_raw = s_val[0];
     const unsigned int pick = s_idx[0];
+    if (conf == nullptr) {
+        if (tid == 0) token[(unsigned long long)seq * token_stride] = pick;
+        return;
+    }
+    const float top = cap > 0.0f ? cap * tanhf(top_raw / cap) : top_raw;
     __syncthreads();
     // sum over the row of exp(softcap(x) - softcap(max)): at least 1 (the pick itself)
     float mass = 0.0f;
     for (unsigned int i = tid; i < n; i += stride) {
-        const float v = __bfloat162float(logits[i]);
+        const float v = value(i);
         if (v == v) mass += expf((cap > 0.0f ? cap * tanhf(v / cap) : v) - top);
     }
     s_val[tid] = mass;
@@ -202,7 +234,7 @@ extern "C" __global__ void __launch_bounds__(1024) inkling2_dspark_pick(
         __syncthreads();
     }
     if (tid == 0) {
-        *token = pick;
-        *conf = -logf(fmaxf(s_val[0], 1.0f));
+        token[(unsigned long long)seq * token_stride] = pick;
+        conf[(unsigned long long)seq * conf_stride] = -logf(fmaxf(s_val[0], 1.0f));
     }
 }

@@ -78,6 +78,10 @@ impl BlockDiffusionDraftHead {
             .arg_ptr(ctx)
             .arg_u32(steps as u32)
             .arg_u32(self.hidden_size as u32)
+            // one sequence: no strides
+            .arg_u32(0)
+            .arg_u32(0)
+            .arg_u32(0)
             .launch(stream)
     }
 
@@ -120,6 +124,10 @@ impl BlockDiffusionDraftHead {
                 .arg_ptr(prev)
                 .arg_ptr(rows.raw)
                 .arg_u32(h)
+                .arg_u32(0)
+                .arg_u32(0)
+                .arg_u32(0)
+                .arg_u32(0)
                 .launch(stream)?;
             KernelLaunch::new(gpu, ink.k.rnn_gate)
                 .grid([1, 1, 1])
@@ -128,6 +136,9 @@ impl BlockDiffusionDraftHead {
                 .arg_ptr(rows.state)
                 .arg_ptr(rows.latent)
                 .arg_u32(FOLD_K as u32)
+                .arg_u32(0)
+                .arg_u32(0)
+                .arg_u32(0)
                 .launch(stream)?;
             ops::dense_gemv(
                 gpu,
@@ -150,15 +161,23 @@ impl BlockDiffusionDraftHead {
             let token = rows.tokens.offset((i + 1) * 4);
             match rows.conf {
                 // the pick and the drafter's confidence in it, word `i + 1`
-                Some(conf) => KernelLaunch::new(gpu, ink.k.pick)
-                    .grid([1, 1, 1])
-                    .block([1024, 1, 1])
-                    .arg_ptr(row(i + 1))
-                    .arg_ptr(token)
-                    .arg_ptr(conf.offset((i + 1) * 4))
-                    .arg_u32(v as u32)
-                    .arg_f32(super::LOGIT_SOFTCAP)
-                    .launch(stream)?,
+                Some(conf) => super::pick(
+                    gpu,
+                    ink,
+                    &super::Pick {
+                        logits: row(i + 1),
+                        logits_stride: 0,
+                        bias: DevicePtr::NULL,
+                        bias_stride: 0,
+                        token,
+                        token_stride: 0,
+                        conf: conf.offset((i + 1) * 4),
+                        conf_stride: 0,
+                        vocab: v,
+                    },
+                    1,
+                    stream,
+                )?,
                 None => ops::argmax_bf16(
                     gpu,
                     self.kernels.argmax,
