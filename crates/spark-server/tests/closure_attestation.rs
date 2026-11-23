@@ -46,24 +46,28 @@ fn the_baked_attestation_reproduces_from_the_tree() {
 
     let root = repo_root();
 
-    // ★ Every target the build resolved must be attested, not merely every
+    // ★ Every target the build selected must be attested, not merely every
     // attested target verifiable. Checking only the baked keys is how
     // `gb10/qwen3.6-27b/nvfp4` — the MLPerf flagship — went missing unnoticed:
     // 21 of 22 entries verified, the test passed, and the one target the whole
     // scheme exists to spare had no attestation at all. A silently absent entry
-    // is fail-closed, which is why nothing else catches it.
-    let gb10: Vec<_> = taxon::walk(&root)
-        .into_iter()
-        .filter(|t| t.hardware == "gb10" && t.quant == "nvfp4")
-        .collect();
-    let missing: Vec<String> = gb10
+    // is fail-closed, which is why nothing else catches it. The expectation is
+    // the build's own selection: `taxon::walk` sees the whole tree, while an
+    // `ATLAS_TARGET_*` build resolves only the selected targets.
+    let selected: Vec<String> = serde_json::from_str(atlas_kernels::TARGET_SELECTION)
+        .expect("TARGET_SELECTION must parse as a JSON array of target keys");
+    assert!(
+        !selected.is_empty(),
+        "TARGET_CLOSURES is non-empty but TARGET_SELECTION is empty — \
+         build.rs and lib.rs have drifted"
+    );
+    let missing: Vec<&String> = selected
         .iter()
-        .map(|t| t.to_string())
-        .filter(|k| !baked.contains_key(k))
+        .filter(|key| !baked.contains_key(key.as_str()))
         .collect();
     assert!(
         missing.is_empty(),
-        "the build resolved these targets but attested none of them, so their \
+        "the build selected these targets but attested none of them, so their \
          records can never be excused: {missing:?}. Check build.rs's cargo:warning \
          output for the reason."
     );

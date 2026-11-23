@@ -59,6 +59,11 @@ struct ModelTypeMatch {
 
 /// A resolved (hw, model, quant) compilation target.
 impl Target {
+    /// The `hardware/model/quant` key records and attestations use.
+    fn key(&self) -> String {
+        format!("{}/{}/{}", self.hw, self.model, self.quant)
+    }
+
     /// The model-specific source layers over `common/`, base first.
     fn overlay_dirs(&self) -> Vec<&std::path::Path> {
         self.base_kernel_dir
@@ -216,6 +221,7 @@ fn main() {
             content_hash(stub)
         );
         println!("cargo:rustc-env=ATLAS_PTX_DIR={}", out_dir.display());
+        println!("cargo:rustc-env=ATLAS_TARGET_SELECTION=[]");
         // No compiler ran, so this binary can attest to nothing. Emitted
         // explicitly rather than left unset so a reader of lib.rs does not have
         // to infer it: a record written from a skip build excuses no future
@@ -636,6 +642,11 @@ fn main() {
     // written — the two differ whenever a build is stale, a tree is dirty, or
     // an image is carried between boxes, all of which happen during a gate
     // campaign.
+    let selection = targets.iter().map(Target::key).collect::<Vec<_>>();
+    println!(
+        "cargo:rustc-env=ATLAS_TARGET_SELECTION={}",
+        serde_json::to_string(&selection).expect("target selection must serialize")
+    );
     println!(
         "cargo:rustc-env=ATLAS_TARGET_CLOSURES={}",
         closure_attestation(workspace_root, &targets, compute_target.as_ref())
@@ -708,7 +719,7 @@ fn closure_attestation(
             println!("cargo:warning=closure: unresolved include ({entry})");
         }
         map.insert(
-            format!("{}/{}/{}", target.hw, target.model, target.quant),
+            target.key(),
             serde_json::json!({
                 "hash": closure.digest,
                 "arch": target.arch,

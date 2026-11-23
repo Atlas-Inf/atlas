@@ -64,6 +64,19 @@ pub const TARGET_CLOSURES: &str = match option_env!("ATLAS_TARGET_CLOSURES") {
     None => "{}",
 };
 
+/// The `(hardware/model/quant)` targets this binary selected, as a JSON array,
+/// baked by `build.rs` beside [`TARGET_CLOSURES`]. Tests use it to check the
+/// attestation against what was actually built rather than the whole tree.
+///
+/// `[]` when the build compiled nothing (`ATLAS_SKIP_BUILD=1`).
+///
+/// `option_env!` rather than `env!` so the crate still builds against an
+/// `OUT_DIR` produced by an older build script.
+pub const TARGET_SELECTION: &str = match option_env!("ATLAS_TARGET_SELECTION") {
+    Some(json) => json,
+    None => "[]",
+};
+
 // ═══════════════════════════════════════════════════════════════════
 // Target-aware PTX grouping
 // ═══════════════════════════════════════════════════════════════════
