@@ -124,7 +124,7 @@ pub async fn messages(
 /// Claude Code calls this to validate the model and estimate token usage.
 pub async fn count_tokens(
     CurrentModel(state): CurrentModel,
-    req: Result<Json<MessagesRequest>, JsonRejection>,
+    req: Result<Json<CountTokensRequest>, JsonRejection>,
 ) -> Response {
     let Json(req) = match req {
         Ok(r) => r,
@@ -223,6 +223,73 @@ async fn openai_error_to_anthropic(resp: Response) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, body::Body, http::Request, routing::post};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    #[test]
+    fn count_tokens_request_contract() {
+        let empty = serde_json::json!({"model": "fixture", "messages": []});
+        let req: CountTokensRequest = serde_json::from_value(empty.clone()).unwrap();
+        assert!(req.messages.is_empty());
+        assert!(serde_json::from_value::<MessagesRequest>(empty).is_err());
+        for invalid in [
+            serde_json::json!({"messages": []}),
+            serde_json::json!({"model": "fixture"}),
+            serde_json::json!({"model": "fixture", "messages": "invalid"}),
+        ] {
+            assert!(serde_json::from_value::<CountTokensRequest>(invalid).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn count_tokens_without_max_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab([("[UNK]".to_string(), 0)].into_iter().collect())
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        tokenizers::Tokenizer::new(model)
+            .save(dir.path().join("tokenizer.json"), false)
+            .unwrap();
+        let tokenizer = crate::tokenizer::ChatTokenizer::from_model_dir(
+            dir.path(),
+            0,
+            true,
+            "glm5_next",
+            "",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let host = Arc::new(crate::main_modules::model_host::ModelHost::empty());
+        host.publish(Arc::new(crate::api::test_app_state::app_state(tokenizer)));
+        let app = Router::new()
+            .route("/v1/messages/count_tokens", post(count_tokens))
+            .with_state(host);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages/count_tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"fixture","messages":[{"role":"user","content":"Hello"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["input_tokens"].as_u64().unwrap() > 0);
+    }
 
     #[tokio::test]
     async fn a_client_error_forwards_as_an_invalid_request_error() {

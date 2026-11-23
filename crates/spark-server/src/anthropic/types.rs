@@ -5,6 +5,37 @@ use serde::{Deserialize, Serialize};
 // ── Anthropic request types ──
 
 #[derive(Debug, Deserialize)]
+pub struct CountTokensRequest {
+    pub model: String,
+    pub messages: Vec<AnthropicMessage>,
+    pub system: Option<SystemContent>,
+    pub tools: Option<Vec<AnthropicTool>>,
+    pub tool_choice: Option<AnthropicToolChoice>,
+    pub thinking: Option<ThinkingConfig>,
+}
+
+impl From<CountTokensRequest> for crate::ir::ChatRequest {
+    fn from(req: CountTokensRequest) -> Self {
+        MessagesRequest {
+            model: req.model,
+            messages: req.messages,
+            system: req.system,
+            tools: req.tools,
+            tool_choice: req.tool_choice,
+            thinking: req.thinking,
+            max_tokens: 0,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            stop_sequences: Vec::new(),
+            stream: false,
+            metadata: None,
+        }
+        .into()
+    }
+}
+
+#[derive(Debug, Deserialize)]
 pub struct MessagesRequest {
     pub model: String,
     pub max_tokens: usize,
