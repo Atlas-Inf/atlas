@@ -89,6 +89,14 @@ pub struct Usage {
     pub response_tokens_per_second: f64,
 }
 
+impl Usage {
+    /// Prompt tokens that missed the prefix cache — Anthropic's
+    /// `input_tokens`, which excludes `cache_read_input_tokens`.
+    pub fn uncached_prompt_tokens(&self) -> usize {
+        self.prompt_tokens.saturating_sub(self.cached_prompt_tokens)
+    }
+}
+
 /// Wire string for a response cut short by the server-side request
 /// deadline (`--request-timeout`, or the per-request `timeout` field).
 ///

@@ -78,6 +78,22 @@ fn text_stream_framing() {
 }
 
 #[test]
+fn final_usage_excludes_cache_reads_from_input_tokens() {
+    let evs = drive(vec![StreamDelta::Finish {
+        reason: FinishReason::Stop,
+        usage: Usage {
+            cached_prompt_tokens: 3,
+            ..usage(10, 1)
+        },
+        token_ids: Vec::new(),
+        guard_stop: None,
+    }]);
+    let delta = evs.iter().find(|e| e.event == "message_delta").unwrap();
+    assert_eq!(delta.data["usage"]["input_tokens"], 7);
+    assert_eq!(delta.data["usage"]["cache_read_input_tokens"], 3);
+}
+
+#[test]
 fn thinking_then_text_framing() {
     let evs = drive(vec![
         StreamDelta::Reasoning {

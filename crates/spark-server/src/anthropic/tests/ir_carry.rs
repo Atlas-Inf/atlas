@@ -369,7 +369,8 @@ fn response_maps_reasoning_text_tools_and_usage() {
     assert_eq!(json["id"], "msg_abc");
     assert_eq!(json["model"], "m");
     assert_eq!(json["stop_reason"], "tool_use");
-    assert_eq!(json["usage"]["input_tokens"], 10);
+    // Anthropic's input_tokens excludes cache reads: 10 prompt − 3 cached.
+    assert_eq!(json["usage"]["input_tokens"], 7);
     assert_eq!(json["usage"]["output_tokens"], 5);
     // B5: prefix-cache hits surface as Anthropic cache accounting.
     assert_eq!(json["usage"]["cache_read_input_tokens"], 3);

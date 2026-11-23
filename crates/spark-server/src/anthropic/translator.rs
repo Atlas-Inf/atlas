@@ -76,7 +76,8 @@ pub struct AnthropicTranslator {
     /// shouldn't re-trigger another `content_block_start`.
     tool_started: std::collections::HashMap<usize, ()>,
     completion_tokens: usize,
-    prompt_tokens: usize,
+    /// Anthropic `input_tokens`: prompt tokens minus cache reads.
+    input_tokens: usize,
     cached_prompt_tokens: usize,
     refused: bool,
     finished: bool,
@@ -92,7 +93,7 @@ impl AnthropicTranslator {
             open_block: OpenBlock::None,
             tool_started: std::collections::HashMap::new(),
             completion_tokens: 0,
-            prompt_tokens: 0,
+            input_tokens: 0,
             cached_prompt_tokens: 0,
             refused: false,
             finished: false,
@@ -129,7 +130,7 @@ impl AnthropicTranslator {
     /// clients merge message_delta.usage over message_start's.
     fn final_usage(&self) -> serde_json::Value {
         serde_json::json!({
-            "input_tokens": self.prompt_tokens,
+            "input_tokens": self.input_tokens,
             "cache_read_input_tokens": self.cached_prompt_tokens,
             "output_tokens": self.completion_tokens,
         })
@@ -204,7 +205,7 @@ impl AnthropicTranslator {
                     "stop_reason": serde_json::Value::Null,
                     "stop_sequence": serde_json::Value::Null,
                     "usage": {
-                        "input_tokens": self.prompt_tokens,
+                        "input_tokens": self.input_tokens,
                         "output_tokens": 0,
                     },
                 },
@@ -336,7 +337,7 @@ impl AnthropicTranslator {
                 ));
             }
             StreamDelta::Finish { reason, usage, .. } => {
-                self.prompt_tokens = usage.prompt_tokens;
+                self.input_tokens = usage.uncached_prompt_tokens();
                 self.completion_tokens = usage.completion_tokens;
                 self.cached_prompt_tokens = usage.cached_prompt_tokens;
                 self.finish_message(convert_stop_reason(reason.as_wire()), out);

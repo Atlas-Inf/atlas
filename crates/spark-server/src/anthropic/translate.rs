@@ -55,7 +55,7 @@ impl From<crate::ir::ChatResponse> for MessagesResponse {
             stop_reason: Some(stop_reason.to_string()),
             stop_sequence,
             usage: AnthropicUsage {
-                input_tokens: ir.usage.prompt_tokens,
+                input_tokens: ir.usage.uncached_prompt_tokens(),
                 output_tokens: ir.usage.completion_tokens,
                 cache_read_input_tokens: ir.usage.cached_prompt_tokens,
             },
