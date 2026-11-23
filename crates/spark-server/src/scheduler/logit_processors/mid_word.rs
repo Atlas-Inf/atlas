@@ -30,6 +30,8 @@ impl LogitsProcessor for MidWordThinkEndMask {
             // token (including a number). This Qwen-specific defer must not
             // suppress that close; request tools are irrelevant here.
             && ctx.glm_tool_boundary.is_none()
+            // Nor Inkling 2's, whose think end closes every block.
+            && ctx.limits.message_open.is_none()
             && a.inside_thinking
             && let Some(end_tok) = ctx.think_end_token
             && let Some(prev_tok) = a.output_tokens.last().copied()

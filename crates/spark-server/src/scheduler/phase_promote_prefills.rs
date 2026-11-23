@@ -23,10 +23,9 @@ pub(super) fn promote_completed_prefills(
     think_start_token: Option<u32>,
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
-    // Served context ceiling (`sched.limits.max_seq_len`) — finish_sequence
-    // needs it for the budget-derived `finish_reason` decision.
-    max_seq_len: usize,
-    glm_tool_boundary: Option<u32>,
+    // The run's hard stops (`sched.limits`): `finish_sequence` needs the
+    // served context ceiling for the budget-derived `finish_reason` decision.
+    limits: super::limits::SchedLimits,
 ) {
     // Process in reverse order so the remaining indices stay valid. `remove`,
     // not `swap_remove`: `prefilling` is the service order (the continue phase
@@ -52,7 +51,12 @@ pub(super) fn promote_completed_prefills(
             }
             continue;
         };
-        let spontaneous_think = !p.enable_thinking && think_start_token == Some(first);
+        let spontaneous_think = first_token_thinking::spontaneous_start(
+            p.enable_thinking,
+            first,
+            think_start_token,
+            limits.message_open,
+        );
         let slot = p.seq.slot_idx;
         super::ttft_trace::mark(
             slot,
@@ -116,10 +120,10 @@ pub(super) fn promote_completed_prefills(
             tool_call_start_token,
             tool_call_end_token,
             model.decode_rollback_ring_slots(),
-            glm_tool_boundary,
+            limits,
         );
         if immediate_finish {
-            finish_sequence(model, &mut a, max_seq_len);
+            finish_sequence(model, &mut a, limits.max_seq_len);
         } else {
             active.push(a);
         }
@@ -145,8 +149,9 @@ pub(super) fn build_active_seq_from_prefill(
     tool_call_end_token: Option<u32>,
     // Phase-C decode-rollback ring capacity (`model.decode_rollback_ring_slots()`).
     ssm_ring_capacity: usize,
-    glm_tool_boundary: Option<u32>,
+    limits: super::limits::SchedLimits,
 ) -> ActiveSeq {
+    let glm_tool_boundary = limits.glm_tool_boundary;
     let temperature = p.temperature;
     // F4: sticky tool-request flag — grammar attached OR legacy tool path.
     // Computed before `p.grammar_state` is moved into the struct below.
@@ -158,6 +163,7 @@ pub(super) fn build_active_seq_from_prefill(
         think_start_token,
         think_end_token,
         glm_tool_boundary.filter(|_| p.tools_present),
+        limits.message_open,
     );
     let mut seq = p.seq;
     // The min_tokens end-token ban, for every chunked prompt (one chunk or more).
@@ -323,8 +329,10 @@ fn failed_prefill_notifies_request_before_releasing_owner() {
         None,
         None,
         None,
-        64,
-        None,
+        super::limits::SchedLimits {
+            max_seq_len: 64,
+            ..super::limits::SchedLimits::NONE
+        },
     );
 
     let delivered = response_rx
@@ -356,8 +364,10 @@ fn finished_prefill_keeps_the_others_in_arrival_order() {
         None,
         None,
         None,
-        64,
-        None,
+        super::limits::SchedLimits {
+            max_seq_len: 64,
+            ..super::limits::SchedLimits::NONE
+        },
     );
 
     let order: Vec<usize> = prefilling.iter().map(|p| p.max_tokens).collect();

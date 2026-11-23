@@ -389,3 +389,42 @@ fn thinking_off_budget_applies_only_to_a_request_that_resolved_off() {
     assert_eq!(low_effort_when_off(Some(256), false, 16), Some(8));
     assert_eq!(low_effort_when_off(Some(256), false, 1), Some(1));
 }
+
+/// Inkling 2's MODEL.toml ceiling: an effort-silent thinking request gets the
+/// medium budget, and the effort ladder spans 2K-32K reasoning tokens, never
+/// clamped by `max_tokens` (`cap_thinking_at_max_tokens = false`).
+#[test]
+fn inkling_budgets_follow_its_model_ceiling() {
+    use crate::ir::EffortLevel;
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/gb10/inkling-2-mini");
+    let b = crate::api::test_app_state::build_behavior::parse_behavior(&dir);
+    let inkling = Policy {
+        disable_thinking: false,
+        model_default: b.thinking_default,
+        thinking_in_tools: b.thinking_in_tools,
+        max_thinking_budget: b.max_thinking_budget,
+        effort_capped_at_ceiling: b.effort_capped_at_ceiling,
+        cap_at_max_tokens: b.cap_thinking_at_max_tokens,
+    };
+    for tools in [false, true] {
+        assert_eq!(
+            resolve(ThinkingDirective::Unspecified, inkling, 4096, tools),
+            (true, Some(8192)),
+            "tools={tools}"
+        );
+    }
+    for (level, budget) in [
+        (EffortLevel::Minimal, 2048),
+        (EffortLevel::Low, 4096),
+        (EffortLevel::Medium, 8192),
+        (EffortLevel::High, 16384),
+        (EffortLevel::XHigh, 32768),
+    ] {
+        assert_eq!(
+            resolve(ThinkingDirective::OnEffort(level), inkling, 4096, false),
+            (true, Some(budget)),
+            "{level:?}"
+        );
+    }
+}

@@ -53,6 +53,8 @@ pub mod post_close;
 pub mod tool_during_think;
 
 #[cfg(test)]
+mod inkling_blocks_tests;
+#[cfg(test)]
 mod pipeline_tests;
 
 /// Per-step environment passed to every processor. Holds tokenizer-

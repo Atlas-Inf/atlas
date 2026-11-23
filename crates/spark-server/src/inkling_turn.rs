@@ -23,8 +23,10 @@
 //!    first answer block when the model did not think); with thinking off the
 //!    thinking body goes too and no think end is emitted;
 //!  * each tool block becomes a Hermes `<tool_call>` envelope with
-//!    `"arguments"`, re-encoded once its close arrives (its arguments are not
-//!    streamed piecewise);
+//!    `"arguments"`: once the body reads `{"name":NAME,"args":` the envelope
+//!    opens and the argument tokens pass through as they arrive, so the
+//!    tool parser streams them; a body of any other shape is re-encoded
+//!    whole when its close arrives;
 //!  * a thinking block after the answer started goes (it has no channel);
 //!  * a text block whose body is only a name followed by
 //!    `<|content_invoke_tool_json|>` is a call: at thinking effort 0 the
@@ -92,6 +94,7 @@ impl InklingMarkers {
             block: Block::Between,
             think_closed: false,
             tool: Vec::new(),
+            call: Call::Prefix,
             held: None,
         }
     }
@@ -106,6 +109,17 @@ enum Block {
     Tool,
 }
 
+/// How far a tool block's body has been read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Call {
+    /// Waiting for `{"name":NAME,"args":`.
+    Prefix,
+    /// The envelope is open; argument tokens pass through.
+    Args,
+    /// Another shape: held whole until the close.
+    Whole,
+}
+
 /// One generation's rewrite state.
 #[derive(Clone, Debug)]
 pub(crate) struct InklingTurn {
@@ -113,7 +127,9 @@ pub(crate) struct InklingTurn {
     keep_thinking: bool,
     block: Block,
     think_closed: bool,
+    /// The tool body's ids not yet emitted.
     tool: Vec<u32>,
+    call: Call,
     /// A text block's opening tokens while they may still be a call's name.
     held: Option<Vec<u32>>,
 }
@@ -187,7 +203,7 @@ impl InklingTurn {
                     out.push(tok);
                 }
             }
-            Block::Tool => self.tool.push(tok),
+            Block::Tool => self.call_token(tok, codec, out),
             Block::Answer | Block::Between => out.push(tok),
         }
     }
@@ -227,7 +243,58 @@ impl InklingTurn {
         }
     }
 
+    fn call_token(&mut self, tok: u32, codec: &dyn TurnCodec, out: &mut Vec<u32>) {
+        self.tool.push(tok);
+        match self.call {
+            Call::Whole => {}
+            Call::Args => self.pass_args(codec, out, false),
+            Call::Prefix => {
+                let text = codec.decode_ids(&self.tool);
+                if text.ends_with(char::REPLACEMENT_CHARACTER) {
+                    return; // a character split across tokens
+                }
+                match call_prefix(&text) {
+                    Prefix::More => {}
+                    Prefix::Other => self.call = Call::Whole,
+                    Prefix::Done { name, end } => {
+                        self.call = Call::Args;
+                        self.tool.clear();
+                        let open = format!(
+                            "<tool_call>\n{{\"name\": {}, \"arguments\": {}",
+                            escape_lt(&name),
+                            escape_lt(&text[end..])
+                        );
+                        out.extend(codec.encode_text(&open));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Argument tokens pass through unchanged unless they hold a `<`, which is
+    /// re-encoded as `\u003c` (see [`hermes_body`]); `all` flushes a split
+    /// character too. A special token decodes to nothing and goes, as it does
+    /// from a call rewritten whole.
+    fn pass_args(&mut self, codec: &dyn TurnCodec, out: &mut Vec<u32>, all: bool) {
+        let text = codec.decode_ids(&self.tool);
+        if text.is_empty() {
+            self.tool.clear();
+        } else if !text.contains('<') {
+            out.append(&mut self.tool);
+        } else if all || !text.ends_with(char::REPLACEMENT_CHARACTER) {
+            out.extend(codec.encode_text(&escape_lt(&text)));
+            self.tool.clear();
+        }
+    }
+
     fn emit_call(&mut self, codec: &dyn TurnCodec, out: &mut Vec<u32>, closed: bool) {
+        if std::mem::replace(&mut self.call, Call::Prefix) == Call::Args {
+            self.pass_args(codec, out, true);
+            if closed {
+                out.extend(codec.encode_text("\n</tool_call>"));
+            }
+            return;
+        }
         let raw = codec.decode_ids(&std::mem::take(&mut self.tool));
         let text = if closed {
             format!("<tool_call>\n{}\n</tool_call>", hermes_body(&raw))
@@ -240,6 +307,96 @@ impl InklingTurn {
         };
         out.extend(codec.encode_text(&text));
     }
+}
+
+/// `s` with every `<` written `\u003c`.
+fn escape_lt(s: &str) -> String {
+    s.replace('<', "\\u003c")
+}
+
+enum Prefix {
+    More,
+    Other,
+    /// `name` is the call's name as a JSON string; the arguments start at `end`.
+    Done {
+        name: String,
+        end: usize,
+    },
+}
+
+/// Longest body read for the name before giving up on streaming it.
+const PREFIX_MAX: usize = 512;
+
+/// Reads `{"name":NAME,"args":` (JSON whitespace allowed) off the start of a
+/// tool body.
+fn call_prefix(text: &str) -> Prefix {
+    let b = text.as_bytes();
+    let mut i = 0;
+    let ws = |i: &mut usize| {
+        while *i < b.len() && b[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+    };
+    // Each literal must match in full; a partial match at the end needs more.
+    let lit = |i: &mut usize, want: &[u8]| -> Option<bool> {
+        let have = &b[*i..b.len().min(*i + want.len())];
+        if !want.starts_with(have) {
+            return Some(false);
+        }
+        if have.len() < want.len() {
+            return None;
+        }
+        *i += want.len();
+        Some(true)
+    };
+    let mut name = String::new();
+    for step in 0..5 {
+        ws(&mut i);
+        let ok = match step {
+            0 => lit(&mut i, b"{"),
+            1 => lit(&mut i, b"\"name\"").and_then(|ok| {
+                ws(&mut i);
+                if ok { lit(&mut i, b":") } else { Some(false) }
+            }),
+            2 => {
+                let start = i;
+                if i == b.len() {
+                    None
+                } else if b[i] != b'"' {
+                    Some(false)
+                } else {
+                    let mut j = i + 1;
+                    while j < b.len() && b[j] != b'"' {
+                        j += if b[j] == b'\\' { 2 } else { 1 };
+                    }
+                    if j >= b.len() {
+                        None
+                    } else {
+                        i = j + 1;
+                        match serde_json::from_str::<String>(&text[start..i]) {
+                            Ok(n) => {
+                                name = serde_json::Value::String(n).to_string();
+                                Some(true)
+                            }
+                            Err(_) => Some(false),
+                        }
+                    }
+                }
+            }
+            3 => lit(&mut i, b","),
+            _ => lit(&mut i, b"\"args\"").and_then(|ok| {
+                ws(&mut i);
+                if ok { lit(&mut i, b":") } else { Some(false) }
+            }),
+        };
+        match ok {
+            Some(true) => {}
+            Some(false) => return Prefix::Other,
+            None if text.len() > PREFIX_MAX => return Prefix::Other,
+            None => return Prefix::More,
+        }
+    }
+    Prefix::Done { name, end: i }
 }
 
 /// `{"name":…,"args":{…}}` as Hermes `{"name": …, "arguments": {…}}`; text

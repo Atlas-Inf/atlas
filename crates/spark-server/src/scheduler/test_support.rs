@@ -136,6 +136,51 @@ pub(super) fn test_owned_seq(
     (a, rx)
 }
 
+/// Inkling 2's turn markers (`crate::inkling_turn`), at ids inside the
+/// 2048-token test vocabulary: the scheduler only compares ids.
+pub(super) mod inkling {
+    use super::{ActiveSeq, RespRx, test_seq};
+    use crate::scheduler::sched_ctx::SchedCtx;
+
+    /// `<|message_model|>`: opens every block.
+    pub const MESSAGE: u32 = 1101;
+    /// `<|content_text|>`.
+    pub const TEXT: u32 = 1104;
+    /// `<|content_model_end_sampling|>`: the end token.
+    pub const EOS: u32 = 1106;
+    /// `<|content_thinking|>`: the scheduler's think start.
+    pub const THINKING: u32 = 1108;
+    /// `<|end_message|>`: closes every block; the scheduler's think end.
+    pub const END: u32 = 1110;
+    /// `<|content_invoke_tool_json|>`.
+    pub const TOOL_JSON: u32 = 1149;
+
+    /// A run serving Inkling: `<|message_model|>` opens the blocks.
+    pub fn sched() -> SchedCtx {
+        let mut s = SchedCtx::for_test();
+        s.limits.message_open = Some(MESSAGE);
+        s
+    }
+
+    /// A turn as promotion leaves it (`an_inkling_turn_is_promoted_between_blocks`):
+    /// the header emitted, no block open or closed, the request's budget, the
+    /// server ceiling Inkling's MODEL.toml sets.
+    pub fn seq(enable_thinking: bool, thinking_budget: Option<u32>) -> (ActiveSeq, RespRx) {
+        let (mut a, rx) = test_seq(vec![MESSAGE], 1000, None, 40);
+        a.finished = false;
+        a.min_tokens = 0;
+        a.eos_tokens = vec![EOS];
+        a.enable_thinking = enable_thinking;
+        a.thinking_budget = thinking_budget;
+        a.spontaneous_think_budget = 8192;
+        a.inside_thinking = false;
+        a.think_ended = false;
+        a.think_end_token = Some(END);
+        a.think_start_token = Some(THINKING);
+        (a, rx)
+    }
+}
+
 /// Grammar fixtures share one vocabulary: a token per ASCII byte, `<eos>`,
 /// `<think>`, `</think>`, `<tool_call>`, padded to the 2048-token test
 /// model's vocabulary.

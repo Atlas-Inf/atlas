@@ -11,6 +11,10 @@
 //!
 //! arXiv evidence (s1 / DeepSeek-R1 / Qwen3 / Production Repetition):
 //! masking dominates penalty stacking for re-entry prevention.
+//!
+//! Inkling 2 (`SchedLimits::message_open`): its think end closes every
+//! block, so it is never masked; its think start is masked only after an
+//! engine close (budget or watchdog), so the close leads to the answer.
 
 use super::{LogitsContext, LogitsProcessor, ProcessorOutcome};
 use crate::scheduler::ActiveSeq;
@@ -24,7 +28,17 @@ impl LogitsProcessor for PostCloseThinkMask {
         a: &mut ActiveSeq,
         ctx: &LogitsContext,
     ) -> ProcessorOutcome {
-        if a.think_ended {
+        if a.think_ended && ctx.limits.message_open.is_some() {
+            // The think end closes every block, so it stays open; only after
+            // the engine closed the reasoning is a second one barred, so the
+            // close leads to the answer, not back into the reasoning.
+            if a.think_force_closed
+                && let Some(start_idx) = a.think_start_token.map(|t| t as usize)
+                && start_idx < logits.len()
+            {
+                logits[start_idx] = f32::NEG_INFINITY;
+            }
+        } else if a.think_ended {
             if let Some(end_tok) = ctx.think_end_token {
                 let end_idx = end_tok as usize;
                 if end_idx < logits.len() {

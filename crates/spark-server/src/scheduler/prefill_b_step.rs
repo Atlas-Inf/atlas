@@ -102,7 +102,9 @@ pub fn prefill_request(
         &grammar_spec,
         // The model's EOS passes through the matcher even under `ignore_eos`.
         &[model_eos, eos_tokens].concat(),
-        req_enable_thinking && think_end_token.is_some(),
+        sched
+            .limits
+            .opens_in_thinking(req_enable_thinking, think_end_token),
         first_token_thinking::native_opener(
             sched.limits.glm_tool_boundary,
             req_tools_present,
@@ -331,13 +333,19 @@ pub fn prefill_request(
 
     // Spontaneous <think>: if the first token is <think> and thinking was not
     // requested, suppress it and enter thinking mode on the ActiveSeq.
-    let spontaneous_think = !req_enable_thinking && think_start_token == Some(first);
+    let spontaneous_think = first_token_thinking::spontaneous_start(
+        req_enable_thinking,
+        first,
+        think_start_token,
+        sched.limits.message_open,
+    );
     let thinking = first_token_thinking::FirstTokenThinking::resolve_with_tool_boundary(
         req_enable_thinking,
         first,
         think_start_token,
         think_end_token,
         sched.limits.glm_tool_boundary.filter(|_| req_tools_present),
+        sched.limits.message_open,
     );
     let native_tool_open =
         max_tokens > 0 && req_tools_present && sched.limits.glm_tool_boundary == Some(first);

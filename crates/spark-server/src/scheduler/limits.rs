@@ -39,6 +39,13 @@ pub struct SchedLimits {
     pub max_seq_len: usize,
     /// Model-qualified native GLM tool opener; per-request tools must also be active.
     pub glm_tool_boundary: Option<u32>,
+    /// The token that opens every block of a turn (Inkling 2's
+    /// `<|message_model|>`), when the think end closes all of them
+    /// (`<|end_message|>`), not only the reasoning. Thinking then starts
+    /// closed and opens only on this token followed by the think start
+    /// (`<|content_thinking|>`), for the turn's first block; an end outside
+    /// thinking closes an answer or tool block. `None` for every other model.
+    pub message_open: Option<u32>,
 }
 
 impl SchedLimits {
@@ -51,7 +58,15 @@ impl SchedLimits {
         code_fence_token: None,
         max_seq_len: 0,
         glm_tool_boundary: None,
+        message_open: None,
     };
+
+    /// Whether a request's generation starts inside its reasoning: thinking
+    /// on and a think end to close it, unless the model opens its own blocks
+    /// ([`Self::message_open`]; its first block may be the answer).
+    pub fn opens_in_thinking(&self, enable_thinking: bool, think_end: Option<u32>) -> bool {
+        enable_thinking && think_end.is_some() && self.message_open.is_none()
+    }
 }
 
 #[cfg(test)]

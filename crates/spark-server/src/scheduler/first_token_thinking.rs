@@ -10,13 +10,24 @@ pub(super) struct FirstTokenThinking {
 }
 
 impl FirstTokenThinking {
+    /// `message_open`: [`crate::scheduler::limits::SchedLimits::message_open`].
     pub fn resolve_with_tool_boundary(
         enabled: bool,
         first: u32,
         start: Option<u32>,
         end: Option<u32>,
         native_tool_boundary: Option<u32>,
+        message_open: Option<u32>,
     ) -> Self {
+        if message_open.is_some() {
+            // The first token is a block's header, and the first block may be
+            // the answer: `think_gate` opens the reasoning when it comes.
+            return Self {
+                inside_thinking: false,
+                think_ended: false,
+                think_just_ended: false,
+            };
+        }
         if enabled && native_tool_boundary == Some(first) {
             tracing::info!(
                 native_opener = first,
@@ -43,6 +54,19 @@ impl FirstTokenThinking {
             think_just_ended: closed,
         }
     }
+}
+
+/// Whether the prefill's first token is a spontaneous `<think>`: thinking was
+/// not requested and the model opened it anyway, so the token is consumed and
+/// the block budgeted by the server ceiling. Never under `message_open`: there
+/// the think start is a block's content type, which the chat paths read.
+pub(super) fn spontaneous_start(
+    enabled: bool,
+    first: u32,
+    start: Option<u32>,
+    message_open: Option<u32>,
+) -> bool {
+    !enabled && start == Some(first) && message_open.is_none()
 }
 
 /// The token that ends reasoning as a native GLM tool call: the configured
@@ -143,5 +167,46 @@ mod tests {
                 "enabled={enabled}, first={first}, start={start:?}, end={end:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_turn_whose_blocks_open_with_a_header_starts_between_blocks() {
+        // Inkling 2: start 10 = `<|content_thinking|>`, end 20 =
+        // `<|end_message|>`, header 40. The first token is the header, and
+        // the first block may be the answer: nothing is open or closed yet.
+        for enabled in [true, false] {
+            for first in [40, 10, 20, 30] {
+                assert_eq!(
+                    FirstTokenThinking::resolve_with_tool_boundary(
+                        enabled,
+                        first,
+                        Some(10),
+                        Some(20),
+                        None,
+                        Some(40),
+                    ),
+                    FirstTokenThinking {
+                        inside_thinking: false,
+                        think_ended: false,
+                        think_just_ended: false,
+                    },
+                    "enabled={enabled}, first={first}"
+                );
+                assert!(!spontaneous_start(enabled, first, Some(10), Some(40)));
+            }
+        }
+        // Without a header the rules are unchanged.
+        assert!(spontaneous_start(false, 10, Some(10), None));
+        assert_eq!(
+            FirstTokenThinking::resolve_with_tool_boundary(
+                true,
+                30,
+                Some(10),
+                Some(20),
+                None,
+                None
+            ),
+            FirstTokenThinking::resolve(true, 30, Some(10), Some(20)),
+        );
     }
 }

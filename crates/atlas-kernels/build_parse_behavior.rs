@@ -104,6 +104,8 @@ pub(crate) struct ParsedBehavior {
     pub verbatim_reasoning_effort: bool,
     /// See `ModelBehavior::ban_tool_call_without_tools`.
     pub ban_tool_call_without_tools: bool,
+    /// See `ModelBehavior::spec_think`.
+    pub spec_think: bool,
 }
 
 impl Default for ParsedBehavior {
@@ -151,6 +153,7 @@ impl Default for ParsedBehavior {
             tool_call_steering: true,
             verbatim_reasoning_effort: false,
             ban_tool_call_without_tools: true,
+            spec_think: false,
         }
     }
 }
@@ -350,6 +353,7 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
     let tool_call_steering = flag("tool_call_steering", true);
     let verbatim_reasoning_effort = flag("verbatim_reasoning_effort", false);
     let ban_tool_call_without_tools = flag("ban_tool_call_without_tools", true);
+    let spec_think = flag("spec_think", false);
     ParsedBehavior {
         thinking_in_tools,
         max_thinking_budget,
@@ -393,5 +397,6 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         tool_call_steering,
         verbatim_reasoning_effort,
         ban_tool_call_without_tools,
+        spec_think,
     }
 }

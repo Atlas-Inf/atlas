@@ -961,20 +961,29 @@ pub(crate) fn load_model(
         tokenizer_limits.glm_tool_boundary,
         tool_call_start_token,
     )?;
-    // A think end that also closes the turn's other blocks (Inkling 2's
-    // `<|end_message|>`) splits reasoning in the chat paths only: the
-    // scheduler's think masks and budgets would forbid the closes the answer
-    // needs.
-    let scheduler_think_end = think_end_token.filter(|_| {
-        reasoning_parser_box
-            .as_ref()
-            .is_none_or(|p| p.end_tag_closes_only_reasoning())
-    });
     let inkling_markers =
         crate::inkling_turn::InklingMarkers::resolve(&config.model_type, &tokenizer);
     if config.model_type == "inkling2_loop" && inkling_markers.is_none() {
         anyhow::bail!("inkling2_loop tokenizer lacks the Inkling 2 message markers");
     }
+    // Inkling 2's `<|end_message|>` closes every block of the turn, so the
+    // scheduler tracks its reasoning by block: `<|message_model|>` then
+    // `<|content_thinking|>` opens it, and `<|end_message|>` closes it only
+    // while it is open (`SchedLimits::message_open`). Any other think end
+    // that closes more than reasoning is the chat paths' alone: the
+    // scheduler's think masks and budgets would forbid the closes the answer
+    // needs.
+    let (scheduler_think_end, scheduler_think_start) = match inkling_markers {
+        Some(m) => (Some(m.end), Some(m.thinking)),
+        None => (
+            think_end_token.filter(|_| {
+                reasoning_parser_box
+                    .as_ref()
+                    .is_none_or(|p| p.end_tag_closes_only_reasoning())
+            }),
+            think_start_token,
+        ),
+    };
 
     // 7. Create scheduler channel + spawn scheduler
     spark_runtime::progress::phase(9, "scheduler");
@@ -1184,7 +1193,7 @@ pub(crate) fn load_model(
     // toggles this run's flag; the MODEL.toml `[behavior]` value is its
     // starting position.
     let sched_levers = std::sync::Arc::new({
-        let mut l = crate::scheduler::levers::SchedLevers::from_env();
+        let mut l = crate::scheduler::levers::SchedLevers::from_env().with_behavior(&behavior);
         if args.reference_mode {
             l.disable_watchdogs = true;
         }
@@ -1219,6 +1228,7 @@ pub(crate) fn load_model(
     let run_snapshot = sched_snapshot.clone();
     let sched_limits = crate::scheduler::limits::SchedLimits {
         max_seq_len: args.max_seq_len,
+        message_open: inkling_markers.map(|m| m.message),
         ..tokenizer_limits
     };
     // Capture the runtime handle IN async context so the scheduler OS thread
@@ -1268,7 +1278,7 @@ pub(crate) fn load_model(
                 high_speed_swap_cfg,
                 block_size,
                 scheduler_think_end,
-                think_start_token,
+                scheduler_think_start,
                 tool_call_start_token,
                 tool_call_end_token,
                 grammar_engine,

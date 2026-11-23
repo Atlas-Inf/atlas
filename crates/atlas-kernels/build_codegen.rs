@@ -205,6 +205,7 @@ pub(super) fn generate_target_ptx_rs(
              \x20               tool_call_steering: {},\n\
              \x20               verbatim_reasoning_effort: {},\n\
              \x20               ban_tool_call_without_tools: {},\n\
+             \x20               spec_think: {},\n\
              \x20           }},\n\
              \x20           model_type_matches: vec![{}],\n\
              \x20           match_names: &[{}],\n\
@@ -259,6 +260,7 @@ pub(super) fn generate_target_ptx_rs(
             target.behavior_tool_call_steering,
             target.behavior_verbatim_reasoning_effort,
             target.behavior_ban_tool_call_without_tools,
+            target.behavior_spec_think,
             target.model_type_matches.iter().map(|m| {
                 let hs = match m.hidden_size {
                     Some(v) => format!("Some({v})"),

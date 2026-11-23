@@ -145,7 +145,9 @@ pub fn start_chunked_prefill(
         &grammar_spec,
         // The model's EOS passes through the matcher even under `ignore_eos`.
         &[model_eos, eos_tokens].concat(),
-        req_enable_thinking && think_end_token.is_some(),
+        sched
+            .limits
+            .opens_in_thinking(req_enable_thinking, think_end_token),
         first_token_thinking::native_opener(
             sched.limits.glm_tool_boundary,
             req_tools_present,
@@ -618,7 +620,12 @@ pub fn start_chunked_prefill(
             }
         };
 
-        let spontaneous_think = !req_enable_thinking && think_start_token == Some(first);
+        let spontaneous_think = first_token_thinking::spontaneous_start(
+            req_enable_thinking,
+            first,
+            think_start_token,
+            sched.limits.message_open,
+        );
         super::ttft_trace::mark(
             p.seq.slot_idx,
             super::ttft_trace::Mark::FirstSampled(!spontaneous_think && max_tokens > 0),
@@ -685,7 +692,7 @@ pub fn start_chunked_prefill(
             tool_call_start_token,
             tool_call_end_token,
             model.decode_rollback_ring_slots(),
-            sched.limits.glm_tool_boundary,
+            sched.limits,
         );
         if immediate_finish {
             finish_sequence(model, &mut a, sched.limits.max_seq_len);
