@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Exercise both completion handlers through the real scheduler request
-//! boundary: request-level speculation policy and streamed logprobs.
+//! boundary: request-level speculation policy, usage, and streamed logprobs.
 //! Ported from Enntity/atlas f4d95a10 (AGPL-3.0-only).
 
 use super::*;
@@ -106,6 +106,52 @@ async fn completion_disable_mtp_reaches_scheduler_for_blocking_and_streaming() {
             scheduler.await.unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn completion_usage_counts_prompt_once_for_multiple_choices() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let state = Arc::new(AppState {
+        request_tx: tx,
+        ..crate::api::test_app_state::app_state(tokenizer())
+    });
+    let req: CompletionRequest = serde_json::from_value(json!({
+        "model": "fixture", "prompt": [6], "max_tokens": 1, "n": 2
+    }))
+    .unwrap();
+    let scheduler = tokio::spawn(async move {
+        for _ in 0..2 {
+            let Some(InferenceRequest::Blocking { response_tx, .. }) = rx.recv().await else {
+                panic!("expected a blocking completion request");
+            };
+            let result = response_tx.send(Ok(InferenceResponse {
+                output_tokens: vec![1],
+                finish_reason: "length".into(),
+                time_to_first_token_ms: 0.0,
+                decode_time_ms: 0.0,
+                logprobs: vec![],
+                reasoning_tokens: 0,
+                cached_prompt_tokens: 1,
+                accepted_prediction_tokens: 0,
+                prompt_logprobs: vec![],
+                guard_stop: None,
+            }));
+            assert!(result.is_ok());
+        }
+    });
+    let response =
+        crate::api::completions::completions(CurrentModel(state), Ok(axum::Json(req))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    scheduler.await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["choices"].as_array().unwrap().len(), 2);
+    assert_eq!(body["usage"]["prompt_tokens"], 1);
+    assert_eq!(body["usage"]["completion_tokens"], 2);
+    assert_eq!(body["usage"]["total_tokens"], 3);
+    assert_eq!(body["usage"]["prompt_tokens_details"]["cached_tokens"], 1);
 }
 
 async fn completion_stream_chunks(

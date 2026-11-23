@@ -90,6 +90,8 @@ pub(super) async fn run_blocking(
     let mut last_tps = 0.0f64;
 
     for (prompt_i, prompt_tokens) in prompts.iter().enumerate() {
+        sum_prompt += prompt_tokens.len();
+        let mut prompt_cached = 0;
         for n_i in 0..n {
             let timeout_at = match state.request_deadline(req.timeout) {
                 Ok(at) => at,
@@ -201,9 +203,8 @@ pub(super) async fn run_blocking(
                 )
             });
 
-            sum_prompt += prompt_tokens.len();
             sum_completion += response.output_tokens.len();
-            sum_cached += response.cached_prompt_tokens as usize;
+            prompt_cached = prompt_cached.max(response.cached_prompt_tokens);
             sum_reasoning += response.reasoning_tokens as usize;
             sum_accepted += response.accepted_prediction_tokens;
             last_ttft = response.time_to_first_token_ms;
@@ -222,6 +223,7 @@ pub(super) async fn run_blocking(
                 response,
             ));
         }
+        sum_cached += prompt_cached as usize;
     }
 
     let usage = Usage {
