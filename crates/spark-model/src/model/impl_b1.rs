@@ -71,7 +71,7 @@ impl TransformerModel {
         // Active sequences
         for (i, seq) in seqs.iter().enumerate() {
             let pos = seq.seq_len as u32;
-            positions.push(pos);
+            positions.push(self.decode_position(seq));
 
             let block_idx = pos as usize / block_size;
             let block_offset = pos as usize % block_size;
@@ -323,7 +323,7 @@ impl TransformerModel {
 
         for seq in seqs.iter() {
             let pos = seq.seq_len as u32;
-            positions.push(pos);
+            positions.push(self.decode_position(seq));
 
             let block_idx = pos as usize / block_size;
             let block_offset = pos as usize % block_size;
@@ -589,7 +589,7 @@ impl TransformerModel {
         let meta_base = self.buffers.scratch().offset(32768);
         let max_blocks = seq.block_table.len() as u32;
 
-        let pos_val = seq.seq_len as u32;
+        let pos_val = self.decode_position(seq);
         self.gpu
             .copy_h2d_async(&pos_val.to_le_bytes(), meta_base, stream)?;
 

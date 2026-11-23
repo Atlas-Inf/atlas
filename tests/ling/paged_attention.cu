@@ -12,6 +12,7 @@
 // Ling's last compact MLA pool (transformer layers 5, 11, ..., 41).
 
 #include "../../kernels/gb10/ling-3.2-air/nvfp4/paged_decode_attn_ling.cu"
+#undef paged_decode_attn
 #undef HDIM
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -166,6 +167,10 @@ int main() {
                 }
                 const size_t oi = (static_cast<size_t>(row) * HEADS + head) * HDIM + dim;
                 const float error = std::abs(static_cast<float>(output[oi]) - expected);
+                if (!std::isfinite(error)) {
+                    std::fprintf(stderr, "nonfinite output at %zu\n", oi);
+                    return 1;
+                }
                 if (error > worst) {
                     worst = error;
                     worst_index = oi;
