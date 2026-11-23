@@ -280,6 +280,18 @@ impl WeightStore {
         }
     }
 
+    /// Move every tensor of `other` into this store (a weight overlay loaded
+    /// beside the checkpoint). A name both stores hold is an error: an
+    /// overlay adds tensors under its own names, it never shadows one.
+    pub fn absorb(&mut self, other: WeightStore) -> Result<()> {
+        if let Some(dup) = other.weights.keys().find(|n| self.weights.contains_key(*n)) {
+            anyhow::bail!("weight overlay tensor {dup} is already in the checkpoint");
+        }
+        self.weights.extend(other.weights);
+        self.deferred.extend(other.deferred);
+        Ok(())
+    }
+
     /// Get a weight tensor by name. Fails fast if not found.
     pub fn get(&self, name: &str) -> Result<&WeightTensor> {
         self.weights

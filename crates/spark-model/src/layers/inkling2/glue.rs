@@ -36,6 +36,9 @@ pub(crate) struct GlueKernels {
     pub kv_write: KernelHandle,
     /// Spark NVFP4 projections: one row, many rows
     pub w4a16_gemv: KernelHandle,
+    /// AMD (strix-hip): the single-warp `w4a16_gemv_sw` (bit-identical to `w4a16_gemv`,
+    /// 8 outputs a block); NULL elsewhere or when the kernel is absent
+    pub w4a16_gemv_sw: KernelHandle,
     pub w4a16_gemv_b8: KernelHandle,
     pub w4a16_gemv_b16: KernelHandle,
 }
@@ -58,6 +61,11 @@ impl GlueKernels {
             topk: gpu.kernel("moe_topk_sig", "moe_topk_sigmoid_batched_f32")?,
             kv_write: gpu.kernel("reshape_and_cache", "reshape_and_cache_flash")?,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
+            w4a16_gemv_sw: if cfg!(atlas_scale) {
+                crate::layers::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw")
+            } else {
+                KernelHandle(0)
+            },
             w4a16_gemv_b8: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch8")?,
             w4a16_gemv_b16: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch16")?,
         })
@@ -150,6 +158,11 @@ impl GlueKernels {
                 self.batchm_with(gpu, self.dense_gemv_batchm, rows, x, w, y, n, k, s)
             }
             Linear::Bf16(w) => ops::bf16_gemm(x, w.0, y, rows as u32, n as u32, k as u32, s),
+            // AMD (strix-hip): the single-warp twin, bit-identical, for the occupancy (f370:
+            // w4a16_gemv was 27% of Spark decode at ~133 GB/s over 288 small calls a token)
+            Linear::Nvfp4 { q, .. } if rows == 1 && self.w4a16_gemv_sw.0 != 0 => {
+                ops::w4a16_gemv_sw(gpu, self.w4a16_gemv_sw, x, &q, y, n as u32, k as u32, s)
+            }
             Linear::Nvfp4 { q, .. } if rows == 1 => {
                 ops::w4a16_gemv(gpu, self.w4a16_gemv, x, &q, y, n as u32, k as u32, s)
             }

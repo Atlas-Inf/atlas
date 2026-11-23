@@ -104,10 +104,7 @@ impl TransformerModel {
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
         // Host-maintained per-layer state must not freeze during graph replay.
-        let layer_veto = self
-            .layers
-            .iter()
-            .any(|l| l.batched_decode_graph_unsupported());
+        let layer_veto = self.layers_veto_batched_graphs();
         // Preserve K5 opt-in; repaired C1 K2 has a separate default-off gate.
         let glm_tp_graphs = (self.config.model_type == "glm5_next"
             && k == 5

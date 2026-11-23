@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+/// Inkling 2 Mini (always on: bit-identical, and every listed kernel waits): every kernel of the target's own
+/// tree that enters with `atlas_pdl_enter()` (decode, verify, prefill and the
+/// DSpark drafter's), and the `common/` kernels its decode chain launches that
+/// do: the BF16 and NVFP4 GEMVs, routing and the KV write. Not listed: the
+/// router's fp32-out GEMV and the head's argmax and softcap, which do not wait.
+pub(super) const INKLING2_PDL_KERNELS: &[&str] = &[
+    "inkling2_rmsnorm",
+    "inkling2_head_norm",
+    "inkling2_gate_mul",
+    "inkling2_residual",
+    "inkling2_layer_out",
+    "inkling2_f32_to_bf16",
+    "inkling2_sconv",
+    "inkling2_sconv_state",
+    "inkling2_block_res_sums",
+    "inkling2_block_res_out",
+    "inkling2_block_res_row",
+    "inkling2_msg_gate_z",
+    "inkling2_msg_gate_out",
+    "inkling2_msg_gate_fused",
+    "inkling2_decode_attn",
+    "inkling2_decode_attn_combine",
+    "inkling2_flash_prefill",
+    "inkling2_moe_gate_up_nvfp4",
+    "inkling2_moe_down_nvfp4",
+    "inkling2_moe_gate_up_mxfp8",
+    "inkling2_moe_down_mxfp8",
+    "inkling2_moe_combine",
+    "inkling2_moe_grouped_gate_up_nvfp4",
+    "inkling2_moe_grouped_down_nvfp4",
+    "inkling2_moe_grouped_gate_up_mxfp8",
+    "inkling2_moe_grouped_down_mxfp8",
+    "inkling2_moe_tiles",
+    "inkling2_quant_fp4",
+    "inkling2_situ_quant_fp4",
+    "inkling2_quant_mxfp8",
+    "inkling2_situ_quant_mxfp8",
+    "inkling2_dspark_mix",
+    "inkling2_dspark_block_input",
+    "inkling2_dspark_rnn_ctx",
+    "inkling2_dspark_rnn_raw",
+    "inkling2_dspark_rnn_gate",
+    "inkling2_proj_gemv",
+    "dense_gemv_bf16",
+    "w4a16_gemv",
+    "moe_topk_sigmoid_batched_f32",
+    "reshape_and_cache_flash",
+];

@@ -51,6 +51,34 @@ architecture = "Hybrid Attention + GDN + Dense FFN + MRoPE"
 match_names = ["qwen3.8-27b"]
 kernel_source = "qwen3.6-27b"
 
+# ── nvidia/Qwen3.8-27B-NVFP4-QAD (quantization-aware distillation) ─────────
+# NVIDIA's QAD release of this model, which SparkQwen (Enntity/sparkqwen#47)
+# made its 27B default on 2026-11-20. It resolves to this target through
+# `match_names`, and it loads with no engine change. Shard-header diff against
+# nvidia/Qwen3.8-27B-NVFP4 (2026-11-21):
+#  * Its MTP head is incomplete: 11 of the 15 `mtp.*` tensors, byte-identical to
+#    nvidia/Qwen3.8-27B-NVFP4's. mtp.fc, mtp.norm and mtp.pre_fc_norm_{embedding,
+#    hidden} are missing, and the loader gates on mtp.fc, so `--speculative` loads no
+#    head and serves serially. Grafting those 4 tensors back from the stock checkpoint
+#    rebuilds its head exactly, and MTP then runs exact (greedy == serial 8/8). Even
+#    so, the DFlash2 drafter in [dflash] below is faster through C2 and on agentic
+#    turns (decode-floor 56.1 vs 31.6 tok/s, 5.7 vs 10.3 s/turn), so serve it with
+#    DFlash2. MTP leads only at C8 aggregate (100.9 vs 89.4 tok/s).
+#  * Gated DeltaNet in_proj_qkv / in_proj_z / out_proj are NVFP4 in 38 of the
+#    48 GDN layers. qkv and z share one weight_scale_2, so they fuse as stored.
+#    The other 10 layers (0-2, 4, 5, 57, 58, 60-62) are FP8 per-tensor and stay
+#    native FP8 by default (`ATLAS_NO_GDN_FP8` is the A/B off switch).
+#  * Attention q/k/v/o are FP8 per-tensor, as in the earlier checkpoint. They
+#    are re-rounded to NVFP4 by default; `ATLAS_DENSE_NATIVE_FP8_ATTN=1` keeps
+#    them as stored.
+#    Keeping them is measurably better on this checkpoint (sparky, 2026-11-21, same
+#    build, dflash2-exact flags): bfcl-subset 89.25 vs 88.14 re-rounded (88.74 on
+#    the stock checkpoint), engine NLL 0.829 vs 0.835 (0.852 stock), agentic
+#    5.66 vs 5.55 s/turn (6.61 stock). sparkrun-recipes qwen3.8-27b-nvfp4-qad sets it.
+#  * Per-tensor input_scale is shaped [1] instead of []. config.json gains a
+#    kv_cache_scheme (static FP8) with no k/v scale tensors; Atlas does not
+#    read it.
+
 # Architecture facts below are the same as qwen3.6-27b's because the configs
 # are bit-identical (verified as above), not because they were assumed.
 layers_total = 64

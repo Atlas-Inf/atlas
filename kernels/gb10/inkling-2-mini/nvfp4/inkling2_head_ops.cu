@@ -241,6 +241,156 @@ extern "C" __global__ void inkling2_msg_gate_out(
     }
 }
 
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+// AMD (strix-hip, gfx1151): the fused message gates below on WMMA
+// (__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32; fragment layout as kernels/strix-hip validates it:
+// A lane l -> a[i] = A[l & 15][k + i], B (N x K rows) b[i] = B[n + (l & 15)][k + i],
+// C element e -> row 2e + (l >> 4), column l & 15). Same phases, arguments and roundings as the
+// gb10 kernel after this block: rms of every gate's h and m rows; z = BF16(D BF16([rms0(h); rms0(m)]))
+// on warps 0-3 (one 16-wide rank tile each); then 64 channels a step, F z on warps 0-3 and G z on
+// warps 4-7 staged in fp32, and out = (1 - tanh(F z)) * h + tanh(G z) * m with every gate's inputs
+// read before its outputs are written (out may alias h). Rank 64. grid (ceil(rows / 16)), block 256.
+#define INK_FG_ROWS 16
+#define INK_FG_K 64
+#define INK_FG_CH 64
+#define INK_FG_PITCH (INK_FG_K + 8)
+typedef __bf16 ink_fg_v16bf __attribute__((ext_vector_type(16)));
+typedef float ink_fg_v8f __attribute__((ext_vector_type(8)));
+// 16 consecutive BF16 of a 16-byte-aligned shared row as one WMMA operand (two ds_read_b128).
+__device__ __forceinline__ ink_fg_v16bf ink_fg_ld16(const __nv_bfloat16* p) {
+    union { uint4 u[2]; ink_fg_v16bf v; } x;
+    x.u[0] = ((const uint4*)p)[0];
+    x.u[1] = ((const uint4*)p)[1];
+    return x.v;
+}
+
+extern "C" __global__ void __launch_bounds__(256) inkling2_msg_gate_fused(
+    const float* h, const float* m,
+    const __nv_bfloat16* __restrict__ D0, const __nv_bfloat16* __restrict__ D1, const __nv_bfloat16* __restrict__ D2,
+    const __nv_bfloat16* __restrict__ F0, const __nv_bfloat16* __restrict__ F1, const __nv_bfloat16* __restrict__ F2,
+    const __nv_bfloat16* __restrict__ G0, const __nv_bfloat16* __restrict__ G1, const __nv_bfloat16* __restrict__ G2,
+    float* out,
+    const unsigned int rows,
+    const unsigned int H,
+    const unsigned int gates,
+    const unsigned long long h_stride,
+    const unsigned long long m_stride,
+    const unsigned long long out_stride,
+    const float eps
+) {
+    atlas_pdl_enter();
+    constexpr unsigned int RANK = INK_MAX_RANK;
+    __shared__ float s_rstd[INK_MAX_GATES][INK_FG_ROWS][2];
+    __shared__ __align__(16) __nv_bfloat16 s_a[INK_FG_ROWS][INK_FG_PITCH];
+    __shared__ __align__(16) __nv_bfloat16 s_w[RANK][INK_FG_PITCH];      // D (z) or F (out) step
+    __shared__ __align__(16) __nv_bfloat16 s_w2[INK_FG_CH][INK_FG_PITCH]; // G (out) step
+    __shared__ __align__(16) __nv_bfloat16 s_z[INK_MAX_GATES][INK_FG_ROWS][INK_FG_PITCH];
+    __shared__ float s_f[INK_MAX_GATES][INK_FG_ROWS][INK_FG_CH];
+    __shared__ float s_g[INK_MAX_GATES][INK_FG_ROWS][INK_FG_CH];
+    const unsigned int row0 = blockIdx.x * INK_FG_ROWS, nr = min(INK_FG_ROWS, rows - row0);
+    const unsigned int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+    const unsigned int l16 = lane & 15, lhi = lane >> 4;
+
+    for (unsigned int t = warp; t < gates * INK_FG_ROWS * 2; t += 8) {
+        const unsigned int g = t / (2 * INK_FG_ROWS), q = (t / 2) % INK_FG_ROWS, half = t % 2;
+        float s = 0.0f;
+        if (q < nr) {
+            const float* p = (half ? m + g * m_stride : h + g * h_stride) + (unsigned long long)(row0 + q) * H;
+            for (unsigned int e = 4 * lane; e < H; e += 128) {
+                const float4 v = *(const float4*)(p + e);
+                s += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+            }
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffff, s, off);
+        }
+        if (lane == 0) s_rstd[g][q][half] = rsqrtf(s / (float)H + eps);
+    }
+    __syncthreads();
+
+    for (unsigned int g = 0; g < gates; g++) {
+        const float* hg = h + g * h_stride;
+        const float* mg = m + g * m_stride;
+        const __nv_bfloat16* d = ink_pick(D0, D1, D2, g);
+        ink_fg_v8f acc = ink_fg_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+        const unsigned int ar = tid / 16, ac = (tid % 16) * 4;
+        for (unsigned int k0 = 0; k0 < 2 * H; k0 += INK_FG_K) {
+            const bool in_h = k0 < H;
+            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (ar < nr) v = *(const float4*)((in_h ? hg + k0 : mg + (k0 - H)) + (unsigned long long)(row0 + ar) * H + ac);
+            const float sc = s_rstd[g][ar][in_h ? 0 : 1];
+            s_a[ar][ac] = __float2bfloat16(v.x * sc);
+            s_a[ar][ac + 1] = __float2bfloat16(v.y * sc);
+            s_a[ar][ac + 2] = __float2bfloat16(v.z * sc);
+            s_a[ar][ac + 3] = __float2bfloat16(v.w * sc);
+            for (unsigned int i = tid; i < RANK * INK_FG_K / 8; i += 256) {
+                const unsigned int r = i / (INK_FG_K / 8), c = (i % (INK_FG_K / 8)) * 8;
+                *(uint4*)&s_w[r][c] = *(const uint4*)(d + (unsigned long long)r * 2 * H + k0 + c);
+            }
+            __syncthreads();
+            if (warp < RANK / 16) {
+#pragma unroll
+                for (unsigned int kk = 0; kk < INK_FG_K; kk += 16)
+                    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ink_fg_ld16(&s_a[l16][kk]),
+                                                                      ink_fg_ld16(&s_w[16 * warp + l16][kk]), acc);
+            }
+            __syncthreads();
+        }
+        if (warp < RANK / 16) {
+#pragma unroll
+            for (int e = 0; e < 8; e++) s_z[g][2 * e + lhi][16 * warp + l16] = __float2bfloat16(acc[e]);
+        }
+    }
+    __syncthreads();
+
+    for (unsigned int c0 = 0; c0 < H; c0 += INK_FG_CH) {
+        for (unsigned int g = 0; g < gates; g++) {
+            const __nv_bfloat16* f = ink_pick(F0, F1, F2, g);
+            const __nv_bfloat16* gw = ink_pick(G0, G1, G2, g);
+            for (unsigned int i = tid; i < INK_FG_CH * RANK / 8; i += 256) {
+                const unsigned int r = i / (RANK / 8), c = (i % (RANK / 8)) * 8;
+                *(uint4*)&s_w[r][c] = *(const uint4*)(f + (unsigned long long)(c0 + r) * RANK + c);
+                *(uint4*)&s_w2[r][c] = *(const uint4*)(gw + (unsigned long long)(c0 + r) * RANK + c);
+            }
+            __syncthreads();
+            // warps 0-3: F tile (warp % 4); warps 4-7: G tile (warp % 4)
+            const __nv_bfloat16 (*wt)[INK_FG_PITCH] = warp < 4 ? s_w : s_w2;
+            const unsigned int nb = 16 * (warp % 4);
+            ink_fg_v8f acc = ink_fg_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+            for (unsigned int kk = 0; kk < RANK; kk += 16)
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ink_fg_ld16(&s_z[g][l16][kk]), ink_fg_ld16(&wt[nb + l16][kk]), acc);
+            float (*dst)[INK_FG_CH] = warp < 4 ? s_f[g] : s_g[g];
+#pragma unroll
+            for (int e = 0; e < 8; e++) dst[2 * e + lhi][nb + l16] = acc[e];
+            __syncthreads();
+        }
+        // 16 rows x 64 channels: 4 elements a thread, every gate's inputs read before any write
+        float res[INK_MAX_GATES][4];
+#pragma unroll
+        for (unsigned int g = 0; g < INK_MAX_GATES; g++) {
+            if (g >= gates) break;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const unsigned int el = tid + 256 * j, q = el / INK_FG_CH, ch = el % INK_FG_CH;
+                res[g][j] = 0.0f;
+                if (q >= nr) continue;
+                const unsigned long long at = (unsigned long long)(row0 + q) * H + c0 + ch;
+                res[g][j] = (1.0f - tanhf(s_f[g][q][ch])) * h[g * h_stride + at] + tanhf(s_g[g][q][ch]) * m[g * m_stride + at];
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (unsigned int g = 0; g < INK_MAX_GATES; g++) {
+            if (g >= gates) break;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const unsigned int el = tid + 256 * j, q = el / INK_FG_CH, ch = el % INK_FG_CH;
+                if (q < nr) out[g * out_stride + (unsigned long long)(row0 + q) * H + c0 + ch] = res[g][j];
+            }
+        }
+    }
+}
+#else
 // The same message gates for prefill rows, fused on the tensor cores: a CTA takes 16 rows
 // and every gate of the launch. Per gate, the rms of its h and m rows, then
 // z = BF16(D BF16([rms0(h); rms0(m)])) (mma.sync m16n8k16, the BF16 inputs staged 64
@@ -392,3 +542,4 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_msg_gate_fused(
         }
     }
 }
+#endif  // AMD
