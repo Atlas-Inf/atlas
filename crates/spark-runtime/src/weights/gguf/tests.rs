@@ -14,6 +14,21 @@ fn push_str(b: &mut Vec<u8>, s: &str) {
     push_u64(b, s.len() as u64);
     b.extend_from_slice(s.as_bytes());
 }
+fn push_meta_str(b: &mut Vec<u8>, key: &str, value: &str) {
+    push_str(b, key);
+    push_u32(b, 8);
+    push_str(b, value);
+}
+fn push_meta_u32(b: &mut Vec<u8>, key: &str, value: u32) {
+    push_str(b, key);
+    push_u32(b, 4);
+    push_u32(b, value);
+}
+fn push_meta_u64(b: &mut Vec<u8>, key: &str, value: u64) {
+    push_str(b, key);
+    push_u32(b, 10);
+    push_u64(b, value);
+}
 
 /// Minimal valid GGUF v3: one F32 1-D tensor + a `general.alignment` KV.
 fn build_single_f32_gguf(name: &str, vals: &[f32]) -> Vec<u8> {
@@ -36,6 +51,60 @@ fn build_single_f32_gguf(name: &str, vals: &[f32]) -> Vec<u8> {
         b.extend_from_slice(&v.to_le_bytes());
     }
     b
+}
+
+/// Minimal clip mmproj GGUF with the patch-embed geometry metadata load_pass needs.
+fn build_clip_patch_gguf(tensor_name: &str, vals: &[f32]) -> Vec<u8> {
+    let mut b = Vec::new();
+    push_u32(&mut b, 0x4655_4747); // "GGUF"
+    push_u32(&mut b, 3); // version
+    push_u64(&mut b, 1); // tensor_count
+    push_u64(&mut b, 4); // kv_count
+    push_meta_str(&mut b, "general.architecture", "clip");
+    push_meta_u32(&mut b, "general.alignment", 32);
+    push_meta_u64(&mut b, "clip.vision.embedding_length", 1152);
+    push_meta_u64(&mut b, "clip.vision.patch_size", 16);
+    push_str(&mut b, tensor_name);
+    push_u32(&mut b, 1); // n_dims
+    push_u64(&mut b, vals.len() as u64); // dims[0]
+    push_u32(&mut b, 0); // ggml_type F32
+    push_u64(&mut b, 0); // offset
+    let pad = (32 - (b.len() % 32)) % 32;
+    b.extend(std::iter::repeat_n(0u8, pad));
+    for v in vals {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    b
+}
+
+#[test]
+fn clip_patch_frame_index_is_bounded() {
+    let tensor_name = "v.patch_embd.weight.18446744073709551615";
+    let bytes = build_clip_patch_gguf(tensor_name, &[1.0]);
+    let gguf = container::GgufFile::parse(&bytes).unwrap();
+    let gpu = MockGpuBackend::new();
+    let mut weights = std::collections::HashMap::new();
+    let mut skipped = 0usize;
+
+    let err = sidecar::load_pass(
+        &GgufLoader::new(),
+        &gpu,
+        &gguf,
+        &bytes,
+        "clip",
+        None,
+        true,
+        false,
+        128,
+        container::Q2Group::G128,
+        &mut weights,
+        &mut skipped,
+    )
+    .expect_err("patch frame index should be rejected");
+
+    let msg = format!("{err:#}");
+    assert!(msg.contains(tensor_name), "{msg}");
+    assert!(msg.contains("patch_embd"), "{msg}");
 }
 
 /// Minimal malformed GGUF: one F32 tensor directory entry and a small data

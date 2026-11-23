@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 use super::{container, dequant_cpu, dequant_to_device, names, value_transform};
 use crate::gpu::GpuBackend;
@@ -121,6 +121,16 @@ pub fn load_pass(
         None
     };
     let mut patch_frames: Vec<Option<Vec<f32>>> = Vec::new();
+    // Valid frames are contiguous from 0, so a frame index cannot reach the
+    // number of patch-frame tensors in the file.
+    let patch_frame_count = if vpatch.is_some() {
+        gguf.tensors
+            .iter()
+            .filter(|t| value_transform::vision_patch_frame(&t.name).is_some())
+            .count()
+    } else {
+        0
+    };
 
     for tensor in &gguf.tensors {
         let num_elements = tensor.num_elements()?;
@@ -140,6 +150,11 @@ pub fn load_pass(
         // frame suffix breaks the default `.weight`/`.bias` name split.
         if let (Some(_), Some(frame)) = (vpatch, value_transform::vision_patch_frame(&tensor.name))
         {
+            ensure!(
+                frame < patch_frame_count,
+                "patch_embd temporal frame {frame} in {} exceeds the patch-embed frame count {patch_frame_count}",
+                tensor.name
+            );
             let gt = dequant_cpu::GgmlType::from_id(id, q2_group)
                 .with_context(|| format!("ggml type for {}", tensor.name))?;
             let mut vals = vec![0f32; num_elements];
