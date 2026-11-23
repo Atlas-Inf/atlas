@@ -13,8 +13,11 @@ use spark_runtime::{gpu::DevicePtr, kernel_args::KernelLaunch};
 ///
 /// When the gate is unset — or a phase's K/N is not a multiple of the
 /// kernel's 128-wide stage — the proven `hy4_batch_expert` kernel keeps
-/// serving the phase unchanged.
+/// serving the phase unchanged. VERIFY rows (≤6) stay on that kernel too:
+/// the MMA CTA is 128 columns × 64 rows, so a 6-row VERIFY launches mostly
+/// padding and measured slower than the scalar expert kernel on GB10.
 const MMA_K_STAGE: usize = 128;
+const MMA_MIN_ROWS: u32 = 32;
 
 impl Hy4Ffn<'_> {
     #[allow(clippy::too_many_arguments)]
@@ -37,7 +40,8 @@ impl Hy4Ffn<'_> {
         // rows (x); down consumes the `rows*slots` activated slot rows.
         let phase_rows = [rows as usize, rows as usize * slots];
         let phase_k = [h, i];
-        let phase_native = std::env::var("ATLAS_HY4_EXPERT_MMA").ok().as_deref() == Some("1");
+        let phase_native = rows >= MMA_MIN_ROWS
+            && std::env::var("ATLAS_HY4_EXPERT_MMA").ok().as_deref() == Some("1");
         // Packed-FP4 prequant buffer per phase. Two ops-cache tags keep the
         // gate/up and down buffers independent (they overlap in time only
         // within this call, but grow-only scratch is keyed per phase anyway).
