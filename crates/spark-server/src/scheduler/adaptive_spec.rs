@@ -92,9 +92,15 @@ pub(crate) fn note_narrow(
 }
 
 /// Whether narrow steps pay: the sequences' pooled mean accepted against
-/// the block threshold `min` scaled to the rows the step verifies
-/// (`offered + 1` of a block's `MAX_DRAFTS + 1`). `None` until every
+/// the block threshold `min` scaled to the draft rows the step adds
+/// (`offered` of a block's `MAX_DRAFTS + 1` rows). `None` until every
 /// sequence has a full window at that width.
+///
+/// The batch already pays for one row a sequence, so only the draft rows
+/// are extra. Measured on Inkling 2 with two sequences of two drafts each
+/// (one GB10): drafting broke even near 0.5 accepted a sequence with the
+/// checkpoint's weights (threshold 2.0: 0.5) and near 0.64 with the Spark
+/// overlay (threshold 2.5: 0.625).
 fn narrow_pays<'a>(
     windows: impl Iterator<Item = (&'a [u32], usize)>,
     offered: usize,
@@ -112,7 +118,7 @@ fn narrow_pays<'a>(
         return None;
     }
     let mean = sum as f32 / steps as f32;
-    let floor = min * (offered + 1) as f32 / (super::dflash_width::MAX_DRAFTS + 1) as f32;
+    let floor = min * offered as f32 / (super::dflash_width::MAX_DRAFTS + 1) as f32;
     Some((mean >= floor, mean))
 }
 
@@ -316,12 +322,12 @@ mod tests {
     fn narrow_steps_are_judged_pooled_at_the_scaled_threshold() {
         let (code, prose) = ([1u32; WINDOW], [0u32; WINDOW]);
         let pays = |w: &[&[u32]], min| narrow_pays(w.iter().map(|w| (*w, 2)), 2, min);
-        // 3 rows of a block's 8, at a 2.0 block threshold: 0.75 a step
+        // 2 draft rows of a block's 8, at a 2.0 block threshold: 0.5 a step
         assert_eq!(pays(&[&code, &code], 2.0), Some((true, 1.0)));
-        assert_eq!(pays(&[&code, &prose], 2.0), Some((false, 0.5)));
+        assert_eq!(pays(&[&code, &prose], 2.0), Some((true, 0.5)));
         assert_eq!(pays(&[&prose, &prose], 2.0), Some((false, 0.0)));
-        // a lower block threshold (0.26 a step) keeps the mixed pair drafting
-        assert_eq!(pays(&[&code, &prose], 0.7), Some((true, 0.5)));
+        // a higher block threshold (2.5: 0.625 a step) holds the mixed pair
+        assert_eq!(pays(&[&code, &prose], 2.5), Some((false, 0.5)));
         // no verdict before every window is full, at one width, for two or more
         assert_eq!(pays(&[&code, &prose[..WINDOW - 1]], 2.0), None);
         assert_eq!(pays(&[&code], 2.0), None);
