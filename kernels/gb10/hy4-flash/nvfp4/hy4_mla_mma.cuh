@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Tensor-core hy4_mla_batch_partial: one CTA per (row, 128-key partition).
-// The scalar kernel re-reads every 576-dim KV row per local head
-// (16 x ~128 keys x 1152 B ~ 2.3 MB of gather per CTA); here the CTA
-// gathers K into shared once (two 64-key chunks to fit the ~99KB opt-in
-// smem cap on sm_120) and runs both attention GEMMs on tensor cores for
-// all heads at once.
+// Tensor-core hy4_mla_batch_partial: one CTA per (row, 128-key partition,
+// 16-head tile). The scalar kernel re-reads every 576-dim KV row per local
+// head; here the CTA gathers K into shared once per 16-head tile (two
+// 64-key chunks to fit the ~99KB opt-in smem cap on sm_120) and runs both
+// attention GEMMs on tensor cores for the tile's heads.
 //
 //   scores  = (K[128 x 576] @ Q[576 x heads]) * 1/16      bf16 -> fp32
 //   partial = softmax(scores) @ K[128 x 512]              bf16 -> fp32
@@ -13,7 +12,7 @@
 // per head, and the GEMM2 accumulators rescale by exp(old-max - new-max)
 // between chunks — same math as the scalar impl's single-pass softmax.
 //
-// Gate: ATLAS_HY4_MLA_MMA=1, heads <= 16.
+// Gate: ATLAS_HY4_MLA_MMA=1, heads <= 32 in 16-head tiles.
 
 #include <cuda_bf16.h>
 
@@ -105,6 +104,9 @@ extern "C" __global__ void hy4_mla_batch_partial_mma(
     const unsigned lane = tid & 31;
     const unsigned row = blockIdx.y;
     const unsigned part = blockIdx.x;
+    const unsigned h0 = blockIdx.z * MLM_HEADS;
+    const unsigned hn = min(MLM_HEADS, heads > h0 ? heads - h0 : 0);
+    if (hn == 0) return;
     const unsigned first = part * MLM_KEYS;
     const unsigned gid = lane >> 2;
     const unsigned t4 = lane & 3;
@@ -135,13 +137,13 @@ extern "C" __global__ void hy4_mla_batch_partial_mma(
     __syncthreads();
 
     // ---- gather Q once (16 heads x 576 dims) ----
-    const __nv_bfloat16* qbase = q + (size_t)row * heads * 576;
+    const __nv_bfloat16* qbase = q + ((size_t)row * heads + h0) * 576;
     for (unsigned i = tid; i < MLM_HEADS * (MLM_SCORE_DIMS / 8);
          i += blockDim.x) {
         unsigned h = i / (MLM_SCORE_DIMS / 8);
         unsigned seg = i % (MLM_SCORE_DIMS / 8);
         mlm_cp16(sQ + h * MLM_KP + seg * 8, qbase + h * 576 + seg * 8,
-                 h < heads);
+                 h < hn);
     }
     mlm_commit();
     mlm_wait0();
@@ -192,13 +194,13 @@ extern "C" __global__ void hy4_mla_batch_partial_mma(
             int k0 = srows[key_base + gid], k1 = srows[key_base + gid + 8];
             float neg = -INFINITY;
             sS[(mt * 16 + gid) * MLM_HEADS + head_base + t4 * 2] =
-                (k0 >= 0 && head_base + t4 * 2 < heads) ? c0 * 0.0625f : neg;
+                (k0 >= 0 && head_base + t4 * 2 < hn) ? c0 * 0.0625f : neg;
             sS[(mt * 16 + gid) * MLM_HEADS + head_base + t4 * 2 + 1] =
-                (k0 >= 0 && head_base + t4 * 2 + 1 < heads) ? c1 * 0.0625f : neg;
+                (k0 >= 0 && head_base + t4 * 2 + 1 < hn) ? c1 * 0.0625f : neg;
             sS[(mt * 16 + gid + 8) * MLM_HEADS + head_base + t4 * 2] =
-                (k1 >= 0 && head_base + t4 * 2 < heads) ? c2 * 0.0625f : neg;
+                (k1 >= 0 && head_base + t4 * 2 < hn) ? c2 * 0.0625f : neg;
             sS[(mt * 16 + gid + 8) * MLM_HEADS + head_base + t4 * 2 + 1] =
-                (k1 >= 0 && head_base + t4 * 2 + 1 < heads) ? c3 * 0.0625f : neg;
+                (k1 >= 0 && head_base + t4 * 2 + 1 < hn) ? c3 * 0.0625f : neg;
         }
         __syncthreads();
 
@@ -208,7 +210,7 @@ extern "C" __global__ void hy4_mla_batch_partial_mma(
             unsigned kc = lane & 15;
             float sc[4];
             float mx = -INFINITY;
-            bool hv = h < heads;
+            bool hv = h < hn;
             for (unsigned j = 0; j < 4; ++j) {
                 sc[j] = hv ? sS[(kc * 4 + j) * MLM_HEADS + h] : -INFINITY;
                 mx = fmaxf(mx, sc[j]);
@@ -267,20 +269,20 @@ extern "C" __global__ void hy4_mla_batch_partial_mma(
     }
 
     // ---- epilogue: write partials ----
-    float* out = partials + ((size_t)(row * heads) * splits + part) * 514;
+    float* out = partials + (((size_t)row * heads + h0) * splits + part) * 514;
     for (unsigned nt = 0; nt < 8; ++nt) {
         unsigned ncol = n0 + nt * 8 + t4 * 2;
         unsigned m0 = gid, m1 = gid + 8;
-        if (m0 < heads) {
+        if (m0 < hn) {
             out[m0 * splits * 514 + ncol] = acc[nt][0];
             out[m0 * splits * 514 + ncol + 1] = acc[nt][1];
         }
-        if (m1 < heads) {
+        if (m1 < hn) {
             out[m1 * splits * 514 + ncol] = acc[nt][2];
             out[m1 * splits * 514 + ncol + 1] = acc[nt][3];
         }
     }
-    if (tid < heads) {
+    if (tid < hn) {
         out[tid * splits * 514 + 512] = sMaxD[tid * 3];
         out[tid * splits * 514 + 513] = sMaxD[tid * 3 + 1];
     }

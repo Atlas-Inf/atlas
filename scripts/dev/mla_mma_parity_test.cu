@@ -3,7 +3,7 @@
 //   nvcc -gencode arch=compute_120a,code=sm_120a -o mla_par mla_mma_parity_test.cu
 //   ./mla_par [rows heads page_size count splits window]
 // Defaults model the TP2 prefill chunk: rows=8 heads=16 count=2048
-// splits=16 indices=on.
+// splits=16 indices=on. SWA layers use heads=32 and window=512.
 #include "../../kernels/gb10/hy4-flash/nvfp4/hy4_mla.cu"
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -87,10 +87,10 @@ int main(int argc, char** argv) {
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
 
-    // MMA launch: grid [splits, rows], dynamic shared
+    // MMA launch: grid [splits, rows, 16-head tiles], dynamic shared
     CK(cudaFuncSetAttribute(hy4_mla_batch_partial_mma,
         cudaFuncAttributeMaxDynamicSharedMemorySize, MLM_SMEM_BYTES));
-    dim3 g_mma(splits, rows);
+    dim3 g_mma(splits, rows, (heads + 15) / 16);
     hy4_mla_batch_partial_mma<<<g_mma, 256, MLM_SMEM_BYTES>>>(
         dq, dcache, dtable, dindices, dp_mma, position, page_size, columns,
         window, count, splits, heads, index_stride);

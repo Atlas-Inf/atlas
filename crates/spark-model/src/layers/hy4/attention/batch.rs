@@ -376,23 +376,27 @@ impl AttentionCache<'_, '_> {
             );
             let splits = count.div_ceil(128);
             let mla = timing::span("latent_attention", stream)?;
-            // ATLAS_HY4_MLA_MMA=1: one CTA per (row, 128-key partition)
-            // gathers K into shared once and runs both attention GEMMs on
-            // tensor cores for all local heads. Requires heads <= 16 and
-            // ~99KB opt-in dynamic shared (sm_120+).
+            // ATLAS_HY4_MLA_MMA=1: one CTA per (row, 128-key partition, 16-head
+            // tile) gathers K into shared once per tile and runs both attention
+            // GEMMs on tensor cores. Requires heads <= 32 and ~99KB opt-in
+            // dynamic shared (sm_120+).
             // EXPERT_MMA+MLA_MMA is decode-unsafe on VERIFY rows: accepted
             // drafts collapse (144 vs 180 on the Step 1 harness). Keep MLA on
             // the tensor-core path only for prefill-scale row counts when the
             // expert MMA path is also enabled; VERIFY stays on the proven MLA
             // kernel while expert MMA still serves the FFN phases.
             let expert_mma = std::env::var("ATLAS_HY4_EXPERT_MMA").ok().as_deref() == Some("1");
-            let mla_mma = a.heads <= 16
+            let mla_mma = a.heads <= 32
                 && std::env::var("ATLAS_HY4_MLA_MMA").as_deref() == Ok("1")
                 && !(expert_mma && rows < 32);
             let (mla_kernel, mla_grid, mla_smem) = if mla_mma {
                 (
                     "hy4_mla_batch_partial_mma",
-                    [splits as u32, (end - first) as u32, 1],
+                    [
+                        splits as u32,
+                        (end - first) as u32,
+                        a.heads.div_ceil(16) as u32,
+                    ],
                     100544,
                 )
             } else {
