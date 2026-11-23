@@ -162,13 +162,12 @@ impl LingMlaWeights {
 /// Maximum rows per MLA projection tile. Decode uses the first row.
 pub(super) const MLA_TILE_ROWS: usize = 128;
 
-/// Scratch layout for a projection tile. All pointers are BF16 except causal lengths and
+/// Scratch layout for a projection tile. All pointers are BF16 except
 /// projection activation/scales, whose sizes are described by the nested
 /// LingProjectionScratch. The caller owns and reuses this storage.
 #[derive(Clone, Copy)]
 pub struct LingMlaScratch {
     pub projection: LingProjectionScratch,
-    pub causal_lengths: DevicePtr,
     pub q_full: DevicePtr,
     pub kv_a: DevicePtr,
     pub kv_norm: DevicePtr,
@@ -198,6 +197,7 @@ pub struct LingMlaKernels {
     pub kv_assemble: KernelHandle,
     pub reshape_cache: KernelHandle,
     pub paged_attention: KernelHandle,
+    pub prefill_attention: KernelHandle,
     pub sigmoid_gate: KernelHandle,
 }
 
@@ -215,6 +215,7 @@ impl LingMlaKernels {
             // so resolve the target-local HDIM=192 module rather than the
             // borrowed generic HDIM=256 paged decoder.
             paged_attention: gpu.kernel("paged_decode_ling", "paged_decode_attn_ling")?,
+            prefill_attention: gpu.kernel("ling_mla_prefill", "ling_mla_prefill")?,
             sigmoid_gate: gpu.kernel("residual_add", "sigmoid_gate_mul_head_broadcast")?,
         })
     }
@@ -291,6 +292,7 @@ impl LingMlaWeights {
         scratch: LingMlaScratch,
         rows: u32,
         write_floor: u32,
+        prompt_offset: Option<u32>,
         stream: u64,
     ) -> Result<()> {
         config.validate()?;
@@ -303,7 +305,7 @@ impl LingMlaWeights {
         ensure!(
             !metadata.block_table.is_null()
                 && metadata.max_blocks_per_seq > 0
-                && !metadata.seq_len.is_null()
+                && (prompt_offset.is_some() || !metadata.seq_len.is_null())
                 && (write_floor == rows || !metadata.slot.is_null()),
             "Ling MLA requires live paged KV metadata from the first prompt token"
         );
@@ -487,30 +489,52 @@ impl LingMlaWeights {
             )?;
         }
 
-        ops::paged_decode_attn_bf16(
-            gpu,
-            kernels.paged_attention,
-            scratch.q_full,
-            kv_cache.k_pool_ptr(layer_idx),
-            kv_cache.v_pool_ptr(layer_idx),
-            scratch.attn_padded,
-            metadata.block_table,
-            metadata.seq_len,
-            if metadata.num_seqs == 1 {
-                0
-            } else {
-                metadata.max_blocks_per_seq
-            },
-            rows,
-            heads,
-            heads,
-            qk,
-            kv_cache.block_size() as u32,
-            1.0 / (config.qk_head_dim() as f32).sqrt(),
-            qdim,
-            0,
-            stream,
-        )?;
+        if let Some(offset) = prompt_offset {
+            ops::prefill_attention_paged(
+                gpu,
+                kernels.prefill_attention,
+                scratch.q_full,
+                kv_cache.k_pool_ptr(layer_idx),
+                kv_cache.v_pool_ptr(layer_idx),
+                scratch.attn_padded,
+                metadata.block_table,
+                rows,
+                offset + rows,
+                offset,
+                heads,
+                heads,
+                qk,
+                kv_cache.block_size() as u32,
+                0,
+                1.0 / (qk as f32).sqrt(),
+                stream,
+            )?;
+        } else {
+            ops::paged_decode_attn_bf16(
+                gpu,
+                kernels.paged_attention,
+                scratch.q_full,
+                kv_cache.k_pool_ptr(layer_idx),
+                kv_cache.v_pool_ptr(layer_idx),
+                scratch.attn_padded,
+                metadata.block_table,
+                metadata.seq_len,
+                if metadata.num_seqs == 1 {
+                    0
+                } else {
+                    metadata.max_blocks_per_seq
+                },
+                rows,
+                heads,
+                heads,
+                qk,
+                kv_cache.block_size() as u32,
+                1.0 / (config.qk_head_dim() as f32).sqrt(),
+                qdim,
+                0,
+                stream,
+            )?;
+        }
 
         // Narrow [heads, 192] attention output to the true [heads, 128] V
         // width before applying the head-wise gate and dense projection.

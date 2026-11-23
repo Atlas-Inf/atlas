@@ -212,7 +212,6 @@ impl LingDecoderLayer {
         let padded = config.num_heads * qk;
         Ok(LingMlaScratch {
             projection,
-            causal_lengths: gpu.alloc(4 * MLA_TILE_ROWS)?,
             q_full: bf16(q)?,
             kv_a: bf16(kv_a)?,
             kv_norm: bf16(config.kv_lora_rank)?,
@@ -383,6 +382,7 @@ impl LingDecoderLayer {
                     *scratch,
                     1,
                     u32::from(!write_kv),
+                    None,
                     stream,
                 )?;
                 ctx.buffers.attn_output()
@@ -623,17 +623,11 @@ impl LingDecoderLayer {
         )?;
         for first in (0..num_tokens).step_by(MLA_TILE_ROWS) {
             let rows = MLA_TILE_ROWS.min(num_tokens - first);
-            let lengths: Vec<u8> = (first..first + rows)
-                .flat_map(|i| ((seq_len_start + i + 1) as u32).to_ne_bytes())
-                .collect();
-            ctx.gpu
-                .copy_h2d_async_retained(&lengths, scratch.causal_lengths, stream)?;
             let metadata = AttnMetadataDev {
                 positions: meta.positions.offset(first * 4),
                 positions_h: meta.positions_h.offset(first * 4),
                 positions_w: meta.positions_w.offset(first * 4),
                 slot: meta.slot.offset(first * 8),
-                seq_len: scratch.causal_lengths,
                 ..meta
             };
             weights.forward_rows(
@@ -648,6 +642,7 @@ impl LingDecoderLayer {
                 scratch,
                 rows as u32,
                 kv_write_start.saturating_sub(first).min(rows) as u32,
+                Some((seq_len_start + first) as u32),
                 stream,
             )?;
         }

@@ -228,6 +228,7 @@ impl TransformerLayer for LingDecoderLayer {
                         scratch,
                         count as u32,
                         0,
+                        None,
                         stream,
                     )?;
                 }
