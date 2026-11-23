@@ -129,7 +129,7 @@ fn merged_records_sample_like_the_full_row() {
             for s in 0..16 {
                 let seed = Some(trial * 100 + s);
                 assert_eq!(
-                    sample_with_absent(&split.present, VOCAB, &params, seed, absent),
+                    sample_with_absent(&split.present, &params, seed, absent),
                     Some(sample_with_params_seeded(&full, &params, &[], seed)),
                     "ranks {ranks} trial {trial} seed {s}"
                 );

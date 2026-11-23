@@ -26,8 +26,8 @@ impl Absent {
     }
 }
 
-/// [`super::sample_with_params_seeded`] over a row of `vocab` tokens of which only
-/// `present` (id, logit after the pipeline) are known: the pick is the one
+/// [`super::sample_with_params_seeded`] over a row of which only `present`
+/// (id, logit after the pipeline) are known: the pick is the one
 /// the full row would give for the same draw, or `None` when the present
 /// tokens do not decide it: a top-k, min-p or top-p cut that could reach an
 /// absent token, or a draw over the whole vocabulary. The answer depends on
@@ -36,7 +36,6 @@ impl Absent {
 /// neutral (the caller's pipeline applied them).
 pub fn sample_with_absent(
     present: &[(u32, f32)],
-    vocab: usize,
     params: &SamplingParams,
     seed: Option<u64>,
     absent: Absent,
@@ -46,16 +45,6 @@ pub fn sample_with_absent(
         let &(id, v) = present.iter().min_by(|a, b| first(a, b))?;
         return absent.beaten_by(v, id).then_some(id);
     }
-    // The full row's top-n-sigma filter ran unless a mask made its sum -inf
-    // (absent tokens are finite there); by Cantelli it keeps at least the
-    // best `vocab·k²/(1+k²)` logits (k = top_n_sigma), so `draw` checks that
-    // every token the pick depends on is among those.
-    let sigma_kept = (params.top_n_sigma > 0.0
-        && !present.iter().any(|&(_, v)| v == f32::NEG_INFINITY))
-    .then(|| {
-        let k2 = (params.top_n_sigma as f64).powi(2);
-        (vocab as f64 * k2 / (1.0 + k2)).floor() as usize
-    });
     let logits: Vec<(u32, f32)> = present
         .iter()
         .copied()
@@ -64,5 +53,44 @@ pub fn sample_with_absent(
     if logits.is_empty() {
         return None;
     }
+    // Cantelli guarantees at least `count·k²/(1+k²)` survivors for k = top_n_sigma
+    // and count = the full row's finite token count. Only the present finite
+    // count is known here. The maximum always survives, even if the bound is < 1.
+    let sigma_kept = (params.top_n_sigma > 0.0).then(|| {
+        let k2 = f64::from(params.top_n_sigma).powi(2);
+        ((logits.len() as f64 * k2 / (1.0 + k2)).floor() as usize).max(1)
+    });
     draw(logits, params, seed, Some((absent, sigma_kept)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sampler::sample_with_params_seeded;
+
+    #[test]
+    fn top_n_sigma_with_masked_logits_split_row() {
+        let mut params = SamplingParams::greedy(1);
+        params.temperature = 4.0;
+        params.top_n_sigma = 0.1;
+        let present = [(0, 3.0), (1, 0.0), (2, 0.0), (3, f32::NEG_INFINITY)];
+        let absent = Absent {
+            bound: 0.0,
+            bound_id: 2,
+            log_mass: -0.25,
+        };
+        let row = [3.0f32, 0.0, 0.0, f32::NEG_INFINITY, -1.0];
+        let bytes: Vec<_> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let seed = Some(0);
+
+        params.top_k = 2;
+        assert_eq!(sample_with_absent(&present, &params, seed, absent), None);
+
+        params.top_k = 1;
+        let full = sample_with_params_seeded(&bytes, &params, &[], seed);
+        assert_eq!(
+            sample_with_absent(&present, &params, seed, absent),
+            Some(full)
+        );
+    }
 }

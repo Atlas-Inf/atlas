@@ -253,7 +253,6 @@ pub(super) fn pick_processed(
                     ids.iter().map(|&i| (i, f32_logits[i as usize])).collect();
                 spark_runtime::sampler::sample_with_absent(
                     &present,
-                    vocab_size,
                     &sampler_shape,
                     step_seed,
                     absent,
