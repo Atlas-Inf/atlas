@@ -211,6 +211,46 @@ fn make_gif(n: u16, size: u16) -> String {
     )
 }
 
+/// A GIF whose frames all declare a 0 ms delay carries no timeline of its
+/// own; the sampler must see the duration the fallback rate implies
+/// (`count / DEFAULT_FPS`), not 0 seconds.
+#[test]
+fn a_zero_delay_gif_samples_the_fallback_timeline() {
+    use base64::Engine as _;
+    use image::codecs::gif::GifEncoder;
+    use image::{Delay, Frame, RgbaImage};
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut enc = GifEncoder::new(&mut buf);
+        for i in 0..8u16 {
+            let v = (20 + (i as u32 * 37) % 200) as u8;
+            let img = RgbaImage::from_pixel(64, 64, image::Rgba([v, 40, 255 - v, 255]));
+            let f = Frame::from_parts(img, 0, 0, Delay::from_numer_denom_ms(0, 1));
+            enc.encode_frame(f).expect("encode frame");
+        }
+    }
+    let uri = format!(
+        "data:image/gif;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&buf)
+    );
+    // 8 frames at the 2 fps fallback = a 4-second clip. The buggy path gave
+    // the sampler 0 s and rejected the clip; the fix spans all 8 frames.
+    let (frames, timestamps) = decode_frames(&uri, 2.0, &no_ffmpeg()).expect("decode");
+    assert_eq!(
+        frames.len(),
+        8,
+        "zero-delay GIF did not keep its fallback-rate frames"
+    );
+    assert_eq!(timestamps.len(), frames.len());
+    assert_eq!(timestamps[0], 0.0);
+    assert!(
+        (timestamps[timestamps.len() - 1] - 3.5).abs() < 0.001,
+        "timestamps were {timestamps:?}"
+    );
+    let v = preprocess_video(&uri, &cfg(), None, 2.0, &no_ffmpeg()).expect("preprocess");
+    assert_eq!(v.grid_t, 4, "8 frames at tp=2 = 4 temporal groups");
+}
+
 #[test]
 fn an_animated_gif_decodes_to_its_frames() {
     let uri = make_gif(6, 64);
