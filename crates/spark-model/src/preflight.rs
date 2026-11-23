@@ -106,10 +106,11 @@ fn check_quant_method(config: &ModelConfig) -> Result<()> {
 }
 
 fn check_embedding_and_head(store: &WeightStore) -> Result<()> {
-    // Three canonical embedding-tensor naming schemes across the
+    // Canonical embedding-tensor naming schemes across the
     // families Atlas supports:
     //   `*.embed_tokens.weight`  — HF standard (Qwen, Gemma, MiniMax)
     //   `*.embeddings.weight`    — Nemotron-H backbone prefix
+    //   `*.word_embeddings.weight` — Ling BailingMoE
     //   `tok_embeddings.weight`  — Mistral consolidated checkpoints
     //   `*.embed.weight`         — Thinking Machines Inkling (`model.llm.embed`)
     // Scan discovery-based so future families that adopt yet-another
@@ -118,6 +119,7 @@ fn check_embedding_and_head(store: &WeightStore) -> Result<()> {
     const EMBED_SUFFIXES: &[&str] = &[
         ".embed_tokens.weight",
         ".embeddings.weight",
+        ".word_embeddings.weight",
         ".embed.weight",
     ];
     const EMBED_EXACTS: &[&str] = &[
