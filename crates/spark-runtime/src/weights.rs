@@ -259,6 +259,10 @@ impl WeightStore {
         self.deferred.get(name)
     }
 
+    pub fn deferred_names(&self) -> impl Iterator<Item = &str> {
+        self.deferred.keys().map(String::as_str)
+    }
+
     /// Every deferred tensor, name-sorted (NUMERIC on a trailing index, so
     /// `embedders.10` sorts after `embedders.2` — a lexicographic sort here
     /// silently mis-maps the n-gram tables, which cost a real debugging
@@ -516,6 +520,7 @@ impl SafetensorsLoader {
 /// `10` first and silently mis-maps every table after the ninth.
 pub mod adapter;
 mod gguf;
+pub mod ling_paging;
 mod loader;
 pub mod mlx_int8;
 pub use gguf::{GgufLoader, config_from_gguf_dir, find_gguf};

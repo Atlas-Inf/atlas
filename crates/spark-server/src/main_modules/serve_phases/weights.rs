@@ -115,6 +115,15 @@ pub(crate) fn load_weight_store(
         && config.tp_world_size <= 1
         && config.ep_world_size <= 1;
 
+    let ling = config.model_type == "bailing_moe_v3_vl"
+        && config
+            .quantization_config
+            .as_ref()
+            .is_some_and(|quant| quant.quant_method == "fp8");
+    anyhow::ensure!(
+        !ling || use_fast_load(args),
+        "Ling routed experts require the fast loader for demand paging"
+    );
     let store = if use_fast_load(args) {
         #[cfg(unix)]
         {
@@ -142,6 +151,7 @@ pub(crate) fn load_weight_store(
                     );
                 }
             }
+            loader.defer_ling_experts = ling;
             loader.peak_memory_multiplier = mult;
             loader.expert_tp = config.expert_tp;
             loader.demand_paged_patterns = demand_paged_patterns(config);

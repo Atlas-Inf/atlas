@@ -37,6 +37,7 @@ pub(crate) struct Plan {
 struct Expect<'a> {
     header: &'a Header,
     seen: BTreeSet<String>,
+    packed_experts: bool,
 }
 
 impl Expect<'_> {
@@ -51,6 +52,9 @@ impl Expect<'_> {
 
     fn tensors(&mut self, prefix: &str, suffixes: &[&str]) -> Result<()> {
         for suffix in suffixes {
+            if self.packed_experts && suffix.ends_with(".weight_scale_inv") {
+                continue;
+            }
             self.tensor(&format!("{prefix}.{suffix}"))?;
         }
         Ok(())
@@ -136,27 +140,21 @@ const DENSE_MLP: &[&str] = &[
     "mlp.up_proj.weight_scale_inv",
 ];
 
-fn expect_moe(e: &mut Expect<'_>, layer: usize, experts: usize, mtp: bool) -> Result<()> {
+fn expect_moe(e: &mut Expect<'_>, layer: usize, experts: usize) -> Result<()> {
     let prefix = format!("model.layers.{layer}");
-    let mut mla = MLA.to_vec();
-    if mtp {
-        mla.push("attention.g_proj.weight_scale_inv");
-    }
-    e.tensors(&prefix, &mla)?;
     e.tensors(&prefix, &["mlp.gate.expert_bias", "mlp.gate.weight"])?;
     for expert in 0..experts {
         let ep = format!("{prefix}.mlp.experts.{expert}");
-        e.tensors(
-            &ep,
-            &[
-                "down_proj.weight",
-                "down_proj.weight_scale_inv",
-                "gate_proj.weight",
-                "gate_proj.weight_scale_inv",
-                "up_proj.weight",
-                "up_proj.weight_scale_inv",
-            ],
-        )?;
+        let suffixes: &[&str] = if e.packed_experts {
+            &["weight_packed", "weight_scale", "weight_global_scale"]
+        } else {
+            &["weight", "weight_scale_inv"]
+        };
+        for projection in ["down_proj", "gate_proj", "up_proj"] {
+            for suffix in suffixes {
+                e.tensor(&format!("{ep}.{projection}.{suffix}"))?;
+            }
+        }
     }
     e.tensors(
         &format!("{prefix}.mlp.shared_experts"),
@@ -197,6 +195,10 @@ pub(crate) fn plan(header: &Header, config: &ModelConfig) -> Result<Plan> {
     let mut e = Expect {
         header,
         seen: BTreeSet::new(),
+        packed_experts: config
+            .quantization_config
+            .as_ref()
+            .is_some_and(|q| q.quant_method == "compressed-tensors"),
     };
     for name in ROOT {
         e.tensor(name)?;
@@ -223,7 +225,7 @@ pub(crate) fn plan(header: &Header, config: &ModelConfig) -> Result<Plan> {
             e.tensors(&prefix, DENSE_MLP)?;
             MlpLayout::Dense
         } else {
-            expect_moe(&mut e, layer, config.num_experts, false)?;
+            expect_moe(&mut e, layer, config.num_experts)?;
             MlpLayout::Moe
         };
         layers.push(LayerPlan {
@@ -237,7 +239,9 @@ pub(crate) fn plan(header: &Header, config: &ModelConfig) -> Result<Plan> {
     let mtp_prefix = format!("model.layers.{mtp_index}");
     e.tensors(&mtp_prefix, COMMON)?;
     e.tensors(&mtp_prefix, MLA_MTP_EXTRA)?;
-    expect_moe(&mut e, mtp_index, config.num_experts, true)?;
+    e.tensors(&mtp_prefix, MLA)?;
+    e.tensors(&mtp_prefix, &["attention.g_proj.weight_scale_inv"])?;
+    expect_moe(&mut e, mtp_index, config.num_experts)?;
     e.finish()?;
     Ok(Plan {
         layers,
@@ -262,6 +266,7 @@ mod tests {
         c.num_experts = 2;
         c.kv_lora_rank = 1;
         c.mlp_only_layers = vec![0];
+        c.quantization_config = None;
         c.layer_types = vec![LayerType::LinearAttention, LayerType::FullAttention];
         c
     }
@@ -427,6 +432,13 @@ mod tests {
         assert_eq!(plan.layers[1].mlp, MlpLayout::Moe);
         assert_eq!(plan.mtp.index, 2);
         assert_eq!(plan.mtp.attention, AttentionLayout::Mla);
+    }
+
+    #[test]
+    fn accepts_kda_with_routed_experts() {
+        let mut c = config();
+        c.mlp_only_layers.clear();
+        plan(&valid_header(&c), &c).expect("KDA + MoE has no MLA weights");
     }
 
     #[test]
