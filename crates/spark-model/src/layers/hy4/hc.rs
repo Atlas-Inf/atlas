@@ -19,6 +19,7 @@ pub struct IndependentHc<'a> {
     pre_kernel: KernelHandle,
     post_kernel: KernelHandle,
     norm_kernel: KernelHandle,
+    scatter_norm_kernel: KernelHandle,
     is_head: bool,
 }
 
@@ -80,6 +81,7 @@ impl<'a> IndependentHc<'a> {
                     "hy4_hc_pre_norm"
                 },
             )?,
+            scatter_norm_kernel: gpu.kernel("hy4_hc", "hy4_hc_post_pre_norm")?,
             is_head: head,
         };
         for (i, (name, _)) in specs.iter().enumerate() {
@@ -200,6 +202,58 @@ impl<'a> IndependentHc<'a> {
             launch.arg_f32(p.magnitude)
         };
         launch.arg_f32(p.norm_eps).launch(stream)
+    }
+
+    /// Fuses the preceding block scatter with this HC's collapse+norm for small batches.
+    /// `post` carries the scatter gates in and this HC's post gates out; `highway` is updated in place.
+    pub fn scatter_collapse_norm(
+        &self,
+        gpu: &dyn GpuBackend,
+        block: DevicePtr,
+        highway: DevicePtr,
+        post: DevicePtr,
+        weight: DevicePtr,
+        out: DevicePtr,
+        tokens: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if tokens == 0 {
+            return Ok(());
+        }
+        ensure!(!self.is_head, "Hy4 head has no scatter collapse");
+        ensure!(
+            self.weights.iter().all(|p| !p.is_null()),
+            "Hy4 iHC already released"
+        );
+        ensure!(
+            !block.is_null()
+                && !highway.is_null()
+                && !post.is_null()
+                && !weight.is_null()
+                && !out.is_null(),
+            "Hy4 iHC null buffer"
+        );
+        let p = self.params;
+        ensure!(p.hidden <= 4096, "Hy4 iHC fused scatter norm hidden bound");
+        let shared = u32::try_from(4 * p.hidden * 2)?;
+        KernelLaunch::new(gpu, self.scatter_norm_kernel)
+            .grid([tokens, 1, 1])
+            .block([256, 1, 1])
+            .shared_mem(shared)
+            .arg_ptr(block)
+            .arg_ptr(highway)
+            .arg_ptr(post)
+            .arg_ptr(self.weights[0])
+            .arg_ptr(self.weights[1])
+            .arg_ptr(self.weights[2])
+            .arg_ptr(out)
+            .arg_ptr(weight)
+            .arg_u32(u32::try_from(p.hidden)?)
+            .arg_f32(p.norm_eps)
+            .arg_f32(p.gate_eps)
+            .arg_f32(p.magnitude)
+            .arg_f32(p.norm_eps)
+            .launch(stream)
     }
 
     /// Residual and out may alias. Scatter rounds the BF16 highway each site.

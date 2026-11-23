@@ -135,15 +135,22 @@ impl Runtime<'_> {
                     )?;
                     drop(attn);
                     let hc = timing::span("ihc_norms", stream)?;
-                    b.hc_attn.scatter(
-                        gpu,
-                        [w.output, w.highway, w.post, w.highway],
-                        n as u32,
-                        stream,
-                    )?;
-                    b.hc_mlp.collapse_norm(
-                        gpu, w.highway, b.mlp_norm, w.normed, w.post, n as u32, stream,
-                    )?;
+                    if n <= 8 && h <= 4096 {
+                        b.hc_mlp.scatter_collapse_norm(
+                            gpu, w.output, w.highway, w.post, b.mlp_norm, w.normed, n as u32,
+                            stream,
+                        )?;
+                    } else {
+                        b.hc_attn.scatter(
+                            gpu,
+                            [w.output, w.highway, w.post, w.highway],
+                            n as u32,
+                            stream,
+                        )?;
+                        b.hc_mlp.collapse_norm(
+                            gpu, w.highway, b.mlp_norm, w.normed, w.post, n as u32, stream,
+                        )?;
+                    }
                     drop(hc);
                     b.ffn.forward(
                         w.normed,

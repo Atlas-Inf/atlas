@@ -47,12 +47,11 @@ __device__ void hy4_collapse(const __nv_bfloat16* streams, const float* fn,
 }
 
 template<bool HEAD>
-__device__ void hy4_collapse_norm(const __nv_bfloat16* streams, const float* fn,
+__device__ void hy4_collapse_norm_at(const __nv_bfloat16* x, const float* fn,
     const float* scale, const float* base, __nv_bfloat16* normed,
     const __nv_bfloat16* weight, float* post,
     unsigned h, float norm_eps, float gate_eps, float magnitude, float rms_eps) {
     const unsigned t=blockIdx.x, tid=threadIdx.x, dim=4*h;
-    const __nv_bfloat16* x=streams+(size_t)t*dim;
     __shared__ float red[256], r, gates[8];
     float ss=0.f;
     for (unsigned k=tid;k<dim;k+=256) {float v=(float)x[k]; ss+=v*v;}
@@ -99,6 +98,14 @@ __device__ void hy4_collapse_norm(const __nv_bfloat16* streams, const float* fn,
     }
 }
 
+template<bool HEAD>
+__device__ void hy4_collapse_norm(const __nv_bfloat16* streams, const float* fn,
+    const float* scale, const float* base, __nv_bfloat16* normed,
+    const __nv_bfloat16* weight, float* post,
+    unsigned h, float norm_eps, float gate_eps, float magnitude, float rms_eps) {
+    hy4_collapse_norm_at<HEAD>(streams+(size_t)blockIdx.x*4*h,fn,scale,base,normed,weight,post,h,norm_eps,gate_eps,magnitude,rms_eps);
+}
+
 extern "C" __global__ void hy4_hc_pre(const __nv_bfloat16* x, const float* fn,
     const float* scale, const float* base, __nv_bfloat16* y, float* post,
     unsigned h, float norm_eps, float gate_eps, float magnitude) {
@@ -131,4 +138,25 @@ extern "C" __global__ void hy4_hc_post(const __nv_bfloat16* block,
     for (unsigned k=threadIdx.x;k<4*h;k+=256)
         out[t*4*h+k]=__float2bfloat16_rn((float)residual[t*4*h+k]
             +post[t*4+k/h]*(float)block[t*h+k%h]);
+}
+
+extern "C" __global__ void hy4_hc_post_pre_norm(const __nv_bfloat16* block,
+    __nv_bfloat16* highway, float* post, const float* fn, const float* scale,
+    const float* base, __nv_bfloat16* normed, const __nv_bfloat16* weight,
+    unsigned h, float norm_eps, float gate_eps, float magnitude, float rms_eps) {
+    const unsigned t=blockIdx.x, tid=threadIdx.x, dim=4*h;
+    extern __shared__ __nv_bfloat16 sh[];
+    const size_t tdim=(size_t)t*dim;
+    const __nv_bfloat16* y=block+(size_t)t*h;
+    __nv_bfloat16* hw=highway+tdim;
+    for (unsigned k=tid;k<dim;k+=256) {
+        const unsigned stream=k/h;
+        const unsigned d=k%h;
+        const float gate=post[(size_t)t*4+stream];
+        const __nv_bfloat16 v=__float2bfloat16_rn((float)hw[k]+gate*(float)y[d]);
+        hw[k]=v;
+        sh[k]=v;
+    }
+    __syncthreads();
+    hy4_collapse_norm_at<false>(sh,fn,scale,base,normed,weight,post,h,norm_eps,gate_eps,magnitude,rms_eps);
 }
