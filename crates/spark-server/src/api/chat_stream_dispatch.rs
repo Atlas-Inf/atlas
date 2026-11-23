@@ -125,6 +125,7 @@ pub(super) async fn dispatch_streaming(
         timeout_at,
         stop_strings,
         req_return_token_ids,
+        req.stream_tool_arguments,
         ctx_for_stream,
         dump_seq,
         active_guard,

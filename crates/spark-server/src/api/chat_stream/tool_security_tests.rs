@@ -368,6 +368,7 @@ fn tool_guard_document_examples_remain_callable_in_both_formats() {
 fn streaming_guard(glm: bool) -> (StreamCtx, StreamState) {
     let (mut c, s) = setup(glm);
     Arc::get_mut(&mut c.state).unwrap().tool_guard.stream = true;
+    c.req_stream_tool_arguments = true;
     (c, s)
 }
 fn started_call(s: &mut StreamState, c: &StreamCtx, args: &str) -> Vec<ir::StreamDelta> {

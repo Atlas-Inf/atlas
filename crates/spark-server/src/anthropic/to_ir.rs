@@ -258,6 +258,7 @@ impl From<MessagesRequest> for ir::ChatRequest {
             seed: None,
             timeout_secs: None,
             return_token_ids: false,
+            stream_tool_arguments: false,
             // Claude Code puts its session uuid in `metadata.user_id`.
             client_session: crate::session_key::ClientSessionId::new(
                 crate::session_key::SessionKeySource::Metadata,
