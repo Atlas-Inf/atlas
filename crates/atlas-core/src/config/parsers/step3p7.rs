@@ -241,15 +241,19 @@ pub(crate) fn parse_step3p7(raw: &serde_json::Value) -> Result<ModelConfig> {
     {
         config.layer_types = list
             .iter()
-            .map(|v| match v.as_str().unwrap_or("full_attention") {
-                "full_attention" => LayerType::FullAttention,
-                "sliding_attention" => LayerType::SlidingAttention,
-                other => panic!(
-                    "step3p7: unexpected layer_type '{other}' — \
-                     only full_attention and sliding_attention are supported"
-                ),
+            .map(|v| {
+                Ok(match v.as_str().unwrap_or("full_attention") {
+                    "full_attention" => LayerType::FullAttention,
+                    "sliding_attention" => LayerType::SlidingAttention,
+                    other => {
+                        anyhow::bail!(
+                            "step3p7: unexpected layer_types entry '{other}' — \
+                             only full_attention and sliding_attention are supported"
+                        )
+                    }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
     }
 
     // Truncate layer_types to num_hidden_layers (Step 3.7 includes MTP layers in the array)

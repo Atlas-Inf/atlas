@@ -836,6 +836,21 @@ fn gemma4_rejects_unknown_attention_pattern_entry() {
 }
 
 #[test]
+fn step3p7_rejects_unknown_layer_type_entry() {
+    let json = r#"{
+        "model_type": "step3p7",
+        "text_config": {
+            "hidden_size": 256,
+            "num_hidden_layers": 1,
+            "layer_types": ["not_an_attention_kind"]
+        }
+    }"#;
+    let err = parse_config(json).unwrap_err();
+    assert!(err.to_string().contains("layer_types"), "{err}");
+    assert!(err.to_string().contains("not_an_attention_kind"), "{err}");
+}
+
+#[test]
 fn test_parse_deepseek_v4_config() {
     let json = r#"{
         "model_type": "deepseek_v4",
