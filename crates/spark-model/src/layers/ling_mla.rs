@@ -296,6 +296,13 @@ impl LingMlaWeights {
             "Ling MLA decode expects one sequence"
         );
         ensure!(
+            !metadata.block_table.is_null()
+                && metadata.max_blocks_per_seq > 0
+                && !metadata.seq_len.is_null()
+                && (!write_kv || !metadata.slot.is_null()),
+            "Ling MLA requires live paged KV metadata from the first prompt token"
+        );
+        ensure!(
             kv_cache.dtype_for_layer(layer_idx) == KvCacheDtype::Bf16,
             "Ling MLA native decode currently requires BF16 KV cache"
         );

@@ -327,7 +327,7 @@ impl TransformerModel {
 
         // For two-phase, we process the full uncached range — attention layers see
         // the full sequence from proc_start. If proc_start > 0, use paged attention.
-        let needs_paged = proc_start > 0;
+        let needs_paged = proc_start > 0 || self.config.model_type == "bailing_moe_v3_vl";
 
         {
             // SAFETY: Single-threaded scheduler access.

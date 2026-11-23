@@ -95,11 +95,14 @@ impl TransformerModel {
         } else {
             (pos_stream_bytes + 7) & !7
         };
-        // GLM-5 MLA attends through the paged cache from the first chunk on.
+        // GLM-5 and Ling MLA attend through the paged cache from the first chunk.
         // ATLAS_QWEN4EXP_PREFILL_ROWINV attends paged from the first chunk on
         // too (`qwen3_attention::prefill_inner_hc`).
         let needs_paged = effective_seq_len_start > 0
-            || self.config.model_type == "glm5_next"
+            || matches!(
+                self.config.model_type.as_str(),
+                "glm5_next" | "bailing_moe_v3_vl"
+            )
             || (self.config.model_type == "qwen4_exp" && crate::layers::ops::qwen4exp_rowinv::on());
 
         // Lock staging, build positions plus non-paged slots, and upload.
