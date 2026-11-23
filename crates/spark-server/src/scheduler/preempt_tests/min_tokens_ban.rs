@@ -138,7 +138,7 @@ fn single_and_multi_chunk_prompts_get_the_same_ban() {
         None,
         None,
         0,
-        None,
+        crate::scheduler::limits::SchedLimits::NONE,
     );
     assert_eq!(multi.seq.eos_ban, single.seq.eos_ban);
     // ... and the drafter skips end tokens below the same floor.

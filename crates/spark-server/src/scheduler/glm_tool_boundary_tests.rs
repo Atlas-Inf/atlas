@@ -178,7 +178,10 @@ fn glm_tool_boundary_actual_first_token_builder() {
                 Some(OPEN),
                 None,
                 0,
-                policy,
+                crate::scheduler::limits::SchedLimits {
+                    glm_tool_boundary: policy,
+                    ..crate::scheduler::limits::SchedLimits::NONE
+                },
             );
             assert_eq!(a.output_tokens, [OPEN]);
             assert_eq!(a.remaining, max_tokens - 1);

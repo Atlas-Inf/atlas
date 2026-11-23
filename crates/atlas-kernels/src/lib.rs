@@ -406,6 +406,11 @@ pub struct ModelBehavior {
     /// a tool-describing system prompt cannot make the model answer with
     /// literal markup nobody can execute. Default `true`; `--reference-mode` skips it.
     pub ban_tool_call_without_tools: bool,
+    /// Speculation runs inside thinking, as under `ATLAS_MTP_SPEC_THINK`, for
+    /// a model whose reasoning was always speculated (Inkling 2: its blocks
+    /// gave the scheduler no thinking span until budget forcing). Default
+    /// `false`.
+    pub spec_think: bool,
 }
 
 /// The server's thinking ceiling for a `max_thinking_budget`: 0 means none,

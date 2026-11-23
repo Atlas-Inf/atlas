@@ -85,8 +85,15 @@ pub(in crate::scheduler) fn hard_stop(a: &mut ActiveSeq, tok: u32, env: &CommitE
 /// that keeps re-entering is cut sooner each time; a stray `</think>` is
 /// skipped, and 50 in a row end the turn (`GUARD_STOP_THINK_SKIP`: it is not an
 /// end token, so an unnamed cut would wire "stop"). Returns true when the
-/// token was consumed.
+/// token was consumed. A model whose blocks open with a header
+/// ([`SchedLimits::message_open`]) runs [`message_gate`] instead.
+///
+/// [`SchedLimits::message_open`]: crate::scheduler::limits::SchedLimits::message_open
 pub(in crate::scheduler) fn think_gate(a: &mut ActiveSeq, tok: u32, env: &CommitEnv) -> bool {
+    if let Some(open) = env.limits.message_open {
+        message_gate(a, tok, open, env);
+        return false;
+    }
     if !a.inside_thinking && a.think_start_token == Some(tok) {
         let decayed = a.spontaneous_think_budget >> a.think_watchdog_fires.min(4);
         a.inside_thinking = true;
@@ -127,6 +134,31 @@ pub(in crate::scheduler) fn think_gate(a: &mut ActiveSeq, tok: u32, env: &Commit
         a.think_skip_count = 0;
     }
     false
+}
+
+/// [`think_gate`] for a turn of blocks, each opened by `open` (Inkling 2's
+/// `<|message_model|>`) and closed by the think end (`<|end_message|>`).
+/// Nothing is consumed: the chat paths' rewrite reads every marker. The
+/// token after a header decides the turn's reasoning once: the think start
+/// opens it (and is its first token), anything else means the answer began
+/// and no later block is the reasoning. A close outside the reasoning ends an
+/// answer or tool block, so it is never a stray. A request that did not ask
+/// for thinking still gets the server ceiling for the block it cannot see.
+fn message_gate(a: &mut ActiveSeq, tok: u32, open: u32, env: &CommitEnv) {
+    if a.inside_thinking || a.think_ended || a.output_tokens.last() != Some(&open) {
+        return;
+    }
+    if a.think_start_token != Some(tok) {
+        a.think_ended = true;
+        return;
+    }
+    a.inside_thinking = true;
+    if !a.enable_thinking {
+        a.thinking_budget = atlas_kernels::thinking_ceiling(a.spontaneous_think_budget);
+    }
+    if !env.quiet {
+        tracing::debug!(budget = ?a.thinking_budget, "message header opened the reasoning block");
+    }
 }
 
 /// The tool-call bookkeeping of a token past [`think_gate`], outside `<think>`
