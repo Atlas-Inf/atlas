@@ -45,11 +45,12 @@ pub fn resolve_model_dir(model: &str, cache_dir: Option<&Path>) -> Result<PathBu
     resolve_from_hf_cache(model, cache_dir)
 }
 
-/// Look up a HuggingFace model ID in the local hub cache.
+/// Resolve a HuggingFace model ID to its `refs/main`-pointed snapshot
+/// directory, with no opinion about what the snapshot contains.
 ///
 /// Cache layout: `{cache_root}/models--{org}--{name}/snapshots/{hash}/`
 /// The active snapshot hash is read from `refs/main`.
-fn resolve_from_hf_cache(model_id: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
+pub(crate) fn hf_snapshot_dir(model_id: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
     let cache_root = resolve_cache_root(cache_dir)?;
 
     // "nvidia/Qwen3-Next-80B-A3B-Instruct-NVFP4" → "models--nvidia--Qwen3-Next-80B-A3B-Instruct-NVFP4"
@@ -88,6 +89,22 @@ fn resolve_from_hf_cache(model_id: &str, cache_dir: Option<&Path>) -> Result<Pat
             snapshot_hash,
         );
     }
+
+    Ok(snapshot_dir)
+}
+
+/// Look up a HuggingFace model ID in the local hub cache.
+fn resolve_from_hf_cache(model_id: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
+    let snapshot_dir = hf_snapshot_dir(model_id, cache_dir)?;
+    let snapshot_hash = snapshot_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let model_cache = snapshot_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
 
     if !snapshot_dir.join("config.json").exists() && !snapshot_dir.join("params.json").exists() {
         bail!(

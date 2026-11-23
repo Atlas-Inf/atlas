@@ -13,6 +13,7 @@ mod preflight;
 mod runtime;
 mod tokenizer_runtime;
 mod topology;
+mod weight_sidecar;
 mod weights;
 
 pub(super) use build::{

@@ -599,6 +599,14 @@ pub struct ServeArgs {
     #[arg(long)]
     pub draft_model: Option<String>,
 
+    /// HuggingFace id (or local path) of a weight overlay loaded beside the
+    /// checkpoint: every `*.safetensors` tensor in it is added to the model's
+    /// weights under its own name (a name the checkpoint already has is an
+    /// error). Inkling 2's Spark mode reads `Enntity/Inkling-2-Mini-Spark-NVFP4`
+    /// this way, so the checkpoint serves from its own repo.
+    #[arg(long)]
+    pub weight_overlay: Option<String>,
+
     /// A second DFlash drafter for the same target (HF id or local path),
     /// loaded beside `--draft-model`: each request proposes with whichever
     /// of the two its recent rounds measure faster (tokens per round over
