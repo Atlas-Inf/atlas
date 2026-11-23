@@ -149,6 +149,9 @@ pub(super) struct StreamState {
     /// `StreamEvent::Done.guard_stop`, e.g. "fuzzy_repetition") — surfaced
     /// in the synthesized --dump body only.
     pub(super) guard_stop: Option<&'static str>,
+    /// The tool guard blocked a call whose start the client already has
+    /// (`--tool-guard stream`): the refusal says so.
+    pub(super) guard_cut_streamed_call: bool,
     /// P0-3: one corrective empty-required-args content chunk per response.
     pub(super) corrective_hint_sent: bool,
     /// Cooperative cancellation flag shared with the scheduler. Flipped
@@ -185,8 +188,8 @@ pub(super) struct StreamState {
     /// True iff the reasoning/`<think>` phase has finished. Starts
     /// `true` when the request did not enable thinking.
     pub(super) thinking_done: bool,
-    /// A tool call's deltas held until the call validates, by index: for
-    /// Poolside v1 streams (`tool_handlers::holds_tool_deltas`). Anything
+    /// A tool call's deltas held until the call validates, by index
+    /// (`tool_handlers::holds_tool_deltas`). Anything
     /// still held when the stream ends is dropped, never sent.
     pub(super) buffered_tool_chunks: std::collections::HashMap<usize, Vec<crate::ir::StreamDelta>>,
     /// Dead after the tool-call retry stack was removed; never set now that
@@ -210,6 +213,11 @@ pub(super) struct PendingRetry {
 }
 
 impl StreamState {
+    /// A tool call has started and not yet ended (held or streamed).
+    pub(super) fn has_open_tool_call(&self) -> bool {
+        !self.buffered_tool_chunks.is_empty() || !self.streaming_tool_args.is_empty()
+    }
+
     pub(super) fn new(
         tools_active: bool,
         enable_thinking: bool,
@@ -252,6 +260,7 @@ impl StreamState {
             name_run: None,
             tool_loop_capped: false,
             guard_stop: None,
+            guard_cut_streamed_call: false,
             corrective_hint_sent: false,
             cancel_flag,
             reasoning_xml_scan_buf: String::new(),

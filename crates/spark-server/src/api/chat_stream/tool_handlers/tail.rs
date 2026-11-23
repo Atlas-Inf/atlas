@@ -60,7 +60,9 @@ pub(crate) fn handle_tool_call_end(
         return;
     }
     if let Some((name, args_json)) = state.streaming_tool_args.remove(&idx) {
+        let streamed = !state.buffered_tool_chunks.contains_key(&idx);
         if super::super::tool_security::check(state, ctx, &args_json) {
+            state.guard_cut_streamed_call |= streamed;
             return;
         }
         if !ctx.state.tool_guard.enabled {
