@@ -575,7 +575,7 @@ pub struct ServeArgs {
 
     /// Enable N-gram speculative decoding: CPU-side pattern matching proposer
     /// without extra weights. HY4 uses native multi-row verification and
-    /// requires an explicit --num-drafts in 1..=5; sampled requests use serial decode.
+    /// requires an explicit --num-drafts in 1..=8; sampled requests use serial decode.
     #[arg(long, default_value_t = false)]
     pub ngram_speculative: bool,
 

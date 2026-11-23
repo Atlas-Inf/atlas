@@ -203,7 +203,7 @@ impl Runtime<'_> {
         count: usize,
         stream: u64,
     ) -> Result<Vec<u32>> {
-        ensure!((1..=5).contains(&count), "Hy4 DFly count must be1..5");
+        ensure!((1..=8).contains(&count), "Hy4 DFly count must be1..8");
         let drafter = self.drafter.as_ref().context("Hy4 DFly disabled")?;
         let mut requests = self.requests.lock();
         requests

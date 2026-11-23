@@ -102,7 +102,7 @@ impl Model for Hy4Model {
             return Ok(None);
         }
         ensure!(
-            (1..=5).contains(&count) && (bonus as usize) < self.vocab_size(),
+            (1..=8).contains(&count) && (bonus as usize) < self.vocab_size(),
             "Hy4 DFly invalid count/bonus"
         );
         let stream = self.eager_stream(stream)?;
@@ -118,7 +118,7 @@ impl Model for Hy4Model {
             .map(Some)
     }
     fn verify_max_drafts(&self) -> Option<usize> {
-        Some(5)
+        Some(8)
     }
     fn verify_context_limit(&self) -> Option<usize> {
         Some(self.borrow_owner().max_seq)

@@ -16,8 +16,8 @@ pub(crate) fn validate(args: &cli::ServeArgs) -> Result<()> {
         "HY4 supports only explicit prompt lookup or DFly, not MTP/self-speculation"
     );
     anyhow::ensure!(
-        !args.uses_lookup_verifier() || args.num_drafts.is_some_and(|n| (1..=5).contains(&n)),
-        "HY4 speculation requires explicit --num-drafts in 1..=5"
+        !args.uses_lookup_verifier() || args.num_drafts.is_some_and(|n| (1..=8).contains(&n)),
+        "HY4 speculation requires explicit --num-drafts in 1..=8"
     );
     Ok(())
 }
@@ -85,11 +85,11 @@ mod tests {
     #[test]
     fn prompt_lookup_is_opt_in_and_requires_an_explicit_bounded_draft_length() {
         assert!(validate(&args(&[])).is_ok());
-        for n in ["1", "5"] {
+        for n in ["1", "5", "8"] {
             assert!(validate(&args(&["--ngram-speculative", "--num-drafts", n])).is_ok());
         }
         assert!(validate(&args(&["--ngram-speculative"])).is_err());
-        for n in ["0", "6"] {
+        for n in ["0", "9"] {
             assert!(validate(&args(&["--ngram-speculative", "--num-drafts", n])).is_err());
         }
         for mode in ["--self-speculative", "--speculative", "--dflash"] {
@@ -99,7 +99,7 @@ mod tests {
 
     #[test]
     fn dfly_requires_explicit_bounded_count_and_excludes_other_proposers() {
-        for n in ["1", "5"] {
+        for n in ["1", "5", "8"] {
             let a = dfly_args(&[
                 "--dfly-speculative",
                 "--num-drafts",
@@ -110,7 +110,7 @@ mod tests {
             assert!(validate(&a).is_ok());
             assert!(a.uses_lookup_verifier());
         }
-        for n in ["0", "6"] {
+        for n in ["0", "9"] {
             assert!(
                 validate(&dfly_args(&[
                     "--dfly-speculative",

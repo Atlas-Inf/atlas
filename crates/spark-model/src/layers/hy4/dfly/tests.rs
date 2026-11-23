@@ -21,7 +21,7 @@ fn input() -> Input {
             latent: DevicePtr(2),
             indices: DevicePtr(3),
             len: 57,
-            capacity: 63,
+            capacity: 66,
         }; 5],
     }
 }
@@ -70,7 +70,7 @@ fn query_rows_use_the_configured_mask_without_replacing_the_bonus() {
             ..config()
         };
         assert!(c.validate().is_ok());
-        for count in 1..=5 {
+        for count in 1..=8 {
             let i = Input { count, ..input() };
             let ids = i.query_ids(c);
             assert_eq!(ids[0], i.bonus);
@@ -81,7 +81,7 @@ fn query_rows_use_the_configured_mask_without_replacing_the_bonus() {
 #[test]
 fn valid_query_fills_capacity_exactly() {
     assert!(input().validate(config()).is_ok());
-    for count in 1..=5 {
+    for count in 1..=8 {
         let i = Input { count, ..input() };
         assert!(i.validate(config()).is_ok());
     }
@@ -94,7 +94,7 @@ fn rejects_empty_oversized_invalid_and_missing_inputs() {
             ..input()
         },
         Input {
-            count: 6,
+            count: 9,
             ..input()
         },
         Input {

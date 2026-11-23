@@ -19,7 +19,7 @@ mod ops;
 mod tests;
 
 const H: usize = 3072;
-const ROWS: usize = 6;
+const ROWS: usize = 9;
 pub const TARGET_LAYERS: [usize; 5] = [25, 29, 33, 37, 41];
 
 #[derive(Clone, Copy, Debug)]
@@ -72,8 +72,8 @@ impl Input {
 
     fn validate(&self, c: Config) -> Result<()> {
         ensure!(
-            (1..=5).contains(&self.count),
-            "DFly draft count must be 1..5"
+            (1..=8).contains(&self.count),
+            "DFly draft count must be 1..8"
         );
         ensure!(
             !self.target_hidden.is_null() && (self.bonus as usize) < c.vocab,
