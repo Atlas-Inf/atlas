@@ -393,3 +393,37 @@ fn a_non_rung_batch_width_above_32_is_refused() {
         );
     }
 }
+
+#[test]
+fn duplicate_stageable_lora_names_are_rejected_before_model_load() {
+    let err = validate_serve_args(&parse(&[
+        "--lora-stageable",
+        "cold=peer-a=/tmp/cold",
+        "--lora-stageable",
+        "cold=peer-b=/tmp/cold-b",
+    ]))
+    .unwrap_err();
+    assert!(err.contains("--lora-stageable"), "{err}");
+    assert!(err.contains("'cold'"), "{err}");
+
+    let err = validate_serve_args(&parse(&[
+        "--lora-stageable-disk",
+        "cold=/tmp/cold",
+        "--lora-stageable-disk",
+        "cold=/tmp/cold-b",
+    ]))
+    .unwrap_err();
+    assert!(err.contains("--lora-stageable-disk"), "{err}");
+    assert!(err.contains("'cold'"), "{err}");
+
+    assert!(
+        validate_serve_args(&parse(&[
+            "--lora-stageable",
+            "peer=peer-id=/tmp/peer",
+            "--lora-stageable-disk",
+            "disk=/tmp/disk",
+        ]))
+        .is_ok(),
+        "distinct peer and disk stageable names stay valid"
+    );
+}

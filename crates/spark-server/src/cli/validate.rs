@@ -51,6 +51,22 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
     args.tool_guard.policy()?;
     let mut v: Vec<Violation> = Vec::new();
 
+    // Stageable adapters are keyed by name in the startup registries; a
+    // repeated name would silently overwrite the earlier entry and leave it
+    // unreachable. Reject it here, before model/GPU boot.
+    check_unique_names(
+        &mut v,
+        "--lora-stageable",
+        args.lora_stageable.iter().map(|(name, _, _)| name.as_str()),
+    );
+    check_unique_names(
+        &mut v,
+        "--lora-stageable-disk",
+        args.lora_stageable_disk
+            .iter()
+            .map(|(name, _)| name.as_str()),
+    );
+
     // ── Enumerated-value typos (caught here so a typo fails fast, before the
     //    model load, rather than mid-startup at each scattered parse site). ──
     check_enum(
@@ -362,6 +378,26 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
         return Ok(());
     }
     Err(format_violations(&v))
+}
+
+/// Push one violation for each name repeated within a repeatable flag.
+fn check_unique_names<'a>(
+    v: &mut Vec<Violation>,
+    flag: &str,
+    names: impl IntoIterator<Item = &'a str>,
+) {
+    let mut seen = std::collections::HashSet::new();
+    let mut reported = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name) && reported.insert(name) {
+            v.push(Violation::new(
+                format!("{flag} name '{name}' given twice (names must be unique)"),
+                "the startup registry is keyed by adapter name, so the later entry \
+                 would silently overwrite the earlier one and make it unreachable.",
+                "give each adapter a distinct name.",
+            ));
+        }
+    }
 }
 
 /// Push a violation if `value` is not in `allowed`.
