@@ -59,6 +59,76 @@ impl LingDenseFfn {
         )?;
         Ok(self.output)
     }
+
+    /// Batched BF16 dense FFN for the prefill path.  The arena's expert
+    /// matrices are sized for `[M, intermediate]` on Ling (the routed
+    /// `top_k * moe_intermediate` width is the same 6144-wide slab), so this
+    /// uses the token matrix in one gate/up/down GEMM sequence instead of
+    /// replaying the decode GEMV once per token.  Original-FP8 dense layers
+    /// deliberately return `Ok(false)`: their projection scratch is one row
+    /// wide and the caller keeps the numerically ordered fallback.
+    fn forward_batched(
+        &self,
+        input: DevicePtr,
+        num_tokens: usize,
+        ctx: &ForwardContext<'_>,
+        stream: u64,
+    ) -> Result<bool> {
+        ensure!(
+            num_tokens > 0,
+            "Ling dense FFN prefill requires at least one token"
+        );
+        if !(self.gate.is_bf16() && self.up.is_bf16() && self.down.is_bf16()) {
+            return Ok(false);
+        }
+        let sizes = ctx.buffers.sizes();
+        let bf16 = std::mem::size_of::<u16>();
+        let intermediate_bytes = num_tokens
+            .checked_mul(self.intermediate)
+            .and_then(|n| n.checked_mul(bf16))
+            .ok_or_else(|| anyhow::anyhow!("Ling dense FFN intermediate size overflow"))?;
+        let hidden_bytes = num_tokens
+            .checked_mul(ctx.config.hidden_size)
+            .and_then(|n| n.checked_mul(bf16))
+            .ok_or_else(|| anyhow::anyhow!("Ling dense FFN hidden size overflow"))?;
+        ensure!(
+            intermediate_bytes <= sizes.expert_gate_out
+                && intermediate_bytes <= sizes.expert_up_out,
+            "Ling dense FFN prefill arena is too small for {num_tokens} rows of {} channels",
+            self.intermediate
+        );
+        ensure!(
+            hidden_bytes <= sizes.moe_output,
+            "Ling dense FFN output arena is too small for {num_tokens} rows"
+        );
+        let rows = u32::try_from(num_tokens)
+            .map_err(|_| anyhow::anyhow!("Ling dense FFN row count exceeds CUDA launch range"))?;
+        let gate_out = ctx.buffers.expert_gate_out();
+        let up_out = ctx.buffers.expert_up_out();
+        self.gate
+            .forward(ctx.gpu, input, gate_out, rows, self.projection, stream)?;
+        self.up
+            .forward(ctx.gpu, input, up_out, rows, self.projection, stream)?;
+        ops::silu_mul(
+            ctx.gpu,
+            self.silu_k,
+            gate_out,
+            up_out,
+            gate_out,
+            rows.checked_mul(self.intermediate as u32)
+                .ok_or_else(|| anyhow::anyhow!("Ling dense FFN activation size overflow"))?,
+            stream,
+        )?;
+        self.down.forward(
+            ctx.gpu,
+            gate_out,
+            ctx.buffers.moe_output(),
+            rows,
+            self.projection,
+            stream,
+        )?;
+        Ok(true)
+    }
 }
 
 enum LingAttention {
@@ -400,26 +470,57 @@ impl LingDecoderLayer {
             LingAttention::Mla { .. } => unreachable!("KDA prefill called on MLA layer"),
         };
         let h_bytes = self.hidden_size * 2;
-        for token in 0..num_tokens {
-            let hidden_t = hidden.offset(token * h_bytes);
-            let residual_t = residual.offset(token * h_bytes);
-            let attn_t = attn.offset(token * h_bytes);
-            ops::residual_add_rms_norm(
+        // The attention result is complete before the post-attention norm, so
+        // the whole token matrix can be normalized in one launch.  This also
+        // makes the arena's `norm_output` a stable input for the batched FFN.
+        ops::residual_add_rms_norm(
+            ctx.gpu,
+            self.residual_add_rms_norm_k,
+            hidden,
+            attn,
+            &self.post_attn_norm,
+            ctx.buffers.norm_output(),
+            residual,
+            num_tokens as u32,
+            self.hidden_size as u32,
+            ctx.config.rms_norm_eps as f32,
+            stream,
+        )?;
+
+        let batched = if let Some(ffn) = &self.dense_ffn {
+            ffn.forward_batched(ctx.buffers.norm_output(), num_tokens, ctx, stream)?
+        } else if let FfnComponent::LingMoe(ffn) = &self.ffn {
+            if ffn.supports_batched_prefill() {
+                self.ffn
+                    .forward_batched(ctx.buffers.norm_output(), num_tokens, ctx, stream)?;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if batched {
+            ops::residual_add(
                 ctx.gpu,
-                self.residual_add_rms_norm_k,
-                hidden_t,
-                attn_t,
-                &self.post_attn_norm,
-                ctx.buffers.norm_output(),
-                residual_t,
-                1,
-                self.hidden_size as u32,
-                ctx.config.rms_norm_eps as f32,
+                self.residual_add_k,
+                hidden,
+                ctx.buffers.moe_output(),
+                (num_tokens * self.hidden_size) as u32,
                 stream,
             )?;
+            return Ok(());
+        }
+
+        // Strict FP8 dense and the original paged FP8 Ling path retain their
+        // one-token ordering/host staging fallback, but consume the already
+        // computed row from the matrix norm output.
+        for token in 0..num_tokens {
+            let hidden_t = hidden.offset(token * h_bytes);
+            let ffn_input = ctx.buffers.norm_output().offset(token * h_bytes);
             let ffn_out = match &self.dense_ffn {
-                Some(ffn) => ffn.forward(ctx.buffers.norm_output(), ctx, stream)?,
-                None => self.ffn.forward(ctx.buffers.norm_output(), ctx, stream)?,
+                Some(ffn) => ffn.forward(ffn_input, ctx, stream)?,
+                None => self.ffn.forward(ffn_input, ctx, stream)?,
             };
             ops::residual_add(
                 ctx.gpu,

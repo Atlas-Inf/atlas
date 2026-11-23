@@ -181,6 +181,11 @@ impl LingMoeFfn {
         let activation_bf16 = gpu.alloc(INTERMEDIATE * 2)?;
         let kernels = Kernels {
             router_gemv: gpu.kernel("gemv", "dense_gemv_bf16_fp32out")?,
+            router_gemm: if a16 {
+                Some(gpu.kernel("gemm", "dense_gemm_bf16_f32out")?)
+            } else {
+                None
+            },
             router: gpu.kernel("ling_router", "ling_grouped_top8")?,
             quant: gpu.kernel("per_token_group_quant_fp8", "per_token_group_quant_fp8")?,
             gemm: gpu.kernel("fp8_gemm_t_blockscaled", "fp8_gemm_t_blockscaled")?,
@@ -190,6 +195,11 @@ impl LingMoeFfn {
             ling_down_fp8: (ling_down_fp8.0 != 0).then_some(ling_down_fp8),
             dense_gemv: if a16 {
                 Some(gpu.kernel("gemv", "dense_gemv_bf16")?)
+            } else {
+                None
+            },
+            dense_gemm: if a16 {
+                Some(gpu.kernel("gemm_tc", "dense_gemm_tc")?)
             } else {
                 None
             },
@@ -205,6 +215,23 @@ impl LingMoeFfn {
             },
             moe_down: if a16 {
                 Some(gpu.kernel("moe_expert_gemv", "moe_expert_gemv")?)
+            } else {
+                None
+            },
+            moe_wide: if a16 {
+                let kernel =
+                    crate::layers::try_kernel(gpu, "moe_expert_gemv_wide", "moe_expert_gemv_wide");
+                (kernel.0 != 0).then_some(kernel)
+            } else {
+                None
+            },
+            blend_rows: if a16 {
+                let kernel = crate::layers::try_kernel(
+                    gpu,
+                    "moe_expert_gemv",
+                    "moe_weighted_sum_blend_rows",
+                );
+                (kernel.0 != 0).then_some(kernel)
             } else {
                 None
             },

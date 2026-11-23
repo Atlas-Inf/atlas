@@ -63,9 +63,12 @@ extern "C" __global__ void moe_expert_gemv_wide(
         return;
     }
 
-    const __nv_bfloat16* input = A
-        + (unsigned long long)tok * K
-        + (input_stride > 0 ? (unsigned long long)expert_slot * input_stride : 0);
+    // Gate/up reads the token row directly.  Down receives route-major
+    // `[token, slot, K]` activations, so include the complete top-k stride
+    // before selecting this expert slot.
+    const __nv_bfloat16* input = input_stride > 0
+        ? A + ((unsigned long long)tok * top_k + expert_slot) * input_stride
+        : A + (unsigned long long)tok * K;
 
     extern __shared__ char smem_raw[];
     float* s_lut = (float*)smem_raw;

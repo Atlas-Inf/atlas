@@ -94,6 +94,7 @@ struct Stage {
 
 struct Kernels {
     router_gemv: KernelHandle,
+    router_gemm: Option<KernelHandle>,
     router: KernelHandle,
     quant: KernelHandle,
     gemm: KernelHandle,
@@ -102,9 +103,12 @@ struct Kernels {
     fp8_gate_up: Option<KernelHandle>,
     ling_down_fp8: Option<KernelHandle>,
     dense_gemv: Option<KernelHandle>,
+    dense_gemm: Option<KernelHandle>,
     silu_bf16: Option<KernelHandle>,
     moe_gate_up: Option<KernelHandle>,
     moe_down: Option<KernelHandle>,
+    moe_wide: Option<KernelHandle>,
+    blend_rows: Option<KernelHandle>,
     weighted_sum: KernelHandle,
     residual_add: KernelHandle,
 }
@@ -141,6 +145,10 @@ pub struct LingMoeFfn {
 }
 
 impl LingMoeFfn {
+    pub(crate) fn supports_batched_prefill(&self) -> bool {
+        self.a16 && self.kernels.moe_wide.is_some() && self.kernels.blend_rows.is_some()
+    }
+
     /// One-token decode forward. The explicit graph-capture refusal protects
     /// the host route-id read and mmap staging from accidental graph replay.
     pub fn forward(
@@ -328,6 +336,9 @@ impl LingMoeFfn {
         ctx: &ForwardContext<'_>,
         stream: u64,
     ) -> Result<()> {
+        if num_tokens > 1 && self.supports_batched_prefill() {
+            return self.forward_a16_prefill(input, num_tokens, ctx, stream);
+        }
         ensure!(
             num_tokens == 1,
             "Ling native FFN currently supports one token, got {num_tokens}"

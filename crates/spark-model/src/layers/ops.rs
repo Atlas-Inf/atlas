@@ -397,8 +397,8 @@ pub use kv_cache_fp8k::*;
 pub use kv_cache_glm::*;
 pub use kv_cache_turbok::*;
 pub(crate) use ling::{
-    dense_gemv_bf16_fp32out, ling_fp8_gate_up_shared, ling_grouped_top8, ling_silu_down_shared_fp8,
-    ling_silu_mul_bf16, ling_silu_mul_quant_fp8, ling_weighted_sum,
+    dense_gemv_bf16_fp32out, ling_fp8_gate_up_shared, ling_grouped_top8, ling_grouped_top8_rows,
+    ling_silu_down_shared_fp8, ling_silu_mul_bf16, ling_silu_mul_quant_fp8, ling_weighted_sum,
 };
 pub use marlin_nvfp4::*;
 pub use marlin_nvfp4_pack::marlin_pack_nvfp4;

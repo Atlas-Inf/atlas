@@ -57,6 +57,31 @@ pub(crate) fn ling_grouped_top8(
         .launch(stream)
 }
 
+/// Batched Ling group-limited top-8 router.  The CUDA kernel already indexes
+/// logits and outputs by `blockIdx.x`; the decode wrapper launches one block,
+/// while prefill launches one block per token without changing its selection
+/// or tie-breaking rules.
+pub(crate) fn ling_grouped_top8_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    logits: DevicePtr,
+    bias: DevicePtr,
+    ids: DevicePtr,
+    weights: DevicePtr,
+    rows: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(rows > 0, "Ling batched router requires at least one row");
+    KernelLaunch::new(gpu, kernel)
+        .grid([rows, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(logits)
+        .arg_ptr(bias)
+        .arg_ptr(ids)
+        .arg_ptr(weights)
+        .launch(stream)
+}
+
 /// W8A8 gate/up GEMV over the eight routed experts plus the shared expert.
 /// The input has already been quantized into one dynamic FP8 group scale per
 /// 128 channels; expert IDs remain on device.

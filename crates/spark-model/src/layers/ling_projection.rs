@@ -166,4 +166,12 @@ impl LingProjection {
             }
         }
     }
+
+    /// Whether this projection can consume a row-major BF16 token matrix
+    /// directly.  Original FP8 projections still use the one-row dynamic
+    /// quantizer scratch owned by the decoder; callers must not mistake that
+    /// scratch for a batched activation buffer.
+    pub(crate) fn is_bf16(&self) -> bool {
+        matches!(self.format, Format::Bf16 { .. })
+    }
 }
