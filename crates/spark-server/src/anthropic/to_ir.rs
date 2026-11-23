@@ -13,7 +13,8 @@ use crate::ir::message::{ImageSource, Reasoning, ToolCall};
 use crate::ir::{ContentPart, ImageData, Message, Role, ThinkingDirective};
 
 use super::types::{
-    AnthropicContent, ContentBlock, MessagesRequest, SystemContent, ThinkingType, ToolResultContent,
+    AnthropicContent, AnthropicRole, ContentBlock, MessagesRequest, SystemContent, ThinkingType,
+    ToolResultContent,
 };
 
 impl From<MessagesRequest> for ir::ChatRequest {
@@ -34,8 +35,8 @@ impl From<MessagesRequest> for ir::ChatRequest {
     ///   `Message::tool_error` — the `[tool error]\n` marker is
     ///   rendered by the shared pipeline (`msg_entry`), not baked into
     ///   the text here.
-    /// * unknown roles collapse to user (Anthropic wire only defines
-    ///   user/assistant).
+    /// * `role` is the closed `user`/`assistant` wire enum; anything
+    ///   else fails request deserialization before lowering.
     fn from(req: MessagesRequest) -> Self {
         // Capacity is a HINT, and it is clamped on purpose.
         //
@@ -73,9 +74,9 @@ impl From<MessagesRequest> for ir::ChatRequest {
 
         // Conversation history.
         for m in req.messages {
-            let role = match m.role.as_str() {
-                "assistant" => Role::Assistant,
-                _ => Role::User,
+            let role = match m.role {
+                AnthropicRole::User => Role::User,
+                AnthropicRole::Assistant => Role::Assistant,
             };
             match m.content {
                 AnthropicContent::Text(s) => {
