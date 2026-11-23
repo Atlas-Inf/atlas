@@ -295,7 +295,7 @@ impl LingMlaWeights {
     ) -> Result<()> {
         config.validate()?;
         ensure!(
-            metadata.num_seqs == 1
+            (metadata.num_seqs == 1 || metadata.num_seqs == rows)
                 && (1..=MLA_TILE_ROWS as u32).contains(&rows)
                 && write_floor <= rows,
             "Ling MLA expects one sequence and a valid causal tile"
@@ -496,7 +496,11 @@ impl LingMlaWeights {
             scratch.attn_padded,
             metadata.block_table,
             metadata.seq_len,
-            0, // All queries use the same physical block table.
+            if metadata.num_seqs == 1 {
+                0
+            } else {
+                metadata.max_blocks_per_seq
+            },
             rows,
             heads,
             heads,

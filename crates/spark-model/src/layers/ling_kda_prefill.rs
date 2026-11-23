@@ -59,7 +59,8 @@ impl LingKdaLayer {
         gpu: &dyn GpuBackend,
         input_norm: DevicePtr,
         tokens: usize,
-        state: LingKdaState,
+        states: &[LingKdaState],
+        fp32_workspace: Option<DevicePtr>,
         scratch: LingKdaPrefillScratch,
         projection: LingProjectionScratch,
         stream: u64,
@@ -67,7 +68,15 @@ impl LingKdaLayer {
         ensure!(tokens > 0, "Ling KDA prefill needs at least one token");
         ensure!(tokens <= u32::MAX as usize, "Ling KDA prefill is too long");
         ensure!(!input_norm.is_null(), "Ling KDA prefill input is null");
-        state.validate()?;
+        ensure!(
+            states.len() == 1 || states.len() == tokens,
+            "expected a prompt state or one state per decode row"
+        );
+        for state in states {
+            state.validate()?;
+        }
+        let rows_per_state = tokens / states.len();
+        let row_bytes = LING_KDA_PROJECTION_SIZE * 2;
         scratch.validate()?;
         let rows = tokens as u32;
         let plane_bytes = tokens * LING_KDA_PROJECTION_SIZE * 2;
@@ -94,28 +103,35 @@ impl LingKdaLayer {
 
         let conv_bytes = LingKdaState::conv_state_bytes();
         let input_stride = LING_KDA_PROJECTION_SIZE as u32;
-        for (plane, (state_ptr, weight)) in [
-            (0usize, (state.q_conv, &self.weights.q_conv)),
-            (1usize, (state.k_conv, &self.weights.k_conv)),
-            (2usize, (state.v_conv, &self.weights.v_conv)),
-        ] {
-            ops::conv1d_update_prefill(
-                gpu,
-                self.conv_prefill_k,
-                self.conv_prefill_tp_k,
-                state_ptr,
-                scratch.qkv_planes.offset(plane * plane_bytes),
-                weight,
-                DevicePtr::NULL,
-                scratch.conv_planes.offset(plane * plane_bytes),
-                LING_KDA_PROJECTION_SIZE as u32,
-                LING_KDA_CONV_WIDTH as u32,
-                rows,
-                input_stride,
-                input_stride,
-                stream,
-            )?;
-            debug_assert_eq!(state_ptr.0, state.q_conv.offset(plane * conv_bytes).0);
+        for (index, state) in states.iter().enumerate() {
+            let first = index * rows_per_state;
+            for (plane, (state_ptr, weight)) in [
+                (0usize, (state.q_conv, &self.weights.q_conv)),
+                (1usize, (state.k_conv, &self.weights.k_conv)),
+                (2usize, (state.v_conv, &self.weights.v_conv)),
+            ] {
+                ops::conv1d_update_prefill(
+                    gpu,
+                    self.conv_prefill_k,
+                    self.conv_prefill_tp_k,
+                    state_ptr,
+                    scratch
+                        .qkv_planes
+                        .offset(plane * plane_bytes + first * row_bytes),
+                    weight,
+                    DevicePtr::NULL,
+                    scratch
+                        .conv_planes
+                        .offset(plane * plane_bytes + first * row_bytes),
+                    LING_KDA_PROJECTION_SIZE as u32,
+                    LING_KDA_CONV_WIDTH as u32,
+                    rows_per_state as u32,
+                    input_stride,
+                    input_stride,
+                    stream,
+                )?;
+                debug_assert_eq!(state_ptr.0, state.q_conv.offset(plane * conv_bytes).0);
+            }
         }
         ops::kda_pack_qkv(
             gpu,
@@ -126,22 +142,72 @@ impl LingKdaLayer {
             LING_KDA_PROJECTION_SIZE as u32,
             stream,
         )?;
-        ops::kda_recurrent(
-            gpu,
-            self.recurrent_k,
-            scratch.qkv,
-            scratch.raw_gate,
-            scratch.raw_beta,
-            self.weights.a_log.weight,
-            self.weights.dt_bias.weight,
-            state.h,
-            scratch.recurrent,
-            rows,
-            LING_KDA_HEADS as u32,
-            LING_KDA_HEAD_DIM as u32,
-            self.config.lower_bound,
-            stream,
-        )?;
+        if let Some(workspace) = fp32_workspace {
+            ensure!(
+                states.len() == 1,
+                "register-resident KDA needs a single prompt"
+            );
+            let fp32_plane = plane_bytes * 2;
+            let q_norm = workspace;
+            let k_norm = workspace.offset(fp32_plane);
+            let beta = workspace.offset(2 * fp32_plane);
+            // The packed QKV has consumed all three convolution planes. Leave
+            // the first BF16 plane for recurrent output and the fourth for g.
+            let decay = scratch.conv_planes.offset(plane_bytes);
+            ops::kda_preprocess_regresident(
+                gpu,
+                self.preprocess_regresident_k,
+                scratch.qkv,
+                scratch.raw_gate,
+                scratch.raw_beta,
+                self.weights.a_log.weight,
+                self.weights.dt_bias.weight,
+                q_norm,
+                k_norm,
+                decay,
+                beta,
+                rows,
+                LING_KDA_HEADS as u32,
+                LING_KDA_HEAD_DIM as u32,
+                self.config.lower_bound,
+                stream,
+            )?;
+            ops::kda_recurrent_regresident(
+                gpu,
+                self.recurrent_regresident_k,
+                scratch.qkv,
+                q_norm,
+                k_norm,
+                decay,
+                beta,
+                states[0].h,
+                scratch.recurrent,
+                rows,
+                LING_KDA_HEADS as u32,
+                LING_KDA_HEAD_DIM as u32,
+                stream,
+            )?;
+        } else {
+            for (index, state) in states.iter().enumerate() {
+                let first = index * rows_per_state;
+                ops::kda_recurrent(
+                    gpu,
+                    self.recurrent_k,
+                    scratch.qkv.offset(first * 3 * row_bytes),
+                    scratch.raw_gate.offset(first * row_bytes),
+                    scratch.raw_beta.offset(first * (LING_KDA_HEADS * 2)),
+                    self.weights.a_log.weight,
+                    self.weights.dt_bias.weight,
+                    state.h,
+                    scratch.recurrent.offset(first * row_bytes),
+                    rows_per_state as u32,
+                    LING_KDA_HEADS as u32,
+                    LING_KDA_HEAD_DIM as u32,
+                    self.config.lower_bound,
+                    stream,
+                )?;
+            }
+        }
         ops::kda_sigmoid_gated_norm(
             gpu,
             self.gated_norm_k,

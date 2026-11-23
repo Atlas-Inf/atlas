@@ -288,6 +288,8 @@ pub struct LingKdaLayer {
     conv_prefill_tp_k: KernelHandle,
     pack_k: KernelHandle,
     recurrent_k: KernelHandle,
+    preprocess_regresident_k: KernelHandle,
+    recurrent_regresident_k: KernelHandle,
     gated_norm_k: KernelHandle,
     residual_add_k: KernelHandle,
 }
@@ -311,6 +313,8 @@ impl LingKdaLayer {
             ),
             pack_k: gpu.kernel("kda", "kda_pack_qkv")?,
             recurrent_k: gpu.kernel("kda", "kda_recurrent_bf16")?,
+            preprocess_regresident_k: gpu.kernel("kda", "kda_preprocess_regresident")?,
+            recurrent_regresident_k: gpu.kernel("kda", "kda_recurrent_bf16_regresident")?,
             gated_norm_k: gpu.kernel("kda", "kda_sigmoid_gated_rms_norm")?,
             residual_add_k: gpu.kernel("residual_add", "bf16_residual_add")?,
         })

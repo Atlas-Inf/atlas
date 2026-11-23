@@ -413,12 +413,12 @@ impl LingDecoderLayer {
         ops::residual_add(ctx.gpu, self.residual_add_k, hidden, ffn_out, h, stream)
     }
 
-    fn run_kda_prefill(
+    fn run_kda_rows(
         &self,
         hidden: DevicePtr,
         residual: DevicePtr,
         num_tokens: usize,
-        state: &mut dyn LayerState,
+        states: &[LingKdaState],
         ctx: &ForwardContext<'_>,
         stream: u64,
     ) -> Result<()> {
@@ -466,10 +466,28 @@ impl LingDecoderLayer {
             ctx.config.rms_norm_eps as f32,
             stream,
         )?;
-        let kda_state = self.state_kda(state, ctx.config)?;
+        // The A16 prompt path can retain KDA state in registers through a tile.
+        // The original FP8 checkpoint keeps its scalar reduction order.
+        let a16 = ctx
+            .config
+            .quantization_config
+            .as_ref()
+            .is_some_and(|q| q.quant_method != "fp8");
+        let fp32_workspace = (a16
+            && states.len() == 1
+            && num_tokens >= 32
+            && sizes.expert_down_out >= 4 * plane_bytes + num_tokens * LING_KDA_HEADS * 4)
+            .then(|| ctx.buffers.expert_down_out());
         let attn = match &self.attention {
             LingAttention::Kda { layer, .. } => layer.forward_prefill(
-                ctx.gpu, normed, num_tokens, kda_state, scratch, projection, stream,
+                ctx.gpu,
+                normed,
+                num_tokens,
+                states,
+                fp32_workspace,
+                scratch,
+                projection,
+                stream,
             )?,
             LingAttention::Mla { .. } => unreachable!("KDA prefill called on MLA layer"),
         };

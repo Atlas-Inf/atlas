@@ -59,7 +59,8 @@ impl TransformerLayer for LingDecoderLayer {
         stream: u64,
     ) -> Result<()> {
         if matches!(&self.attention, LingAttention::Kda { .. }) {
-            return self.run_kda_prefill(hidden, residual, num_tokens, state, ctx, stream);
+            let state = self.state_kda(state, ctx.config)?;
+            return self.run_kda_rows(hidden, residual, num_tokens, &[state], ctx, stream);
         }
         if matches!(&self.attention, LingAttention::Mla { .. }) {
             return self.run_mla_prefill(
@@ -155,21 +156,84 @@ impl TransformerLayer for LingDecoderLayer {
             );
         }
         ensure!(states.len() >= active_seqs && seq_lens.len() >= active_seqs);
-        let h_bytes = self.hidden_size * 2;
-        for i in 0..active_seqs.min(num_seqs) {
-            let row_meta = meta.map(|m| Self::metadata_row(m, i));
-            self.run_one(
-                hidden.offset(i * h_bytes),
-                residual.offset(i * h_bytes),
-                states[i],
+        let rows = active_seqs.min(num_seqs);
+        if rows == 0 {
+            return Ok(());
+        }
+        if rows == 1 {
+            return self.run_one(
+                hidden,
+                residual,
+                states[0],
                 kv_cache,
                 true,
-                row_meta,
+                meta.map(|m| Self::metadata_row(m, 0)),
                 ctx,
                 stream,
-            )?;
+            );
         }
-        Ok(())
+        match &self.attention {
+            LingAttention::Kda { .. } => {
+                let states: Vec<_> = states[..rows]
+                    .iter_mut()
+                    .map(|state| self.state_kda(*state, ctx.config))
+                    .collect::<Result<_>>()?;
+                self.run_kda_rows(hidden, residual, rows, &states, ctx, stream)
+            }
+            LingAttention::Mla {
+                config,
+                weights,
+                kernels,
+                scratch,
+                ..
+            } => {
+                let meta = meta.expect("validated MLA batch metadata");
+                let normed = ctx.buffers.norm_output();
+                let attn = ctx.buffers.attn_output();
+                let mut scratch = *scratch;
+                scratch.projection = LingProjectionScratch::new(
+                    ctx.buffers.fp8_act(),
+                    ctx.buffers.fp8_act_bytes(),
+                    ctx.buffers.fp8_act_scale(),
+                    ctx.buffers.sizes().fp8_act_scale,
+                );
+                ops::rms_norm_residual(
+                    ctx.gpu,
+                    self.rms_norm_residual_k,
+                    hidden,
+                    &self.input_norm,
+                    normed,
+                    residual,
+                    rows as u32,
+                    self.hidden_size as u32,
+                    ctx.config.rms_norm_eps as f32,
+                    stream,
+                )?;
+                for first in (0..rows).step_by(MLA_TILE_ROWS) {
+                    let count = MLA_TILE_ROWS.min(rows - first);
+                    let metadata = AttnMetadataDev {
+                        num_seqs: count as u32,
+                        ..Self::metadata_row(meta, first)
+                    };
+                    let offset = first * self.hidden_size * 2;
+                    weights.forward_rows(
+                        *config,
+                        *kernels,
+                        ctx.gpu,
+                        kv_cache,
+                        self.attention_layer_idx.expect("Ling MLA needs a KV layer"),
+                        metadata,
+                        normed.offset(offset),
+                        attn.offset(offset),
+                        scratch,
+                        count as u32,
+                        0,
+                        stream,
+                    )?;
+                }
+                self.finish_prefill_ffn(hidden, residual, attn, rows, ctx, stream)
+            }
+        }
     }
 
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
