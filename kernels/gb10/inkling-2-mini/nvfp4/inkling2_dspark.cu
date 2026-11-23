@@ -157,3 +157,52 @@ extern "C" __global__ void __launch_bounds__(RNN_RANK) inkling2_dspark_rnn_gate(
     latent[c] = __float2bfloat16(tanhf(o));
     for (unsigned int i = RNN_RANK + c; i < latent_len; i += RNN_RANK) latent[i] = __float2bfloat16(i == RNN_RANK ? 1.0f : 0.0f);
 }
+
+// A draft row's pick and the drafter's confidence in it: token = argmax(logits) (the lowest
+// index among equal maxima, as `argmax_bf16`), conf = log softmax(softcap(logits))[token] with
+// softcap(x) = cap * tanh(x / cap) (cap 0: none), the reference's `markov_logits`. NaN reads as
+// the lowest value. grid (1), block 1024.
+extern "C" __global__ void __launch_bounds__(1024) inkling2_dspark_pick(
+    const __nv_bfloat16* __restrict__ logits, unsigned int* __restrict__ token,
+    float* __restrict__ conf, const unsigned int n, const float cap
+) {
+    __shared__ float s_val[1024];
+    __shared__ unsigned int s_idx[1024];
+    const unsigned int tid = threadIdx.x, stride = blockDim.x;
+    float best = -1e30f;
+    unsigned int at = 0;
+    for (unsigned int i = tid; i < n; i += stride) {
+        const float v = __bfloat162float(logits[i]);
+        if (v > best) { best = v; at = i; }
+    }
+    s_val[tid] = best;
+    s_idx[tid] = at;
+    __syncthreads();
+    for (unsigned int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s && (s_val[tid + s] > s_val[tid]
+                        || (s_val[tid + s] == s_val[tid] && s_idx[tid + s] < s_idx[tid]))) {
+            s_val[tid] = s_val[tid + s];
+            s_idx[tid] = s_idx[tid + s];
+        }
+        __syncthreads();
+    }
+    const float top = cap > 0.0f ? cap * tanhf(s_val[0] / cap) : s_val[0];
+    const unsigned int pick = s_idx[0];
+    __syncthreads();
+    // sum over the row of exp(softcap(x) - softcap(max)): at least 1 (the pick itself)
+    float mass = 0.0f;
+    for (unsigned int i = tid; i < n; i += stride) {
+        const float v = __bfloat162float(logits[i]);
+        if (v == v) mass += expf((cap > 0.0f ? cap * tanhf(v / cap) : v) - top);
+    }
+    s_val[tid] = mass;
+    __syncthreads();
+    for (unsigned int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s) s_val[tid] += s_val[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        *token = pick;
+        *conf = -logf(fmaxf(s_val[0], 1.0f));
+    }
+}

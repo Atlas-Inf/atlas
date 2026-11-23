@@ -205,6 +205,8 @@ impl BlockDiffusionDraftHead {
                     ctx: g.ctx.offset(m * g.ctx_bytes),
                     anchor: g.anchors.offset(m * 4),
                     tokens: g.tokens.offset(m * g.gamma * 4),
+                    // a group's narrow steps are not sized by confidence
+                    conf: None,
                     raw: g.raw,
                     state: g.state,
                     latent: g.latent,

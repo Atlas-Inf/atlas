@@ -39,6 +39,7 @@ struct Kernels {
     rnn_ctx: KernelHandle,
     rnn_raw: KernelHandle,
     rnn_gate: KernelHandle,
+    pick: KernelHandle,
 }
 
 impl Kernels {
@@ -53,6 +54,7 @@ impl Kernels {
             rnn_ctx: k("inkling2_dspark_rnn_ctx")?,
             rnn_raw: k("inkling2_dspark_rnn_raw")?,
             rnn_gate: k("inkling2_dspark_rnn_gate")?,
+            pick: k("inkling2_dspark_pick")?,
         })
     }
 }
@@ -64,7 +66,16 @@ pub struct InklingDspark {
     k: Kernels,
     /// A step's shared head pass (`inkling_group.rs`).
     group: group::TailGroup,
+    /// Report each draft's confidence after the block's tokens
+    /// (`draft_conf.rs`): the log-probability of the pick under the
+    /// softcapped logits, for the scheduler's verify width.
+    conf: bool,
 }
+
+/// The checkpoint's `final_logit_softcapping`, which the reference applies
+/// to a draft row's logits (`markov_logits`). It does not move the argmax;
+/// the confidence is taken under it.
+const LOGIT_SOFTCAP: f32 = 30.0;
 
 /// One propose lane's buffers.
 pub struct InklingScratch {
@@ -161,6 +172,7 @@ impl InklingDspark {
         hidden: usize,
         gamma: usize,
         dense_gemm: KernelHandle,
+        conf: bool,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
         ensure!(
@@ -214,6 +226,7 @@ impl InklingDspark {
             fold: DenseWeight { weight: fold },
             k: Kernels::resolve(gpu)?,
             group: group::TailGroup::alloc(gpu, hidden, gamma, vocab)?,
+            conf,
         })
     }
 

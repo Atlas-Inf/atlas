@@ -42,6 +42,10 @@ impl BlockDiffusionDraftHead {
                 ctx: sc.ctx,
                 anchor: scratch.markov_prev_dev,
                 tokens: scratch.draft_tokens_dev,
+                // after the block's `gamma` tokens (`draft_conf::record_bytes`)
+                conf: ink
+                    .conf
+                    .then(|| scratch.draft_tokens_dev.offset(self.gamma * 4)),
                 raw: sc.raw,
                 state: sc.state,
                 latent: sc.latent,
@@ -143,14 +147,27 @@ impl BlockDiffusionDraftHead {
                 v as u32,
                 stream,
             )?;
-            ops::argmax_bf16(
-                gpu,
-                self.kernels.argmax,
-                row(i + 1),
-                rows.tokens.offset((i + 1) * 4),
-                v as u32,
-                stream,
-            )?;
+            let token = rows.tokens.offset((i + 1) * 4);
+            match rows.conf {
+                // the pick and the drafter's confidence in it, word `i + 1`
+                Some(conf) => KernelLaunch::new(gpu, ink.k.pick)
+                    .grid([1, 1, 1])
+                    .block([1024, 1, 1])
+                    .arg_ptr(row(i + 1))
+                    .arg_ptr(token)
+                    .arg_ptr(conf.offset((i + 1) * 4))
+                    .arg_u32(v as u32)
+                    .arg_f32(super::LOGIT_SOFTCAP)
+                    .launch(stream)?,
+                None => ops::argmax_bf16(
+                    gpu,
+                    self.kernels.argmax,
+                    row(i + 1),
+                    token,
+                    v as u32,
+                    stream,
+                )?,
+            }
         }
         Ok(())
     }
@@ -166,6 +183,9 @@ pub(super) struct TailRows {
     pub(super) anchor: DevicePtr,
     /// `[1 + steps]` `u32` out: row 0's argmax, then the drafts.
     pub(super) tokens: DevicePtr,
+    /// `[1 + steps]` `f32` out, when confidences are reported: word `r` is
+    /// row `r`'s (word 0 is not written; the anchor row is not a draft).
+    pub(super) conf: Option<DevicePtr>,
     pub(super) raw: DevicePtr,
     pub(super) state: DevicePtr,
     pub(super) latent: DevicePtr,
