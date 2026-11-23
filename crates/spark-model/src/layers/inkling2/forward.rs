@@ -207,8 +207,14 @@ impl Inkling2Layer {
         gm.kv_write(
             gpu, n, s.kn, s.vn, k_pool, v_pool, meta.slots, p.kv_heads, p.head_dim, bs, stream,
         )?;
-        if batch.seqs.len() == 1 && batch.rows_per_seq > 1 {
-            // a prefill chunk (or verify run) of one sequence: tensor cores
+        let body = ops::attn_body(
+            batch.seqs.len(),
+            batch.rows_per_seq,
+            super::layer::MAX_VERIFY_ROWS,
+            ops::attn_slots(d.max_rows, d.max_seqs),
+        );
+        if body == ops::AttnBody::Prefill {
+            // a prefill chunk of one sequence: tensor cores
             ops::prefill_attn(
                 gpu,
                 &self.k,
@@ -236,11 +242,11 @@ impl Inkling2Layer {
                 stream,
             )?;
         } else {
-            // decode rows split their keys over the GPU; prefill rows have rows enough
-            let splits = if batch.rows_per_seq == 1 {
-                ops::DECODE_ATTN_SPLITS
-            } else {
-                1
+            // decode and verify rows split their keys over the GPU; prefill
+            // rows have rows enough
+            let splits = match body {
+                ops::AttnBody::Decode { splits } => splits,
+                ops::AttnBody::Prefill => 1,
             };
             ops::decode_attn(
                 gpu,
