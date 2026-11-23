@@ -28,7 +28,7 @@ impl Runtime<'_> {
                     return Ok(());
                 }
                 for (cache, layer) in checkpoint.caches.iter_mut().zip(&data.layers) {
-                    cache.copy_state_from(&layer.attn, stream)?;
+                    cache.copy_committed_state_from(&layer.attn, stream)?;
                 }
                 checkpoint.history.clone_from(&data.history);
                 if let (Some(saved), Some(current)) = (&mut checkpoint.draft, &data.draft) {
@@ -38,7 +38,7 @@ impl Runtime<'_> {
                 let caches = data
                     .layers
                     .iter()
-                    .map(|layer| layer.attn.fork(stream))
+                    .map(|layer| layer.attn.fork_committed(stream))
                     .collect::<Result<Vec<_>>>()?;
                 data.checkpoint = Some(Checkpoint {
                     caches,

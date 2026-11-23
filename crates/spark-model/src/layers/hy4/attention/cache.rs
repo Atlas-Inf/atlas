@@ -201,7 +201,30 @@ impl<'layer, 'gpu> AttentionCache<'layer, 'gpu> {
         Ok(copy)
     }
 
+    pub fn fork_committed(&self, stream: u64) -> Result<Self> {
+        ensure!(
+            !self.poisoned && self.stream.is_none_or(|s| s == stream),
+            "Hy4 invalid cache fork/stream"
+        );
+        let mut copy = Self::new(self.layer, self.max_tokens, self.layout.page_size)?;
+        copy.copy_committed_state_from(self, stream)?;
+        Ok(copy)
+    }
+
     pub fn copy_state_from(&mut self, source: &Self, stream: u64) -> Result<()> {
+        self.copy_state_from_impl(source, stream, false)
+    }
+
+    pub fn copy_committed_state_from(&mut self, source: &Self, stream: u64) -> Result<()> {
+        self.copy_state_from_impl(source, stream, true)
+    }
+
+    fn copy_state_from_impl(
+        &mut self,
+        source: &Self,
+        stream: u64,
+        committed_only: bool,
+    ) -> Result<()> {
         ensure!(
             !source.poisoned
                 && std::ptr::eq(self.layer, source.layer)
@@ -213,10 +236,33 @@ impl<'layer, 'gpu> AttentionCache<'layer, 'gpu> {
             "Hy4 invalid attention snapshot"
         );
         let gpu = self.layer.memory.gpu;
-        gpu.copy_d2d_async(source.latent, self.latent, self.latent_bytes, stream)?;
-        if self.pool_bytes > 0 {
-            gpu.copy_d2d_async(source.pool, self.pool, self.pool_bytes, stream)?;
-            gpu.copy_d2d_async(source.tail, self.tail, 4 * 128 * 2, stream)?;
+        if committed_only {
+            let pages = source.len.div_ceil(self.layout.page_size);
+            let latent_bytes = pages
+                .checked_mul(self.layout.page_size)
+                .and_then(|n| n.checked_mul(576 * 2))
+                .ok_or_else(|| anyhow::anyhow!("Hy4 snapshot byte overflow"))?
+                .min(self.latent_bytes);
+            if latent_bytes > 0 {
+                gpu.copy_d2d_async(source.latent, self.latent, latent_bytes, stream)?;
+            }
+            if self.pool_bytes > 0 {
+                let pool_bytes = (source.len / 4)
+                    .div_ceil(64)
+                    .checked_mul(8448)
+                    .ok_or_else(|| anyhow::anyhow!("Hy4 snapshot pool overflow"))?
+                    .min(self.pool_bytes);
+                if pool_bytes > 0 {
+                    gpu.copy_d2d_async(source.pool, self.pool, pool_bytes, stream)?;
+                }
+                gpu.copy_d2d_async(source.tail, self.tail, 4 * 128 * 2, stream)?;
+            }
+        } else {
+            gpu.copy_d2d_async(source.latent, self.latent, self.latent_bytes, stream)?;
+            if self.pool_bytes > 0 {
+                gpu.copy_d2d_async(source.pool, self.pool, self.pool_bytes, stream)?;
+                gpu.copy_d2d_async(source.tail, self.tail, 4 * 128 * 2, stream)?;
+            }
         }
         self.len = source.len;
         self.first_group_position = source.first_group_position;
