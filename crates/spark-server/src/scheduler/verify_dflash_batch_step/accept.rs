@@ -26,7 +26,11 @@ pub(in crate::scheduler) fn apply_dflash_accept(
             break;
         }
     }
-    crate::scheduler::adaptive_spec::record_verify(a, num_accepted, sched);
+    if crate::scheduler::adaptive_spec::judges_block(drafts.len()) {
+        crate::scheduler::adaptive_spec::record_verify(a, num_accepted, sched);
+    } else {
+        crate::scheduler::adaptive_spec::note_narrow(a, num_accepted, drafts.len(), sched);
+    }
 
     let tokens_len = drafts.len() + 1;
     let pre_verify_len = a.seq.seq_len.saturating_sub(tokens_len);

@@ -618,6 +618,7 @@ impl BlockDiffusionDraftHead {
     ) -> Result<Vec<u32>> {
         if let Some(s) = scratch.inkling.as_ref() {
             s.set_tail_steps(self.draft_cap(_num_drafts), self.gamma);
+            s.take_held();
         }
         let drafts = self
             .forward_block(

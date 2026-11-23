@@ -40,12 +40,134 @@ pub(crate) struct AdaptState {
     window: Vec<u32>,
     suspended: bool,
     serial_tokens: u32,
+    /// Accepts of the last narrow steps (fewer drafts offered than a block:
+    /// two or more live sequences on a depth table), and the width they
+    /// were offered at.
+    narrow: Vec<u32>,
+    narrow_offered: usize,
+    /// Plain batched steps left before this sequence's batch drafts again
+    /// ([`judge_narrow`]).
+    hold: u32,
     /// The current verify span's per-position pipeline effects, applied as
     /// each picked token is committed (`emit_step::PickEffects`).
     pub(in crate::scheduler) pick_effects: crate::scheduler::emit_step::PickEffects,
 }
 
 const WINDOW: usize = 12;
+
+/// Whether a step that offered `offered` drafts feeds the per-sequence
+/// window. The suspension threshold asks how a whole block does; a narrower
+/// step (two or more live sequences on a depth table) offers fewer drafts
+/// than it asks to be accepted, so it is judged with its batch instead
+/// ([`note_narrow`], [`judge_narrow`]).
+pub(crate) fn judges_block(offered: usize) -> bool {
+    offered >= super::dflash_width::MAX_DRAFTS
+}
+
+/// Record a narrow verify step's accept count for [`judge_narrow`].
+pub(crate) fn note_narrow(
+    a: &mut ActiveSeq,
+    num_accepted: usize,
+    offered: usize,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+) {
+    if !sched.levers.dflash_adaptive {
+        return;
+    }
+    let st = &mut a.spec_adapt;
+    if st.narrow_offered != offered {
+        st.narrow.clear();
+        st.narrow_offered = offered;
+    }
+    st.narrow.push(num_accepted as u32);
+    if st.narrow.len() > WINDOW {
+        st.narrow.remove(0);
+    }
+}
+
+/// Whether narrow steps pay: the sequences' pooled mean accepted against
+/// the block threshold `min` scaled to the rows the step verifies
+/// (`offered + 1` of a block's `MAX_DRAFTS + 1`). `None` until every
+/// sequence has a full window at that width.
+fn narrow_pays<'a>(
+    windows: impl Iterator<Item = (&'a [u32], usize)>,
+    offered: usize,
+    min: f32,
+) -> Option<(bool, f32)> {
+    let (mut sum, mut steps) = (0u32, 0usize);
+    for (window, width) in windows {
+        if window.len() < WINDOW || width != offered {
+            return None;
+        }
+        sum += window.iter().sum::<u32>();
+        steps += window.len();
+    }
+    if steps < 2 * WINDOW {
+        return None;
+    }
+    let mean = sum as f32 / steps as f32;
+    let floor = min * (offered + 1) as f32 / (super::dflash_width::MAX_DRAFTS + 1) as f32;
+    Some((mean >= floor, mean))
+}
+
+/// After a batched verify of narrow steps: when the batch's drafts stop
+/// paying, hold every member to plain batched decode until the re-probe.
+/// The members stop together because a batch that drafts for one sequence
+/// and not the other runs two forwards a step.
+pub(crate) fn judge_narrow(
+    batch: &mut [&mut ActiveSeq],
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+) {
+    if !sched.levers.dflash_adaptive {
+        return;
+    }
+    let Some(offered) = batch
+        .iter()
+        .find(|a| !a.finished)
+        .map(|a| a.spec_adapt.narrow_offered)
+    else {
+        return;
+    };
+    let live = batch.iter().filter(|a| !a.finished);
+    let verdict = narrow_pays(
+        live.map(|a| (a.spec_adapt.narrow.as_slice(), a.spec_adapt.narrow_offered)),
+        offered,
+        sched.levers.dflash_adaptive_min,
+    );
+    if let Some((false, mean)) = verdict {
+        for a in batch.iter_mut() {
+            a.spec_adapt.hold = sched.levers.dflash_adaptive_reprobe;
+            a.spec_adapt.narrow.clear();
+        }
+        tracing::info!(
+            "adaptive spec: batch HELD (mean accepted {mean:.2} of {offered} offered over \
+             {WINDOW} steps) — plain decode until re-probe"
+        );
+    }
+}
+
+/// Whether this sequence's batch is held to plain decode.
+pub(crate) fn held(a: &ActiveSeq) -> bool {
+    a.spec_adapt.hold > 0
+}
+
+/// Once a scheduler step: whether a hold keeps this step's sequences on
+/// plain batched decode, counting the step against it. A sequence left
+/// alone drops its hold (alone it drafts whole blocks, judged by its own
+/// window).
+pub(crate) fn plain_hold_step(active: &mut [ActiveSeq]) -> bool {
+    if active.len() < 2 {
+        for a in active.iter_mut() {
+            a.spec_adapt.hold = 0;
+        }
+        return false;
+    }
+    let held = active.iter().any(held);
+    for a in active.iter_mut() {
+        a.spec_adapt.hold = a.spec_adapt.hold.saturating_sub(1);
+    }
+    held
+}
 
 /// Record one K=γ verify step's accept count; may trip suspension.
 /// Call after `num_accepted` is known (verify_dflash_step).
@@ -121,3 +243,31 @@ pub(crate) fn tick_serial(a: &mut ActiveSeq, sched: &crate::scheduler::sched_ctx
 // `::dflash_unified_ctx`, resolved once per run and read through `SchedCtx`.
 
 // The `ATLAS_DFLASH_ADAPTIVE*` statics are now `SchedLevers::dflash_adaptive*`.
+
+#[cfg(test)]
+mod tests {
+    use super::{WINDOW, narrow_pays};
+
+    #[test]
+    fn only_whole_blocks_feed_the_window() {
+        assert!(super::judges_block(7) && super::judges_block(15));
+        assert!(!super::judges_block(2) && !super::judges_block(3));
+    }
+
+    #[test]
+    fn narrow_steps_are_judged_pooled_at_the_scaled_threshold() {
+        let (code, prose) = ([1u32; WINDOW], [0u32; WINDOW]);
+        let pays = |w: &[&[u32]], min| narrow_pays(w.iter().map(|w| (*w, 2)), 2, min);
+        // 3 rows of a block's 8, at a 2.0 block threshold: 0.75 a step
+        assert_eq!(pays(&[&code, &code], 2.0), Some((true, 1.0)));
+        assert_eq!(pays(&[&code, &prose], 2.0), Some((false, 0.5)));
+        assert_eq!(pays(&[&prose, &prose], 2.0), Some((false, 0.0)));
+        // a lower block threshold (0.26 a step) keeps the mixed pair drafting
+        assert_eq!(pays(&[&code, &prose], 0.7), Some((true, 0.5)));
+        // no verdict before every window is full, at one width, for two or more
+        assert_eq!(pays(&[&code, &prose[..WINDOW - 1]], 2.0), None);
+        assert_eq!(pays(&[&code], 2.0), None);
+        let widths = [(&code[..], 2), (&prose[..], 3)];
+        assert_eq!(narrow_pays(widths.into_iter(), 2, 2.0), None);
+    }
+}

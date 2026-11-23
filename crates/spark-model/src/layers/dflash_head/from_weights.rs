@@ -1037,6 +1037,7 @@ impl BlockDiffusionDraftHead {
                 head.lm_head_shared,
                 head.vocab_size,
                 head.hidden_size,
+                head.gamma,
                 head.kernels.dense_gemm,
                 gpu,
             )?);

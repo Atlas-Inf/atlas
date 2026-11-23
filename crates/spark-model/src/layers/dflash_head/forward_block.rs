@@ -558,6 +558,13 @@ impl BlockDiffusionDraftHead {
                 self.rms_norm_eps,
                 stream,
             )?;
+            // A step's group takes this sequence's rows for its one head
+            // pass (`inkling_group.rs`); its drafts come from the group.
+            if let Some(ink) = self.inkling.as_ref()
+                && self.inkling_group_hold(ink, gpu, norm_noise_local, scratch, stream)?
+            {
+                return Ok(());
+            }
             // Phase G: lm_head GEMM. Largest GEMM in the drafter
             // (γ × vocab=248320). FP8 path uses the small-M kernel
             // fp8_gemm_t_row_scaled_m16 (M_TILE=16, 1 warp/CTA) against
@@ -972,7 +979,7 @@ impl BlockDiffusionDraftHead {
                 // runs eagerly.
                 let tail_handle = graphs[tail_slot];
                 let short = scratch.inkling.as_ref().and_then(|s| s.short_tail());
-                if tail_handle.0 != 0 && short.is_none() {
+                if tail_handle.0 != 0 && short.is_none() && !self.inkling_group_open() {
                     gpu.launch_graph(tail_handle, stream)?;
                 } else {
                     run_tail()?;
@@ -1043,13 +1050,20 @@ impl BlockDiffusionDraftHead {
                         }
                     }
 
-                    // tail subgraph, always the whole block's steps
+                    // tail subgraph, always the whole block's steps and
+                    // never a group's hold
                     if let Some(s) = scratch.inkling.as_ref() {
                         s.set_tail_steps(self.gamma, self.gamma);
+                        s.set_inline_tail(true);
                     }
                     gpu.begin_capture(stream)?;
-                    run_tail()?;
-                    let tail_graph = gpu.end_capture(stream)?;
+                    let captured = run_tail();
+                    let tail_graph = gpu.end_capture(stream);
+                    if let Some(s) = scratch.inkling.as_ref() {
+                        s.set_inline_tail(false);
+                    }
+                    captured?;
+                    let tail_graph = tail_graph?;
                     new_graphs.push(tail_graph);
                     if tail_graph.0 != 0 {
                         gpu.launch_graph(tail_graph, stream)?;
@@ -1069,6 +1083,11 @@ impl BlockDiffusionDraftHead {
             }
         } else {
             run_all_eager()?;
+        }
+
+        // Held for the step's group: its head pass produces these drafts.
+        if scratch.inkling.as_ref().is_some_and(|s| s.take_held()) {
+            return Ok(Vec::new());
         }
 
         // ── Step 6: D2H γ × 4 bytes ──

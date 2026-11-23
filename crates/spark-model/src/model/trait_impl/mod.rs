@@ -830,6 +830,17 @@ impl Model for TransformerModel {
             None => 2,
         }
     }
+    fn mtp_group_begin(&self, members: usize, drafts: usize) -> bool {
+        self.proposer
+            .as_ref()
+            .is_some_and(|p| p.group_begin(members, drafts))
+    }
+    fn mtp_group_finish(&self) -> Result<Vec<Vec<u32>>> {
+        match &self.proposer {
+            Some(p) => p.group_finish(self.gpu.as_ref(), self.gpu.default_stream()),
+            None => Ok(Vec::new()),
+        }
+    }
     fn dflash_tree_supported(&self) -> bool {
         self.dflash_tree_supported_impl()
     }
