@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `VisionTower` — the model-side handle on either vision encoder family:
-//! the Qwen-VL tower (`VisionEncoder`) or the omni RADIO tower
-//! (`RadioVisionTower`). The prefill splice sites stay one-liners via
+//! `VisionTower` — the model-side handle on a vision encoder family:
+//! the Qwen-VL tower (`VisionEncoder`), the omni RADIO tower
+//! (`RadioVisionTower`) or Inkling 2's (`Inkling2VisionTower`). The prefill splice sites stay one-liners via
 //! `forward_batched` / `out_row` / `out_hidden_size` on the enum.
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
+use crate::inkling2_vision::Inkling2VisionTower;
 use crate::radio_tower::RadioVisionTower;
 
 use super::VisionEncoder;
@@ -15,6 +16,7 @@ use super::VisionEncoder;
 pub enum VisionTower {
     Qwen(Box<VisionEncoder>),
     Radio(Box<RadioVisionTower>),
+    Inkling2(Box<Inkling2VisionTower>),
 }
 
 impl VisionTower {
@@ -23,6 +25,7 @@ impl VisionTower {
         match self {
             VisionTower::Qwen(v) => v.buf_out,
             VisionTower::Radio(r) => r.buf_out,
+            VisionTower::Inkling2(t) => t.buf_out,
         }
     }
 
@@ -30,7 +33,7 @@ impl VisionTower {
     pub fn lent_scratch_bytes(&self) -> usize {
         match self {
             VisionTower::Qwen(v) => v.lent_scratch_bytes(),
-            VisionTower::Radio(_) => 0,
+            VisionTower::Radio(_) | VisionTower::Inkling2(_) => 0,
         }
     }
 
@@ -38,7 +41,9 @@ impl VisionTower {
     pub fn attach_lent_scratch(&mut self, base: DevicePtr, borrowed: bool) -> Result<()> {
         match self {
             VisionTower::Qwen(v) => v.attach_lent_scratch(base, borrowed),
-            VisionTower::Radio(_) => anyhow::bail!("the RADIO tower takes no lent scratch"),
+            VisionTower::Radio(_) | VisionTower::Inkling2(_) => {
+                anyhow::bail!("this vision tower takes no lent scratch")
+            }
         }
     }
 
@@ -56,6 +61,7 @@ impl VisionTower {
         match self {
             VisionTower::Qwen(v) => v.out_hidden_size,
             VisionTower::Radio(r) => r.out_hidden_size,
+            VisionTower::Inkling2(t) => t.out_hidden_size,
         }
     }
 
@@ -70,14 +76,14 @@ impl VisionTower {
     ) -> Result<Vec<(usize, usize, usize)>> {
         match self {
             VisionTower::Qwen(v) => v.forward_items(items, gpu, stream),
-            VisionTower::Radio(r) => {
+            VisionTower::Radio(_) | VisionTower::Inkling2(_) => {
                 let mut images = Vec::new();
                 for item in items {
                     for group in item.groups.iter() {
                         images.push((group.as_slice(), item.grid_h, item.grid_w));
                     }
                 }
-                r.forward_batched(&images, gpu, stream)
+                self.forward_batched(&images, gpu, stream)
             }
         }
     }
@@ -89,6 +95,7 @@ impl VisionTower {
         match self {
             VisionTower::Qwen(v) => v.output_rows(),
             VisionTower::Radio(r) => r.p_max / 4,
+            VisionTower::Inkling2(t) => t.output_rows(),
         }
     }
 
@@ -103,6 +110,7 @@ impl VisionTower {
         match self {
             VisionTower::Qwen(v) => v.forward_batched(images, gpu, stream),
             VisionTower::Radio(r) => r.forward_batched(images, gpu, stream),
+            VisionTower::Inkling2(t) => t.forward_batched(images, gpu, stream),
         }
     }
 }

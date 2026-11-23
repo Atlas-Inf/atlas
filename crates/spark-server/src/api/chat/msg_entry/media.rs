@@ -109,6 +109,12 @@ pub(super) fn preprocess_media(
                 admission.note(probed.pad_count(sms))?;
                 Sized::Still(probed)
             }
+            MediaKind::Video if vcfg.is_inkling2 => {
+                return Err(openai_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "this model takes images, not video".to_string(),
+                ));
+            }
             MediaKind::Video => {
                 // Decoded before admission (no header probe): under the
                 // large-decode gate, so videos cannot add to the decode peak.
@@ -193,7 +199,9 @@ pub(super) fn preprocess_media(
                         Vec::new(),
                         false, // GLM path: qwen3vl=false
                     )?);
-                } else {
+                } else if !vcfg.is_inkling2 {
+                    // Inkling's template writes one image token per image;
+                    // `expand_vision_pads` repeats it (no start/end markers).
                     qwen_placeholders.push(QwenVisionPlaceholder {
                         kind: QwenVisionKind::Image,
                         pad_count: pad_counts[idx],

@@ -189,6 +189,7 @@ pub fn parse_nemotron_h_omni(raw: &serde_json::Value) -> Result<ModelConfig> {
         config.vision = Some(crate::config::VisionConfig {
             is_glm5_next: false,
             is_qwen3vl_video: false,
+            is_inkling2: false,
             in_channels: 3,
             depth: g("num_hidden_layers"),
             hidden_size: g("hidden_size"),

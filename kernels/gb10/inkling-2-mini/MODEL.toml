@@ -1,7 +1,8 @@
 # Thinking Machines Inkling 2 Mini (`model_type: inkling2_loop`), Strict.
-# Work in progress: no DSpark drafter, no vision tower, no CUDA graphs. Its
-# message blocks reach the reasoning and tool paths through spark-server's
-# inkling_turn.rs (reasoning parser `inkling2`, tool parser `hermes`).
+# Its message blocks reach the reasoning and tool paths through spark-server's
+# inkling_turn.rs (reasoning parser `inkling2`, tool parser `hermes`). Images:
+# the checkpoint's 23-layer ViT (`vision_encoder` module, spark-model's
+# inkling2_vision.rs), one token per 40x40 pixel tile, no resize.
 #
 # 24 physical layers (20 sliding-window 1024 + 4 full), the core 6-17 run
 # three times with shared weights: the engine sees 48 visits, each with its
@@ -42,7 +43,7 @@ moe_routing_bias = true
 vocab_size = 201024
 max_position_embeddings = 1048576
 sliding_window = 1024
-vision = false
+vision = true
 mtp_layers = 0
 
 # Neutral presets until the release's own defaults are wired; request values win.

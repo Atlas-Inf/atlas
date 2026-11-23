@@ -20,6 +20,7 @@ pub(crate) const HEADS: usize = 2;
 pub(crate) fn config() -> VisionConfig {
     VisionConfig {
         is_qwen3vl_video: false,
+        is_inkling2: false,
         is_glm5_next: true,
         in_channels: 3,
         depth: 2,

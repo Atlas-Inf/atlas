@@ -119,7 +119,7 @@ impl InklingDspark {
             "Inkling 2 DSpark needs the target's BF16 head and Markov rank {RANK}"
         );
         ensure!(
-            !w.target_embed_norm.is_null() && !w.target_final_norm.is_null(),
+            !w.target_final_norm.is_null(),
             "Inkling 2 DSpark: target norms not attached"
         );
         let bf16 = 2;
