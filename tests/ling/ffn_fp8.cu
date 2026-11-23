@@ -179,9 +179,12 @@ int main() {
     auto input = managed<__nv_bfloat16>(kHidden);
     auto activations = managed<unsigned char>(kHidden);
     auto activation_scales = managed<float>(input_groups);
-    auto gate_weight = managed<__nv_fp8_e4m3>(kIntermediate * kHidden);
-    auto up_weight = managed<__nv_fp8_e4m3>(kIntermediate * kHidden);
-    auto down_weight = managed<__nv_fp8_e4m3>(kHidden * kIntermediate);
+    auto gate_weight_base = managed<__nv_fp8_e4m3>(kIntermediate * kHidden + 1);
+    auto gate_weight = gate_weight_base + 1;
+    auto up_weight_base = managed<__nv_fp8_e4m3>(kIntermediate * kHidden + 2);
+    auto up_weight = up_weight_base + 2;
+    auto down_weight_base = managed<__nv_fp8_e4m3>(kHidden * kIntermediate + 3);
+    auto down_weight = down_weight_base + 3;
     auto gate_scale = managed<float>(gate_scale_count);
     auto up_scale = managed<float>(gate_scale_count);
     auto down_scale = managed<float>(down_scale_count);
@@ -285,7 +288,7 @@ int main() {
     release(down_scale_ptrs); release(up_scale_ptrs); release(gate_scale_ptrs);
     release(down_ptrs); release(up_ptrs); release(gate_ptrs);
     release(down_scale); release(up_scale); release(gate_scale);
-    release(down_weight); release(up_weight); release(gate_weight);
+    release(down_weight_base); release(up_weight_base); release(gate_weight_base);
     release(activation_scales); release(activations); release(input);
     return 0;
 }

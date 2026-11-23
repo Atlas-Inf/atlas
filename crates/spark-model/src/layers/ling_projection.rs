@@ -36,7 +36,7 @@ enum Format {
     },
     Fp8 {
         scales: DevicePtr,
-        bf16: bool,
+        gemm: KernelHandle,
         quant: KernelHandle,
         linear: KernelHandle,
     },
@@ -86,8 +86,13 @@ impl LingProjection {
                     s.dtype
                 );
                 Format::Fp8 {
-                    scales: s.ptr,
-                    bf16: s.dtype == WeightDtype::BF16,
+                    scales: crate::weight_map::dense_keep_f32(
+                        store,
+                        &format!("{name}.weight_scale_inv"),
+                        gpu,
+                    )?
+                    .weight,
+                    gemm: gpu.kernel("fp8_gemm_t_blockscaled", "fp8_gemm_t_blockscaled")?,
                     quant: gpu.kernel("per_token_group_quant_fp8", "per_token_group_quant_fp8")?,
                     linear: gpu.kernel("ling_fp8_linear", "ling_fp8_linear")?,
                 }
@@ -130,7 +135,7 @@ impl LingProjection {
             }
             Format::Fp8 {
                 scales,
-                bf16,
+                gemm,
                 quant,
                 linear,
             } => {
@@ -151,6 +156,21 @@ impl LingProjection {
                     self.k,
                     stream,
                 )?;
+                if rows >= 16 {
+                    return ops::fp8_gemm_t_blockscaled(
+                        gpu,
+                        gemm,
+                        scratch.act,
+                        scratch.scales,
+                        self.weight,
+                        scales,
+                        output,
+                        rows,
+                        self.n,
+                        self.k,
+                        stream,
+                    );
+                }
                 KernelLaunch::new(gpu, linear)
                     .grid([self.n.div_ceil(8), rows, 1])
                     .block([256, 1, 1])
@@ -161,17 +181,9 @@ impl LingProjection {
                     .arg_ptr(output)
                     .arg_u32(self.n)
                     .arg_u32(self.k)
-                    .arg_u32(u32::from(bf16))
+                    .arg_u32(0)
                     .launch(stream)
             }
         }
-    }
-
-    /// Whether this projection can consume a row-major BF16 token matrix
-    /// directly.  Original FP8 projections still use the one-row dynamic
-    /// quantizer scratch owned by the decoder; callers must not mistake that
-    /// scratch for a batched activation buffer.
-    pub(crate) fn is_bf16(&self) -> bool {
-        matches!(self.format, Format::Bf16 { .. })
     }
 }

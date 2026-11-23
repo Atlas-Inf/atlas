@@ -62,28 +62,25 @@ impl LingDenseFfn {
         Ok(self.output)
     }
 
-    /// Batched BF16 dense FFN for the prefill path.  The arena's expert
-    /// matrices are sized for `[M, intermediate]` on Ling (the routed
-    /// `top_k * moe_intermediate` width is the same 6144-wide slab), so this
-    /// uses the token matrix in one gate/up/down GEMM sequence instead of
-    /// replaying the decode GEMV once per token.  Original-FP8 dense layers
-    /// deliberately return `Ok(false)`: their projection scratch is one row
-    /// wide and the caller keeps the numerically ordered fallback.
+    /// The shared arena supplies batched activation and scale storage for both formats.
     fn forward_batched(
         &self,
         input: DevicePtr,
         num_tokens: usize,
         ctx: &ForwardContext<'_>,
         stream: u64,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         ensure!(
             num_tokens > 0,
             "Ling dense FFN prefill requires at least one token"
         );
-        if !(self.gate.is_bf16() && self.up.is_bf16() && self.down.is_bf16()) {
-            return Ok(false);
-        }
         let sizes = ctx.buffers.sizes();
+        let projection = LingProjectionScratch::new(
+            ctx.buffers.fp8_act(),
+            ctx.buffers.fp8_act_bytes(),
+            ctx.buffers.fp8_act_scale(),
+            sizes.fp8_act_scale,
+        );
         let bf16 = std::mem::size_of::<u16>();
         let intermediate_bytes = num_tokens
             .checked_mul(self.intermediate)
@@ -108,9 +105,9 @@ impl LingDenseFfn {
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
         self.gate
-            .forward(ctx.gpu, input, gate_out, rows, self.projection, stream)?;
+            .forward(ctx.gpu, input, gate_out, rows, projection, stream)?;
         self.up
-            .forward(ctx.gpu, input, up_out, rows, self.projection, stream)?;
+            .forward(ctx.gpu, input, up_out, rows, projection, stream)?;
         ops::silu_mul(
             ctx.gpu,
             self.silu_k,
@@ -126,10 +123,10 @@ impl LingDenseFfn {
             gate_out,
             ctx.buffers.moe_output(),
             rows,
-            self.projection,
+            projection,
             stream,
         )?;
-        Ok(true)
+        Ok(())
     }
 }
 
@@ -522,7 +519,8 @@ impl LingDecoderLayer {
         )?;
 
         let batched = if let Some(ffn) = &self.dense_ffn {
-            ffn.forward_batched(ctx.buffers.norm_output(), num_tokens, ctx, stream)?
+            ffn.forward_batched(ctx.buffers.norm_output(), num_tokens, ctx, stream)?;
+            true
         } else if let FfnComponent::LingMoe(ffn) = &self.ffn {
             if ffn.supports_batched_prefill() {
                 self.ffn

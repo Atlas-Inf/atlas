@@ -76,7 +76,17 @@ __device__ __forceinline__ void ling_load_four(const unsigned char* src, float (
     #pragma unroll
     for (int i = 0; i < 4; ++i) out[i] = ling_decode_e4m3(src[i]);
 #else
-    const unsigned int word = *reinterpret_cast<const unsigned int*>(src);
+    // Safetensors can place an E4M3 matrix at any byte offset. GB10 reads
+    // those expert pages directly from the original file mapping.
+    unsigned int word;
+    if ((reinterpret_cast<size_t>(src) & 3u) == 0) {
+        word = *reinterpret_cast<const unsigned int*>(src);
+    } else {
+        word = static_cast<unsigned int>(src[0])
+             | (static_cast<unsigned int>(src[1]) << 8)
+             | (static_cast<unsigned int>(src[2]) << 16)
+             | (static_cast<unsigned int>(src[3]) << 24);
+    }
     const __half2 low = __nv_cvt_fp8x2_to_halfraw2(static_cast<unsigned short>(word), __NV_E4M3);
     const __half2 high = __nv_cvt_fp8x2_to_halfraw2(static_cast<unsigned short>(word >> 16), __NV_E4M3);
     const float2 a = __half22float2(low);

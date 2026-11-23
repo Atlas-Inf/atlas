@@ -20,18 +20,18 @@ def main():
             w = shard.get_tensor(name + '.weight')
             s = shard.get_tensor(name + '.weight_scale_inv')
             n, k = w.shape
-            for m in (1,9):
+            for m in (1,9,17,65):
                 # Set the maximum of each block to a power-of-two multiple
                 # of 448. Both implementations then quantize identical ties.
                 x = torch.randn(m,k,generator=generator).bfloat16()
                 x[:,::128] = 7
                 baseline = block_fp8(x,w,s)
-                xg,wg,sg = x.cuda(),w.cuda(),s.cuda()
+                xg,wg,sg = x.cuda(),w.cuda(),s.float().cuda()
                 ag = torch.empty_like(xg,dtype=w.dtype)
                 ax = torch.empty((m,k//128),device='cuda',dtype=torch.float32)
                 y = torch.empty((m,n),device='cuda',dtype=torch.bfloat16)
                 torch.cuda.synchronize()
-                code = project(*(v.data_ptr() for v in (xg,ag,ax,wg,sg,y)),m,n,k,int(s.dtype==torch.bfloat16))
+                code = project(*(v.data_ptr() for v in (xg,ag,ax,wg,sg,y)),m,n,k,int(sg.dtype==torch.bfloat16))
                 if code:
                     raise RuntimeError(f'CUDA error {code}')
                 actual = y.cpu()
