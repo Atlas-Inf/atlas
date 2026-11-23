@@ -78,7 +78,7 @@ impl LingKdaWeights {
     /// Load the KDA names below `prefix` from an existing [`WeightStore`].
     /// Projection tensors use `<name>.weight`; the remaining names match the
     /// Ling checkpoint exactly (`A_log`, `dt_bias`, and `o_norm.weight`).
-    pub fn load(store: &WeightStore, prefix: &str) -> Result<Self> {
+    pub fn load(gpu: &dyn GpuBackend, store: &WeightStore, prefix: &str) -> Result<Self> {
         let name = |local: &str| {
             if prefix.is_empty() {
                 local.to_owned()
@@ -125,42 +125,49 @@ impl LingKdaWeights {
 
         Ok(Self {
             q_proj: LingProjection::load(
+                gpu,
                 store,
                 &name("q_proj"),
                 LING_KDA_PROJECTION_SIZE,
                 LING_KDA_HIDDEN_SIZE,
             )?,
             k_proj: LingProjection::load(
+                gpu,
                 store,
                 &name("k_proj"),
                 LING_KDA_PROJECTION_SIZE,
                 LING_KDA_HIDDEN_SIZE,
             )?,
             v_proj: LingProjection::load(
+                gpu,
                 store,
                 &name("v_proj"),
                 LING_KDA_PROJECTION_SIZE,
                 LING_KDA_HIDDEN_SIZE,
             )?,
             f_proj: LingProjection::load(
+                gpu,
                 store,
                 &name("f_proj"),
                 LING_KDA_PROJECTION_SIZE,
                 LING_KDA_HIDDEN_SIZE,
             )?,
             b_proj: LingProjection::load(
+                gpu,
                 store,
                 &name("b_proj"),
                 LING_KDA_HEADS,
                 LING_KDA_HIDDEN_SIZE,
             )?,
             g_proj: LingProjection::load(
+                gpu,
                 store,
                 &name("g_proj"),
                 LING_KDA_PROJECTION_SIZE,
                 LING_KDA_HIDDEN_SIZE,
             )?,
             o_proj: LingProjection::load(
+                gpu,
                 store,
                 &name("o_proj"),
                 LING_KDA_HIDDEN_SIZE,

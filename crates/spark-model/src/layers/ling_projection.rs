@@ -2,7 +2,7 @@
 //! Original BF16 or dynamic W8A8 projections for the Ling trunk on one GPU.
 
 use anyhow::{Result, bail, ensure};
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
@@ -30,8 +30,16 @@ impl LingProjectionScratch {
 
 #[derive(Clone, Copy)]
 enum Format {
-    Bf16,
-    Fp8 { scales: DevicePtr, bf16: bool },
+    Bf16 {
+        gemv: KernelHandle,
+        gemm: KernelHandle,
+    },
+    Fp8 {
+        scales: DevicePtr,
+        bf16: bool,
+        quant: KernelHandle,
+        linear: KernelHandle,
+    },
 }
 
 pub struct LingProjection {
@@ -42,7 +50,13 @@ pub struct LingProjection {
 }
 
 impl LingProjection {
-    pub fn load(store: &WeightStore, name: &str, rows: usize, cols: usize) -> Result<Self> {
+    pub fn load(
+        gpu: &dyn GpuBackend,
+        store: &WeightStore,
+        name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
         ensure!(rows > 0 && cols > 0, "empty Ling projection {name}");
         let w = store.get(&format!("{name}.weight"))?;
         ensure!(
@@ -51,7 +65,10 @@ impl LingProjection {
             w.shape
         );
         let format = match w.dtype {
-            WeightDtype::BF16 => Format::Bf16,
+            WeightDtype::BF16 => Format::Bf16 {
+                gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
+                gemm: gpu.kernel("gemm_tc", "dense_gemm_tc")?,
+            },
             WeightDtype::FP8E4M3 => {
                 ensure!(
                     cols.is_multiple_of(128),
@@ -71,6 +88,8 @@ impl LingProjection {
                 Format::Fp8 {
                     scales: s.ptr,
                     bf16: s.dtype == WeightDtype::BF16,
+                    quant: gpu.kernel("per_token_group_quant_fp8", "per_token_group_quant_fp8")?,
+                    linear: gpu.kernel("ling_fp8_linear", "ling_fp8_linear")?,
                 }
             }
             other => bail!("{name}: unsupported Ling projection dtype {other:?}"),
@@ -97,36 +116,24 @@ impl LingProjection {
             "invalid Ling projection row count {rows}"
         );
         match self.format {
-            Format::Bf16 => {
+            Format::Bf16 { gemv, gemm } => {
                 let weight = DenseWeight {
                     weight: self.weight,
                 };
                 if rows == 1 {
-                    ops::dense_gemv(
-                        gpu,
-                        gpu.kernel("gemv", "dense_gemv_bf16")?,
-                        input,
-                        &weight,
-                        output,
-                        self.n,
-                        self.k,
-                        stream,
-                    )
+                    ops::dense_gemv(gpu, gemv, input, &weight, output, self.n, self.k, stream)
                 } else {
                     ops::dense_gemm_tc(
-                        gpu,
-                        gpu.kernel("gemm_tc", "dense_gemm_tc")?,
-                        input,
-                        &weight,
-                        output,
-                        rows,
-                        self.n,
-                        self.k,
-                        stream,
+                        gpu, gemm, input, &weight, output, rows, self.n, self.k, stream,
                     )
                 }
             }
-            Format::Fp8 { scales, bf16 } => {
+            Format::Fp8 {
+                scales,
+                bf16,
+                quant,
+                linear,
+            } => {
                 let elems = (rows as usize)
                     .checked_mul(self.k as usize)
                     .ok_or_else(|| anyhow::anyhow!("Ling FP8 scratch size overflow"))?;
@@ -136,7 +143,7 @@ impl LingProjection {
                 );
                 ops::per_token_group_quant_fp8(
                     gpu,
-                    gpu.kernel("per_token_group_quant_fp8", "per_token_group_quant_fp8")?,
+                    quant,
                     input,
                     scratch.act,
                     scratch.scales,
@@ -144,7 +151,7 @@ impl LingProjection {
                     self.k,
                     stream,
                 )?;
-                KernelLaunch::new(gpu, gpu.kernel("ling_fp8_linear", "ling_fp8_linear")?)
+                KernelLaunch::new(gpu, linear)
                     .grid([self.n.div_ceil(8), rows, 1])
                     .block([256, 1, 1])
                     .arg_ptr(scratch.act)

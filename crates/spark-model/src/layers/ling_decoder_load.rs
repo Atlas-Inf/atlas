@@ -59,6 +59,7 @@ pub fn load_ling_layers(
                 LingAttention::Kda {
                     layer: LingKdaLayer::new(
                         crate::layers::ling_kda::LingKdaWeights::load(
+                            gpu,
                             store,
                             &format!("{prefix}.attention"),
                         )?,
@@ -90,6 +91,7 @@ pub fn load_ling_layers(
                 (
                     LingAttention::Mla {
                         weights: LingMlaWeights::load(
+                            gpu,
                             store,
                             &format!("{prefix}.attention"),
                             mla,
@@ -177,18 +179,21 @@ fn load_dense_ffn(
     )?;
     Ok(LingDenseFfn {
         gate: LingProjection::load(
+            gpu,
             store,
             &format!("{prefix}.mlp.gate_proj"),
             intermediate,
             hidden,
         )?,
         up: LingProjection::load(
+            gpu,
             store,
             &format!("{prefix}.mlp.up_proj"),
             intermediate,
             hidden,
         )?,
         down: LingProjection::load(
+            gpu,
             store,
             &format!("{prefix}.mlp.down_proj"),
             hidden,

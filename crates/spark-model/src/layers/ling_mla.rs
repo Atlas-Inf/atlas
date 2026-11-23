@@ -101,6 +101,7 @@ pub struct LingMlaWeights {
 
 impl LingMlaWeights {
     pub fn load(
+        gpu: &dyn GpuBackend,
         store: &WeightStore,
         prefix: &str,
         config: LingMlaConfig,
@@ -123,8 +124,9 @@ impl LingMlaWeights {
             "{prefix}.kv_a_layernorm.weight must be BF16"
         );
         Ok(Self {
-            q_proj: LingProjection::load(store, &format!("{prefix}.q_proj"), q, h)?,
+            q_proj: LingProjection::load(gpu, store, &format!("{prefix}.q_proj"), q, h)?,
             kv_a_proj_with_mqa: LingProjection::load(
+                gpu,
                 store,
                 &format!("{prefix}.kv_a_proj_with_mqa"),
                 kv_a,
@@ -132,13 +134,21 @@ impl LingMlaWeights {
             )?,
             kv_a_layernorm: DenseWeight { weight: norm.ptr },
             kv_b_proj: LingProjection::load(
+                gpu,
                 store,
                 &format!("{prefix}.kv_b_proj"),
                 kv_b,
                 config.kv_lora_rank,
             )?,
-            g_proj: LingProjection::load(store, &format!("{prefix}.g_proj"), config.num_heads, h)?,
+            g_proj: LingProjection::load(
+                gpu,
+                store,
+                &format!("{prefix}.g_proj"),
+                config.num_heads,
+                h,
+            )?,
             dense: LingProjection::load(
+                gpu,
                 store,
                 &format!("{prefix}.dense"),
                 h,

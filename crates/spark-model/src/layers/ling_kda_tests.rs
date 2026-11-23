@@ -130,7 +130,7 @@ fn pinned_geometry_matches_kda_kernel_contract() {
 #[test]
 fn mock_decode_dispatches_direct_kda_chain_and_separate_residual() {
     let gpu = MockGpuBackend::new();
-    let weights = LingKdaWeights::load(&test_store(), "").unwrap();
+    let weights = LingKdaWeights::load(&gpu, &test_store(), "").unwrap();
     let layer = LingKdaLayer::new(weights, LingKdaConfig::pinned(), &gpu).unwrap();
     let state = LingKdaState {
         q_conv: DevicePtr(0x20_0000),
@@ -165,7 +165,7 @@ fn mock_decode_dispatches_direct_kda_chain_and_separate_residual() {
 #[test]
 fn mock_prefill_dispatches_one_batched_kda_chain() {
     let gpu = MockGpuBackend::new();
-    let weights = LingKdaWeights::load(&test_store(), "").unwrap();
+    let weights = LingKdaWeights::load(&gpu, &test_store(), "").unwrap();
     let layer = LingKdaLayer::new(weights, LingKdaConfig::pinned(), &gpu).unwrap();
     let state = LingKdaState {
         q_conv: DevicePtr(0x21_0000),
@@ -199,7 +199,7 @@ fn config_rejects_non_pinned_decay_bound() {
         lower_bound: -4.0,
         ..LingKdaConfig::pinned()
     };
-    let weights = LingKdaWeights::load(&test_store(), "").unwrap();
+    let weights = LingKdaWeights::load(&gpu, &test_store(), "").unwrap();
     let err = match LingKdaLayer::new(weights, config, &gpu) {
         Ok(_) => panic!("non-pinned KDA config unexpectedly accepted"),
         Err(err) => err,
