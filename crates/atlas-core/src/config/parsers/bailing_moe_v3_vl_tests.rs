@@ -120,6 +120,9 @@ fn parses_reference_hybrid_layout_and_quantization() {
 #[test]
 fn parses_the_exact_upstream_3_2_air_config() {
     let config = parse_config(EXACT).expect("exact Ling 3.2 air config");
+    assert_eq!(config.kda_gate_lower_bound, -5.0);
+    assert_eq!(config.ssm_h_state_bytes(), 32 * 128 * 128 * 4);
+    assert_eq!(config.ssm_conv_state_bytes(), 3 * 4096 * 4 * 4);
     assert_eq!(config.layer_types.len(), 42);
     assert_eq!(config.layer_types[5], LayerType::FullAttention);
     assert_eq!(config.layer_types[41], LayerType::FullAttention);

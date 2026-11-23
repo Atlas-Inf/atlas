@@ -181,7 +181,8 @@ pub(crate) fn parse_bailing_moe_v3_vl(raw: &Value) -> Result<ModelConfig> {
     );
     ensure!(usize_field(text, "n_group")? == 8 && usize_field(text, "topk_group")? == 4);
     ensure!(usize_field(text, "group_norm_size")? == 1);
-    ensure!(f64_field(text, "kda_lower_bound")? == -5.0);
+    let decay_lower_bound = f64_field(text, "kda_lower_bound")?;
+    ensure!(decay_lower_bound == -5.0);
     expect_reference_lists(text, layers)?;
 
     let vision = parse_vision(raw, text)?;
@@ -208,6 +209,7 @@ pub(crate) fn parse_bailing_moe_v3_vl(raw: &Value) -> Result<ModelConfig> {
         })
         .collect();
     config.full_attention_interval = group;
+    config.kda_gate_lower_bound = decay_lower_bound as f32;
     config.mlp_only_layers = (0..first_dense).collect();
     config.linear_num_key_heads = heads;
     config.linear_key_head_dim = head_dim;
