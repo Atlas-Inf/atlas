@@ -335,6 +335,60 @@ fn run_qwen3vl(
     (t, h, w)
 }
 
+fn run_ling(
+    tokens: &[u32],
+    grids: &[(usize, usize, usize)],
+    start: u32,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let (mut t, mut h, mut w) = (Vec::new(), Vec::new(), Vec::new());
+    build_ling(
+        tokens,
+        grids,
+        0,
+        grids.len(),
+        start,
+        IMG,
+        VID,
+        &mut t,
+        &mut h,
+        &mut w,
+    );
+    (t, h, w)
+}
+
+// ── Ling body-diagonal form ─────────────────────────────────────────────
+
+#[test]
+fn ling_image_uses_centered_spatial_axes_and_one_post_media_position() {
+    let tokens = [TXT, IMG, IMG, IMG, IMG, TXT];
+    let (t, h, w) = run_ling(&tokens, &[(1, 2, 2)], 0);
+
+    // The reference computes base=1, T=1 for the still, then starts the
+    // trailing text at max(T)+1=2. Even-sized axes use integer floor offsets.
+    assert_eq!(t, vec![0, 1, 1, 1, 1, 2]);
+    assert_eq!(h, vec![0, 1, 1, 2, 2, 2]);
+    assert_eq!(w, vec![0, 1, 2, 1, 2, 2]);
+}
+
+#[test]
+fn ling_video_advances_t_by_two_and_preserves_signed_center_offsets() {
+    let mut tokens = vec![VID; 18];
+    tokens.push(TXT);
+    let (t, h, w) = run_ling(&tokens, &[(2, 3, 3)], 0);
+
+    // Two 3x3 groups: T=0 then 2; H/W are body-diagonal coordinates with
+    // offset -(3-1)//2=-1. The final text position is last(T)+1=3.
+    assert_eq!(t[0..9], [0; 9]);
+    assert_eq!(&t[9..], &[2; 9]);
+    assert_eq!(t.last(), Some(&3));
+    let hi: Vec<i32> = h.iter().map(|&v| v as i32).collect();
+    let wi: Vec<i32> = w.iter().map(|&v| v as i32).collect();
+    assert_eq!(&hi[0..9], &[-1, -1, -1, 0, 0, 0, 1, 1, 1]);
+    assert_eq!(&wi[0..9], &[-1, 0, 1, -1, 0, 1, -1, 0, 1]);
+    assert_eq!(&hi[9..18], &[1, 1, 1, 2, 2, 2, 3, 3, 3]);
+    assert_eq!(&wi[9..18], &[1, 2, 3, 1, 2, 3, 1, 2, 3]);
+}
+
 /// HF's get_rope_index truth for a 2-group video at gh=gw=2, spatial_merge=2:
 /// each group is a t=1 plane (T=base), H/W carry the grid, pos advances by
 /// max(gh,gw) per plane, and timestamp + inner/outer boundary tokens are

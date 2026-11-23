@@ -168,6 +168,147 @@ pub(crate) fn build_qwen3vl(
     }
 }
 
+/// Ling 3.2's body-diagonal MRoPE walk.
+///
+/// This is the token/layout rule in the pinned Bailing implementation.  A
+/// media span is preceded and followed by ordinary text, while its temporal
+/// axis advances by two positions per temporal group and the spatial axes are
+/// centered around that temporal base:
+///
+/// ```text
+/// T[g] = st_idx + text_len + 2*g
+/// H[g,r] = T[g] + r - (H-1)//2
+/// W[g,c] = T[g] + c - (W-1)//2
+/// ```
+///
+/// Unlike Qwen3-VL's timestamped form, the current Ling processor emits one
+/// contiguous patch run for each image/video item.  Keeping this separate from
+/// `build_qwen3vl` is important: using the ordinary long-side walk silently
+/// changes every token after a video and the reference model's body diagonal.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_ling(
+    chunk_tokens: &[u32],
+    grids: &[(usize, usize, usize)],
+    grid_base: usize,
+    grid_hi: usize,
+    start_pos: u32,
+    image_pad: u32,
+    video_pad: u32,
+    t_out: &mut Vec<u32>,
+    h_out: &mut Vec<u32>,
+    w_out: &mut Vec<u32>,
+) {
+    let is_pad = |tok: u32| tok == image_pad || tok == video_pad;
+    // Atlas metadata stores bits as u32; the Ling kernel interprets H/W as
+    // signed i32 because the reference centers spatial coordinates.
+    let mut pos = start_pos as i32;
+    let mut item = grid_base;
+    let mut cursor = 0usize;
+    while cursor < chunk_tokens.len() {
+        let Some(rel) = chunk_tokens[cursor..].iter().position(|&tok| is_pad(tok)) else {
+            for _ in cursor..chunk_tokens.len() {
+                t_out.push(pos as u32);
+                h_out.push(pos as u32);
+                w_out.push(pos as u32);
+                pos += 1;
+            }
+            break;
+        };
+        let pad = cursor + rel;
+        for _ in cursor..pad {
+            t_out.push(pos as u32);
+            h_out.push(pos as u32);
+            w_out.push(pos as u32);
+            pos += 1;
+        }
+        if item >= grid_hi || item >= grids.len() {
+            // This request does not own the next media item.  Keep the
+            // one-token-in/one-position-out invariant and let the caller's
+            // ownership check report any mismatched placeholder count.
+            t_out.push(pos as u32);
+            h_out.push(pos as u32);
+            w_out.push(pos as u32);
+            pos += 1;
+            cursor = pad + 1;
+            continue;
+        }
+        let (t_len, gh, gw) = grids[item];
+        let t_len = t_len.max(1);
+        let gh = gh.max(1);
+        let gw = gw.max(1);
+        let plane = gh * gw;
+        let run = t_len.saturating_mul(plane);
+        let available = chunk_tokens[pad..]
+            .iter()
+            .take_while(|&&tok| is_pad(tok))
+            .count();
+        if run == 0 || available < run {
+            // Malformed or timestamp-separated input: consume one pad as
+            // text rather than swallowing a boundary token into this item.
+            t_out.push(pos as u32);
+            h_out.push(pos as u32);
+            w_out.push(pos as u32);
+            pos += 1;
+            cursor = pad + 1;
+            continue;
+        }
+        let base = pos;
+        for temporal in 0..t_len {
+            let t = base + (2 * temporal) as i32;
+            for row in 0..gh {
+                for col in 0..gw {
+                    t_out.push(t as u32);
+                    h_out.push((t + row as i32 - ((gh - 1) / 2) as i32) as u32);
+                    w_out.push((t + col as i32 - ((gw - 1) / 2) as i32) as u32);
+                }
+            }
+        }
+        // The next text segment starts at `last(T) + 1`, not one full extra
+        // temporal stride after it. For t=1 this is base+1; the reference
+        // computes the same value from `llm_pos_ids_list[-1][0].max() + 1`.
+        pos = base + (2 * t_len).saturating_sub(1) as i32;
+        cursor = pad + run;
+        item += 1;
+    }
+}
+
+/// Return the decode-time MRoPE delta for a complete Ling prompt.
+///
+/// The reference keeps the prompt's temporal stream separate from the number
+/// of placeholder tokens (`rope_delta = max(T) + 1 - seq_len`) and adds that
+/// delta to every generated text position.  This is negative when the prompt
+/// ends inside a large image/video patch run, and positive when ordinary text
+/// follows media.
+pub(crate) fn ling_rope_delta(
+    prompt_tokens: &[u32],
+    grids: &[(usize, usize, usize)],
+    grid_base: usize,
+    grid_hi: usize,
+    image_pad: u32,
+    video_pad: u32,
+) -> i32 {
+    if prompt_tokens.is_empty() {
+        return 0;
+    }
+    let mut t = Vec::new();
+    let mut h = Vec::new();
+    let mut w = Vec::new();
+    build_ling(
+        prompt_tokens,
+        grids,
+        grid_base,
+        grid_hi,
+        0,
+        image_pad,
+        video_pad,
+        &mut t,
+        &mut h,
+        &mut w,
+    );
+    let max_t = t.iter().copied().max().unwrap_or(0) as i32;
+    max_t + 1 - prompt_tokens.len() as i32
+}
+
 /// GLM-5 position walk for the checkpoint's expanded prompt form. Images use
 /// one image marker triple. Videos use
 /// `video_start, (image_start, image_pad*, image_end, timestamp*)*, video_end`;
@@ -307,6 +448,8 @@ pub(crate) enum Walk {
     Generic,
     /// [`build_qwen3vl`]: one timestamp-separated `t=1` plane per group.
     Qwen3vl,
+    /// [`build_ling`]: Ling 3.2's body-diagonal video/image positions.
+    Ling,
     /// [`build_glm5`]: per-frame image markers; the four marker ids.
     Glm5 {
         image_start: u32,
@@ -370,6 +513,9 @@ pub(crate) fn walk_rows(
             &mut t,
             &mut h,
             &mut w,
+        ),
+        Walk::Ling => build_ling(
+            tokens, grids, grid_base, grid_hi, 0, image_pad, video_pad, &mut t, &mut h, &mut w,
         ),
     }
     if rows.end > t.len().min(h.len()).min(w.len()) {

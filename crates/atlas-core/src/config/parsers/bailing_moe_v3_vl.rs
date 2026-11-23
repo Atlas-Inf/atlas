@@ -225,10 +225,11 @@ pub(crate) fn parse_bailing_moe_v3_vl(raw: &Value) -> Result<ModelConfig> {
     config.nested_config = true;
     config.mtp_num_hidden_layers = 1;
     config.mrope_section = mrope_section;
-    // Ling's custom video RoPE is neither Atlas's contiguous nor Qwen3.6's
-    // round-robin layout. Keep the section metadata but leave the forward
-    // path unselectable until that dedicated kernel exists.
-    config.mrope_interleaved = false;
+    // Ling carries three position streams through Atlas metadata. Its native
+    // decoder applies the checkpoint's body-diagonal channel mapping (rather
+    // than Qwen3.6's round-robin kernel), so the shared staging/layout must
+    // still reserve H/W streams for every prefill and decode row.
+    config.mrope_interleaved = true;
     config.vision = Some(vision);
 
     finalize_config(&mut config, raw)?;

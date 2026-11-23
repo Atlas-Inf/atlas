@@ -10,10 +10,11 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use crate::radio_tower::RadioVisionTower;
 
-use super::VisionEncoder;
+use super::{LingVisionTower, VisionEncoder};
 
 pub enum VisionTower {
     Qwen(Box<VisionEncoder>),
+    Ling(Box<LingVisionTower>),
     Radio(Box<RadioVisionTower>),
 }
 
@@ -22,6 +23,7 @@ impl VisionTower {
     pub fn out_row(&self) -> DevicePtr {
         match self {
             VisionTower::Qwen(v) => v.buf_out,
+            VisionTower::Ling(v) => v.out_row(),
             VisionTower::Radio(r) => r.buf_out,
         }
     }
@@ -30,6 +32,7 @@ impl VisionTower {
     pub fn lent_scratch_bytes(&self) -> usize {
         match self {
             VisionTower::Qwen(v) => v.lent_scratch_bytes(),
+            VisionTower::Ling(_) => 0,
             VisionTower::Radio(_) => 0,
         }
     }
@@ -38,6 +41,7 @@ impl VisionTower {
     pub fn attach_lent_scratch(&mut self, base: DevicePtr, borrowed: bool) -> Result<()> {
         match self {
             VisionTower::Qwen(v) => v.attach_lent_scratch(base, borrowed),
+            VisionTower::Ling(_) => anyhow::bail!("the Ling tower takes no lent scratch"),
             VisionTower::Radio(_) => anyhow::bail!("the RADIO tower takes no lent scratch"),
         }
     }
@@ -55,6 +59,7 @@ impl VisionTower {
     pub fn out_hidden_size(&self) -> usize {
         match self {
             VisionTower::Qwen(v) => v.out_hidden_size,
+            VisionTower::Ling(v) => v.out_hidden_size(),
             VisionTower::Radio(r) => r.out_hidden_size,
         }
     }
@@ -70,6 +75,7 @@ impl VisionTower {
     ) -> Result<Vec<(usize, usize, usize)>> {
         match self {
             VisionTower::Qwen(v) => v.forward_items(items, gpu, stream),
+            VisionTower::Ling(v) => v.forward_items(items, gpu, stream),
             VisionTower::Radio(r) => {
                 let mut images = Vec::new();
                 for item in items {
@@ -88,6 +94,7 @@ impl VisionTower {
     pub fn output_rows(&self) -> usize {
         match self {
             VisionTower::Qwen(v) => v.output_rows(),
+            VisionTower::Ling(v) => v.output_rows(),
             VisionTower::Radio(r) => r.p_max / 4,
         }
     }
@@ -102,6 +109,7 @@ impl VisionTower {
     ) -> Result<Vec<(usize, usize, usize)>> {
         match self {
             VisionTower::Qwen(v) => v.forward_batched(images, gpu, stream),
+            VisionTower::Ling(v) => v.forward_batched(images, gpu, stream),
             VisionTower::Radio(r) => r.forward_batched(images, gpu, stream),
         }
     }

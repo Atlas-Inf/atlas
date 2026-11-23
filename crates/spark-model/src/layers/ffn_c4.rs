@@ -19,6 +19,9 @@ impl FfnComponent {
         );
         match self {
             Self::Moe(m) => m.forward_independent(input, rows, ctx, stream),
+            Self::LingMoe(_) => {
+                anyhow::bail!("Ling native FFN does not support independent rows yet")
+            }
             Self::Dense(d) if d.can_forward_km(rows as u32) => {
                 d.forward_km(input, rows as u32, ctx, stream)?;
                 Ok(ctx.buffers.moe_output())
@@ -58,6 +61,7 @@ impl FfnComponent {
         );
         match self {
             Self::Moe(m) => m.forward_c4(input, ctx, stream),
+            Self::LingMoe(_) => anyhow::bail!("Ling native FFN does not support K=4 verify yet"),
             Self::Dense(d) if d.can_forward_km(4) => {
                 d.forward_km(input, 4, ctx, stream)?;
                 Ok(ctx.buffers.moe_output())

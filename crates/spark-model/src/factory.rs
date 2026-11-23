@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn ling_loader_is_explicitly_non_serving_until_forward_lands() {
+    fn ling_loader_validates_the_original_embedding_name() {
         let mut config = ModelConfig::qwen3_next_80b_nvfp4();
         config.model_type = "bailing_moe_v3_vl".to_string();
         let loader = loader_for_config(&config).expect("Ling has a dedicated loader");
@@ -243,10 +243,7 @@ mod tests {
         let store = WeightStore::empty();
         let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
         let err = loader.load_embedding(&store, &config, &gpu).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("bailing_moe_v3_vl forward is not implemented")
-        );
+        assert!(err.to_string().contains("model.word_embeddings.weight"));
     }
 
     // The generic `ModelWeightLoader` for NLLB must fail fast: real NLLB serving

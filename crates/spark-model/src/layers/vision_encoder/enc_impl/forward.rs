@@ -207,7 +207,11 @@ impl VisionEncoder {
         for (i, (_px, gh, gw)) in images.iter().enumerate() {
             let src = self.buf_h1.offset(p_off[i] * self.hidden_size * 2);
             let out_slice = self.buf_out.offset(mp_off[i] * self.out_hidden_size * 2);
-            self.apply_merger(&self.merger, p_i[i], *gh, *gw, src, out_slice, gpu, stream)?;
+            if self.raw_spatial_merge {
+                self.apply_raw_spatial_merge(p_i[i], *gh, *gw, src, out_slice, gpu, stream)?;
+            } else {
+                self.apply_merger(&self.merger, p_i[i], *gh, *gw, src, out_slice, gpu, stream)?;
+            }
         }
         if timing {
             gpu.synchronize(stream).ok();
@@ -276,16 +280,20 @@ impl VisionEncoder {
                 self.vit_block(blk, p, gpu, stream)?;
             }
             let out_slice = self.buf_out.offset(mp_off[i] * self.out_hidden_size * 2);
-            self.apply_merger(
-                &self.merger,
-                p,
-                *gh,
-                *gw,
-                self.buf_h1,
-                out_slice,
-                gpu,
-                stream,
-            )?;
+            if self.raw_spatial_merge {
+                self.apply_raw_spatial_merge(p, *gh, *gw, self.buf_h1, out_slice, gpu, stream)?;
+            } else {
+                self.apply_merger(
+                    &self.merger,
+                    p,
+                    *gh,
+                    *gw,
+                    self.buf_h1,
+                    out_slice,
+                    gpu,
+                    stream,
+                )?;
+            }
         }
         Ok(images
             .iter()

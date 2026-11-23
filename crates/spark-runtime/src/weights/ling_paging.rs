@@ -40,7 +40,8 @@ impl LingPageKind {
         }
     }
 
-    fn element_bytes(self) -> usize {
+    /// Bytes per element in the original file representation.
+    pub fn element_bytes(self) -> usize {
         match self {
             Self::E4M3Weight => 1,
             Self::Bf16Scale => 2,
@@ -68,6 +69,16 @@ impl LingPage {
     /// Immutable bytes exactly covering the deferred tensor.
     pub fn bytes(&self) -> &[u8] {
         &self.mapping[self.range.clone()]
+    }
+
+    /// Raw address of [`Self::bytes`], valid while this page is retained.
+    ///
+    /// This is intentionally a host address.  A GPU backend that advertises
+    /// pageable host-page-table access may turn it into a device address for
+    /// read-only kernels; other backends must reject that operation and use
+    /// the ordered staging fallback instead.
+    pub fn host_ptr(&self) -> *mut u8 {
+        self.bytes().as_ptr() as *mut u8
     }
 
     /// The validated on-disk representation of this page.

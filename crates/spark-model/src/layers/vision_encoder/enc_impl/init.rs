@@ -204,6 +204,7 @@ impl VisionEncoder {
             deepstack,
             deepstack_indexes,
             merger,
+            raw_spatial_merge: false,
             k_gemm: gpu.kernel("vision_encoder", "vision_gemm_bias")?,
             // Tensor-core pipelined matmul (~40× the scalar vision_gemm_bias on
             // the ViT's large-M GEMMs) + a row-broadcast bias add. Both gated to
@@ -277,6 +278,61 @@ impl VisionEncoder {
         })
     }
 
+    /// Construct a Qwen ViT whose final output is the raw spatial merge.
+    ///
+    /// Ling 3.2 sets `vision_config.disable_merger_proj=true`: its visual
+    /// tower still has the Qwen3 ViT blocks and 2×2 merge, applies the
+    /// merger's per-patch LayerNorm, and skips only the MLP projection.  The
+    /// text-side `linear_proj` is applied by the Ling tower wrapper after this
+    /// encoder returns the 4608-wide rows.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_raw(
+        patch_embed_w: DevicePtr,
+        patch_embed_b: DevicePtr,
+        pos_embed: DevicePtr,
+        num_position_embeddings: usize,
+        blocks: Vec<ViTBlock>,
+        merger_norm_w: DevicePtr,
+        merger_norm_b: DevicePtr,
+        hidden_size: usize,
+        num_heads: usize,
+        spatial_merge_size: usize,
+        intermediate_size: usize,
+        patch_size: usize,
+        max_pixels: Option<usize>,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
+        let merged_width = spatial_merge_size * spatial_merge_size * hidden_size;
+        let null_merger = MergerLayer {
+            norm_w: merger_norm_w,
+            norm_b: merger_norm_b,
+            fc1_w: VitWeight::Bf16(DevicePtr::NULL),
+            fc1_b: DevicePtr::NULL,
+            fc2_w: VitWeight::Bf16(DevicePtr::NULL),
+            fc2_b: DevicePtr::NULL,
+        };
+        let mut encoder = Self::new(
+            patch_embed_w,
+            patch_embed_b,
+            pos_embed,
+            num_position_embeddings,
+            blocks,
+            Vec::new(),
+            Vec::new(),
+            null_merger,
+            hidden_size,
+            num_heads,
+            spatial_merge_size,
+            merged_width,
+            intermediate_size,
+            patch_size,
+            max_pixels,
+            gpu,
+        )?;
+        encoder.raw_spatial_merge = true;
+        Ok(encoder)
+    }
+
     /// Construct the distinct GLM-5.3 visual tower while retaining the
     /// historical `VisionEncoder` wrapper used by model prefill/splicing.
     pub(crate) fn new_glm(
@@ -341,6 +397,7 @@ impl VisionEncoder {
                 fc2_w: super::super::VitWeight::Bf16(DevicePtr::NULL),
                 fc2_b: DevicePtr::NULL,
             },
+            raw_spatial_merge: false,
             k_gemm: KernelHandle(0),
             k_gemm_pipelined: KernelHandle(0),
             k_add_bias: KernelHandle(0),

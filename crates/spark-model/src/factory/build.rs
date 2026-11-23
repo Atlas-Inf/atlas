@@ -644,6 +644,13 @@ pub fn build_model(
     let glm_cache_shape = glm::cache_shape(&config, kv_dtype, &layer_dtypes)?;
     let (kv_num_heads, kv_head_dim) = if let Some(shape) = glm_cache_shape {
         (shape.num_kv_heads(), shape.head_dim())
+    } else if config.model_type == "bailing_moe_v3_vl" {
+        // Ling's initial paged-attention implementation stores expanded keys and
+        // zero-pads the narrower values to the same cache stride.
+        (
+            config.num_attention_heads,
+            config.qk_nope_head_dim + config.qk_rope_head_dim,
+        )
     } else if config.kv_lora_rank > 0 {
         let mla_cache_dim = config.kv_lora_rank + config.qk_rope_head_dim;
         tracing::info!(

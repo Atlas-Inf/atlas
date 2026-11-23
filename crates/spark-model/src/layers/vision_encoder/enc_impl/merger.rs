@@ -9,6 +9,49 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 use super::super::{MergerLayer, VisionEncoder};
 
 impl VisionEncoder {
+    /// Normalize and spatially merge the final ViT rows without the Qwen
+    /// merger projection.  Ling 3.2's `disable_merger_proj` path uses this
+    /// exact stream as the input to its text-side `linear_proj`
+    /// (`[4608] -> [2560]`).
+    pub(super) fn apply_raw_spatial_merge(
+        &self,
+        p: usize,
+        grid_h: usize,
+        grid_w: usize,
+        hidden_src: DevicePtr,
+        out_slice: DevicePtr,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let ms = self.spatial_merge_size as u32;
+        let merged_in = (ms as usize * ms as usize * self.hidden_size) as u32;
+        let merged_p = (p / (self.spatial_merge_size * self.spatial_merge_size)) as u32;
+        // The Ling checkpoint disables only the merger projection.  Its
+        // merger LayerNorm remains active and is applied per patch before the
+        // 2×2 shuffle, exactly like Qwen3-VL's `use_postshuffle_norm=false`
+        // path.
+        KernelLaunch::new(gpu, self.k_norm)
+            .grid([p as u32, 1, 1])
+            .block([self.hidden_size.min(1024) as u32, 1, 1])
+            .arg_ptr(hidden_src)
+            .arg_ptr(self.merger.norm_w)
+            .arg_ptr(self.merger.norm_b)
+            .arg_u32(p as u32)
+            .arg_u32(self.hidden_size as u32)
+            .arg_f32(1e-6)
+            .launch(stream)?;
+        KernelLaunch::new(gpu, self.k_merge)
+            .grid([merged_p, 1, 1])
+            .block([merged_in.min(1024), 1, 1])
+            .arg_ptr(hidden_src)
+            .arg_ptr(out_slice)
+            .arg_u32(grid_h as u32)
+            .arg_u32(grid_w as u32)
+            .arg_u32(self.hidden_size as u32)
+            .arg_u32(ms)
+            .launch(stream)
+    }
+
     /// Apply one DeepStack/final merger: norm (per-patch) → spatial merge → fc1 → GELU → fc2.
     /// Writes output to `out_slice` (pre-offset into buf_out for this merger index).
     ///

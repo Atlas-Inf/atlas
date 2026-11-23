@@ -107,7 +107,7 @@ fn parses_reference_hybrid_layout_and_quantization() {
     assert_eq!(config.layer_type(41), LayerType::FullAttention);
     assert_eq!(config.rotary_dim(), 64);
     assert_eq!(config.mrope_section, [8, 12, 12]);
-    assert!(!config.mrope_interleaved);
+    assert!(config.mrope_interleaved);
     assert!(config.vision.is_some());
     assert_eq!(config.vision.as_ref().unwrap().image_pad_token_id, 157157);
     assert_eq!(config.vision.as_ref().unwrap().video_pad_token_id, 156909);

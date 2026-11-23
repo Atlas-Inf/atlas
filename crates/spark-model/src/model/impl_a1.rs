@@ -86,7 +86,9 @@ impl TransformerModel {
         // `rms_norm_kernel` normalizes exactly one weight: `final_norm` (a
         // checkpoint tensor). Models that ship HF-vanilla norm weights load it
         // exactly and must use the vanilla kernel.
-        let rms_norm_kernel = if crate::ships_vanilla_norm_weights(&config) {
+        let rms_norm_kernel = if config.model_type == "bailing_moe_v3_vl" {
+            gpu.kernel("ling_norm", "ling_rms_norm")?
+        } else if crate::ships_vanilla_norm_weights(&config) {
             gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?
         } else {
             gpu.kernel("norm", "rms_norm")?

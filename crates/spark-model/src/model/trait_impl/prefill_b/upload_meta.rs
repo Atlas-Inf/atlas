@@ -141,6 +141,7 @@ impl TransformerModel {
                     .vision
                     .as_ref()
                     .is_some_and(|v| v.is_qwen3vl_video);
+                let ling = self.config.model_type == "bailing_moe_v3_vl";
                 // Both walkers build against the prompt from position 0 and
                 // slice the processed range: text after an image keeps the
                 // image's compressed position base in every later chunk, an
@@ -168,7 +169,23 @@ impl TransformerModel {
                         grids.len()
                     };
                     let (mut full_t, mut full_h, mut full_w) = (Vec::new(), Vec::new(), Vec::new());
-                    if let Some(v) = glm_vision {
+                    if ling {
+                        // Ling's body-diagonal MRoPE uses centered H/W
+                        // coordinates and a two-position temporal stride;
+                        // it is not Qwen3-VL's timestamped long-side walk.
+                        mrope_pos::build_ling(
+                            tokens,
+                            &grids,
+                            grid_base,
+                            grid_hi,
+                            0,
+                            pad_id,
+                            video_pad_id,
+                            &mut full_t,
+                            &mut full_h,
+                            &mut full_w,
+                        );
+                    } else if let Some(v) = glm_vision {
                         // GLM-5 expands a video into per-frame image markers
                         // and timestamp text; its structural markers require
                         // the GLM-specific walker.
