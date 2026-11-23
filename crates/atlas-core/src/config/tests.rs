@@ -814,6 +814,28 @@ fn gemma4_moe_config_preserves_routing_and_canonical_rope_controls() {
 }
 
 #[test]
+fn gemma4_rejects_unknown_attention_pattern_entry() {
+    let json = r#"{
+        "model_type": "gemma4",
+        "text_config": {
+            "hidden_size": 256,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "head_dim": 64,
+            "intermediate_size": 512,
+            "vocab_size": 128,
+            "attention_pattern": ["not_an_attention_kind"],
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 128
+        }
+    }"#;
+    let err = parse_config(json).unwrap_err();
+    assert!(err.to_string().contains("attention_pattern"), "{err}");
+    assert!(err.to_string().contains("not_an_attention_kind"), "{err}");
+}
+
+#[test]
 fn test_parse_deepseek_v4_config() {
     let json = r#"{
         "model_type": "deepseek_v4",

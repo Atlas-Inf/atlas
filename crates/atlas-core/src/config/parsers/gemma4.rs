@@ -70,12 +70,14 @@ pub(crate) fn parse_gemma4_params(raw: &serde_json::Value) -> Result<ModelConfig
             .iter()
             .map(|v| {
                 // All attention types map to FullAttention (no SSM in Gemma-4)
-                match v.as_str().unwrap_or("full_attention") {
+                Ok(match v.as_str().unwrap_or("full_attention") {
                     "sliding_attention" | "full_attention" => LayerType::FullAttention,
-                    other => panic!("Unknown Gemma-4 attention_pattern entry: '{other}'"),
-                }
+                    other => {
+                        anyhow::bail!("gemma4: unknown attention_pattern entry '{other}'")
+                    }
+                })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?
     } else {
         vec![LayerType::FullAttention; num_hidden_layers]
     };
