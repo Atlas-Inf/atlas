@@ -24,7 +24,7 @@ pub(crate) struct StackedExperts {
 
 impl StackedExperts {
     /// Code rows are read 16 bytes and scale rows `scale_align` bytes at a time.
-    fn ensure_aligned(&self, scale_align: u64) -> Result<()> {
+    pub(super) fn ensure_aligned(&self, scale_align: u64) -> Result<()> {
         ensure!(
             self.w13.0.is_multiple_of(16)
                 && self.w2.0.is_multiple_of(16)
@@ -147,8 +147,9 @@ pub(crate) struct MoePrefill {
     pub up_softcap: f32,
 }
 
-/// Output columns per CTA of `inkling2_moe_gemm_w4a4` / `_w8a8`.
-const GEMM_N_TILE: u32 = 128;
+/// Output columns per CTA of `inkling2_moe_gemm_w4a4` / `_w8a8` (and of the strix-hip
+/// BF16-row `inkling2_moe_gemm_nvfp4` / `_mxfp8`).
+pub(super) const GEMM_N_TILE: u32 = 128;
 
 /// Rows from which the routed experts run as grouped GEMMs (fewer rows read
 /// each expert once per row through the decode GEMVs).
@@ -190,6 +191,17 @@ pub(crate) fn moe_prefill(
         u32_of(a.top_k, "top_k")?,
         stream,
     )?;
+    if cfg!(atlas_scale) {
+        return super::moe_prefill_hip::moe_prefill_bf16(
+            gpu,
+            k,
+            a,
+            sorted_rows,
+            offsets,
+            to_perm,
+            stream,
+        );
+    }
     moe_prefill_lowp(gpu, k, a, sorted_rows, offsets, to_perm, stream)
 }
 
