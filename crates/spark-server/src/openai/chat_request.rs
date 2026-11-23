@@ -58,7 +58,7 @@ pub struct ChatCompletionRequest {
     /// Per-token logit bias: {"token_id": bias_value}. Positive boosts, negative suppresses.
     /// Applied additively to logits before sampling. OpenAI-compatible.
     #[serde(default)]
-    pub logit_bias: Option<std::collections::HashMap<String, f32>>,
+    pub logit_bias: Option<std::collections::HashMap<String, f64>>,
     #[serde(default)]
     pub stream: bool,
     /// Emit exact sampled token IDs on each streamed chunk's

@@ -95,7 +95,7 @@ impl From<ChatCompletionRequest> for ir::ChatRequest {
         // don't parse as token ids are dropped (historical behavior).
         let logit_bias: Vec<(u32, f32)> = req.logit_bias.as_ref().map_or(Vec::new(), |map| {
             map.iter()
-                .filter_map(|(k, &v)| k.parse::<u32>().ok().map(|id| (id, v)))
+                .filter_map(|(k, &v)| k.parse::<u32>().ok().map(|id| (id, v as f32)))
                 .collect()
         });
         let response_format = match req.response_format {

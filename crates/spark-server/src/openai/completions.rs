@@ -63,7 +63,7 @@ pub struct CompletionRequest {
     pub frequency_penalty: Option<f32>,
     /// Per-token logit bias.
     #[serde(default)]
-    pub logit_bias: Option<std::collections::HashMap<String, f32>>,
+    pub logit_bias: Option<std::collections::HashMap<String, f64>>,
     #[serde(default)]
     pub stream: bool,
     /// Include exact generated IDs in blocking `choices[].token_ids`.

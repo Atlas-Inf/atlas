@@ -89,11 +89,40 @@ async fn logit_bias_rejects_malformed_keys_before_dispatch() {
 }
 
 #[tokio::test]
+async fn logit_bias_rejects_out_of_range_values_before_dispatch() {
+    for chat in [false, true] {
+        for stream in [false, true] {
+            for value in [-101.0, -100.1, -100.000001, 100.000001, 100.1, 101.0] {
+                let (response, dispatched) = request(chat, stream, json!({"1": value})).await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "chat={chat}, stream={stream}, value={value}"
+                );
+                assert_eq!(dispatched, None);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["error"]["type"], "invalid_request_error");
+                assert_eq!(body["error"]["param"], "logit_bias");
+                let message = body["error"]["message"].as_str().unwrap();
+                assert!(
+                    message.contains("logit_bias")
+                        && message.contains("-100")
+                        && message.contains("100")
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn logit_bias_preserves_valid_empty_and_absent_maps() {
     for chat in [false, true] {
         for stream in [false, true] {
             for bias in [
-                json!({"0": -1.5, "1": 2.0, "4294967295": 0.5}),
+                json!({"0": -100.0, "1": 2.0, "2": 100.0, "4294967295": 0.5}),
                 json!({}),
                 json!(null),
             ] {

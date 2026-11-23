@@ -189,7 +189,7 @@ pub async fn completions(
     // Convert logit_bias from OpenAI format (string keys) to Vec<(u32, f32)>
     let logit_bias: Vec<(u32, f32)> = req.logit_bias.as_ref().map_or(Vec::new(), |map| {
         map.iter()
-            .filter_map(|(k, &v)| k.parse::<u32>().ok().map(|id| (id, v)))
+            .filter_map(|(k, &v)| k.parse::<u32>().ok().map(|id| (id, v as f32)))
             .collect()
     });
     // OpenAI spec bounds n to 1-128; an unbounded n would drive both an

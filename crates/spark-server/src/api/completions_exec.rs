@@ -19,14 +19,24 @@ use super::inference_types::{InferenceRequest, RepetitionDetectionParams};
 use super::strip::strip_thinking_tags;
 
 pub(super) fn validate_logit_bias(
-    bias: Option<&std::collections::HashMap<String, f32>>,
+    bias: Option<&std::collections::HashMap<String, f64>>,
 ) -> Result<(), Box<Response>> {
     if let Some(map) = bias {
-        for key in map.keys() {
+        for (key, value) in map {
             if key.parse::<u32>().is_err() {
                 return Err(Box::new(super::compact::openai_error_response_with_param(
                     StatusCode::BAD_REQUEST,
                     format!("Invalid logit_bias token ID key '{key}': expected a u32"),
+                    Some("logit_bias"),
+                    None,
+                )));
+            }
+            if !(-100.0..=100.0).contains(value) {
+                return Err(Box::new(super::compact::openai_error_response_with_param(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Invalid logit_bias value {value} for token ID '{key}': expected a number between -100 and 100"
+                    ),
                     Some("logit_bias"),
                     None,
                 )));
