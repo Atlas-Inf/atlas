@@ -297,7 +297,10 @@ pub(crate) fn resolve_tokenizer_runtime(
         let model_vocab_size = Some(config.vocab_size);
         match grammar::GrammarEngine::from_tokenizer(tokenizer.inner(), model_vocab_size, &stop_ids)
         {
-            Ok(engine) => {
+            Ok(mut engine) => {
+                if config.model_type == "bailing_moe_v3_vl" {
+                    engine.poolside_tag_separator = "\n";
+                }
                 tracing::info!(
                     "Grammar engine initialized (vocab_size={}, vocab_type=auto-detected from tokenizer)",
                     engine.vocab_size()

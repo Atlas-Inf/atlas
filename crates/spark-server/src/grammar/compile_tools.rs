@@ -742,6 +742,10 @@ impl GrammarEngine {
             return Err(GrammarError::NoTools);
         }
 
+        let separator = self.poolside_tag_separator;
+        let key_value_boundary =
+            serde_json::Value::from(format!("</arg_key>{separator}<arg_value>"));
+        let next_key = serde_json::Value::from(format!("{separator}<arg_key>"));
         let mut tag_entries = Vec::with_capacity(tools.len());
         for tool in tools {
             let name = &tool.function.name;
@@ -781,11 +785,16 @@ impl GrammarEngine {
                 .as_deref()
                 .filter(|_| closed_values)
                 .and_then(|names| {
-                    super::poolside_values::closed_pair_rules(&schema, names, value_close)
+                    super::poolside_values::closed_pair_rules(
+                        &schema,
+                        names,
+                        value_close,
+                        &key_value_boundary,
+                    )
                 })
                 .unwrap_or_else(|| {
                     format!(
-                        "pair_body ::= paramname \"</arg_key><arg_value>\" value \"{value_close}\"\n\
+                        "pair_body ::= paramname {key_value_boundary} value \"{value_close}\"\n\
                          {paramname_rule}"
                     )
                 });
@@ -795,7 +804,7 @@ impl GrammarEngine {
                 let body_ebnf = format!(
                     "root ::= first_pair pair*\n\
                      first_pair ::= \"arg_key>\" pair_body\n\
-                     pair ::= \"<arg_key>\" pair_body\n\
+                     pair ::= {next_key} pair_body\n\
                      {pair_rules}\n\
                      value ::= value_part*\n\
                      value_part ::= {value_ladder}"
@@ -807,9 +816,15 @@ impl GrammarEngine {
             // The first `<` is consumed here; the grammar's first pair starts
             // at `arg_key>`, while the zero-argument end consumes `tool_call>`.
             let (begin, end) = if has_no_parameters {
-                (format!("<tool_call>{name}</"), "tool_call>".to_string())
+                (
+                    format!("<tool_call>{name}{separator}</"),
+                    "tool_call>".to_string(),
+                )
             } else {
-                (format!("<tool_call>{name}<"), "</tool_call>".to_string())
+                (
+                    format!("<tool_call>{name}{separator}<"),
+                    format!("{separator}</tool_call>"),
+                )
             };
             tag_entries.push(serde_json::json!({
                 "type": "tag",

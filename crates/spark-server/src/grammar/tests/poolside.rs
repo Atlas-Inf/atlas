@@ -22,6 +22,18 @@ fn poolside_grammar_accepts_native_call() {
 }
 
 #[test]
+fn ling_forced_tool_grammar_uses_the_checkpoint_line_breaks() {
+    let mut engine = GrammarEngine::new(&test_vocab(), &[130]).unwrap();
+    engine.poolside_tag_separator = "\n";
+    let compiled = engine
+        .compile_poolside_v1_tool_grammar(&test_tool_defs(), false, "</arg_value>")
+        .unwrap();
+    let call = "<tool_call>get_weather\n<arg_key>location</arg_key>\n<arg_value>Boston</arg_value>\n</tool_call>";
+    assert!(grammar_accepts(&compiled, call));
+    assert!(!grammar_accepts(&compiled, &call.replace('\n', "")));
+}
+
+#[test]
 fn poolside_auto_grammar_keeps_bare_opener_in_prose() {
     let mut engine = GrammarEngine::new(&test_vocab(), &[130]).unwrap();
     let compiled = engine

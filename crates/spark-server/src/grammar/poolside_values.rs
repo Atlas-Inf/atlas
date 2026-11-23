@@ -22,6 +22,7 @@ pub(super) fn closed_pair_rules(
     schema: &Value,
     param_names: &[String],
     value_close: &str,
+    key_value_boundary: &Value,
 ) -> Option<String> {
     let properties = schema.get("properties")?;
     let values: Vec<_> = param_names
@@ -41,7 +42,7 @@ pub(super) fn closed_pair_rules(
     for (i, (name, value)) in param_names.iter().zip(values).enumerate() {
         let value = value.map_or_else(|| "value".to_string(), |arms| format!("({arms})"));
         rules.push(format!(
-            "key_{i} ::= {} \"</arg_key><arg_value>\" {value} \"{value_close}\"",
+            "key_{i} ::= {} {key_value_boundary} {value} \"{value_close}\"",
             literal(name)
         ));
     }
