@@ -66,6 +66,33 @@ fn user_text_plus_tool_result_splits_into_user_then_tool() {
 }
 
 #[test]
+fn tool_result_then_follow_up_text_splits_into_tool_then_user() {
+    // Claude's tool-result turn often carries the user's next instruction
+    // in the same content array, after the result. The result must answer
+    // the assistant's tool call before the follow-up user turn.
+    let ir = lower(serde_json::json!({
+        "model": "m", "max_tokens": 16,
+        "messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "write",
+                 "input": {"path": "/tmp/x.txt", "content": "hi"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "Wrote."},
+                {"type": "text", "text": "follow up"}
+            ]}
+        ]
+    }));
+    assert_eq!(ir.messages.len(), 3);
+    assert_eq!(ir.messages[0].role, Role::Assistant);
+    assert_eq!(ir.messages[1].role, Role::Tool);
+    assert_eq!(ir.messages[1].tool_call_id.as_deref(), Some("toolu_1"));
+    assert_eq!(text_of(&ir.messages[1].content), "Wrote.");
+    assert_eq!(ir.messages[2].role, Role::User);
+    assert_eq!(text_of(&ir.messages[2].content), "follow up");
+}
+
+#[test]
 fn tool_result_only_message_emits_no_empty_user_turn() {
     // Claude Code sends the common case — a user message whose ONLY
     // content is tool results. An empty user turn ahead of them would
