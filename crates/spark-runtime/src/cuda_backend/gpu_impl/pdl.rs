@@ -9,7 +9,8 @@
 //! under `ATLAS_RICURSIVE_PDL=1` ([`RICURSIVE_PDL_KERNELS`]), Qwen3.8-27B under
 //! `ATLAS_QWEN38_PDL=1` (prefill, [`QWEN38_PDL_KERNELS`]) and, separately,
 //! `ATLAS_QWEN38_PDL_DECODE=1` (the decode chain,
-//! [`QWEN38_PDL_DECODE_KERNELS`]). A kernel launches with PDL when a switch
+//! [`QWEN38_PDL_DECODE_KERNELS`]), and Inkling 2 Mini always
+//! ([`ALWAYS_ON`]: its decode chain, [`INKLING2_PDL_KERNELS`]). A kernel launches with PDL when a switch
 //! that is on lists it. A list is its target's own: a `common/` kernel that
 //! waits for one target's sake is launched with PDL only where a target lists
 //! it (without the launch attribute its `griddepcontrol` instructions are
@@ -85,18 +86,34 @@ pub(super) const PDL_TARGETS: &[PdlTarget] = &[
             },
         ],
     },
+    PdlTarget {
+        model: "inkling-2-mini",
+        switches: &[PdlSwitch {
+            name: ALWAYS_ON,
+            kernels: INKLING2_PDL_KERNELS,
+        }],
+    },
 ];
 
+/// The name of a switch that is always on for its target: no environment
+/// variable, the list launches with PDL whenever that target is served.
+pub(super) const ALWAYS_ON: &str = "";
+
 fn switch_on(name: &str) -> bool {
-    std::env::var(name).as_deref() == Ok("1")
+    name == ALWAYS_ON || std::env::var(name).as_deref() == Ok("1")
 }
 
 static PDL_TARGET: OnceLock<Option<&'static PdlTarget>> = OnceLock::new();
 
 /// Record the served kernel target before any kernel handle is resolved.
 pub fn configure_pdl(target_model: &str) {
+    let served = PDL_TARGETS.iter().find(|t| t.model == target_model);
     for other in PDL_TARGETS.iter().filter(|t| t.model != target_model) {
-        for switch in other.switches.iter().filter(|s| switch_on(s.name)) {
+        for switch in other
+            .switches
+            .iter()
+            .filter(|s| s.name != ALWAYS_ON && switch_on(s.name))
+        {
             tracing::warn!(
                 "{}=1 ignored: it enables PDL for kernel target {}, not {target_model}",
                 switch.name,
@@ -104,7 +121,7 @@ pub fn configure_pdl(target_model: &str) {
             );
         }
     }
-    let _ = PDL_TARGET.set(PDL_TARGETS.iter().find(|t| t.model == target_model));
+    let _ = PDL_TARGET.set(served);
 }
 
 fn target() -> Option<&'static PdlTarget> {
@@ -463,3 +480,7 @@ pub(super) const QWEN38_PDL_DECODE_KERNELS: &[&str] = &[
 #[cfg(test)]
 #[path = "pdl_tests.rs"]
 mod tests;
+
+#[path = "pdl_inkling2.rs"]
+mod inkling2;
+use inkling2::INKLING2_PDL_KERNELS;

@@ -347,8 +347,9 @@ impl DflashConfig {
 /// [`DflashConfig::block_size`]), so every consumer of `rope_theta` /
 /// `block_size` sees the checkpoint's values instead of the Qwen3.6 defaults.
 pub fn parse_dflash_config(json: &str) -> Result<DflashConfig> {
-    let raw: serde_json::Value =
+    let mut raw: serde_json::Value =
         serde_json::from_str(json).context("Parsing DFlash drafter config.json")?;
+    super::inkling::reshape_inkling2_mtp_config(&mut raw)?;
     let mut config: DflashConfig =
         serde_json::from_value(raw.clone()).context("Parsing DFlash drafter config.json")?;
     if let Some(params) = config.rope_parameters.clone() {

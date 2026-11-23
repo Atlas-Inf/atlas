@@ -189,7 +189,10 @@ impl TransformerModel {
         // failed with "decode at pos 34 but 26 tokens ingested". `decode_a`
         // and `decode_a2` already apply this veto; the verify paths never did,
         // because on this model they used to refuse before reaching a graph.
-        let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
+        let layer_veto = self
+            .layers
+            .iter()
+            .any(|l| l.batched_decode_graph_unsupported());
         let use_graphs = self.comm.is_none() && !hss_engaged && !lora_eager && !layer_veto;
 
         // PLE's host half (n-gram hash + NVMe fault-in + slot upload) for the

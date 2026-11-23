@@ -78,9 +78,12 @@ fn depth_for(table: &[(usize, usize)], n: usize) -> usize {
 
 /// Whether `n` live sequences speculate at all: a depth of 0 in the table
 /// is plain batched decode, which past the speculation width delivers more
-/// (every verify row costs about a decode row; see [`WIDE_DEPTHS`]).
+/// (every verify row costs about a decode row; see [`WIDE_DEPTHS`]). The
+/// default table speculates at two; an `ATLAS_DFLASH_BATCH_DEPTH` table may
+/// stop there (Inkling 2's per-sequence DSpark proposes lose to plain decode
+/// from two sequences: 32 vs 43 tok/s on GB10).
 pub(crate) fn spec_width_ok(n: usize) -> bool {
-    n <= 2 || wide_depth(n) > 0
+    n <= 1 || wide_depth(n) > 0
 }
 
 fn parse_depths(spec: Option<&str>) -> Option<Vec<(usize, usize)>> {

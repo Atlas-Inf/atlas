@@ -189,8 +189,18 @@ fn the_save_pairs_live_h_with_the_boundary_conv() {
     )
     .unwrap();
     let layers = pool.num_ssm_layers;
-    let snaps =
-        SsmSnapshotPool::new(3, pool.h_bytes, pool.conv_bytes, layers, 0, 0, 8, &gpu).unwrap();
+    let snaps = SsmSnapshotPool::new(
+        3,
+        pool.h_bytes,
+        pool.conv_bytes,
+        layers,
+        0,
+        0,
+        8,
+        false,
+        &gpu,
+    )
+    .unwrap();
     let (h_live, conv_live, conv_row) = (
         |l: usize| 10 + l as u8,
         |l: usize| 80 + l as u8,

@@ -237,3 +237,17 @@ fn format_from_str() {
     );
     assert!(ReasoningFormat::from_str("nonsense").is_err());
 }
+
+#[test]
+fn inkling2_end_tag_is_shared_with_the_other_blocks() {
+    use std::str::FromStr;
+    let p = parser(ReasoningFormat::from_str("inkling2").unwrap());
+    assert_eq!(p.name(), "inkling2");
+    assert_eq!(p.end_tag(), "<|end_message|>");
+    assert!(!p.end_tag_closes_only_reasoning());
+    assert!(parser(ReasoningFormat::Qwen).end_tag_closes_only_reasoning());
+    // A length-cut generation that never closed thinking is all reasoning.
+    let (reasoning, content) = p.extract_thinking("still thinking", true);
+    assert_eq!(reasoning.as_deref(), Some("still thinking"));
+    assert_eq!(content, "");
+}

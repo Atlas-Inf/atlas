@@ -1,6 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Default-off admission for the repaired single-draft distributed graph.
 
+use super::super::super::types::TransformerModel;
+
+impl TransformerModel {
+    /// Any layer whose host-maintained state must not freeze during graph
+    /// replay vetoes batched decode graphs.
+    pub(super) fn layers_veto_batched_graphs(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|l| l.batched_decode_graph_unsupported())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn mtp1_graph_allowed(
     requested: bool,

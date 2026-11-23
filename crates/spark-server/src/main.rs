@@ -38,6 +38,7 @@ pub mod grammar;
 mod halluc_probe;
 mod hint_injector;
 mod ids;
+mod inkling_turn;
 mod ir;
 mod literal_xml;
 mod llmlingua;

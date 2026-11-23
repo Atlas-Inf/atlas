@@ -48,6 +48,10 @@ impl BlockDiffusionDraftHead {
         markov_bias: DevicePtr,
     ) -> Result<()> {
         let bf16 = 2usize;
+        if let Some(ink) = self.inkling.as_ref() {
+            let _ = (last_token, ban_depth, markov_embed, markov_bias);
+            return self.inkling_tail(ink, gpu, hidden_buf, scratch, stream);
+        }
         if let Some(sc) = scratch.dspine.as_ref() {
             let _ = (last_token, ban_depth, hidden_buf, markov_embed, markov_bias);
             return self.dspine_tail(

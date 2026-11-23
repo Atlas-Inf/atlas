@@ -38,6 +38,7 @@ impl BlockDiffusionDraftHead {
     ) -> Result<Self> {
         super::selector_platform::validate_requested_features(startup.diagnostics.draft_conf)?;
         let dspine_weights = weights.dspine.take();
+        let inkling_weights = weights.inkling.take();
         let dspine_spec = dspine_weights.as_ref().map(|w| w.spec);
         let embed_tokens_shared = weights
             .embed_tokens
@@ -183,7 +184,7 @@ impl BlockDiffusionDraftHead {
             dense_gemv_batchm: gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?,
             dense_gemv_tc16: dense_gemv_tc[0],
             dense_gemv_tc32: dense_gemv_tc[1],
-            small_m_gemv: small_m_gemv(&dense_gemv_tc),
+            small_m_gemv: small_m_gemv(&dense_gemv_tc, weights.config.is_inkling2_dspark()),
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             w4a16_gemm: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm"),
             dense_gemm_pipelined: gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
@@ -457,6 +458,19 @@ impl BlockDiffusionDraftHead {
                 dspine: dspine_spec
                     .as_ref()
                     .map(|spec| super::dspine::DspineScratch::alloc(gpu, spec, hidden_size, g))
+                    .transpose()?,
+                inkling: inkling_weights
+                    .as_ref()
+                    .map(|_| {
+                        super::inkling::InklingScratch::alloc(
+                            gpu,
+                            hidden_size,
+                            g,
+                            vocab_size,
+                            ctx_window,
+                            kv_dim,
+                        )
+                    })
                     .transpose()?,
             };
             // C1 diagnostic: zero ALL device buffers so any uninitialized
@@ -929,6 +943,7 @@ impl BlockDiffusionDraftHead {
                 None
             },
             dspine: None,
+            inkling: None,
             alt: None,
             live: Default::default(),
             // Phase 2 stage 2: fused KV weight built above by copy_d2d
@@ -1015,6 +1030,16 @@ impl BlockDiffusionDraftHead {
         };
         if let Some(w) = dspine_weights {
             head.dspine = Some(super::dspine::Dspine::build(&head, w, gpu)?);
+        }
+        if let Some(w) = inkling_weights {
+            head.inkling = Some(super::inkling::InklingDspark::build(
+                w,
+                head.lm_head_shared,
+                head.vocab_size,
+                head.hidden_size,
+                head.kernels.dense_gemm,
+                gpu,
+            )?);
         }
 
         // Fallback pool prime for build paths that skipped the early

@@ -83,7 +83,31 @@ pub(super) fn strip_bare_role_literal(delta: &mut String, inside_tool_call: bool
 pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> DeltaVec {
     // Count generated tokens without reopening a terminal parser/stream.
     crate::metrics::DECODED_TOKENS_TOTAL.inc();
-    terminal_token::while_open(state, |state| handle_open_token(state, ctx, tok))
+    let Some(turn) = state.inkling.as_mut() else {
+        return terminal_token::while_open(state, |state| handle_open_token(state, ctx, tok));
+    };
+    let mut ids = Vec::new();
+    turn.feed(tok, &ctx.state.tokenizer, &mut ids);
+    handle_rewritten(state, ctx, ids)
+}
+
+/// Before `Done`: what Inkling 2's rewrite still holds (a length-cut call).
+pub(super) fn flush_inkling(state: &mut StreamState, ctx: &StreamCtx) -> DeltaVec {
+    let mut ids = Vec::new();
+    if let Some(turn) = state.inkling.as_mut() {
+        turn.finish(&ctx.state.tokenizer, &mut ids);
+    }
+    handle_rewritten(state, ctx, ids)
+}
+
+fn handle_rewritten(state: &mut StreamState, ctx: &StreamCtx, ids: Vec<u32>) -> DeltaVec {
+    let mut out = DeltaVec::new();
+    for tok in ids {
+        out.extend(terminal_token::while_open(state, |state| {
+            handle_open_token(state, ctx, tok)
+        }));
+    }
+    out
 }
 
 fn handle_open_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> DeltaVec {

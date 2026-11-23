@@ -81,6 +81,7 @@ fn state(dir: &std::path::Path) -> AppState {
         sampling_presets: Default::default(),
         tool_call_start_token_id: None,
         glm_tool_boundary: None,
+        inkling_markers: None,
         auto_compact_threshold: None,
         request_timeout: 0,
         effective_context: 0,
