@@ -104,7 +104,11 @@ impl TransformerModel {
         // the SSM/attention sites — it picks the 3-deep pipeline variant when
         // present. lm_head launches 1938 CTAs and already sits at ~83% of
         // achievable, so the expected gain here is small; measured, not assumed.
-        let w4a16_gemm_t_kernel = crate::layers::tgemm_kernel(gpu.as_ref());
+        let w4a16_gemm_t_kernel = if lm_head_nvfp4.is_some() || mtp_lm_head_nvfp4.is_some() {
+            crate::layers::tgemm_kernel(gpu.as_ref())
+        } else {
+            KernelHandle(0)
+        };
         // Lossless BF16-MMA sibling for lm_head, OPT-IN via ATLAS_LMHEAD_LOSSLESS=1.
         // Measured cost 1.81% at C=16 (129.68 -> 127.33). Default is the faster
         // FP8-activation path because the accuracy question it addresses CANNOT

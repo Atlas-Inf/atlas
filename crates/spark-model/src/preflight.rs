@@ -235,7 +235,7 @@ fn check_expert_count(store: &WeightStore, config: &ModelConfig) -> Result<()> {
         return Ok(());
     }
     let mut max_expert: Option<usize> = None;
-    for name in store.names() {
+    for name in store.names().chain(store.deferred_names()) {
         // Patterns seen across supported MoE models:
         //   <prefix>.layers.{L}.block_sparse_moe.experts.{E}.w?.weight
         //   <prefix>.layers.{L}.mlp.experts.{E}.{up|down|gate}_proj.weight
