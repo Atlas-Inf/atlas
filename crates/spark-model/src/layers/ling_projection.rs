@@ -9,6 +9,25 @@ use spark_runtime::weights::{WeightDtype, WeightStore};
 use crate::layers::ops;
 use crate::weight_map::DenseWeight;
 
+/// The one-row decode and small concurrent batches use the original kernels.
+pub(crate) fn bf16_prompt_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    if m >= 32 {
+        ops::bf16_gemm(input, weight.weight.0, output, m, n, k, stream)
+    } else {
+        ops::dense_gemm_tc(gpu, kernel, input, weight, output, m, n, k, stream)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct LingProjectionScratch {
     act: DevicePtr,
@@ -128,7 +147,7 @@ impl LingProjection {
                 if rows == 1 {
                     ops::dense_gemv(gpu, gemv, input, &weight, output, self.n, self.k, stream)
                 } else {
-                    ops::dense_gemm_tc(
+                    bf16_prompt_rows(
                         gpu, gemm, input, &weight, output, rows, self.n, self.k, stream,
                     )
                 }

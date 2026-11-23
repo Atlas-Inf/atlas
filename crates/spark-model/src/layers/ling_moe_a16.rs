@@ -120,7 +120,7 @@ impl LingMoeFfn {
 
         // Shared expert first.  Its gate/up buffers are intentionally reused
         // for routed rows after the down GEMM has consumed the activation.
-        ops::dense_gemm_tc(
+        crate::layers::ling_projection::bf16_prompt_rows(
             ctx.gpu,
             dense_kernel,
             input,
@@ -131,7 +131,7 @@ impl LingMoeFfn {
             self.hidden as u32,
             stream,
         )?;
-        ops::dense_gemm_tc(
+        crate::layers::ling_projection::bf16_prompt_rows(
             ctx.gpu,
             dense_kernel,
             input,
@@ -153,7 +153,7 @@ impl LingMoeFfn {
             shared_swiglu_limit(self.layer_idx),
             stream,
         )?;
-        ops::dense_gemm_tc(
+        crate::layers::ling_projection::bf16_prompt_rows(
             ctx.gpu,
             dense_kernel,
             ctx.buffers.expert_gate_out(),
