@@ -266,15 +266,25 @@ pub fn best_first(
             .filter(|(_, ok)| **ok)
             .map(|(v, _)| (*v as f64 - m).exp())
             .sum();
+        // A token the selector lists more than once is one child carrying
+        // the summed mass: siblings never share a token (`validate`).
+        let mut merged: Vec<(u32, f64)> = Vec::new();
         for (j, &id) in lat.ids[d].iter().enumerate() {
             if ok[j] {
-                heap.push(Cand {
-                    prob: prob * (s[j] as f64 - m).exp() / z,
-                    parent: node,
-                    depth: depth + 1,
-                    token: id,
-                });
+                let p = (s[j] as f64 - m).exp() / z;
+                match merged.iter_mut().find(|(t, _)| *t == id) {
+                    Some((_, q)) => *q += p,
+                    None => merged.push((id, p)),
+                }
             }
+        }
+        for (id, p) in merged {
+            heap.push(Cand {
+                prob: prob * p,
+                parent: node,
+                depth: depth + 1,
+                token: id,
+            });
         }
     };
     push_children(&mut heap, score, 0, &nodes);
