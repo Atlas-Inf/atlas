@@ -61,8 +61,17 @@ pub(crate) fn parse_qwen4_exp(raw: &Value) -> Result<ModelConfig> {
         .get("text_config")
         .context("qwen4_exp config.json missing text_config")?;
 
+    let mut normalized = text.clone();
+    // Normalize before deserializing ModelConfig's scalar EOS field, like LongCat.
+    if let Some(ids) = text.get("eos_token_id").and_then(Value::as_array) {
+        let primary = ids
+            .first()
+            .and_then(Value::as_u64)
+            .context("qwen4_exp eos_token_id must be an integer or non-empty integer array")?;
+        normalized["eos_token_id"] = Value::from(primary);
+    }
     let mut config: ModelConfig =
-        serde_json::from_value(text.clone()).context("Failed to parse qwen4_exp text_config")?;
+        serde_json::from_value(normalized).context("Failed to parse qwen4_exp text_config")?;
 
     // text_config's own model_type is "qwen4_exp_text"; the engine keys
     // kernel-target resolution off the TOP-level name.
@@ -98,18 +107,6 @@ pub(crate) fn parse_qwen4_exp(raw: &Value) -> Result<ModelConfig> {
         config.vocab_size > 0,
         "qwen4_exp vocab_size must be non-zero"
     );
-
-    // eos_token_id may be an array; take the primary.
-    if config.eos_token_id == 0
-        && let Some(eos) = text.get("eos_token_id")
-    {
-        let primary = match eos {
-            Value::Number(n) => n.as_u64(),
-            Value::Array(ids) => ids.first().and_then(Value::as_u64),
-            _ => None,
-        };
-        config.eos_token_id = primary.unwrap_or(0) as u32;
-    }
 
     parse_rope(text, &mut config)?;
     parse_hyper_connections(text, &mut config)?;

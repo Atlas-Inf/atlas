@@ -11,6 +11,9 @@ use crate::config::LayerType;
 #[path = "qwen4_exp_yarn_tests.rs"]
 mod yarn_tests;
 
+#[path = "qwen4_exp_eos_tests.rs"]
+mod eos_tests;
+
 /// A trimmed copy of the shipped config — every key the parser reads, with
 /// the checkpoint's actual values, so a rename upstream fails here first.
 fn raw_config() -> Value {
@@ -90,6 +93,7 @@ fn parses_the_shipped_checkpoint_config() {
     assert!(c.nested_config);
     assert_eq!(c.hidden_size, 2560);
     assert_eq!(c.vocab_size, 248320);
+    assert_eq!(c.eos_token_id, 248044);
     assert_eq!(c.head_dim, 256);
     assert_eq!(c.num_experts, 512);
     assert_eq!(c.num_experts_per_tok, 10);
