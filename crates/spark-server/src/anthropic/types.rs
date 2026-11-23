@@ -173,30 +173,32 @@ pub enum ContentBlock {
 /// Anthropic image source. `type:"base64"` carries `media_type` + `data`;
 /// `type:"url"` carries `url`.
 #[derive(Debug, Deserialize)]
-pub struct ImageSourceBlock {
-    #[serde(rename = "type")]
-    pub source_type: String,
-    #[serde(default)]
-    pub media_type: Option<String>,
-    #[serde(default)]
-    pub data: Option<String>,
-    #[serde(default)]
-    pub url: Option<String>,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ImageSourceBlock {
+    Base64 {
+        #[serde(default)]
+        media_type: Option<String>,
+        data: String,
+    },
+    Url {
+        url: String,
+    },
+    #[serde(other)]
+    Unknown,
 }
 
 impl ImageSourceBlock {
     /// Build the string the vision encoder consumes: a `data:` URI for
-    /// base64 sources, or the raw URL for url sources. `None` when the
-    /// required fields are missing.
+    /// base64 sources, or the raw URL for url sources. `None` for source
+    /// types Atlas does not model.
     pub(super) fn maybe_get_image_uri(&self) -> Option<String> {
-        match self.source_type.as_str() {
-            "base64" => {
-                let data = self.data.as_ref()?;
-                let mt = self.media_type.as_deref().unwrap_or("image/png");
+        match self {
+            ImageSourceBlock::Base64 { media_type, data } => {
+                let mt = media_type.as_deref().unwrap_or("image/png");
                 Some(format!("data:{mt};base64,{data}"))
             }
-            "url" => self.url.clone(),
-            _ => None,
+            ImageSourceBlock::Url { url } => Some(url.clone()),
+            ImageSourceBlock::Unknown => None,
         }
     }
 }

@@ -222,6 +222,19 @@ fn rejects_object_message_role() {
 }
 
 #[test]
+fn url_image_source_without_url_is_rejected() {
+    serde_json::from_value::<MessagesRequest>(serde_json::json!({
+        "model": "qwen3-80b",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "hi"},
+            {"type": "image", "source": {"type": "url"}}
+        ]}],
+    }))
+    .expect_err("a url image source without url should be rejected");
+}
+
+#[test]
 fn tool_result_is_error_defaults_to_none_when_absent() {
     // The success path is "field absent", not "field false" — a missing
     // `is_error` must not deserialize into an error-flagged result.
