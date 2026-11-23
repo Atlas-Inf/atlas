@@ -193,7 +193,7 @@ impl<'a> Dfly<'a> {
         self.validate_draft(input, head.weight, comm)?;
         self.forward(
             input,
-            head.weight,
+            head,
             &mut |tokens, output, stream| {
                 let bytes: Vec<_> = tokens.iter().flat_map(|id| id.to_le_bytes()).collect();
                 self.ops
@@ -222,7 +222,16 @@ impl<'a> Dfly<'a> {
         stream: u64,
     ) -> Result<Vec<u32>> {
         self.validate_draft(input, weight, comm)?;
-        self.forward(input, weight, lookup, comm, stream)
+        self.forward(
+            input,
+            Head {
+                embedding: DevicePtr::NULL,
+                weight,
+            },
+            lookup,
+            comm,
+            stream,
+        )
     }
 
     fn validate_draft(

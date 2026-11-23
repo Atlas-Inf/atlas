@@ -232,7 +232,7 @@ impl<'a> Ops<'a> {
         id: DevicePtr,
         comm: Option<&dyn CommBackend>,
         stream: u64,
-    ) -> Result<u32> {
+    ) -> Result<()> {
         let c = self.config;
         let local = c.vocab / c.world;
         let start = local * c.rank;
@@ -261,10 +261,6 @@ impl<'a> Ops<'a> {
             .arg_ptr(logits)
             .arg_ptr(id)
             .arg_u32(c.vocab as u32)
-            .launch(stream)?;
-        self.gpu.synchronize(stream)?;
-        let mut bytes = [0u8; 4];
-        self.gpu.copy_d2h(id, &mut bytes)?;
-        Ok(u32::from_le_bytes(bytes))
+            .launch(stream)
     }
 }

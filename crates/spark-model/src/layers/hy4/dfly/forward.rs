@@ -6,7 +6,7 @@ impl Dfly<'_> {
     pub(super) fn forward(
         &self,
         input: &Input,
-        weight: DevicePtr,
+        head: Head,
         lookup: &mut EmbeddingLookup<'_>,
         comm: Option<&dyn CommBackend>,
         stream: u64,
@@ -14,6 +14,8 @@ impl Dfly<'_> {
         let c = self.config;
         let s = &self.scratch;
         let o = &self.ops;
+        let weight = head.weight;
+        let embedding = head.embedding;
         let rows = input.count + 1;
         let heads = 32 / c.world;
         let ids = input.query_ids(c);
@@ -88,10 +90,38 @@ impl Dfly<'_> {
             stream,
         )?;
         let b = &self.correction;
-        let mut previous = input.bonus;
-        let mut tokens = Vec::with_capacity(input.count);
+        if embedding.is_null() {
+            let mut previous = input.bonus;
+            let mut tokens = Vec::with_capacity(input.count);
+            for step in 0..input.count {
+                lookup(&[previous], s.embedding, stream)?;
+                let hidden = s.final_hidden.offset((step + 1) * H * 2);
+                o.norm(hidden, b.hn, s.concat, [1, H, H, H], stream)?;
+                o.norm(
+                    s.embedding,
+                    b.en,
+                    s.concat.offset(H * 2),
+                    [1, H, H, H],
+                    stream,
+                )?;
+                o.linear(s.concat, b.gate, s.cg, [1, H, 2 * H], stream)?;
+                o.linear(s.concat, b.up, s.cu, [1, H, 2 * H], stream)?;
+                o.element(Op::Silu, s.cg, s.cu, s.ca, H, stream)?;
+                o.linear(s.ca, b.down, s.delta, [1, H, H], stream)?;
+                o.element(Op::Add, hidden, s.delta, s.corrected, H, stream)?;
+                o.head(s.corrected, weight, s.logits, s.id, comm, stream)?;
+                o.gpu.synchronize(stream)?;
+                let mut bytes = [0u8; 4];
+                o.gpu.copy_d2h(s.id, &mut bytes)?;
+                previous = u32::from_le_bytes(bytes);
+                tokens.push(previous);
+            }
+            return Ok(tokens);
+        }
+        let bonus = input.bonus.to_le_bytes();
+        o.gpu.copy_h2d_async_retained(&bonus, s.id, stream)?;
         for step in 0..input.count {
-            lookup(&[previous], s.embedding, stream)?;
+            o.embed(embedding, s.id, s.embedding, 1, stream)?;
             let hidden = s.final_hidden.offset((step + 1) * H * 2);
             o.norm(hidden, b.hn, s.concat, [1, H, H, H], stream)?;
             o.norm(
@@ -106,9 +136,16 @@ impl Dfly<'_> {
             o.element(Op::Silu, s.cg, s.cu, s.ca, H, stream)?;
             o.linear(s.ca, b.down, s.delta, [1, H, H], stream)?;
             o.element(Op::Add, hidden, s.delta, s.corrected, H, stream)?;
-            previous = o.head(s.corrected, weight, s.logits, s.id, comm, stream)?;
-            tokens.push(previous);
+            o.head(s.corrected, weight, s.logits, s.id, comm, stream)?;
+            o.gpu
+                .copy_d2d_async(s.id, s.ids.offset(step * 4), 4, stream)?;
         }
-        Ok(tokens)
+        o.gpu.synchronize(stream)?;
+        let mut bytes = vec![0u8; input.count * 4];
+        o.gpu.copy_d2h(s.ids, bytes.as_mut_slice())?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect())
     }
 }
