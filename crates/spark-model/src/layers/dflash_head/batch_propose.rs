@@ -307,19 +307,10 @@ impl BlockDiffusionDraftHead {
                 }
             }
             if self.inkling.is_some() {
-                // Inkling 2: the shared head, then its recurrent tail over
-                // the batch, which writes every record (`inkling_batch.rs`).
+                // Inkling 2: the head and its recurrent tail (`inkling_batch.rs`).
                 anyhow::ensure!(!walked, "Inkling 2 DSpark has no rank-split batch");
-                self.batched_final_norm(batch_rows, ctx, stream)?;
-                self.batched_head_logits(batch_rows, ctx, stream)?;
-                self.mask_batched_draft_logits(n, grammar_bitmasks, ctx, stream)?;
-                let steps = super::batch_plan::batched_draft_cap(
-                    self.draft_cap(num_drafts),
-                    super::batch_plan::multi_owner_draft_cap(),
-                    n,
-                )
-                .min(self.gamma - 1);
-                self.inkling_batch_tail(ctx.gpu, n, steps, stream)?;
+                let inputs = (batch_rows, n, num_drafts);
+                self.inkling_batch_head_tail(inputs, grammar_bitmasks, ctx, stream)?;
             } else {
                 if !walked {
                     self.run_batched_tail_base(batch_rows, ctx, stream)?;

@@ -273,7 +273,10 @@ mod tests {
         let u64_at = |o: usize| u64::from_le_bytes(table[o..o + 8].try_into().unwrap());
         let u32_at = |o: usize| u32::from_le_bytes(table[o..o + 4].try_into().unwrap());
         // entry 0: a, w, scale, c, n, block0, scale2
-        assert_eq!([u64_at(0), u64_at(8), u64_at(16), u64_at(24)], [0x10, 0x20, 0x30, 0x40]);
+        assert_eq!(
+            [u64_at(0), u64_at(8), u64_at(16), u64_at(24)],
+            [0x10, 0x20, 0x30, 0x40]
+        );
         assert_eq!([u32_at(32), u32_at(36)], [3072, 0]);
         assert_eq!(f32::from_le_bytes(table[40..44].try_into().unwrap()), 0.5);
         // entry 1 starts where entry 0's blocks end, and is BF16
@@ -283,4 +286,3 @@ mod tests {
         assert_eq!(u32_at(2 * MIX_SEG_BYTES + 36), 774);
     }
 }
-

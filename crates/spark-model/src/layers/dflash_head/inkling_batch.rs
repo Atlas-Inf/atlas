@@ -136,6 +136,28 @@ impl BlockDiffusionDraftHead {
         Ok(())
     }
 
+    /// After the staged layers over `(rows, n sequences, drafts asked)`: the
+    /// final norm and shared head, the sequences' grammar masks, then the
+    /// recurrent tail for as many drafts as the batch's cap keeps.
+    pub(in crate::layers::dflash_head) fn inkling_batch_head_tail(
+        &self,
+        (rows, n, num_drafts): (u32, usize, usize),
+        grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
+        ctx: &crate::layer::ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.batched_final_norm(rows, ctx, stream)?;
+        self.batched_head_logits(rows, ctx, stream)?;
+        self.mask_batched_draft_logits(n, grammar_bitmasks, ctx, stream)?;
+        let steps = super::super::batch_plan::batched_draft_cap(
+            self.draft_cap(num_drafts),
+            super::super::batch_plan::multi_owner_draft_cap(),
+            n,
+        )
+        .min(self.gamma - 1);
+        self.inkling_batch_tail(ctx.gpu, n, steps, stream)
+    }
+
     /// After the staged head: the Markov tail of `n` sequences, `steps` drafts
     /// each, over `batch_norm` and `batch_logits`. Sequence `s`'s record in
     /// `batch_tokens` gets row 0's pick in word 0 and its drafts in words
