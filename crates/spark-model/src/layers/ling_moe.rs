@@ -168,7 +168,7 @@ impl LingMoeFfn {
             !ctx.graph_capture,
             "Ling native FFN does not support CUDA graph capture yet"
         );
-        ensure!(ctx.config.hidden_size == self.hidden && self.hidden % GROUP == 0);
+        ensure!(ctx.config.hidden_size == self.hidden && self.hidden.is_multiple_of(GROUP));
         let one = 1u32;
         ops::per_token_group_quant_fp8(
             ctx.gpu,

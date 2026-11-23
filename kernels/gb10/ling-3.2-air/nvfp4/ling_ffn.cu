@@ -69,6 +69,22 @@ __device__ __forceinline__ float ling_decode_e4m3(unsigned char bits) {
     return (bits & 0x80u) ? -value : value;
 }
 
+// Each lane owns four contiguous FP8 coefficients. Fetch a single word
+// and convert two pairs with Blackwell's native E4M3 instructions.
+__device__ __forceinline__ void ling_load_four(const unsigned char* src, float (&out)[4]) {
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) out[i] = ling_decode_e4m3(src[i]);
+#else
+    const unsigned int word = *reinterpret_cast<const unsigned int*>(src);
+    const __half2 low = __nv_cvt_fp8x2_to_halfraw2(static_cast<unsigned short>(word), __NV_E4M3);
+    const __half2 high = __nv_cvt_fp8x2_to_halfraw2(static_cast<unsigned short>(word >> 16), __NV_E4M3);
+    const float2 a = __half22float2(low);
+    const float2 b = __half22float2(high);
+    out[0] = a.x; out[1] = a.y; out[2] = b.x; out[3] = b.y;
+#endif
+}
+
 // W8A8 gate/up decode for one token.  Each warp owns two output rows and
 // folds the dynamic activation scale with the original 128x128 weight scale
 // after the FP8 dot product, matching fp8_gemm_t_blockscaled numerics.
@@ -142,12 +158,14 @@ extern "C" __global__ void ling_fp8_gate_up_shared(
         const float as = a_scale[group];
         float dot1 = 0.0f;
         float dot2 = 0.0f;
+        float activation[4], w1[4], w2[4];
+        ling_load_four(A_fp8 + base, activation);
+        ling_load_four(weight + (unsigned long long)n1 * K + base, w1);
+        if (have_n2) ling_load_four(weight + (unsigned long long)n2 * K + base, w2);
         #pragma unroll
         for (unsigned int i = 0; i < 4; ++i) {
-            const float a = ling_decode_e4m3(A_fp8[base + i]);
-            dot1 += a * ling_decode_e4m3(weight[(unsigned long long)n1 * K + base + i]);
-            if (have_n2)
-                dot2 += a * ling_decode_e4m3(weight[(unsigned long long)n2 * K + base + i]);
+            dot1 += activation[i] * w1[i];
+            if (have_n2) dot2 += activation[i] * w2[i];
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
             dot1 += __shfl_down_sync(0xffffffff, dot1, offset);
@@ -338,6 +356,9 @@ extern "C" __global__ void ling_silu_down_shared_fp8(
             local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
         float activation_scale = fmaxf(local_max / FP8_E4M3_MAX, 1.0e-12f);
         activation_scale = __shfl_sync(0xffffffff, activation_scale, 0);
+        float w1[4], w2[4];
+        ling_load_four(weight + (unsigned long long)n1 * K + base, w1);
+        if (have_n2) ling_load_four(weight + (unsigned long long)n2 * K + base, w2);
         float dot1 = 0.0f;
         float dot2 = 0.0f;
         #pragma unroll
@@ -346,9 +367,9 @@ extern "C" __global__ void ling_silu_down_shared_fp8(
                                                   FP8_E4M3_MAX),
                                            -FP8_E4M3_MAX);
             const float activation = ling_decode_e4m3(ling_encode_e4m3(normalized));
-            dot1 += activation * ling_decode_e4m3(weight[(unsigned long long)n1 * K + base + i]);
+            dot1 += activation * w1[i];
             if (have_n2)
-                dot2 += activation * ling_decode_e4m3(weight[(unsigned long long)n2 * K + base + i]);
+                dot2 += activation * w2[i];
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
             dot1 += __shfl_down_sync(0xffffffff, dot1, offset);
@@ -360,13 +381,9 @@ extern "C" __global__ void ling_silu_down_shared_fp8(
                 acc2 += dot2 * activation_scale * block_scale[n2_block * groups + group];
         }
     }
-    for (int offset = 16; offset > 0; offset >>= 1)
-        acc1 += __shfl_down_sync(0xffffffff, acc1, offset);
     __nv_bfloat16* out = is_shared ? shared_down_out : output + (unsigned long long)expert_slot * N;
     if (lane == 0) out[n1] = __float2bfloat16(acc1);
     if (have_n2) {
-        for (int offset = 16; offset > 0; offset >>= 1)
-            acc2 += __shfl_down_sync(0xffffffff, acc2, offset);
         if (lane == 0) out[n2] = __float2bfloat16(acc2);
     }
 }

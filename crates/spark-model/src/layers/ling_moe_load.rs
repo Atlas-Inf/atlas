@@ -372,7 +372,7 @@ fn validate_scale(
     prefix: &str,
 ) -> Result<()> {
     ensure!(
-        k % GROUP == 0 && shape == [n.div_ceil(GROUP), k / GROUP],
+        k.is_multiple_of(GROUP) && shape == [n.div_ceil(GROUP), k / GROUP],
         "Ling projection {prefix} has invalid block scale shape {:?}; expected [{}, {}]",
         shape,
         n.div_ceil(GROUP),
