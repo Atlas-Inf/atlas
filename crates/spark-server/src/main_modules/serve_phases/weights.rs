@@ -219,6 +219,8 @@ pub(crate) fn load_weight_store(
             .load(model_dir, gpu, oom_reserve_bytes)
             .context("Failed to load model weights")?
     };
+    let mut store = store;
+    super::weight_sidecar::absorb_weight_overlay(args, &mut store, gpu)?;
     tracing::info!("Loaded {} weight tensors", store.len());
     Ok(store)
 }
@@ -287,6 +289,12 @@ fn load_drafter(
                 drafter_dir.display()
             )
         })?;
+    // A drafter inside its target's repo (Inkling 2 Mini's mtp.safetensors).
+    let (drafter_config_json, drafter_dir) =
+        match super::weight_sidecar::embedded_drafter(&drafter_dir, &drafter_config_json)? {
+            Some((json, dir)) => (json, dir),
+            None => (drafter_config_json, drafter_dir),
+        };
     let drafter_config =
         spark_model::weight_loader::dflash_loader::parse_dflash_config(&drafter_config_json)?;
     // Only the head proposes. A worker keeps the drafter's config (its target
