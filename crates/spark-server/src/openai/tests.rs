@@ -6,4 +6,5 @@ mod annotations;
 mod chat_wire;
 mod completions;
 mod responses;
+mod responses_text_format;
 mod thinking;

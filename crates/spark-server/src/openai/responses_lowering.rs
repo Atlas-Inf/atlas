@@ -148,6 +148,7 @@ pub fn lower_responses_to_chat(
             }
         }
     };
+    let response_format = lower_text_format(r.text)?;
     Ok(ChatCompletionRequest {
         model: r.model,
         adapter: None,
@@ -213,7 +214,7 @@ pub fn lower_responses_to_chat(
             }
         },
         stop: Vec::new(),
-        response_format: None,
+        response_format,
         min_tokens: 0,
         ignore_eos: false,
         disable_mtp: false,
@@ -237,4 +238,27 @@ pub fn lower_responses_to_chat(
         web_search_options: None,
         reasoning_effort: None,
     })
+}
+
+fn lower_text_format(
+    text: Option<serde_json::Value>,
+) -> Result<Option<ResponseFormat>, LowerResponsesError> {
+    let Some(format) =
+        text.and_then(|mut text| text.get_mut("format").map(serde_json::Value::take))
+    else {
+        return Ok(None);
+    };
+    // Responses flattens json_schema fields while chat nests them.
+    let normalized = if format.get("type").and_then(|v| v.as_str()) == Some("json_schema") {
+        serde_json::json!({"type": "json_schema", "json_schema": format})
+    } else {
+        format
+    };
+    match serde_json::from_value::<ResponseFormat>(normalized) {
+        Ok(ResponseFormat::Text) => Ok(None),
+        Ok(format) => Ok(Some(format)),
+        Err(e) => Err(LowerResponsesError::BadRequest(format!(
+            "invalid text.format: {e}"
+        ))),
+    }
 }
