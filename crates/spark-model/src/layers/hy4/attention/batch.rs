@@ -8,10 +8,11 @@ use spark_comm::CommBackend;
 use spark_runtime::{gpu::DevicePtr, kernel_args::KernelLaunch};
 
 const CAUSAL_ROWS: usize = 8;
+const INDEXED_TILE_ROWS: usize = 64; // DSA layers: non-circular paged cache
 const INDEX_KEYS: usize = 2048;
 
 fn causal_rows(window: Option<usize>, slots: usize) -> usize {
-    window.map_or(CAUSAL_ROWS, |w| (slots - (w - 1)).min(CAUSAL_ROWS))
+    window.map_or(INDEXED_TILE_ROWS, |w| (slots - (w - 1)).min(CAUSAL_ROWS))
 }
 
 pub(super) struct BatchScratch<'a> {
@@ -39,11 +40,12 @@ impl<'a> BatchScratch<'a> {
     fn new(a: &Hy4Attention<'a>) -> Result<Self> {
         let mut m = Owned::new(a.memory.gpu);
         let max_groups = a.max_context.div_ceil(4);
+        let tile_rows = a.window.map_or(INDEXED_TILE_ROWS, |_| CAUSAL_ROWS);
         let (quant, scales, scores) = match &a.index {
             Some(ix) => (
-                m.alloc(CAUSAL_ROWS * ix.heads * 128)?,
-                m.alloc(CAUSAL_ROWS * ix.heads * 4)?,
-                m.alloc(CAUSAL_ROWS * max_groups * 4)?,
+                m.alloc(tile_rows * ix.heads * 128)?,
+                m.alloc(tile_rows * ix.heads * 4)?,
+                m.alloc(tile_rows * max_groups * 4)?,
             ),
             None => (DevicePtr::NULL, DevicePtr::NULL, DevicePtr::NULL),
         };
@@ -61,9 +63,9 @@ impl<'a> BatchScratch<'a> {
             key: alloc(128)?,
             query: alloc(a.index.as_ref().map_or(1, |ix| ix.heads * 128))?,
             hw: alloc(a.index.as_ref().map_or(1, |ix| ix.heads))?,
-            indices: m.alloc(CAUSAL_ROWS * INDEX_KEYS * 4)?,
+            indices: m.alloc(tile_rows * INDEX_KEYS * 4)?,
             softmax_parts: m.alloc(
-                CAUSAL_ROWS * a.heads * a.window.unwrap_or(INDEX_KEYS).div_ceil(128) * 514 * 4,
+                tile_rows * a.heads * a.window.unwrap_or(INDEX_KEYS).div_ceil(128) * 514 * 4,
             )?,
             quant,
             scales,
@@ -251,7 +253,14 @@ impl AttentionCache<'_, '_> {
             linear(b.qc, ix.query, b.query, ix.heads * 128, a.qrank)?;
             linear(input, ix.head, b.hw, ix.heads, a.hidden)?;
         }
+        // Speculative VERIFY keeps the proven tile geometry while prefix
+        // capture is active (the window constraint still applies to SWA).
         let causal_rows = causal_rows(a.window, self.layout.table.len() * self.layout.page_size);
+        let causal_rows = if self.prefix_capturing() {
+            causal_rows.min(CAUSAL_ROWS)
+        } else {
+            causal_rows
+        };
         for first in (0..rows).step_by(causal_rows) {
             let end = (first + causal_rows).min(rows);
             let start_position = self.len;
@@ -376,15 +385,10 @@ impl AttentionCache<'_, '_> {
             );
             let splits = count.div_ceil(128);
             let mla = timing::span("latent_attention", stream)?;
-            // ATLAS_HY4_MLA_MMA=1: one CTA per (row, 128-key partition, 16-head
-            // tile) gathers K into shared once per tile and runs both attention
-            // GEMMs on tensor cores. Requires heads <= 32 and ~99KB opt-in
-            // dynamic shared (sm_120+).
-            // EXPERT_MMA+MLA_MMA is decode-unsafe on VERIFY rows: accepted
-            // drafts collapse (144 vs 180 on the Step 1 harness). Keep MLA on
-            // the tensor-core path only for prefill-scale row counts when the
-            // expert MMA path is also enabled; VERIFY stays on the proven MLA
-            // kernel while expert MMA still serves the FFN phases.
+            // ATLAS_HY4_MLA_MMA=1: tensor-core MLA, heads <= 32, ~99KB opt-in
+            // smem. EXPERT_MMA+MLA_MMA is decode-unsafe on VERIFY rows (drafts
+            // collapsed in Step 1), so keep MLA MMA off sub-32-row VERIFY
+            // batches while expert MMA serves the FFN phases.
             let expert_mma = std::env::var("ATLAS_HY4_EXPERT_MMA").ok().as_deref() == Some("1");
             let mla_mma = a.heads <= 32
                 && std::env::var("ATLAS_HY4_MLA_MMA").as_deref() == Ok("1")
@@ -491,6 +495,6 @@ mod tests {
                 assert!(window - 1 + rows <= capacity);
             }
         }
-        assert_eq!(causal_rows(None, 1), CAUSAL_ROWS);
+        assert_eq!(causal_rows(None, 1), INDEXED_TILE_ROWS);
     }
 }

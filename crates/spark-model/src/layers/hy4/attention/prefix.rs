@@ -14,6 +14,7 @@ pub(super) struct Prefix<'a> {
     capacity: usize,
     base: usize,
     rows: usize,
+    capturing: bool,
     positions: Vec<Option<[i64; 3]>>,
 }
 
@@ -31,6 +32,7 @@ impl<'a> Prefix<'a> {
             capacity: rows,
             base: 0,
             rows: 0,
+            capturing: false,
             positions: Vec::with_capacity(rows),
         })
     }
@@ -56,8 +58,13 @@ impl AttentionCache<'_, '_> {
         let p = self.prefix.as_mut().unwrap();
         p.base = self.len;
         p.rows = rows;
+        p.capturing = true;
         p.positions.clear();
         Ok(())
+    }
+
+    pub(super) fn prefix_capturing(&self) -> bool {
+        self.prefix.as_ref().is_some_and(|p| p.capturing)
     }
 
     pub(super) fn record_prefix(&mut self, stream: u64) -> Result<()> {
@@ -177,6 +184,9 @@ impl AttentionCache<'_, '_> {
         }
         self.len = source.len + accepted;
         self.first_group_position = p.positions[accepted - 1];
+        if let Some(prefix) = self.prefix.as_mut() {
+            prefix.capturing = false;
+        }
         self.poisoned = false;
         Ok(())
     }
