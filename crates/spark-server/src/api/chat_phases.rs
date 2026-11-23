@@ -15,7 +15,7 @@ use crate::ir::ChatRequest;
 use super::compact::{openai_error_response, openai_error_response_with_param};
 
 /// Validate the input contract on the IR envelope: messages length,
-/// max_tokens > 0, temperature/top_p ranges, tool_choice mode/name
+/// max_tokens > 0, sampling ranges, tool_choice mode/name
 /// compatibility. Returns `Err(Response)` for fail-fast 400 paths so
 /// the caller can `?` directly into a Response.
 #[allow(clippy::result_large_err)]
@@ -55,6 +55,21 @@ pub(super) fn validate_input(req: &ChatRequest) -> Result<(), Response> {
             Some("top_p"),
             None,
         ));
+    }
+    for (param, value) in [
+        ("presence_penalty", req.sampling.presence_penalty),
+        ("frequency_penalty", req.sampling.frequency_penalty),
+    ] {
+        if let Some(value) = value
+            && !(-2.0..=2.0).contains(&value)
+        {
+            return Err(openai_error_response_with_param(
+                StatusCode::BAD_REQUEST,
+                format!("{param} must be between -2 and 2, got {value}"),
+                Some(param),
+                None,
+            ));
+        }
     }
     if req.max_tokens == 0 {
         return Err(openai_error_response_with_param(
@@ -115,6 +130,34 @@ pub(super) fn validate_input(req: &ChatRequest) -> Result<(), Response> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn sampling_penalty_ranges() {
+        for param in ["presence_penalty", "frequency_penalty"] {
+            for (value, valid) in [(-2.1, false), (-2.0, true), (2.0, true), (2.1, false)] {
+                let wire: crate::openai::ChatCompletionRequest = serde_json::from_value(json!({
+                    "model": "test",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    (param): value,
+                }))
+                .unwrap();
+                let result = validate_input(&wire.into());
+                if valid {
+                    assert!(result.is_ok(), "{param}={value} should be accepted");
+                } else {
+                    let response = result
+                        .err()
+                        .unwrap_or_else(|| panic!("{param}={value} should be rejected"));
+                    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(error["error"]["param"], param);
+                }
+            }
+        }
+    }
 
     fn named_tool_request(tools: Option<serde_json::Value>) -> ChatRequest {
         let mut body = json!({
