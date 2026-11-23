@@ -117,7 +117,8 @@ const VENDOR_META = {
   Mistral: { order: 4, icon: 'mistral' },
   MiniMax: { order: 5, icon: 'minimax' },
   DeepSeek: { order: 6, icon: 'deepseek' },
-  Ricursive: { order: 7, icon: 'ricursive' }
+  Ricursive: { order: 7, icon: 'ricursive' },
+  'Thinking Machines': { order: 8, icon: 'thinkingmachines' }
 };
 
 const FAMILY_DISPLAY = {
@@ -136,7 +137,8 @@ const FAMILY_DISPLAY = {
   'mistral-small-4': 'Mistral-Small-4',
   'minimax-m2.7': 'MiniMax-M2.7',
   'deepseek-v4': 'DeepSeek-V4',
-  'ricursive': 'Ripple'
+  'ricursive': 'Ripple',
+  'inkling2': 'Inkling 2'
 };
 
 const VENDOR_OF_FAMILY = {
@@ -155,7 +157,8 @@ const VENDOR_OF_FAMILY = {
   'mistral-small-4': 'Mistral',
   'minimax-m2.7': 'MiniMax',
   'deepseek-v4': 'DeepSeek',
-  'ricursive': 'Ricursive'
+  'ricursive': 'Ricursive',
+  'inkling2': 'Thinking Machines'
 };
 
 function vendorOf(fam) {
