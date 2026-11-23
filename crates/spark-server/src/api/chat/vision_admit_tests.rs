@@ -326,7 +326,7 @@ async fn mixed_image_video_image_keeps_temporal_groups_aligned() {
     );
     assert_eq!(out.image_pad_counts, vec![4, 8, 4]);
     assert_eq!(
-        out.messages[0].media,
+        out.messages[0].media_kinds(),
         vec![MediaKind::Image, MediaKind::Video, MediaKind::Image]
     );
     assert_eq!(

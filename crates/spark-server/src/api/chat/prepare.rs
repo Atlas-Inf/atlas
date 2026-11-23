@@ -159,9 +159,7 @@ pub(crate) fn prepare_chat_prompt(
     };
     let repeating = repeat_run >= crate::hint_injector::REPEAT_NOTICE_MIN_RUN;
     if repeating && let Some(last_tool) = messages.iter_mut().rev().find(|e| e.role == "tool") {
-        last_tool
-            .content
-            .push_str(&crate::hint_injector::repeat_notice(repeat_run));
+        last_tool.append_text(&crate::hint_injector::repeat_notice(repeat_run));
         tracing::info!(
             repeat_run,
             "Repeat notice appended to the latest tool result"

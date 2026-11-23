@@ -199,7 +199,7 @@ mod build_tests {
         )
         .expect("text-only ok");
         assert_eq!(out.messages.len(), 1);
-        assert!(out.messages[0].media.is_empty());
+        assert!(out.messages[0].media_kinds().is_empty());
     }
 
     #[test]
@@ -360,7 +360,7 @@ mod build_tests {
         )
         .expect("enabled");
         assert_eq!(enabled.cwd_hint.as_deref(), Some("/tmp/project"));
-        assert!(enabled.messages[0].content.contains("<environment>"));
+        assert!(enabled.messages[0].text().contains("<environment>"));
 
         let disabled_levers = ChatLevers {
             disable_cwd_hint_injection: true,
@@ -385,7 +385,7 @@ mod build_tests {
         .expect("disabled");
         assert_eq!(disabled.cwd_hint.as_deref(), Some("/tmp/project"));
         assert_eq!(
-            disabled.messages[0].content,
+            disabled.messages[0].text(),
             "client prompt\nworking directory: /tmp/project"
         );
     }

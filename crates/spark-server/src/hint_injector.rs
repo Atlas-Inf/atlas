@@ -249,9 +249,8 @@ impl HintInjector for GenericErrorHint {
 
 // ─── Registry ────────────────────────────────────────────────────────
 
-/// Run all registered hint injectors on a tool response.
-/// Returns the first matching hint (specific injectors first, generic last).
-pub fn inject_hints(text: &mut String, consecutive_errors: u32) {
+/// The first matching hint for a tool response, without mutating the text.
+pub fn hint_for(text: &str, consecutive_errors: u32) -> Option<String> {
     let ctx = HintContext {
         text,
         consecutive_errors,
@@ -272,10 +271,18 @@ pub fn inject_hints(text: &mut String, consecutive_errors: u32) {
         if injector.is_relevant(&ctx) {
             let hint = injector.hint(&ctx);
             if !hint.is_empty() {
-                text.push_str(&hint);
-                return; // First match wins — don't stack hints.
+                return Some(hint); // First match wins — don't stack hints.
             }
         }
+    }
+    None
+}
+
+/// Run all registered hint injectors on a tool response.
+/// Returns the first matching hint (specific injectors first, generic last).
+pub fn inject_hints(text: &mut String, consecutive_errors: u32) {
+    if let Some(hint) = hint_for(text, consecutive_errors) {
+        text.push_str(&hint);
     }
 }
 

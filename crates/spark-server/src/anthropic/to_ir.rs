@@ -25,14 +25,14 @@ impl From<MessagesRequest> for ir::ChatRequest {
     /// byte-for-byte at the rendered-prompt level):
     /// * `system` (string or `text` blocks, `x-anthropic-*` billing
     ///   blocks filtered) → one leading System message when non-empty.
-    /// * assistant blocks → ONE assistant message: `[image*, text]`
-    ///   parts, `tool_use` → structured tool_calls (arguments stay
-    ///   parsed JSON), `thinking` blocks → first-class reasoning
-    ///   (joined with `\n`).
+    /// * assistant blocks → ONE assistant message: text/image parts in
+    ///   wire order (adjacent text joined with no separator), `tool_use`
+    ///   → structured tool_calls (arguments stay parsed JSON), `thinking`
+    ///   blocks → first-class reasoning (joined with `\n`).
     /// * user blocks → text/image segments and `tool_result`s lowered in
     ///   wire block order: each result becomes one Tool message keyed by
     ///   `tool_use_id`, and the surrounding text/images become User
-    ///   messages (`[image*, text]`, only when non-empty) at the same
+    ///   messages (wire order preserved, only when non-empty) at the same
     ///   positions. `is_error` travels as `Message::tool_error` — the
     ///   `[tool error]\n` marker is rendered by the shared pipeline
     ///   (`msg_entry`), not baked into the text here.
@@ -173,16 +173,19 @@ impl From<MessagesRequest> for ir::ChatRequest {
 }
 
 fn assistant_message(blocks: Vec<ContentBlock>) -> Message {
-    let mut text_parts: Vec<String> = Vec::new();
-    let mut images: Vec<String> = Vec::new();
+    let mut content: Vec<ContentPart> = Vec::new();
+    let mut text = String::new();
     let mut reasoning_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     for b in blocks {
         match b {
-            ContentBlock::Text { text } => text_parts.push(text),
+            ContentBlock::Text { text: block_text } => text.push_str(&block_text),
             ContentBlock::Image { source } => {
                 if let Some(uri) = source.maybe_get_image_uri() {
-                    images.push(uri);
+                    push_text_part(&mut content, &mut text);
+                    content.push(ContentPart::Image(ImageSource {
+                        data: ImageData::from_uri(uri),
+                    }));
                 }
             }
             ContentBlock::ToolUse { id, name, input } => {
@@ -204,10 +207,10 @@ fn assistant_message(blocks: Vec<ContentBlock>) -> Message {
             ContentBlock::ToolResult { .. } | ContentBlock::Unknown => {}
         }
     }
-    let text_content = text_parts.join("");
+    push_text_part(&mut content, &mut text);
     Message {
         role: Role::Assistant,
-        content: parts_from(&images, &text_content),
+        content,
         tool_calls,
         tool_call_id: None,
         name: None,
@@ -223,46 +226,54 @@ fn assistant_message(blocks: Vec<ContentBlock>) -> Message {
 }
 
 fn push_user_blocks(blocks: Vec<ContentBlock>, messages: &mut Vec<Message>) {
-    let mut text_parts: Vec<String> = Vec::new();
-    let mut images: Vec<String> = Vec::new();
+    let mut content: Vec<ContentPart> = Vec::new();
+    let mut text = String::new();
     for b in blocks {
         match b {
-            ContentBlock::Text { text } => text_parts.push(text),
+            ContentBlock::Text { text: block_text } => text.push_str(&block_text),
             ContentBlock::Image { source } => {
                 if let Some(uri) = source.maybe_get_image_uri() {
-                    images.push(uri);
+                    push_text_part(&mut content, &mut text);
+                    content.push(ContentPart::Image(ImageSource {
+                        data: ImageData::from_uri(uri),
+                    }));
                 }
             }
             ContentBlock::ToolResult {
                 tool_use_id,
-                content,
+                content: tool_content,
                 is_error,
             } => {
-                push_user_message(messages, &images, &text_parts);
-                text_parts.clear();
-                images.clear();
-                messages.push(tool_result_message(tool_use_id, content, is_error));
+                push_text_part(&mut content, &mut text);
+                push_user_message(messages, &mut content);
+                messages.push(tool_result_message(tool_use_id, tool_content, is_error));
             }
             ContentBlock::ToolUse { .. }
             | ContentBlock::Thinking { .. }
             | ContentBlock::Unknown => {}
         }
     }
-    push_user_message(messages, &images, &text_parts);
+    push_text_part(&mut content, &mut text);
+    push_user_message(messages, &mut content);
 }
 
-fn push_user_message(messages: &mut Vec<Message>, images: &[String], text_parts: &[String]) {
-    let text_content = text_parts.join("");
-    if !text_content.is_empty() || !images.is_empty() {
+fn push_user_message(messages: &mut Vec<Message>, content: &mut Vec<ContentPart>) {
+    if !content.is_empty() {
         messages.push(Message {
             role: Role::User,
-            content: parts_from(images, &text_content),
+            content: std::mem::take(content),
             tool_calls: Vec::new(),
             tool_call_id: None,
             name: None,
             reasoning: None,
             tool_error: false,
         });
+    }
+}
+
+fn push_text_part(content: &mut Vec<ContentPart>, text: &mut String) {
+    if !text.is_empty() {
+        content.push(ContentPart::Text(std::mem::take(text)));
     }
 }
 
@@ -295,9 +306,9 @@ fn tool_result_message(
     }
 }
 
-/// `[image*, text]` content parts — image order preserved, single
-/// joined text part last, omitted when empty. Matches the OpenAI
-/// adapter's shape so the template sees one canonical layout.
+/// Tool-result content parts: images first (client order among images),
+/// then the joined text, omitted when empty. Tool results carry one text
+/// payload, so they keep the shared pipeline's canonical layout.
 fn parts_from(images: &[String], text: &str) -> Vec<ContentPart> {
     let mut content: Vec<ContentPart> = Vec::with_capacity(images.len() + 1);
     for uri in images {

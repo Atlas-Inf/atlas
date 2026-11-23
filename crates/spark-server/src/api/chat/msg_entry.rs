@@ -34,28 +34,27 @@ pub(crate) struct VideoDecode<'a> {
     pub(crate) fps: f32,
 }
 
-/// Per-message data: role, content text, optional structured
-/// `tool_calls`, and image-part count for the Jinja vision-marker
-/// expansion. `pub(super)` so `chat::chat_completions_inner` and
-/// the other `chat/*` sub-files can read every field.
+/// One rendered content item: text prose or a media marker. The parts keep
+/// the client's interleaving; the template JSON and the encoder inputs are
+/// both built from this one sequence.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum MsgContentPart {
+    Text(String),
+    Media(MediaKind),
+}
+
+/// Per-message data used by every downstream phase (json_messages, loop
+/// detector, task pin, observation mask, …). `pub(super)` so
+/// `chat::chat_completions_inner` and the other `chat/*` sub-files can
+/// read every field.
 pub(crate) struct MsgEntry {
     pub(super) role: String,
-    pub(super) content: String,
+    pub(super) parts: Vec<MsgContentPart>,
     /// Structured tool_calls for the Jinja template (arguments
     /// pre-parsed to dicts).
     pub(super) tool_calls: Option<Vec<serde_json::Value>>,
     /// Links a tool-result message to the assistant call it answers.
     pub(super) tool_call_id: Option<String>,
-    /// This message's media parts, tagged and in the order the client
-    /// sent them. When non-empty the json_messages builder emits a
-    /// structured content array so the Jinja template can render one
-    /// `<|vision_start|><|image_pad|><|vision_end|>` (or `<|video_pad|>`)
-    /// marker per entry, in this order.
-    ///
-    /// A `(image_count, video_count)` pair lived here before and could not
-    /// express order, so the markers came out grouped by modality — see
-    /// [`crate::ir::Message::media_kinds`].
-    pub(super) media: Vec<MediaKind>,
     /// Historical reasoning trace from a prior assistant turn (the
     /// `<think>...</think>` body). Forwarded from `IncomingMessage`
     /// and passed to the Jinja template so the template can
@@ -64,6 +63,107 @@ pub(crate) struct MsgEntry {
     /// empty-`<think></think>` poisoning pattern that triggers
     /// premature `<|im_end|>` (vLLM/SGLang #131, MLC commit d75d64e).
     pub(super) reasoning_content: Option<String>,
+}
+
+impl MsgEntry {
+    /// All text parts joined in content order (media parts carry no prose).
+    pub(super) fn text(&self) -> String {
+        text_of_parts(&self.parts)
+    }
+
+    /// Media kinds in content order — the same order `collect_message_media`
+    /// appends encoder items and pad counts.
+    pub(super) fn media_kinds(&self) -> Vec<MediaKind> {
+        self.parts
+            .iter()
+            .filter_map(|p| match p {
+                MsgContentPart::Media(kind) => Some(*kind),
+                MsgContentPart::Text(_) => None,
+            })
+            .collect()
+    }
+
+    /// Append prompt-pipeline text (hints, environment blocks) without
+    /// disturbing media positions: it lands on the trailing text part, or
+    /// becomes a new trailing text part after any trailing media.
+    pub(super) fn append_text(&mut self, suffix: &str) {
+        append_text_part(&mut self.parts, suffix);
+    }
+
+    /// Replace this entry's prose while keeping media parts in place. Used
+    /// by duplicate-error masking, where the whole observation is swapped
+    /// for a short pointer to the newest copy.
+    pub(super) fn set_text(&mut self, text: String) {
+        set_text_part(&mut self.parts, text);
+    }
+}
+
+fn content_parts(m: &Message) -> Vec<MsgContentPart> {
+    let mut parts = Vec::with_capacity(m.content.len());
+    for part in &m.content {
+        match part {
+            ContentPart::Text(t) => {
+                if t.is_empty() {
+                    continue;
+                }
+                match parts.last_mut() {
+                    Some(MsgContentPart::Text(last)) => last.push_str(t),
+                    _ => parts.push(MsgContentPart::Text(t.clone())),
+                }
+            }
+            ContentPart::Image(_) => parts.push(MsgContentPart::Media(MediaKind::Image)),
+            ContentPart::Video(_) => parts.push(MsgContentPart::Media(MediaKind::Video)),
+        }
+    }
+    parts
+}
+
+fn text_of_parts(parts: &[MsgContentPart]) -> String {
+    parts
+        .iter()
+        .filter_map(|p| match p {
+            MsgContentPart::Text(t) => Some(t.as_str()),
+            MsgContentPart::Media(_) => None,
+        })
+        .collect()
+}
+
+fn append_text_part(parts: &mut Vec<MsgContentPart>, suffix: &str) {
+    if suffix.is_empty() {
+        return;
+    }
+    match parts.last_mut() {
+        Some(MsgContentPart::Text(last)) => last.push_str(suffix),
+        _ => parts.push(MsgContentPart::Text(suffix.to_string())),
+    }
+}
+
+fn prefix_text_part(parts: &mut Vec<MsgContentPart>, prefix: &str) {
+    if prefix.is_empty() {
+        return;
+    }
+    match parts
+        .iter_mut()
+        .find(|p| matches!(p, MsgContentPart::Text(_)))
+    {
+        Some(MsgContentPart::Text(first)) => first.insert_str(0, prefix),
+        _ => parts.push(MsgContentPart::Text(prefix.to_string())),
+    }
+}
+
+fn set_text_part(parts: &mut Vec<MsgContentPart>, text: String) {
+    let first_text = parts
+        .iter()
+        .position(|p| matches!(p, MsgContentPart::Text(_)));
+    parts.retain(|p| !matches!(p, MsgContentPart::Text(_)));
+    if text.is_empty() {
+        return;
+    }
+    let part = MsgContentPart::Text(text);
+    match first_text {
+        Some(i) => parts.insert(i.min(parts.len()), part),
+        None => parts.push(part),
+    }
 }
 
 /// Outputs of [`build_msg_entries_admitted`]. Bundled as a struct because
@@ -130,7 +230,7 @@ fn collect_message_media(
     // ORDER IS A CONTRACT, and the order is the CLIENT'S. The template emits
     // one marker per media item in the order they appear in the content
     // array, and `expand_vision_pads` walks pad tokens left to right
-    // consuming one count each — so this one pass, `MsgEntry::media` and the
+    // consuming one count each — so this one pass, `MsgEntry::parts` and the
     // preprocessing loop below must all traverse `m.content` the same way.
     // Grouping by modality anywhere in that chain shows the model the items
     // in an order the caller never wrote, and does it silently: every count
@@ -286,7 +386,7 @@ pub(super) fn build_msg_entries_admitted(
     // itself (via its own `ns.last_query_index` computation) and the
     // injection here was the source of empty-think poisoning. Removed.
     for m in input.iter() {
-        let mut text = m.text();
+        let mut parts = content_parts(m);
         // F6: a failed tool result (Anthropic `is_error`, carried as
         // `Message::tool_error`) gets an explicit ASCII marker — chat-tuned
         // models have no structural error concept and otherwise hallucinate
@@ -294,7 +394,7 @@ pub(super) fn build_msg_entries_admitted(
         // every surface gets identical prompt bytes, and applied before the
         // error-hint scan below so hints see the final text.
         if m.tool_error && aids {
-            text = format!("[tool error]\n{text}");
+            prefix_text_part(&mut parts, "[tool error]\n");
         }
 
         // Preserve structured tool_calls for the Jinja template.
@@ -337,22 +437,23 @@ pub(super) fn build_msg_entries_admitted(
         // handles `<tool_response>` wrapping and consecutive
         // grouping.
         if tools_active && m.role == Role::Tool {
-            let mut text = text;
+            let text = text_of_parts(&parts);
             // P1-6 (2026-07-09): record the pre-hint original at the
             // index this entry is about to occupy.
             tool_result_originals.push((messages.len(), text.clone()));
             if aids && crate::hint_injector::looks_like_error(&text) {
                 consecutive_tool_errors += 1;
-                crate::hint_injector::inject_hints(&mut text, consecutive_tool_errors);
+                if let Some(hint) = crate::hint_injector::hint_for(&text, consecutive_tool_errors) {
+                    append_text_part(&mut parts, &hint);
+                }
             } else {
                 consecutive_tool_errors = 0;
             }
             messages.push(MsgEntry {
                 role: "tool".into(),
-                content: text,
+                parts,
                 tool_calls: None,
                 tool_call_id: m.tool_call_id.clone(),
-                media: m.media_kinds(),
                 reasoning_content: None,
             });
             collect_message_media(
@@ -388,10 +489,9 @@ pub(super) fn build_msg_entries_admitted(
         };
         messages.push(MsgEntry {
             role,
-            content: text,
+            parts,
             tool_calls: tool_calls_json,
             tool_call_id: m.tool_call_id.clone(),
-            media: m.media_kinds(),
             // F1: forward reasoning_content for assistant messages only.
             // Wave 3: when strip_reasoning=true, drop it for ALL turns,
             // forcing the template back to the pre-F1 "clean content
@@ -429,13 +529,14 @@ pub(super) fn build_msg_entries_admitted(
     // refer to the un-shifted `messages` vec.
     if tools_active && aids && !error_dedup_disabled() {
         for (idx, replacement) in tail::duplicate_error_masks(&tool_result_originals) {
-            messages[idx].content = replacement;
+            messages[idx].set_text(replacement);
         }
     }
 
     // Extract working directory from the system message if present.
     let cwd_hint: Option<String> = messages.iter().find(|m| m.role == "system").and_then(|m| {
-        for line in m.content.lines() {
+        let text = m.text();
+        for line in text.lines() {
             let lower = line.to_lowercase();
             if (lower.contains("working directory")
                 || lower.contains("working_directory")
@@ -464,7 +565,7 @@ pub(super) fn build_msg_entries_admitted(
         if let Some(first) = messages.first_mut()
             && first.role == "system"
         {
-            first.content.push_str(&hints);
+            first.append_text(&hints);
         }
     }
 
@@ -481,11 +582,12 @@ pub(super) fn build_msg_entries_admitted(
     if aids
         && messages
             .first()
-            .is_some_and(|m| m.role == "system" && tail::is_vacuous_system_content(&m.content))
+            .is_some_and(|m| m.role == "system" && tail::is_vacuous_system_content(&m.text()))
     {
         let removed = messages.remove(0);
+        let dropped = removed.text();
         tracing::info!(
-            dropped = %removed.content.trim(),
+            dropped = %dropped.trim(),
             "Dropped content-free client system message (would bias the model toward terse output)"
         );
     }
@@ -532,7 +634,7 @@ pub(super) fn build_msg_entries_admitted(
         )
         && let Some(last_tool) = messages.iter_mut().rev().find(|e| e.role == "tool")
     {
-        last_tool.content.push_str(&hint);
+        last_tool.append_text(&hint);
     }
 
     Ok(BuildOut {

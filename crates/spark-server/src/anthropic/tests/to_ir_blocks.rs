@@ -44,6 +44,42 @@ fn adjacent_text_blocks_join_with_no_separator() {
 }
 
 #[test]
+fn user_text_image_text_preserves_wire_order() {
+    // The prompt is built from the IR content sequence, so grouping all
+    // images before all text here silently moves the image ahead of the
+    // prose the client wrote before it.
+    let ir = lower(serde_json::json!({
+        "model": "m", "max_tokens": 16,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "before"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAA"}},
+            {"type": "text", "text": "after"}
+        ]}]
+    }));
+    let user = ir
+        .messages
+        .iter()
+        .find(|m| m.role == Role::User)
+        .expect("user msg");
+    assert_eq!(user.content.len(), 3, "parts: {user:?}");
+    assert!(
+        matches!(&user.content[0], ContentPart::Text(t) if t == "before"),
+        "parts: {:?}",
+        user.content
+    );
+    assert!(
+        matches!(user.content[1], ContentPart::Image(_)),
+        "parts: {:?}",
+        user.content
+    );
+    assert!(
+        matches!(&user.content[2], ContentPart::Text(t) if t == "after"),
+        "parts: {:?}",
+        user.content
+    );
+}
+
+#[test]
 fn user_text_plus_tool_result_splits_into_user_then_tool() {
     // One wire message, two IR messages: the prose stays a user turn and
     // the result becomes its own Tool message keyed by tool_use_id.

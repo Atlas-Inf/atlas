@@ -2,7 +2,7 @@
 
 //! ★ The reordering regression, at the site that builds the three vectors
 //! which must agree: the encoder inputs, the pad counts, and (via
-//! `MsgEntry::media`) the rendered markers.
+//! `MsgEntry::parts`) the rendered markers.
 //!
 //! These call `collect_message_media` directly rather than going through
 //! `build_msg_entries`, because collection is where order is decided and
@@ -95,7 +95,7 @@ fn alternating_media_keeps_every_position() {
     );
 }
 
-/// The ordered collection and `MsgEntry::media` are built by two
+/// The ordered collection and `MsgEntry::media_kinds` are built by two
 /// different traversals of the same content, and the splice is only
 /// correct while they agree — so pin them against each other.
 #[test]

@@ -55,8 +55,10 @@ fn user_image_block_is_carried() {
         vec![&ImageData::Base64("data:image/png;base64,AAA".into())]
     );
     assert_eq!(text_of(&user.content), "what is this?");
-    // Canonical part order: images first, then the joined text.
-    assert!(matches!(user.content[0], ContentPart::Image(_)));
+    // Wire order is preserved: the text block precedes the image block.
+    assert_eq!(user.content.len(), 2);
+    assert!(matches!(&user.content[0], ContentPart::Text(t) if t == "what is this?"));
+    assert!(matches!(user.content[1], ContentPart::Image(_)));
 }
 
 #[test]

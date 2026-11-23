@@ -14,7 +14,7 @@ use crate::AppState;
 use crate::tokenizer::{Glm5VisionPlaceholder, QwenVisionPlaceholder};
 
 use super::super::compact::{compact_messages, openai_error_response};
-use super::msg_entry::MsgEntry;
+use super::msg_entry::{MsgContentPart, MsgEntry};
 
 /// Outputs of [`render_template`]. Threaded into the streaming /
 /// blocking dispatch.
@@ -221,9 +221,10 @@ mod thinking_tests;
 /// Build the Jinja-facing JSON message array from the processed
 /// [`MsgEntry`] vec. Pure (no tokenizer/state) so it can be
 /// characterization-tested directly:
-///   * no media → `content` is a plain string,
-///   * media    → `content` is `[<one marker per media item, in the
-///     client's order>, {type:text}]` (text part omitted when empty),
+///   * no media → `content` is a plain string (all text parts joined),
+///   * media    → `content` is the message's parts in order: one marker
+///     per media item (`{"type": "image"}` / `{"type": "video"}`) and one
+///     `{"type": "text", "text": ...}` per text part, empty text omitted,
 ///   * `tool_calls` / `reasoning_content` attached when present.
 ///
 /// Roles arrive canonical (`developer` → `system` normalization happens
@@ -239,27 +240,35 @@ fn build_json_messages_for(
     messages
         .iter()
         .map(|m| {
-            let content_val = if !m.media.is_empty() {
-                let mut items: Vec<serde_json::Value> = Vec::with_capacity(m.media.len() + 1);
-                // One marker per media item, in the SAME order
-                // `collect_message_media` appended the pad counts and the
-                // encoder items — the template walks this array left to
-                // right and its `Picture N:` / `Video N:` counters follow
-                // from it. The bundled Qwen3-VL template renders
-                // `{"type": "video"}` as
-                // `<|vision_start|><|video_pad|><|vision_end|>`.
-                for kind in &m.media {
-                    items.push(match kind {
-                        crate::ir::MediaKind::Image => serde_json::json!({"type": "image"}),
-                        crate::ir::MediaKind::Video => serde_json::json!({"type": "video"}),
-                    });
-                }
-                if !m.content.is_empty() {
-                    items.push(serde_json::json!({"type": "text", "text": m.content}));
+            let has_media = m
+                .parts
+                .iter()
+                .any(|p| matches!(p, MsgContentPart::Media(_)));
+            let content_val = if has_media {
+                let mut items: Vec<serde_json::Value> = Vec::with_capacity(m.parts.len());
+                // The bundled Qwen3-VL template walks this array left to
+                // right and renders `{"type": "video"}` as
+                // `<|vision_start|><|video_pad|><|vision_end|>`, so this
+                // order is the order the model reads. It must match the
+                // encoder items and pad counts collected from the same
+                // IR content sequence.
+                for part in &m.parts {
+                    match part {
+                        MsgContentPart::Media(crate::ir::MediaKind::Image) => {
+                            items.push(serde_json::json!({"type": "image"}));
+                        }
+                        MsgContentPart::Media(crate::ir::MediaKind::Video) => {
+                            items.push(serde_json::json!({"type": "video"}));
+                        }
+                        MsgContentPart::Text(text) if !text.is_empty() => {
+                            items.push(serde_json::json!({"type": "text", "text": text}));
+                        }
+                        MsgContentPart::Text(_) => {}
+                    }
                 }
                 serde_json::Value::Array(items)
             } else {
-                serde_json::Value::String(m.content.clone())
+                serde_json::Value::String(m.text())
             };
             // `developer` → `system` normalization happens upstream at
             // MsgEntry build time (msg_entry.rs), so the role arrives
@@ -287,202 +296,5 @@ fn build_json_messages_for(
 }
 
 #[cfg(test)]
-mod json_message_tests {
-    use super::MsgEntry;
-    use super::build_json_messages;
-
-    fn entry(role: &str, content: &str, image_count: usize) -> MsgEntry {
-        MsgEntry {
-            role: role.to_string(),
-            content: content.to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            media: vec![crate::ir::MediaKind::Image; image_count],
-            reasoning_content: None,
-        }
-    }
-
-    /// PROMPT-STABILITY GATE. Characterization golden for the full
-    /// `Vec<ir::Message>` → `build_msg_entries` → `build_json_messages`
-    /// path — the exact JSON the Jinja chat template consumes. Any
-    /// change here changes rendered prompts, which breaks kv-cache
-    /// prefix reuse across requests of the same conversation. Update
-    /// ONLY for an intentional, documented behavior change.
-    #[test]
-    fn prompt_json_stability_gate() {
-        use crate::ir::message::{Reasoning, ToolCall};
-        use crate::ir::{ContentPart, Message, Role};
-
-        fn text_msg(role: Role, t: &str) -> Message {
-            Message {
-                role,
-                content: vec![ContentPart::Text(t.into())],
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                name: None,
-                reasoning: None,
-                tool_error: false,
-            }
-        }
-
-        let mut assistant = text_msg(Role::Assistant, "Sure.");
-        assistant.reasoning = Some(Reasoning {
-            text: "plan the verification".into(),
-        });
-        assistant.tool_calls = vec![
-            ToolCall {
-                id: "c1".into(),
-                name: "bash".into(),
-                arguments: serde_json::json!({"command": "cargo test"}),
-            },
-            ToolCall {
-                id: "c2".into(),
-                name: "read".into(),
-                arguments: serde_json::json!({"path": "a.rs"}),
-            },
-        ];
-        let mut tool_result = text_msg(Role::Tool, "total 0");
-        tool_result.tool_call_id = Some("c1".into());
-        tool_result.name = Some("bash".into());
-
-        let msgs = vec![
-            text_msg(
-                Role::System,
-                "You are helpful.\nworking directory: /tmp/proj",
-            ),
-            text_msg(Role::Other("developer".into()), "be terse"),
-            text_msg(Role::User, "run the tests"),
-            assistant,
-            tool_result,
-            text_msg(Role::User, "thanks"),
-        ];
-
-        let out = super::super::msg_entry::build_msg_entries_admitted(
-            None,
-            None,
-            &crate::api::chat::remote_image::RemoteImagePolicy::default(),
-            &crate::api::chat::msg_entry::VideoDecode {
-                ffmpeg: &spark_model::video_decode_ffmpeg::FfmpegPolicy {
-                    enabled: false,
-                    ..Default::default()
-                },
-                fps: 2.0,
-            },
-            &msgs,
-            true,
-            &crate::api::chat::levers::ChatLevers::OFF,
-            false,
-            crate::api::chat::vision_admit::AdmitCtx::default(),
-        )
-        .expect("fixture builds");
-        assert_eq!(out.cwd_hint.as_deref(), Some("/tmp/proj"));
-        let json = build_json_messages(&out.messages);
-
-        let expected = serde_json::json!([
-            {
-                "role": "system",
-                "content": "You are helpful.\nworking directory: /tmp/proj\n<environment>\nworking_directory: /tmp/proj\n</environment>"
-            },
-            {"role": "system", "content": "be terse"},
-            {"role": "user", "content": "run the tests"},
-            {
-                "role": "assistant",
-                "content": "Sure.",
-                "tool_calls": [
-                    {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": {"command": "cargo test"}}},
-                    {"id": "c2", "type": "function", "function": {"name": "read", "arguments": {"path": "a.rs"}}}
-                ],
-                "reasoning_content": "plan the verification"
-            },
-            {"role": "tool", "content": "total 0"},
-            {"role": "user", "content": "thanks"}
-        ]);
-        assert_eq!(
-            serde_json::Value::Array(json.clone()),
-            expected,
-            "prompt JSON drifted — this breaks kv-cache prefix stability:\n{}",
-            serde_json::to_string_pretty(&json).unwrap()
-        );
-    }
-
-    #[test]
-    fn plain_text_message_serializes_to_string_content() {
-        let out = build_json_messages(&[entry("user", "hi", 0)]);
-        assert_eq!(
-            out,
-            vec![serde_json::json!({"role": "user", "content": "hi"})]
-        );
-    }
-
-    #[test]
-    fn images_expand_to_structured_content_array_with_text_last() {
-        let out = build_json_messages(&[entry("user", "look", 2)]);
-        assert_eq!(
-            out,
-            vec![serde_json::json!({
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "image"},
-                    {"type": "text", "text": "look"}
-                ]
-            })]
-        );
-    }
-
-    #[test]
-    fn empty_text_with_images_omits_text_part() {
-        let out = build_json_messages(&[entry("user", "", 1)]);
-        assert_eq!(
-            out,
-            vec![serde_json::json!({"role": "user", "content": [{"type": "image"}]})]
-        );
-    }
-
-    /// ★ The reordering regression, at the rendering end. The builder used
-    /// to emit `image_count` image markers and then `video_count` video
-    /// markers, so a client that sent a video first had its still
-    /// described instead — silently, since the marker count, the pad runs
-    /// and the encoder rows all still matched.
-    ///
-    /// The bundled template walks this array left to right and numbers its
-    /// `Picture N:` / `Video N:` labels from it, so the array order IS the
-    /// order the model reads.
-    #[test]
-    fn media_markers_render_in_the_clients_order() {
-        use crate::ir::MediaKind;
-
-        let mut e = entry("user", "which came first?", 0);
-        e.media = vec![MediaKind::Video, MediaKind::Image, MediaKind::Video];
-        let out = build_json_messages(&[e]);
-        assert_eq!(
-            out,
-            vec![serde_json::json!({
-                "role": "user",
-                "content": [
-                    {"type": "video"},
-                    {"type": "image"},
-                    {"type": "video"},
-                    {"type": "text", "text": "which came first?"}
-                ]
-            })]
-        );
-    }
-
-    #[test]
-    fn tool_calls_and_reasoning_are_attached() {
-        let mut e = entry("assistant", "", 0);
-        e.tool_calls = Some(vec![serde_json::json!({"id": "c1"})]);
-        e.reasoning_content = Some("because".to_string());
-        let out = build_json_messages(&[e]);
-        assert_eq!(
-            out,
-            vec![serde_json::json!({
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{"id": "c1"}],
-                "reasoning_content": "because"
-            })]
-        );
-    }
-}
+#[path = "template/json_message_tests.rs"]
+mod json_message_tests;
