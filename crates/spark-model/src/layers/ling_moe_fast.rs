@@ -97,38 +97,27 @@ impl StrictFastTables {
             upload_scales(gpu, &scale_bytes[1])?,
             upload_scales(gpu, &scale_bytes[2])?,
         ];
-        let tables = [
-            StrictFp8Table {
-                weight_ptrs: upload_ptrs(gpu, &weight_ptrs[0])?,
-                scale_ptrs: scale_table(gpu, scale_storage[0], scale_elements)?,
-            },
-            StrictFp8Table {
-                weight_ptrs: upload_ptrs(gpu, &weight_ptrs[1])?,
-                scale_ptrs: scale_table(gpu, scale_storage[1], scale_elements)?,
-            },
-            StrictFp8Table {
-                weight_ptrs: upload_ptrs(gpu, &weight_ptrs[2])?,
-                scale_ptrs: scale_table(gpu, scale_storage[2], scale_elements)?,
-            },
-        ];
+        let gate = StrictFp8Table {
+            weight_ptrs: upload_ptrs(gpu, &weight_ptrs[0])?,
+            scale_ptrs: scale_table(gpu, scale_storage[0], scale_elements)?,
+        };
+        let up = StrictFp8Table {
+            weight_ptrs: upload_ptrs(gpu, &weight_ptrs[1])?,
+            scale_ptrs: scale_table(gpu, scale_storage[1], scale_elements)?,
+        };
+        let down = StrictFp8Table {
+            weight_ptrs: upload_ptrs(gpu, &weight_ptrs[2])?,
+            scale_ptrs: scale_table(gpu, scale_storage[2], scale_elements)?,
+        };
         let shared_gate_up = gpu.alloc(INTERMEDIATE * 2 * std::mem::size_of::<u16>())?;
         Ok(Self {
-            gate: tables[0].clone_for_move(),
-            up: tables[1].clone_for_move(),
-            down: tables[2].clone_for_move(),
+            gate,
+            up,
+            down,
             shared_gate_up,
             _pages: pages,
             _scale_storage: scale_storage,
         })
-    }
-}
-
-impl StrictFp8Table {
-    fn clone_for_move(&self) -> Self {
-        Self {
-            weight_ptrs: self.weight_ptrs,
-            scale_ptrs: self.scale_ptrs,
-        }
     }
 }
 
@@ -157,21 +146,36 @@ fn scale_table(gpu: &dyn GpuBackend, storage: DevicePtr, elements: usize) -> Res
 }
 
 fn append_scale_f32(output: &mut Vec<u8>, page: &LingPage) -> Result<()> {
-    match page.kind() {
+    output.extend_from_slice(&widen_scale_bytes(page.kind(), page.bytes())?);
+    Ok(())
+}
+
+fn widen_scale_bytes(kind: LingPageKind, bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(bytes.len() * 2);
+    match kind {
         LingPageKind::Bf16Scale => {
-            for chunk in page.bytes().chunks_exact(2) {
+            ensure!(bytes.len().is_multiple_of(2));
+            for chunk in bytes.chunks_exact(2) {
                 let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
                 output.extend_from_slice(&f32::from_bits(u32::from(bits) << 16).to_le_bytes());
             }
         }
-        LingPageKind::F32Scale => output.extend_from_slice(page.bytes()),
+        LingPageKind::F32Scale => {
+            ensure!(bytes.len().is_multiple_of(4));
+            output.extend_from_slice(bytes)
+        }
         LingPageKind::E4M3Weight => anyhow::bail!("Ling weight page used as a scale"),
     }
-    ensure!(page.bytes().len() % page.kind().element_bytes() == 0);
-    Ok(())
+    Ok(output)
 }
 
 impl LingMoeFfn {
+    /// Only fixed pointer-table variants are safe to replay in a CUDA graph;
+    /// the staged fallback performs host route reads and mmap copies.
+    pub(crate) fn supports_cuda_graph(&self) -> bool {
+        self.a16 || self.strict_fast.is_some()
+    }
+
     pub(super) fn forward_strict_fast(
         &self,
         input: DevicePtr,
@@ -179,10 +183,6 @@ impl LingMoeFfn {
         stream: u64,
     ) -> Result<DevicePtr> {
         ensure!(ctx.config.model_type == "bailing_moe_v3_vl");
-        ensure!(
-            !ctx.graph_capture,
-            "Ling native FFN does not support graph capture yet"
-        );
         ensure!(ctx.config.hidden_size == self.hidden);
         let fast = self
             .strict_fast
@@ -191,6 +191,16 @@ impl LingMoeFfn {
         let shared_gate = self.shared_gate.resident().expect("validated shared gate");
         let shared_up = self.shared_up.resident().expect("validated shared up");
         let shared_down = self.shared_down.resident().expect("validated shared down");
+        ops::per_token_group_quant_fp8(
+            ctx.gpu,
+            self.kernels.quant,
+            input,
+            self.input_fp8,
+            self.input_scale,
+            1,
+            HIDDEN as u32,
+            stream,
+        )?;
         let ids = ctx.buffers.scratch();
         let weights = ids.offset(TOP_K * std::mem::size_of::<i32>());
         ensure!(ctx.buffers.scratch_bytes() >= TOP_K * 8 * std::mem::size_of::<u32>());
@@ -215,12 +225,13 @@ impl LingMoeFfn {
             stream,
         )?;
         let shared_up_out = fast.shared_gate_up.offset(INTERMEDIATE * 2);
-        ops::moe_expert_gate_up_shared_fp8(
+        ops::ling_fp8_gate_up_shared(
             ctx.gpu,
             self.kernels
                 .fp8_gate_up
                 .expect("strict fast gate/up kernel"),
-            input,
+            self.input_fp8,
+            self.input_scale,
             fast.gate.weight_ptrs,
             fast.gate.scale_ptrs,
             ctx.buffers.expert_gate_out(),
@@ -281,20 +292,25 @@ impl LingMoeFfn {
 
 #[cfg(test)]
 mod tests {
-    use super::append_scale_f32;
-    use spark_runtime::weights::ling_paging::{LingPage, LingPageKind};
+    use super::widen_scale_bytes;
+    use spark_runtime::weights::ling_paging::LingPageKind;
 
     // The conversion is intentionally kept in this module rather than using
     // a GPU widen launch: table construction must finish before any decode
     // stream can observe a pointer table.
     #[test]
     fn bf16_scale_widen_is_exact() {
-        // Constructing a LingPage needs a mapped shard, so exercise the same
-        // bit operation directly without coupling this unit test to mmap I/O.
-        let bits = 0x3f80u16;
-        assert_eq!(f32::from_bits(u32::from(bits) << 16), 1.0);
-        let _ = append_scale_f32;
-        let _ = LingPageKind::Bf16Scale;
-        let _ = std::mem::size_of::<LingPage>();
+        let bytes = widen_scale_bytes(LingPageKind::Bf16Scale, &[0x80, 0x3f, 0x00, 0xc0]).unwrap();
+        assert_eq!(f32::from_le_bytes(bytes[0..4].try_into().unwrap()), 1.0);
+        assert_eq!(f32::from_le_bytes(bytes[4..8].try_into().unwrap()), -2.0);
+    }
+
+    #[test]
+    fn f32_scale_bytes_are_preserved() {
+        let bytes = [1.0f32.to_le_bytes(), (-2.0f32).to_le_bytes()].concat();
+        assert_eq!(
+            widen_scale_bytes(LingPageKind::F32Scale, &bytes).unwrap(),
+            bytes
+        );
     }
 }

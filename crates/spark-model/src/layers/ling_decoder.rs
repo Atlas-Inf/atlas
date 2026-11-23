@@ -91,20 +91,27 @@ pub struct LingDecoderLayer {
     hidden_size: usize,
     h_state_bytes: usize,
     conv_state_bytes: usize,
-    layer_idx: usize,
+    /// Compact index into the paged KV cache's full-attention pools.  Ling's
+    /// transformer indices include 35 KDA layers, while the cache allocates
+    /// only the seven MLA layers; keeping this separate prevents a layer 5,
+    /// 11, ... transformer index from indexing past the seven cache pools.
+    attention_layer_idx: Option<usize>,
 }
 
 impl LingDecoderLayer {
-    fn alloc_projection_scratch(gpu: &dyn GpuBackend) -> Result<LingProjectionScratch> {
-        // The largest Ling projection contraction is the 4096-wide KDA/MLA
-        // output.  Keep one reusable activation and scale buffer per layer.
-        let act = gpu.alloc(LING_KDA_PROJECTION_SIZE)?;
-        let scales = gpu.alloc((LING_KDA_PROJECTION_SIZE / 128) * 4)?;
+    fn alloc_projection_scratch(
+        gpu: &dyn GpuBackend,
+        max_input_width: usize,
+    ) -> Result<LingProjectionScratch> {
+        let input_width = max_input_width.max(LING_KDA_PROJECTION_SIZE).div_ceil(128) * 128;
+        let scale_bytes = input_width.div_ceil(128) * 4;
+        let act = gpu.alloc(input_width)?;
+        let scales = gpu.alloc(scale_bytes)?;
         Ok(LingProjectionScratch::new(
             act,
-            LING_KDA_PROJECTION_SIZE,
+            input_width,
             scales,
-            (LING_KDA_PROJECTION_SIZE / 128) * 4,
+            scale_bytes,
         ))
     }
 
@@ -275,8 +282,6 @@ impl LingDecoderLayer {
                     *projection,
                     stream,
                 )?;
-                // KDA scratch is layer-owned; the shared attention buffer is
-                // the FFN seam used by LingMoe's weighted residual fold.
                 ctx.gpu.copy_d2d_async(
                     out,
                     ctx.buffers.attn_output(),
@@ -300,7 +305,8 @@ impl LingDecoderLayer {
                     *kernels,
                     ctx.gpu,
                     kv_cache,
-                    self.layer_idx,
+                    self.attention_layer_idx
+                        .expect("Ling MLA layer must have a compact KV-cache index"),
                     metadata,
                     normed,
                     ctx.buffers.attn_output(),
@@ -409,14 +415,6 @@ impl LingDecoderLayer {
                 1,
                 self.hidden_size as u32,
                 ctx.config.rms_norm_eps as f32,
-                stream,
-            )?;
-            // LingMoe folds the attention branch from the shared base pointer;
-            // preserve the row-local branch before its one-token FFN call.
-            ctx.gpu.copy_d2d_async(
-                attn_t,
-                ctx.buffers.attn_output(),
-                self.hidden_size * 2,
                 stream,
             )?;
             let ffn_out = match &self.dense_ffn {

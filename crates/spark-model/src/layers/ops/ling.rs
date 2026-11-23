@@ -57,6 +57,55 @@ pub(crate) fn ling_grouped_top8(
         .launch(stream)
 }
 
+/// W8A8 gate/up GEMV over the eight routed experts plus the shared expert.
+/// The input has already been quantized into one dynamic FP8 group scale per
+/// 128 channels; expert IDs remain on device.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ling_fp8_gate_up_shared(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input_fp8: DevicePtr,
+    input_scale: DevicePtr,
+    gate_weight_ptrs: DevicePtr,
+    gate_scale_ptrs: DevicePtr,
+    gate_out: DevicePtr,
+    up_weight_ptrs: DevicePtr,
+    up_scale_ptrs: DevicePtr,
+    up_out: DevicePtr,
+    expert_indices: DevicePtr,
+    shared_gate: &Fp8Weight,
+    shared_gate_out: DevicePtr,
+    shared_up: &Fp8Weight,
+    shared_up_out: DevicePtr,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 8), top_k + 1, 2])
+        .block([128, 1, 1])
+        .arg_ptr(input_fp8)
+        .arg_ptr(input_scale)
+        .arg_ptr(gate_weight_ptrs)
+        .arg_ptr(gate_scale_ptrs)
+        .arg_ptr(gate_out)
+        .arg_ptr(up_weight_ptrs)
+        .arg_ptr(up_scale_ptrs)
+        .arg_ptr(up_out)
+        .arg_ptr(expert_indices)
+        .arg_ptr(shared_gate.weight)
+        .arg_ptr(shared_gate.row_scale)
+        .arg_ptr(shared_gate_out)
+        .arg_ptr(shared_up.weight)
+        .arg_ptr(shared_up.row_scale)
+        .arg_ptr(shared_up_out)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .launch(stream)
+}
+
 /// Ling's original gated SwiGLU followed by per-token group-128 FP8
 /// quantization.  `out_bf16` may be null when only the quantized activation is
 /// needed by the down projection.

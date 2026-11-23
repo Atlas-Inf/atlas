@@ -197,7 +197,10 @@ impl LingMlaKernels {
             q_rope_writeback: gpu.kernel("mla_absorbed", "mla_q_rope_writeback_batched")?,
             kv_assemble: gpu.kernel("mla_absorbed", "mla_kv_assemble_batched")?,
             reshape_cache: gpu.kernel("reshape_and_cache", "reshape_and_cache_flash")?,
-            paged_attention: gpu.kernel("paged_decode", "paged_decode_attn")?,
+            // Ling's absorbed K/V rows are 192-wide (qk_nope 128 + RoPE 64),
+            // so resolve the target-local HDIM=192 module rather than the
+            // borrowed generic HDIM=256 paged decoder.
+            paged_attention: gpu.kernel("paged_decode_ling", "paged_decode_attn_ling")?,
             sigmoid_gate: gpu.kernel("residual_add", "sigmoid_gate_mul_head_broadcast")?,
         })
     }

@@ -37,6 +37,10 @@ pub fn load_ling_layers(
     );
     ensure!(config.layer_types.len() == config.num_hidden_layers);
     let mut layers: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(config.num_hidden_layers);
+    // PagedKvCache stores only full-attention layers for Ling.  Its layer
+    // index is therefore compact (0..7), not the transformer layer number
+    // (5, 11, ... 41) used by the model's interleaved KDA/MLA schedule.
+    let mut attention_layer_idx = 0usize;
     for layer_idx in 0..config.num_hidden_layers {
         let prefix = format!("model.layers.{layer_idx}");
         let input_norm = load_norm(
@@ -49,23 +53,26 @@ pub fn load_ling_layers(
             &format!("{prefix}.post_attention_layernorm.weight"),
             config.hidden_size,
         )?;
-        let projection = LingDecoderLayer::alloc_projection_scratch(gpu)?;
-        let attention = match config.layer_type(layer_idx) {
-            LayerType::LinearAttention => LingAttention::Kda {
-                layer: LingKdaLayer::new(
-                    crate::layers::ling_kda::LingKdaWeights::load(
-                        store,
-                        &format!("{prefix}.attention"),
+        let projection = LingDecoderLayer::alloc_projection_scratch(gpu, config.intermediate_size)?;
+        let (attention, cache_layer_idx) = match config.layer_type(layer_idx) {
+            LayerType::LinearAttention => (
+                LingAttention::Kda {
+                    layer: LingKdaLayer::new(
+                        crate::layers::ling_kda::LingKdaWeights::load(
+                            store,
+                            &format!("{prefix}.attention"),
+                        )?,
+                        LingKdaConfig {
+                            lower_bound: config.kda_gate_lower_bound,
+                            rms_norm_eps: config.rms_norm_eps as f32,
+                        },
+                        gpu,
                     )?,
-                    LingKdaConfig {
-                        lower_bound: config.kda_gate_lower_bound,
-                        rms_norm_eps: config.rms_norm_eps as f32,
-                    },
-                    gpu,
-                )?,
-                scratch: LingDecoderLayer::alloc_kda_scratch(gpu)?,
-                projection,
-            },
+                    scratch: LingDecoderLayer::alloc_kda_scratch(gpu)?,
+                    projection,
+                },
+                None,
+            ),
             LayerType::FullAttention => {
                 let mla = LingMlaConfig {
                     hidden_size: config.hidden_size,
@@ -78,17 +85,22 @@ pub fn load_ling_layers(
                     rms_eps: config.rms_norm_eps as f32,
                 };
                 let kernels = LingMlaKernels::load(gpu)?;
-                LingAttention::Mla {
-                    weights: LingMlaWeights::load(
-                        store,
-                        &format!("{prefix}.attention"),
-                        mla,
-                        rope_inv_freq,
-                    )?,
-                    scratch: LingDecoderLayer::alloc_mla_scratch(gpu, mla, projection)?,
-                    config: mla,
-                    kernels,
-                }
+                let cache_layer_idx = attention_layer_idx;
+                attention_layer_idx += 1;
+                (
+                    LingAttention::Mla {
+                        weights: LingMlaWeights::load(
+                            store,
+                            &format!("{prefix}.attention"),
+                            mla,
+                            rope_inv_freq,
+                        )?,
+                        scratch: LingDecoderLayer::alloc_mla_scratch(gpu, mla, projection)?,
+                        config: mla,
+                        kernels,
+                    },
+                    Some(cache_layer_idx),
+                )
             }
             other => bail!("Ling layer {layer_idx} has unsupported type {other:?}"),
         };
@@ -121,7 +133,7 @@ pub fn load_ling_layers(
             hidden_size: config.hidden_size,
             h_state_bytes: config.ssm_h_state_bytes(),
             conv_state_bytes: config.ssm_conv_state_bytes(),
-            layer_idx,
+            attention_layer_idx: cache_layer_idx,
         }));
     }
     Ok(layers)
@@ -159,7 +171,10 @@ fn load_dense_ffn(
         gate.shape[0]
     );
     let intermediate = gate.shape[0];
-    let projection = LingDecoderLayer::alloc_projection_scratch(gpu)?;
+    let projection = LingDecoderLayer::alloc_projection_scratch(
+        gpu,
+        config.intermediate_size.max(intermediate),
+    )?;
     Ok(LingDenseFfn {
         gate: LingProjection::load(
             store,

@@ -149,11 +149,7 @@ impl LingMoeFfn {
         // and both pointer-table kernels are present.  A failed capability
         // probe deliberately leaves the existing ordered staging path intact.
         let fp8_gate_up = if !a16 {
-            crate::layers::try_kernel(
-                gpu,
-                "moe_shared_expert_fused_fp8",
-                "moe_expert_gate_up_shared_fp8",
-            )
+            crate::layers::try_kernel(gpu, "ling_ffn", "ling_fp8_gate_up_shared")
         } else {
             spark_runtime::gpu::KernelHandle(0)
         };

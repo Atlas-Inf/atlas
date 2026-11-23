@@ -55,6 +55,116 @@ __device__ __forceinline__ unsigned char ling_encode_e4m3(float v) {
 #endif
 }
 
+__device__ __forceinline__ float ling_decode_e4m3(unsigned char bits) {
+    const unsigned int exponent = (bits >> 3) & 0x0Fu;
+    const unsigned int mantissa = bits & 0x07u;
+    float value;
+    if (exponent == 0) {
+        value = (float)mantissa * 0.001953125f;
+    } else if (exponent == 15 && mantissa == 7) {
+        value = 0.0f; // E4M3 NaN; checkpoint weights never intentionally use it.
+    } else {
+        value = (1.0f + (float)mantissa * 0.125f) * exp2f((float)exponent - 7.0f);
+    }
+    return (bits & 0x80u) ? -value : value;
+}
+
+// W8A8 gate/up decode for one token.  Each warp owns two output rows and
+// folds the dynamic activation scale with the original 128x128 weight scale
+// after the FP8 dot product, matching fp8_gemm_t_blockscaled numerics.
+extern "C" __global__ void ling_fp8_gate_up_shared(
+    const unsigned char* __restrict__ A_fp8,
+    const float* __restrict__ a_scale,
+    const unsigned long long* __restrict__ gate_weight_ptrs,
+    const unsigned long long* __restrict__ gate_scale_ptrs,
+    __nv_bfloat16* __restrict__ gate_out,
+    const unsigned long long* __restrict__ up_weight_ptrs,
+    const unsigned long long* __restrict__ up_scale_ptrs,
+    __nv_bfloat16* __restrict__ up_out,
+    const unsigned int* __restrict__ expert_indices,
+    const unsigned char* __restrict__ shared_gate_weight,
+    const float* __restrict__ shared_gate_scale,
+    __nv_bfloat16* __restrict__ shared_gate_out,
+    const unsigned char* __restrict__ shared_up_weight,
+    const float* __restrict__ shared_up_scale,
+    __nv_bfloat16* __restrict__ shared_up_out,
+    unsigned int N,
+    unsigned int K,
+    unsigned int top_k) {
+    const unsigned int slot = blockIdx.y;
+    const bool is_shared = slot == top_k;
+    const unsigned int projection = blockIdx.z;
+    const unsigned char* weight;
+    const float* block_scale;
+    __nv_bfloat16* output;
+    if (is_shared) {
+        if (projection == 0) {
+            weight = shared_gate_weight;
+            block_scale = shared_gate_scale;
+            output = shared_gate_out;
+        } else {
+            weight = shared_up_weight;
+            block_scale = shared_up_scale;
+            output = shared_up_out;
+        }
+    } else {
+        const unsigned int expert = expert_indices[slot];
+        if (projection == 0) {
+            weight = (const unsigned char*)gate_weight_ptrs[expert];
+            block_scale = (const float*)gate_scale_ptrs[expert];
+            output = gate_out + (unsigned long long)slot * N;
+        } else {
+            weight = (const unsigned char*)up_weight_ptrs[expert];
+            block_scale = (const float*)up_scale_ptrs[expert];
+            output = up_out + (unsigned long long)slot * N;
+        }
+        if (weight == 0) {
+            const unsigned int base = blockIdx.x * 8;
+            for (unsigned int i = threadIdx.x; i < 8 && base + i < N; i += 128)
+                output[base + i] = __float2bfloat16(0.0f);
+            return;
+        }
+    }
+
+    const unsigned int local_output = threadIdx.x / 32;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int n1 = blockIdx.x * 8 + local_output * 2;
+    const unsigned int n2 = n1 + 1;
+    if (n1 >= N) return;
+    const bool have_n2 = n2 < N;
+    const unsigned int groups = K / FP8_GROUP_K;
+    const unsigned int n1_block = n1 / FP8_GROUP_K;
+    const unsigned int n2_block = n2 / FP8_GROUP_K;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    for (unsigned int group = 0; group < groups; ++group) {
+        const unsigned int base = group * FP8_GROUP_K + lane * 4;
+        const float as = a_scale[group];
+        float dot1 = 0.0f;
+        float dot2 = 0.0f;
+        #pragma unroll
+        for (unsigned int i = 0; i < 4; ++i) {
+            const float a = ling_decode_e4m3(A_fp8[base + i]);
+            dot1 += a * ling_decode_e4m3(weight[(unsigned long long)n1 * K + base + i]);
+            if (have_n2)
+                dot2 += a * ling_decode_e4m3(weight[(unsigned long long)n2 * K + base + i]);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot1 += __shfl_down_sync(0xffffffff, dot1, offset);
+            dot2 += __shfl_down_sync(0xffffffff, dot2, offset);
+        }
+        if (lane == 0) {
+            acc1 += dot1 * as * block_scale[n1_block * groups + group];
+            if (have_n2)
+                acc2 += dot2 * as * block_scale[n2_block * groups + group];
+        }
+    }
+    if (lane == 0) {
+        output[n1] = __float2bfloat16(acc1);
+        if (have_n2) output[n2] = __float2bfloat16(acc2);
+    }
+}
+
 // Clamp follows the reference implementation: SiLU(gate) is computed first,
 // then bounded above, while up is bounded on both sides.  The product is
 // rounded through BF16 before the group maximum and FP8 encoding, matching the
@@ -149,24 +259,10 @@ extern "C" __global__ void ling_weighted_sum(
     output[index] = __float2bfloat16(sum);
 }
 
-// Original-FP8 down projection with the Ling clamp order.  The gate/up
-// projection is shared with the regular FP8 fused MoE kernel; this variant
-// only differs in the activation epilogue, where the reference clamps after
-// BF16-rounded SiLU and uses distinct routed/shared limits.
-__device__ __forceinline__ float ling_decode_e4m3(unsigned char bits) {
-    const unsigned int exponent = (bits >> 3) & 0x0Fu;
-    const unsigned int mantissa = bits & 0x07u;
-    float value;
-    if (exponent == 0) {
-        value = (float)mantissa * 0.001953125f;
-    } else if (exponent == 15 && mantissa == 7) {
-        value = 0.0f; // E4M3 NaN; checkpoint weights never intentionally use it.
-    } else {
-        value = (1.0f + (float)mantissa * 0.125f) * exp2f((float)exponent - 7.0f);
-    }
-    return (bits & 0x80u) ? -value : value;
-}
-
+// Original-FP8 down projection with dynamic group-128 activation quantization
+// and the Ling clamp order.  The activation is quantized inside the same
+// warp that consumes it, so the fast path never materializes eight BF16
+// activation rows or stages a selected weight through host memory.
 extern "C" __global__ void ling_silu_down_shared_fp8(
     const __nv_bfloat16* __restrict__ gate_out,
     const __nv_bfloat16* __restrict__ up_out,
@@ -216,49 +312,52 @@ extern "C" __global__ void ling_silu_down_shared_fp8(
     const unsigned int n2 = n1 + 1;
     if (n1 >= N) return;
     const bool have_n2 = n2 < N;
-    const unsigned int k8 = K / 8;
-    const unsigned int k_blocks = (K + 127) / 128;
+    const unsigned int groups = K / FP8_GROUP_K;
     const unsigned int n1_block = n1 / 128;
     const unsigned int n2_block = n2 / 128;
-    __shared__ float activation[1024];
-    for (unsigned int i = threadIdx.x; i < K; i += 128) {
-        const float g = __bfloat162float(gate[i]);
-        float u = __bfloat162float(up[i]);
-        const float silu = __bfloat162float(__float2bfloat16(g / (1.0f + __expf(-g))));
-        const float limit = is_shared ? shared_limit : routed_limit;
-        float bounded = silu;
-        if (limit > 0.0f) {
-            bounded = fminf(bounded, limit);
-            u = fminf(fmaxf(u, -limit), limit);
-        }
-        activation[i] = __bfloat162float(__float2bfloat16(bounded * u));
-    }
-    __syncthreads();
-
     float acc1 = 0.0f;
     float acc2 = 0.0f;
-    for (unsigned int group = lane; group < k8; group += threads_per_output) {
-        const unsigned int base = group * 8;
-        const unsigned int k_block = base / 128;
-        const float scale1 = block_scale[n1_block * k_blocks + k_block];
-        const float scale2 = have_n2 ? block_scale[n2_block * k_blocks + k_block] : 0.0f;
-        const unsigned int w1a = *(const unsigned int*)(weight + (unsigned long long)n1 * K + base);
-        const unsigned int w1b = *(const unsigned int*)(weight + (unsigned long long)n1 * K + base + 4);
-        const unsigned int w2a = have_n2 ? *(const unsigned int*)(weight + (unsigned long long)n2 * K + base) : 0;
-        const unsigned int w2b = have_n2 ? *(const unsigned int*)(weight + (unsigned long long)n2 * K + base + 4) : 0;
+    const float limit = is_shared ? shared_limit : routed_limit;
+    for (unsigned int group = 0; group < groups; ++group) {
+        const unsigned int base = group * FP8_GROUP_K + lane * 4;
+        float values[4];
+        float local_max = 0.0f;
         #pragma unroll
-        for (int b = 0; b < 2; ++b) {
-            const unsigned int wa = b == 0 ? w1a : w1b;
-            const unsigned int wb = b == 0 ? w2a : w2b;
-            const unsigned int offset = base + b * 4;
-            acc1 += activation[offset] * ling_decode_e4m3((wa)&0xFFu) * scale1;
-            acc1 += activation[offset + 1] * ling_decode_e4m3((wa >> 8) & 0xFFu) * scale1;
-            acc1 += activation[offset + 2] * ling_decode_e4m3((wa >> 16) & 0xFFu) * scale1;
-            acc1 += activation[offset + 3] * ling_decode_e4m3((wa >> 24) & 0xFFu) * scale1;
-            acc2 += activation[offset] * ling_decode_e4m3((wb)&0xFFu) * scale2;
-            acc2 += activation[offset + 1] * ling_decode_e4m3((wb >> 8) & 0xFFu) * scale2;
-            acc2 += activation[offset + 2] * ling_decode_e4m3((wb >> 16) & 0xFFu) * scale2;
-            acc2 += activation[offset + 3] * ling_decode_e4m3((wb >> 24) & 0xFFu) * scale2;
+        for (unsigned int i = 0; i < 4; ++i) {
+            const float g = __bfloat162float(gate[base + i]);
+            float u = __bfloat162float(up[base + i]);
+            float activated = __bfloat162float(__float2bfloat16(g / (1.0f + __expf(-g))));
+            if (limit > 0.0f) {
+                activated = fminf(activated, limit);
+                u = fminf(fmaxf(u, -limit), limit);
+            }
+            values[i] = __bfloat162float(__float2bfloat16(activated * u));
+            local_max = fmaxf(local_max, fabsf(values[i]));
+        }
+        for (int offset = 16; offset > 0; offset >>= 1)
+            local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+        float activation_scale = fmaxf(local_max / FP8_E4M3_MAX, 1.0e-12f);
+        activation_scale = __shfl_sync(0xffffffff, activation_scale, 0);
+        float dot1 = 0.0f;
+        float dot2 = 0.0f;
+        #pragma unroll
+        for (unsigned int i = 0; i < 4; ++i) {
+            const float normalized = fmaxf(fminf(values[i] / activation_scale,
+                                                  FP8_E4M3_MAX),
+                                           -FP8_E4M3_MAX);
+            const float activation = ling_decode_e4m3(ling_encode_e4m3(normalized));
+            dot1 += activation * ling_decode_e4m3(weight[(unsigned long long)n1 * K + base + i]);
+            if (have_n2)
+                dot2 += activation * ling_decode_e4m3(weight[(unsigned long long)n2 * K + base + i]);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot1 += __shfl_down_sync(0xffffffff, dot1, offset);
+            dot2 += __shfl_down_sync(0xffffffff, dot2, offset);
+        }
+        if (lane == 0) {
+            acc1 += dot1 * activation_scale * block_scale[n1_block * groups + group];
+            if (have_n2)
+                acc2 += dot2 * activation_scale * block_scale[n2_block * groups + group];
         }
     }
     for (int offset = 16; offset > 0; offset >>= 1)

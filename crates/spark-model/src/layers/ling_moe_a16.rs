@@ -21,10 +21,6 @@ impl LingMoeFfn {
         stream: u64,
     ) -> Result<DevicePtr> {
         ensure!(ctx.config.model_type == "bailing_moe_v3_vl");
-        ensure!(
-            !ctx.graph_capture,
-            "Ling native A16 FFN does not support CUDA graph capture yet"
-        );
         ensure!(ctx.config.hidden_size == self.hidden);
         let dense_kernel = self
             .kernels

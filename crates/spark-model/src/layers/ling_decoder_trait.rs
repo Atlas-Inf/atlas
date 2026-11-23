@@ -187,6 +187,13 @@ impl TransformerLayer for LingDecoderLayer {
     }
 
     fn decode_graph_unsupported(&self) -> bool {
-        matches!(&self.ffn, FfnComponent::LingMoe(_))
+        matches!(&self.ffn, FfnComponent::LingMoe(ffn) if !ffn.supports_cuda_graph())
+    }
+
+    fn multi_seq_decode_graph_unsupported(&self) -> bool {
+        // Each row carries a different KDA state (and MLA cache metadata),
+        // while this layer has no pre-capture state-pointer table. A graph
+        // would bake the first batch's per-sequence addresses.
+        true
     }
 }
