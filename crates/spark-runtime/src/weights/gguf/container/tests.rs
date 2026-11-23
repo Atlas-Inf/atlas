@@ -142,6 +142,34 @@ fn nested_array_of_arrays() {
 }
 
 #[test]
+fn rejects_excessively_nested_metadata_arrays() {
+    const NESTED_ARRAY_HEADERS: usize = 200_000;
+
+    let mut b = Vec::new();
+    b.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+    b.extend_from_slice(&3u32.to_le_bytes());
+    b.extend_from_slice(&0u64.to_le_bytes()); // 0 tensors
+    b.extend_from_slice(&1u64.to_le_bytes()); // 1 kv
+
+    push_str(&mut b, "x");
+    b.extend_from_slice(&9u32.to_le_bytes()); // metadata value = ARRAY
+    for _ in 0..NESTED_ARRAY_HEADERS {
+        b.extend_from_slice(&9u32.to_le_bytes()); // element type = ARRAY
+        b.extend_from_slice(&1u64.to_le_bytes()); // one element
+    }
+    b.extend_from_slice(&0u32.to_le_bytes()); // innermost element type = UINT8
+    b.extend_from_slice(&1u64.to_le_bytes());
+    b.push(0);
+    while !b.len().is_multiple_of(32) {
+        b.push(0);
+    }
+
+    let err = GgufFile::parse(&b).expect_err("deeply nested metadata must be rejected");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("nesting"), "unexpected error: {msg}");
+}
+
+#[test]
 fn rejects_bad_magic() {
     let mut b = vec![0u8; 24];
     b[0] = b'X';

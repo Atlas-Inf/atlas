@@ -2,7 +2,7 @@
 //! Little-endian bounds-checked cursor + metadata value decoder for the GGUF
 //! container parser. Split out of `container.rs` to keep each file ≤500 LoC.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use super::MetaValue;
 
@@ -12,8 +12,14 @@ pub(super) fn align_up(pos: usize, align: usize) -> usize {
     pos.div_ceil(align) * align
 }
 
+const MAX_METADATA_ARRAY_DEPTH: usize = 128;
+
 /// Decode one metadata value of the given wire type (recurses for arrays).
 pub(super) fn read_value(r: &mut Reader, vtype: u32) -> Result<MetaValue> {
+    read_value_at_depth(r, vtype, 0)
+}
+
+fn read_value_at_depth(r: &mut Reader, vtype: u32, depth: usize) -> Result<MetaValue> {
     Ok(match vtype {
         0 => MetaValue::U8(r.u8()?),
         1 => MetaValue::I8(r.i8()?),
@@ -25,11 +31,15 @@ pub(super) fn read_value(r: &mut Reader, vtype: u32) -> Result<MetaValue> {
         7 => MetaValue::Bool(r.u8()? != 0),
         8 => MetaValue::Str(r.string()?),
         9 => {
+            ensure!(
+                depth < MAX_METADATA_ARRAY_DEPTH,
+                "GGUF metadata array nesting exceeds maximum depth {MAX_METADATA_ARRAY_DEPTH}"
+            );
             let elem_type = r.u32().context("array element type")?;
             let len = r.u64().context("array length")?;
             let mut items = Vec::with_capacity(len.min(1 << 20) as usize);
             for _ in 0..len {
-                items.push(read_value(r, elem_type)?);
+                items.push(read_value_at_depth(r, elem_type, depth + 1)?);
             }
             MetaValue::Array(items)
         }
