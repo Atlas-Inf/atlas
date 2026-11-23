@@ -17,7 +17,10 @@ pub(crate) fn configure_attn_projection(config: &mut ModelConfig, dtype: &str) -
     );
     config.attn_proj_bf16 = dtype == "bf16";
     if let Some(hy4) = &mut config.hy4 {
-        hy4.attention_projection_fp8 = dtype == "fp8";
+        // HY4 serving defaults to FP8 attention projections; `bf16` is the
+        // explicit rollback arm.
+        hy4.attention_projection_fp8 =
+            dtype == "fp8" || (dtype == "default" && config.model_type == "hy_v4_flash");
     }
     Ok(())
 }
@@ -27,7 +30,7 @@ mod attention_projection_tests {
     use super::*;
 
     #[test]
-    fn fp8_requires_explicit_hy4_opt_in_and_can_be_disabled() {
+    fn fp8_is_hy4_default_and_can_be_disabled() {
         let mut c = atlas_core::config::parse_config(include_str!(
             "../../../../atlas-core/src/config/fixtures/hy4/config.json"
         ))
@@ -40,7 +43,7 @@ mod attention_projection_tests {
         assert!(c.attn_proj_bf16);
         assert!(!c.hy4.as_ref().unwrap().attention_projection_fp8);
         configure_attn_projection(&mut c, "default").unwrap();
-        assert!(!c.hy4.as_ref().unwrap().attention_projection_fp8);
+        assert!(c.hy4.as_ref().unwrap().attention_projection_fp8);
         c.model_type = "qwen3".into();
         assert!(configure_attn_projection(&mut c, "fp8").is_err());
     }

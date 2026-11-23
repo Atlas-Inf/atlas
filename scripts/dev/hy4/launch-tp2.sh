@@ -31,7 +31,7 @@ cmd=(docker run --detach --name "atlas-hy4-r$rank" --restart=no
     --master-addr=192.168.200.1 --master-port=29611 --gpu-ordinal=0
     --max-seq-len="${HY4_MAX_SEQ_LEN:-4096}" --max-prefill-tokens="${HY4_MAX_PREFILL_TOKENS:-256}"
     --max-batch-size=1 --max-num-seqs=1 --block-size=16
-    --kv-cache-dtype=bf16 --attn-proj-dtype=bf16 --lm-head-dtype=default
+    --kv-cache-dtype=bf16 --attn-proj-dtype=fp8 --lm-head-dtype=default
     --gpu-memory-utilization=0.88 --oom-guard-mb=12288
     --enable-prefix-caching=false --swap-space-gb=0 --no-auto-swap
     --ssm-cache-slots=0 --ssm-checkpoint-interval=0
