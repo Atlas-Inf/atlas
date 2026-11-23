@@ -66,6 +66,12 @@ pub struct ChatCompletionRequest {
     /// `usage.completion_tokens` counting. Defaults false (opt-in).
     #[serde(default)]
     pub return_token_ids: bool,
+    /// Atlas extension: under `--tool-guard stream`, send this request's tool
+    /// calls (header and arguments) as the model writes them. Without it a
+    /// call is held until it passes, exactly as under `--tool-guard on`.
+    /// Ignored under `on` (held) and `off` (unchanged).
+    #[serde(default)]
+    pub stream_tool_arguments: bool,
     /// Enable chain-of-thought reasoning (Qwen3.5 thinking models).
     /// `Some(true)`: model generates its reasoning first. `Some(false)`: model
     /// answers directly. `None` (field omitted): defer to the model's design
