@@ -10,13 +10,14 @@
 use std::any::Any;
 use std::sync::Mutex;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::batch::Batch;
 use super::glue::GlueKernels;
 use super::ops::{self, Inkling2Kernels};
+use super::owner_runs::owner_runs;
 use super::schedule::Visit;
 use super::shared::{Dims, Shared};
 use super::weights::{GlobalWeights, PhysicalWeights};
@@ -114,28 +115,6 @@ fn seq_state(state: &mut dyn LayerState) -> Result<&mut Inkling2SeqState> {
         .as_any_mut()
         .downcast_mut::<Inkling2SeqState>()
         .context("inkling2 layer state")
-}
-
-/// `(first row, rows)` of each of `seqs` sequences in `row_owner`, which must
-/// list every sequence's rows together and in order.
-fn owner_runs(row_owner: &[usize], seqs: usize) -> Result<Vec<(usize, usize)>> {
-    let mut runs: Vec<(usize, usize)> = Vec::with_capacity(seqs);
-    for (r, &o) in row_owner.iter().enumerate() {
-        let seen = runs.len();
-        if seen > 0 && o + 1 == seen {
-            runs[seen - 1].1 += 1;
-        } else if o == seen {
-            runs.push((r, 1));
-        } else {
-            bail!("inkling2: verify row {r} of sequence {o} out of order");
-        }
-    }
-    ensure!(
-        runs.len() == seqs && seqs > 0,
-        "inkling2: verify rows of {} sequences for {seqs} states",
-        runs.len()
-    );
-    Ok(runs)
 }
 
 fn conv_base(state: &mut dyn LayerState) -> Result<DevicePtr> {
@@ -499,27 +478,5 @@ impl TransformerLayer for Inkling2Layer {
 
     fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
         Some(self)
-    }
-}
-
-#[cfg(test)]
-mod owner_run_tests {
-    use super::owner_runs;
-
-    #[test]
-    fn rows_group_by_sequence_in_order() {
-        assert_eq!(owner_runs(&[0, 0, 0], 1).unwrap(), vec![(0, 3)]);
-        assert_eq!(
-            owner_runs(&[0, 0, 1, 1, 1], 2).unwrap(),
-            vec![(0, 2), (2, 3)]
-        );
-    }
-
-    #[test]
-    fn out_of_order_or_missing_rows_fail() {
-        assert!(owner_runs(&[0, 1, 0], 2).is_err());
-        assert!(owner_runs(&[1, 1], 2).is_err());
-        assert!(owner_runs(&[0, 0], 2).is_err());
-        assert!(owner_runs(&[], 1).is_err());
     }
 }
