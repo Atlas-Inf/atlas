@@ -296,6 +296,23 @@ fn a_forced_close_then_headerless_text_is_the_answer() {
     assert_eq!(show(&M.turn(true).map_all(&ids, &Chars)), "t|391#");
 }
 
+/// A grammar-forced call (`tool_choice` required or a named function) is
+/// written as Hermes text with no block header at all. It is the answer: with
+/// thinking on, the think end comes first, or the stream reads the call as
+/// reasoning and the in-think leak guard cuts the response.
+#[test]
+fn headerless_text_with_no_block_before_it_is_the_answer() {
+    let ids = [s("<tool_call>x</tool_call>"), vec![EOS]].concat();
+    assert_eq!(
+        show(&M.turn(true).map_all(&ids, &Chars)),
+        "|<tool_call>x</tool_call>#"
+    );
+    assert_eq!(
+        show(&M.turn(false).map_all(&ids, &Chars)),
+        "<tool_call>x</tool_call>#"
+    );
+}
+
 /// With thinking off the scheduler does not stream the reasoning body (the
 /// header before it and its close are streamed); the rewrite reads the same
 /// answer as from the whole turn.
