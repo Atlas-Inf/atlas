@@ -102,7 +102,7 @@ impl WeightLoader for SafetensorsLoader {
                 reserve_gb,
                 has_fp8,
             );
-            if peak_estimated + oom_reserve_bytes > free {
+            if peak_estimated.saturating_add(oom_reserve_bytes) > free {
                 bail!(
                     "OOM pre-flight: model peak memory ({:.2} GB = {:.2} GB weights × {:.1}x \
                      model-building overhead) + {:.1} GB reserve = {:.2} GB, \
@@ -259,6 +259,34 @@ pub(crate) fn read_safetensor_header(
     Ok(tensors)
 }
 
+fn dtype_elem_bytes(dtype: safetensors::Dtype) -> usize {
+    match dtype {
+        safetensors::Dtype::F32 | safetensors::Dtype::I32 | safetensors::Dtype::U32 => 4,
+        safetensors::Dtype::F16
+        | safetensors::Dtype::BF16
+        | safetensors::Dtype::I16
+        | safetensors::Dtype::U16 => 2,
+        safetensors::Dtype::I8
+        | safetensors::Dtype::U8
+        | safetensors::Dtype::F8_E4M3
+        | safetensors::Dtype::F8_E5M2 => 1,
+        _ => 2,
+    }
+}
+
+fn tensor_numel(name: &str, shape: &[usize]) -> Result<usize> {
+    shape
+        .iter()
+        .try_fold(1usize, |numel, &dim| numel.checked_mul(dim))
+        .with_context(|| format!("tensor {name}: shape {shape:?} overflows"))
+}
+
+fn tensor_bytes(name: &str, shape: &[usize], dtype: safetensors::Dtype) -> Result<usize> {
+    tensor_numel(name, shape)?
+        .checked_mul(dtype_elem_bytes(dtype))
+        .with_context(|| format!("tensor {name}: byte count overflows"))
+}
+
 /// Scan safetensor file headers (metadata only, no data loaded) to estimate
 /// total GPU bytes this rank will load. Reads only the JSON header from each
 /// file — does NOT mmap, so it's safe on GB10 unified memory.
@@ -276,23 +304,16 @@ pub(crate) fn estimate_load_bytes(
             // FP4-Local (3.6 GB on disk, 7.5 GB on device). Count the one
             // component that sizes it at that size and the others at zero.
             if let Some((_, part)) = super::nvfp4_csf::csf_part(&name) {
-                total += super::nvfp4_csf::decoded_len(part, &shape).unwrap_or(0);
+                let decoded = super::nvfp4_csf::decoded_len(part, &shape).unwrap_or(0);
+                total = total
+                    .checked_add(decoded)
+                    .with_context(|| format!("tensor {name}: total estimate overflows"))?;
                 continue;
             }
-            let numel: usize = shape.iter().product();
-            let elem_bytes = match dtype {
-                safetensors::Dtype::F32 | safetensors::Dtype::I32 | safetensors::Dtype::U32 => 4,
-                safetensors::Dtype::F16
-                | safetensors::Dtype::BF16
-                | safetensors::Dtype::I16
-                | safetensors::Dtype::U16 => 2,
-                safetensors::Dtype::I8
-                | safetensors::Dtype::U8
-                | safetensors::Dtype::F8_E4M3
-                | safetensors::Dtype::F8_E5M2 => 1,
-                _ => 2,
-            };
-            total += numel * elem_bytes;
+            let bytes = tensor_bytes(&name, &shape, dtype)?;
+            total = total
+                .checked_add(bytes)
+                .with_context(|| format!("tensor {name}: total estimate overflows"))?;
         }
     }
     Ok(total)
@@ -312,26 +333,17 @@ pub(crate) fn estimate_has_fp8(
             if skip_fn(&name) {
                 continue;
             }
-            let numel: usize = shape.iter().product();
-            let elem_bytes = match dtype {
-                safetensors::Dtype::F32 | safetensors::Dtype::I32 | safetensors::Dtype::U32 => 4,
-                safetensors::Dtype::F16
-                | safetensors::Dtype::BF16
-                | safetensors::Dtype::I16
-                | safetensors::Dtype::U16 => 2,
-                safetensors::Dtype::I8
-                | safetensors::Dtype::U8
-                | safetensors::Dtype::F8_E4M3
-                | safetensors::Dtype::F8_E5M2 => 1,
-                _ => 2,
-            };
-            let bytes = numel * elem_bytes;
-            total_bytes += bytes;
+            let bytes = tensor_bytes(&name, &shape, dtype)?;
+            total_bytes = total_bytes
+                .checked_add(bytes)
+                .with_context(|| format!("tensor {name}: total byte estimate overflows"))?;
             if matches!(
                 dtype,
                 safetensors::Dtype::F8_E4M3 | safetensors::Dtype::F8_E5M2
             ) {
-                fp8_bytes += bytes;
+                fp8_bytes = fp8_bytes
+                    .checked_add(bytes)
+                    .with_context(|| format!("tensor {name}: FP8 byte estimate overflows"))?;
             }
         }
     }
@@ -373,3 +385,48 @@ mod load_fns;
 #[cfg(any(target_os = "windows", test))]
 mod slab_plan;
 use load_fns::{load_sharded, load_single};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn estimates_reject_overflowing_header_shapes() {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "atlas-loader-overflow-{}-{unique}-{n}.safetensors",
+            std::process::id()
+        ));
+        let header = serde_json::json!({
+            "evil.weight": {
+                "dtype": "BF16",
+                "shape": [u64::MAX, 2],
+                "data_offsets": [0, 0]
+            }
+        });
+        let bytes = serde_json::to_vec(&header).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&(bytes.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&bytes).unwrap();
+        drop(file);
+
+        let files = vec![path.clone()];
+        let err = estimate_load_bytes(&files, &|_| false).unwrap_err();
+        assert!(format!("{err:#}").contains("overflows"), "{err:#}");
+        let err = estimate_has_fp8(&files, &|_| false).unwrap_err();
+        assert!(format!("{err:#}").contains("overflows"), "{err:#}");
+
+        std::fs::remove_file(path).unwrap();
+    }
+}

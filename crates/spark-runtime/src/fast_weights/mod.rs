@@ -256,7 +256,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 has_fp8,
             );
             crate::progress::preflight(gib(estimated), gib(free));
-            if peak + oom_reserve_bytes > free {
+            if peak.saturating_add(oom_reserve_bytes) > free {
                 bail!(
                     "OOM pre-flight: peak {:.2} GB + {:.2} GB reserve exceeds {:.2} GB free. \
                      Use a smaller quantization or add more GPUs for EP.",

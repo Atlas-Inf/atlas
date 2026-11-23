@@ -200,7 +200,7 @@ pub(super) fn load_sharded(
         reserve_gb,
         has_fp8,
     );
-    if peak_estimated + oom_reserve_bytes > free {
+    if peak_estimated.saturating_add(oom_reserve_bytes) > free {
         bail!(
             "OOM pre-flight: model peak memory ({:.2} GB = {:.2} GB weights × {:.1}x \
              model-building overhead) + {:.1} GB reserve = {:.2} GB, \

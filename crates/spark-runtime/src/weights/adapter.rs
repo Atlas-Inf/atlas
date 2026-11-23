@@ -47,7 +47,7 @@ pub fn load_adapter_safetensors(
     // its post-conversion BF16 footprint.
     let estimated = super::estimate_load_bytes(std::slice::from_ref(&path), &|_| false)?;
     let free = gpu.free_memory()?;
-    if estimated + oom_reserve_bytes > free {
+    if estimated.saturating_add(oom_reserve_bytes) > free {
         bail!(
             "OOM pre-flight (LoRA adapter): {estimated} B adapter tensors + \
              {oom_reserve_bytes} B reserve exceeds {free} B free"
