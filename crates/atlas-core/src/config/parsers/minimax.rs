@@ -57,14 +57,19 @@ pub(crate) fn parse_minimax_m2(raw: &serde_json::Value) -> Result<ModelConfig> {
             .get("attn_type_list")
             .and_then(serde_json::Value::as_array)
     {
-        config.layer_types = list.iter().map(|v| {
-                match v.as_u64().unwrap_or(1) {
+        config.layer_types = list
+            .iter()
+            .map(|v| {
+                Ok(match v.as_u64().unwrap_or(1) {
                     1 => LayerType::FullAttention,
-                    other => panic!(
-                        "minimax_m2: unexpected attn_type_list entry {other} — only 1 (full) is supported in M1"
-                    ),
-                }
-            }).collect();
+                    other => {
+                        anyhow::bail!(
+                            "minimax_m2: unexpected attn_type_list entry {other}; only 1 (full attention) is supported"
+                        )
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
     }
 
     // MTP: MiniMax exposes `use_mtp` + `num_mtp_modules` + `mtp_transformer_layers`.

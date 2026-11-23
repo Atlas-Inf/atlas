@@ -552,6 +552,31 @@ fn test_parse_nemotron_h_unknown_block_type_fails_closed() {
 }
 
 #[test]
+fn nemotron_h_rejects_unknown_hybrid_override_pattern_char() {
+    let json = r#"{
+        "model_type": "nemotron_h",
+        "hidden_size": 2688,
+        "hybrid_override_pattern": "MX"
+    }"#;
+    let err = parse_config(json).unwrap_err();
+    assert!(err.to_string().contains("hybrid_override_pattern"), "{err}");
+    assert!(err.to_string().contains("'X'"), "{err}");
+}
+
+#[test]
+fn minimax_m2_rejects_unknown_attn_type_list_entry() {
+    let json = r#"{
+        "model_type": "minimax_m2",
+        "hidden_size": 2048,
+        "num_hidden_layers": 1,
+        "attn_type_list": [2]
+    }"#;
+    let err = parse_config(json).unwrap_err();
+    assert!(err.to_string().contains("attn_type_list"), "{err}");
+    assert!(err.to_string().contains('2'), "{err}");
+}
+
+#[test]
 fn test_parse_nemotron_h_puzzle_config() {
     // Minimal Puzzle-shaped schedule: 4 layers with heterogeneous MoE dims.
     // Full checkpoint has 88 layers; this covers dispatch + per-layer lookup.

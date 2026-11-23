@@ -56,13 +56,17 @@ pub fn parse_nemotron_h(raw: &serde_json::Value, top_model_type: &str) -> Result
         config.layer_types = config
             .hybrid_override_pattern
             .chars()
-            .map(|c| match c {
-                'M' => LayerType::LinearAttention,
-                'E' => LayerType::Moe,
-                '*' => LayerType::FullAttention,
-                other => panic!("Unknown hybrid_override_pattern char: '{other}'"),
+            .map(|c| {
+                Ok(match c {
+                    'M' => LayerType::LinearAttention,
+                    'E' => LayerType::Moe,
+                    '*' => LayerType::FullAttention,
+                    other => {
+                        anyhow::bail!("unknown hybrid_override_pattern char: '{other}'")
+                    }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
     }
     // Nemotron-H variants without the pattern (e.g. Nemotron 3.5
     // Lightning's public config) ship the hybrid schedule as
