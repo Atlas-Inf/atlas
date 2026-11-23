@@ -103,7 +103,7 @@ pub(super) fn parse_poolside_v1_call(text: &str) -> Option<ToolCall> {
         if !is_tool_name_component(key) || args.contains_key(key) {
             return None;
         }
-        rest = &rest[key_end + "</arg_key>".len()..];
+        rest = rest[key_end + "</arg_key>".len()..].trim_start();
         rest = rest.strip_prefix("<arg_value>")?;
         let value_end = rest.find("</arg_value>")?;
         // Keep the text as written. GLM's template renders a string argument
@@ -117,7 +117,7 @@ pub(super) fn parse_poolside_v1_call(text: &str) -> Option<ToolCall> {
             key.to_string(),
             serde_json::Value::String(raw_value.to_string()),
         );
-        rest = &rest[value_end + "</arg_value>".len()..];
+        rest = rest[value_end + "</arg_value>".len()..].trim_start();
     }
 
     Some(ToolCall {
@@ -133,6 +133,14 @@ pub(super) fn parse_poolside_v1_call(text: &str) -> Option<ToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_ling_multiline_arguments_without_trimming_values() {
+        let call = parse_poolside_v1_call("write\n<arg_key>text</arg_key>\n<arg_value>  value\n</arg_value>\n<arg_key>count</arg_key>\n<arg_value>2</arg_value>\n").unwrap();
+        let args: serde_json::Value = serde_json::from_str(&call.function.arguments).unwrap();
+        assert_eq!(args["text"], "  value\n");
+        assert_eq!(args["count"], "2");
+    }
 
     #[test]
     fn parses_native_poolside_call() {

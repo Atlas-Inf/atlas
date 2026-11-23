@@ -9,6 +9,7 @@
 #   deepseek_v4 — Native DSML: <｜DSML｜tool_calls>...<｜DSML｜invoke ...>
 
 [model_type]
+bailing_moe_v3_vl = "poolside_v1" # Ling emits named <arg_key>/<arg_value> pairs.
 qwen3_5_moe = "qwen3_coder"    # Qwen3.5-35B, Qwen3.5-122B — native XML format
 qwen3_5     = "qwen3_coder"    # Qwen3.5-27B Dense — native XML format
 qwen3_6_moe = "qwen3_coder"    # Qwen3.6-35B — same XML format; MRoPE-interleaved only differs at kernel layer
@@ -39,6 +40,7 @@ inkling2_loop = "hermes"       # Inkling 2 — inkling_turn.rs rewrites its JSON
 # keep distinct identities so a model is parsed under its own contract.
 
 [reasoning]
+bailing_moe_v3_vl = "qwen" # The generation prompt opens or closes <think>.
 qwen3_5_moe = "qwen"
 qwen3_5     = "qwen"
 qwen3_6_moe = "qwen"

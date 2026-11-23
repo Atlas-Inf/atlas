@@ -202,7 +202,7 @@ impl LingMlaKernels {
     pub fn load(gpu: &dyn GpuBackend) -> Result<Self> {
         Ok(Self {
             rms_norm: gpu.kernel("ling_norm", "ling_rms_norm")?,
-            ling_mrope: gpu.kernel("rope_mrope_interleaved", "ling_mrope_rope_bf16")?,
+            ling_mrope: gpu.kernel("ling_mrope", "ling_mrope_rope_bf16")?,
             q_rope_extract: gpu.kernel("mla_absorbed", "mla_q_rope_extract_batched")?,
             q_rope_writeback: gpu.kernel("mla_absorbed", "mla_q_rope_writeback_batched")?,
             kv_assemble: gpu.kernel("mla_absorbed", "mla_kv_assemble_batched")?,
