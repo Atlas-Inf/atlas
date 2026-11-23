@@ -48,7 +48,7 @@ fn gguf_real_file_ternary_bonsai() {
     const N_BLOCKS: usize = 20_000;
     let n_elems = N_BLOCKS * GROUP;
 
-    let start = gguf.tensor_abs_offset(t);
+    let start = gguf.tensor_abs_offset(t).expect("tensor offset");
     let raw = &mmap[start..start + N_BLOCKS * BLOCK_BYTES];
 
     let mut out = vec![0f32; n_elems];

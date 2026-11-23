@@ -236,7 +236,7 @@ fn preflight_oom(
         gb(free),
         gb(reserve_bytes),
     );
-    if peak + reserve_bytes > free {
+    if peak.saturating_add(reserve_bytes) > free {
         bail!(
             "Pre-flight OOM: GGUF dequant to BF16 needs ~{:.2} GB peak + {:.1} GB reserve, \
              only {:.2} GB free. Use a smaller model or lower --oom-guard-mb.",
@@ -312,9 +312,12 @@ impl super::WeightLoader for GgufLoader {
         });
 
         // Pre-flight: combined BF16 footprint of both files.
-        let mut est = sidecar::est_bf16(&bb_gguf, &arch);
+        let mut est = sidecar::est_bf16(&bb_gguf, &arch)?;
         if let (Some((_, _, mm_gguf)), Some(mm_arch)) = (mmproj.as_ref(), mmproj_arch.as_ref()) {
-            est += sidecar::est_bf16(mm_gguf, mm_arch);
+            let mm_est = sidecar::est_bf16(mm_gguf, mm_arch)?;
+            est = est
+                .checked_add(mm_est)
+                .context("combined GGUF BF16 estimate overflows")?;
         }
         preflight_oom(gpu, est, oom_reserve_bytes, self.peak_memory_multiplier)?;
 

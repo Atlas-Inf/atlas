@@ -308,8 +308,11 @@ pub struct TensorInfo {
 
 impl TensorInfo {
     /// Product of `dims` (1 for a 0-d scalar).
-    pub fn num_elements(&self) -> usize {
-        self.dims.iter().product()
+    pub fn num_elements(&self) -> Result<usize> {
+        self.dims
+            .iter()
+            .try_fold(1usize, |n, &dim| n.checked_mul(dim))
+            .with_context(|| format!("tensor {:?}: dims {:?} overflows", self.name, self.dims))
     }
 }
 
@@ -446,20 +449,30 @@ impl GgufFile {
     }
 
     /// Absolute byte offset of a tensor's data within the file.
-    pub fn tensor_abs_offset(&self, t: &TensorInfo) -> usize {
-        self.data_offset + t.offset as usize
+    pub fn tensor_abs_offset(&self, t: &TensorInfo) -> Result<usize> {
+        let offset = usize::try_from(t.offset).with_context(|| {
+            format!(
+                "tensor {:?}: offset {} does not fit usize",
+                t.name, t.offset
+            )
+        })?;
+        self.data_offset
+            .checked_add(offset)
+            .with_context(|| format!("tensor {:?}: offset overflows", t.name))
     }
 
     /// On-disk byte size of a tensor's data (for slicing / bounds checks).
     pub(crate) fn tensor_byte_size(&self, t: &TensorInfo, q2: Q2Group) -> Result<usize> {
         let (block_elems, block_bytes) = t.ggml_type.block_layout(q2)?;
-        let n = t.num_elements();
+        let n = t.num_elements()?;
         ensure!(
             n.is_multiple_of(block_elems),
             "tensor {:?} element count {n} not a multiple of block size {block_elems}",
             t.name
         );
-        Ok(n / block_elems * block_bytes)
+        (n / block_elems)
+            .checked_mul(block_bytes)
+            .with_context(|| format!("tensor {:?}: byte count overflows", t.name))
     }
 }
 

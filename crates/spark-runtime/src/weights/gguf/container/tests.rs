@@ -76,13 +76,13 @@ fn parses_metadata_and_tensor_dir() {
     assert_eq!(t.dims, vec![8, 4]);
     assert_eq!(t.ggml_type, GgmlType::F32);
     assert_eq!(t.offset, 0);
-    assert_eq!(t.num_elements(), 32);
+    assert_eq!(t.num_elements().unwrap(), 32);
 
     // default alignment, data section aligned right after the header.
     assert_eq!(f.alignment, 32);
     assert_eq!(f.data_offset, align_up(header_end, 32));
     assert_eq!(f.data_offset % 32, 0);
-    assert_eq!(f.tensor_abs_offset(t), f.data_offset);
+    assert_eq!(f.tensor_abs_offset(t).unwrap(), f.data_offset);
 
     // F32 byte size = 32 elems * 4 bytes.
     assert_eq!(f.tensor_byte_size(t, Q2Group::G128).unwrap(), 128);

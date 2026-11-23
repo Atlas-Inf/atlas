@@ -38,6 +38,46 @@ fn build_single_f32_gguf(name: &str, vals: &[f32]) -> Vec<u8> {
     b
 }
 
+/// Minimal malformed GGUF: one F32 tensor directory entry and a small data
+/// section, with caller-controlled dims/offset. Used to prove directory math
+/// fails cleanly instead of panicking or wrapping.
+fn build_malformed_f32_gguf(name: &str, dims: &[u64], offset: u64) -> Vec<u8> {
+    let mut b = Vec::new();
+    push_u32(&mut b, 0x4655_4747); // "GGUF"
+    push_u32(&mut b, 3); // version
+    push_u64(&mut b, 1); // tensor_count
+    push_u64(&mut b, 1); // kv_count
+    push_str(&mut b, "general.alignment");
+    push_u32(&mut b, 4); // UINT32
+    push_u32(&mut b, 32);
+    push_str(&mut b, name);
+    push_u32(&mut b, dims.len() as u32);
+    for dim in dims {
+        push_u64(&mut b, *dim);
+    }
+    push_u32(&mut b, 0); // ggml_type F32
+    push_u64(&mut b, offset);
+    let pad = (32 - (b.len() % 32)) % 32;
+    b.extend(std::iter::repeat_n(0u8, pad));
+    b.extend_from_slice(&[0u8; 64]);
+    b
+}
+
+fn malformed_gguf_error(tag: &str, name: &str, dims: &[u64], offset: u64) -> anyhow::Error {
+    let bytes = build_malformed_f32_gguf(name, dims, offset);
+    let dir =
+        std::env::temp_dir().join(format!("atlas_gguf_malformed_{tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("model.gguf"), &bytes).unwrap();
+
+    let result = GgufLoader::new().load(&dir, &MockGpuBackend::new(), 1024 * 1024);
+    std::fs::remove_dir_all(&dir).ok();
+    match result {
+        Ok(_) => panic!("malformed GGUF loaded successfully"),
+        Err(err) => err,
+    }
+}
+
 #[test]
 fn loads_single_tensor_cpu_fallback() {
     // Mock cannot execute kernels, so force the CPU reference dequant path.
@@ -114,4 +154,42 @@ fn find_gguf_skips_mmproj_and_find_mmproj_pairs() {
 
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&dir2).ok();
+}
+
+#[test]
+fn malformed_gguf_rejects_tensor_offset_overflow() {
+    let err = malformed_gguf_error("offset", "mystery.weight", &[1], u64::MAX);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("offset") && msg.contains("overflow"), "{msg}");
+}
+
+#[test]
+fn malformed_gguf_rejects_dim_product_overflow_in_estimate() {
+    let err = malformed_gguf_error(
+        "dims-estimate",
+        "token_embd.weight",
+        &[u32::MAX as u64 + 1, u32::MAX as u64 + 1],
+        0,
+    );
+    let msg = format!("{err:#}");
+    assert!(msg.contains("dims") && msg.contains("overflow"), "{msg}");
+}
+
+#[test]
+fn malformed_gguf_rejects_dim_product_overflow_in_load_pass() {
+    let err = malformed_gguf_error(
+        "dims-load-pass",
+        "mystery.weight",
+        &[u32::MAX as u64 + 1, u32::MAX as u64 + 1],
+        0,
+    );
+    let msg = format!("{err:#}");
+    assert!(msg.contains("dims") && msg.contains("overflow"), "{msg}");
+}
+
+#[test]
+fn malformed_gguf_rejects_tensor_byte_size_overflow() {
+    let err = malformed_gguf_error("byte-size", "mystery.weight", &[u64::MAX / 4 + 1], 0);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("byte") && msg.contains("overflow"), "{msg}");
 }

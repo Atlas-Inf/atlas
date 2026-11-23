@@ -66,7 +66,7 @@ pub fn open_gguf(path: &Path) -> Result<(std::fs::File, memmap2::Mmap, container
 /// Sum the BF16 footprint of every tensor a pass will actually keep (i.e. that
 /// `names::translate` maps to a stored tensor, plus the clip patch-embed frames
 /// that are fused rather than name-mapped), for the pre-flight OOM estimate.
-pub fn est_bf16(gguf: &container::GgufFile, arch: &str) -> usize {
+pub fn est_bf16(gguf: &container::GgufFile, arch: &str) -> Result<usize> {
     let is_clip = value_transform::is_clip(arch);
     gguf.tensors
         .iter()
@@ -77,8 +77,15 @@ pub fn est_bf16(gguf: &container::GgufFile, arch: &str) -> usize {
                     None | Some(names::GgufName::Drop)
                 )
         })
-        .map(|t| t.num_elements() * WeightDtype::BF16.byte_size())
-        .sum()
+        .try_fold(0usize, |total, t| {
+            let bytes = t
+                .num_elements()?
+                .checked_mul(WeightDtype::BF16.byte_size())
+                .with_context(|| format!("tensor {:?}: BF16 estimate overflows", t.name))?;
+            total
+                .checked_add(bytes)
+                .with_context(|| format!("tensor {:?}: total BF16 estimate overflows", t.name))
+        })
 }
 
 /// Load every recognized tensor from one already-parsed GGUF into `weights`,
@@ -116,13 +123,14 @@ pub fn load_pass(
     let mut patch_frames: Vec<Option<Vec<f32>>> = Vec::new();
 
     for tensor in &gguf.tensors {
-        let num_elements = tensor.num_elements();
+        let num_elements = tensor.num_elements()?;
         let raw_len = gguf
             .tensor_byte_size(tensor, q2_variant)
             .with_context(|| format!("byte-len for tensor {}", tensor.name))?;
-        let start = gguf.tensor_abs_offset(tensor);
+        let start = gguf.tensor_abs_offset(tensor)?;
         let raw = mmap
-            .get(start..start + raw_len)
+            .get(start..)
+            .and_then(|tail| tail.get(..raw_len))
             .with_context(|| format!("tensor {} out of bounds in GGUF", tensor.name))?;
         let id = tensor.ggml_type.id();
 
