@@ -400,8 +400,7 @@ extern "C" __global__ void paged_decode_attn_splitk(
 
         const unsigned int* k32 = (const unsigned int*)(K_cache
             + (unsigned long long)physical_block * page_stride
-            + (unsigned long long)block_offset * head_stride_kv
-            + (unsigned long long)kv_head * head_dim + vec_offset);
+            + (unsigned long long)block_offset * head_stride_kv);
 
         float dot = 0.0f;
         #pragma unroll
@@ -422,8 +421,7 @@ extern "C" __global__ void paged_decode_attn_splitk(
 
         const unsigned int* v32 = (const unsigned int*)(V_cache
             + (unsigned long long)physical_block * page_stride
-            + (unsigned long long)block_offset * head_stride_kv
-            + (unsigned long long)kv_head * head_dim + vec_offset);
+            + (unsigned long long)block_offset * head_stride_kv);
 
         #pragma unroll
         for (int i = 0; i < VEC_U32; i++) {

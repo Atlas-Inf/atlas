@@ -391,7 +391,7 @@ impl LingMlaWeights {
                 ),
             "Ling MLA cache geometry must be ({} heads, {}-wide K/V), got {:?}",
             config.num_heads,
-            config.qk_head_dim(),
+            config.qk_nope_head_dim + config.qk_rope_head_dim / config.num_heads,
             kv_cache.config().dims_for_layer(layer_idx)
         );
         ensure!(
