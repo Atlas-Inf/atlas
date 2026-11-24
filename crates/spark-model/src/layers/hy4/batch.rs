@@ -24,15 +24,21 @@ pub(crate) fn gemm(
     let [kind, float_out] = flags;
     // Tensor-core paths gated by ATLAS_HY4_LINEAR_MMA=1: fp8-e4m3 weights
     // decode to bf16 in-kernel (numerics identical to the GEMV, bf16
-    // output only), and bf16 weights run mma directly. Both are bf16
-    // output only: the fp32 router GEMM stays on the scalar GEMV because
-    // fp32 accumulation order flips top-k expert ties (parity break).
-    // Requires K%32; crossover vs the GEMV is rows~32 on GB10 (kernel
-    // bench), so decode stays on the GEMV.
+    // output only), and bf16 weights run mma directly. Requires K%32;
+    // crossover vs the GEMV is rows~32 on GB10 (kernel bench), so decode
+    // stays on the GEMV.
+    // The fp32 router GEMM (the only float_out==1 caller) stays on the
+    // scalar GEMV by default because fp32 accumulation order flips top-k
+    // expert ties (parity break). ATLAS_HY4_ROUTER_MMA=1 opts it into the
+    // same bf16 mma kernel with fp32 accumulate and fp32 logits output —
+    // top-k selection still reads fp32 logits, unchanged — accepting
+    // top-k drift for prefill speed evals.
     let linear_mma = std::env::var("ATLAS_HY4_LINEAR_MMA").ok().as_deref() == Some("1");
+    let router_mma = std::env::var("ATLAS_HY4_ROUTER_MMA").ok().as_deref() == Some("1");
     let mma_fp8 = kind == 1 && float_out == 0 && linear_mma;
     let mma_bf16 = kind == 0 && float_out == 0 && linear_mma;
-    if (mma_fp8 || mma_bf16) && k % 32 == 0 && rows >= 32 {
+    let mma_router = kind == 0 && float_out == 1 && router_mma;
+    if (mma_fp8 || mma_bf16 || mma_router) && k % 32 == 0 && rows >= 32 {
         let name = if mma_fp8 {
             "hy4_batch_linear_mma"
         } else if buffers[2].is_null() {
@@ -53,7 +59,7 @@ pub(crate) fn gemm(
         for n in dimensions {
             launch = launch.arg_u32(u32::try_from(n)?);
         }
-        if mma_bf16 {
+        if mma_bf16 || mma_router {
             launch = launch.arg_u32(float_out);
         }
         return launch.launch(stream);
