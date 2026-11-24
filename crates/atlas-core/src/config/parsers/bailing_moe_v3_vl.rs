@@ -126,13 +126,21 @@ fn parse_vision(raw: &Value, text: &Value) -> Result<VisionConfig> {
             && vision.temporal_patch_size == 2
             && vision.spatial_merge_size == 2
             && vision.intermediate_size == 4304
-            && vision.out_hidden_size == 4096,
+            && matches!(vision.out_hidden_size, 4096 | 4608),
         "bailing_moe_v3_vl vision_config is not the Ling 3.2 Qwen3-VL tower"
     );
     vision.image_start_token_id = top_u32(raw, "vision_start_token_id")?;
     vision.image_end_token_id = top_u32(raw, "vision_end_token_id")?;
-    vision.video_start_token_id = top_u32(text, "video_start_token")?;
-    vision.video_end_token_id = vision.image_end_token_id;
+    vision.video_start_token_id = if raw.get("video_start_token_id").is_some() {
+        top_u32(raw, "video_start_token_id")?
+    } else {
+        top_u32(text, "video_start_token")?
+    };
+    vision.video_end_token_id = if raw.get("video_end_token_id").is_some() {
+        top_u32(raw, "video_end_token_id")?
+    } else {
+        vision.image_end_token_id
+    };
     vision.is_bailing_vl = true;
     vision.is_qwen3vl_video = true;
     Ok(vision)
@@ -162,13 +170,14 @@ pub(crate) fn parse_bailing_moe_v3_vl(raw: &Value) -> Result<ModelConfig> {
         "Ling supports up to one next-token prediction layer"
     );
     ensure!(
-        usize_field(text, "num_kv_heads_for_linear_attn")? == 0,
+        text.get("num_kv_heads_for_linear_attn").is_none()
+            || usize_field(text, "num_kv_heads_for_linear_attn")? == 0,
         "bailing_moe_v3_vl only supports the full-head KDA layout"
     );
     ensure!(
         bool_field(text, "no_kda_lora")?
-            && !bool_field(text, "use_kda_lora")?
-            && !bool_field(text, "mtp_use_kda")?,
+            && (text.get("use_kda_lora").is_none() || !bool_field(text, "use_kda_lora")?)
+            && (text.get("mtp_use_kda").is_none() || !bool_field(text, "mtp_use_kda")?),
         "bailing_moe_v3_vl only supports no-KDA-LoRA layers"
     );
     ensure!(
@@ -192,7 +201,11 @@ pub(crate) fn parse_bailing_moe_v3_vl(raw: &Value) -> Result<ModelConfig> {
     expect_reference_lists(text, layers)?;
 
     let vision = parse_vision(raw, text)?;
-    let mrope_section = parse_mrope(raw)?;
+    let mrope_section = parse_mrope(if text.get("mrope_section").is_some() {
+        text
+    } else {
+        raw
+    })?;
     let mut normalized = text.clone();
     normalized["q_lora_rank"] = 0.into();
     let mut config: ModelConfig = serde_json::from_value(normalized)

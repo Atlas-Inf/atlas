@@ -340,7 +340,9 @@ impl TransformerModel {
                 let layer_type = self.config.layer_type(layer_idx);
 
                 if layer_type == LayerType::FullAttention {
-                    if hss_engaged {
+                    if hss_engaged || self.config.model_type == "bailing_moe_v3_vl" {
+                        // Ling's two-row hook handles temporal MLA metadata and
+                        // selects the same scalar/batched control as its KDA layers.
                         // HSS path: `decode_multi_seq` calls the production
                         // paged-decode kernel which reads K/V from HBM only
                         // (`meta.block_table`). Under HSS, HBM is capped to

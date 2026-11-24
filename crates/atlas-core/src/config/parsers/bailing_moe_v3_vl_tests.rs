@@ -141,3 +141,40 @@ fn refuses_unsupported_bailing_layout_variants() {
     text["no_kda_lora"] = false.into();
     assert!(parse_config(&raw.to_string()).is_err());
 }
+
+#[test]
+fn parses_revised_publisher_config_and_video_tokens() {
+    let mut raw: serde_json::Value = serde_json::from_str(EXACT).unwrap();
+    let section = raw
+        .as_object_mut()
+        .unwrap()
+        .remove("mrope_section")
+        .unwrap();
+    raw["vision_config"]["out_hidden_size"] = 4608.into();
+    raw["video_start_token_id"] = 157160.into();
+    raw["video_end_token_id"] = 157161.into();
+    let text = raw["text_config"].as_object_mut().unwrap();
+    for key in [
+        "num_kv_heads_for_linear_attn",
+        "mtp_use_kda",
+        "use_kda_lora",
+        "video_start_token",
+    ] {
+        text.remove(key);
+    }
+    text.insert("mrope_section".into(), section);
+    let config = parse_config(&raw.to_string()).unwrap();
+    assert_eq!(config.mrope_section, [8, 12, 12]);
+    assert_eq!(config.mtp_num_hidden_layers, 1);
+    let vision = config.vision.unwrap();
+    assert_eq!(
+        (
+            vision.out_hidden_size,
+            vision.video_start_token_id,
+            vision.video_end_token_id
+        ),
+        (4608, 157160, 157161)
+    );
+    raw["text_config"]["mtp_use_kda"] = true.into();
+    assert!(parse_config(&raw.to_string()).is_err());
+}
