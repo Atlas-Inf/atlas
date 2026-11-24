@@ -17,10 +17,11 @@ pub(crate) fn configure_attn_projection(config: &mut ModelConfig, dtype: &str) -
     );
     config.attn_proj_bf16 = dtype == "bf16";
     if let Some(hy4) = &mut config.hy4 {
-        // HY4 serving defaults to FP8 attention projections; `bf16` is the
-        // explicit rollback arm.
-        hy4.attention_projection_fp8 =
-            dtype == "fp8" || (dtype == "default" && config.model_type == "hy_v4_flash");
+        // HY4 serving defaults to BF16 attention projections. FP8 is opt-in:
+        // on the NVFP4 checkpoint it measurably degrades output (garbled
+        // tool-call markup, spurious refusals — 7/8 vs 16/16 clean tool calls
+        // on a 16-prompt probe, 2026-11-24) for a prefill-only speed win.
+        hy4.attention_projection_fp8 = dtype == "fp8";
     }
     Ok(())
 }
@@ -30,20 +31,24 @@ mod attention_projection_tests {
     use super::*;
 
     #[test]
-    fn fp8_is_hy4_default_and_can_be_disabled() {
+    fn bf16_is_hy4_default_and_fp8_is_opt_in() {
         let mut c = atlas_core::config::parse_config(include_str!(
             "../../../../atlas-core/src/config/fixtures/hy4/config.json"
         ))
         .unwrap();
         assert!(!c.hy4.as_ref().unwrap().attention_projection_fp8);
+        // default keeps HY4 attention projections at BF16 (quality-safe)
+        configure_attn_projection(&mut c, "default").unwrap();
+        assert!(!c.hy4.as_ref().unwrap().attention_projection_fp8);
+        assert!(!c.attn_proj_bf16);
+        // fp8 is an explicit opt-in
         configure_attn_projection(&mut c, "fp8").unwrap();
         assert!(c.hy4.as_ref().unwrap().attention_projection_fp8);
         assert!(!c.attn_proj_bf16);
+        // bf16 is an explicit arm
         configure_attn_projection(&mut c, "bf16").unwrap();
         assert!(c.attn_proj_bf16);
         assert!(!c.hy4.as_ref().unwrap().attention_projection_fp8);
-        configure_attn_projection(&mut c, "default").unwrap();
-        assert!(c.hy4.as_ref().unwrap().attention_projection_fp8);
         c.model_type = "qwen3".into();
         assert!(configure_attn_projection(&mut c, "fp8").is_err());
     }

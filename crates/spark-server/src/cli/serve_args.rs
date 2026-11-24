@@ -426,7 +426,10 @@ pub struct ServeArgs {
     /// anyway; O keeps a BF16 copy; decode/prefill use the dense GEMV/GEMM
     /// arms), `nvfp4` = force the quantized arms (today identical to
     /// `default`), `fp8` = HY4-only load-time E4M3 with FP32 per-row scales.
-    /// HY4 serving defaults to `fp8`; pass `bf16` for the previous behavior.
+    /// HY4 serving defaults to `bf16` attention projections: on the NVFP4
+    /// checkpoint the fp8 projections measurably degrade output (garbled
+    /// tool-call markup, spurious refusals; 2026-11-24 probe 7/8 vs 16/16
+    /// clean tool calls) for a prefill-only win. Pass `fp8` to opt into them.
     /// Quality lever in the spirit of --lm-head-dtype: 4-bit q/k
     /// perturbations reroute attention on long prompts (see the
     /// ATLAS_ATTN_W4A4 note in the prefill path). Quality-gate per model.
