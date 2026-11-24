@@ -230,6 +230,22 @@ fn main() {
 
     // ── Resolve targets (supports wildcards) ──
     let targets = resolve_targets(workspace_root);
+    // What the build resolved, beside what it attests (`TARGET_CLOSURES`): a
+    // one-model build (`ATLAS_TARGET_MODEL=<model>`, as product images build)
+    // resolves that model's targets, not the tree's, and the closure test must
+    // know which (#250).
+    println!(
+        "cargo:rustc-env=ATLAS_TARGETS_RESOLVED={}",
+        targets
+            .iter()
+            .map(|t| format!("{}/{}/{}", t.hw, t.model, t.quant))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    println!(
+        "cargo:rustc-env=ATLAS_TARGET_MODEL_SPEC={}",
+        env::var("ATLAS_TARGET_MODEL").unwrap_or_else(|_| "*".into())
+    );
 
     assert!(
         !targets.is_empty(),

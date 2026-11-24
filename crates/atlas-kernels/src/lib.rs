@@ -64,6 +64,20 @@ pub const TARGET_CLOSURES: &str = match option_env!("ATLAS_TARGET_CLOSURES") {
     None => "{}",
 };
 
+/// The `hardware/model/quant` targets this build resolved, comma-separated;
+/// empty when it compiled nothing. [`TARGET_CLOSURES`] attests each of them.
+pub const TARGETS_RESOLVED: &str = match option_env!("ATLAS_TARGETS_RESOLVED") {
+    Some(keys) => keys,
+    None => "",
+};
+
+/// The `ATLAS_TARGET_MODEL` the build resolved its targets from: `*` (the
+/// default) is every model in the tree, anything else a one-model build.
+pub const TARGET_MODEL_SPEC: &str = match option_env!("ATLAS_TARGET_MODEL_SPEC") {
+    Some(spec) => spec,
+    None => "*",
+};
+
 // ═══════════════════════════════════════════════════════════════════
 // Target-aware PTX grouping
 // ═══════════════════════════════════════════════════════════════════
