@@ -369,6 +369,8 @@ impl TransformerModel {
             let bs = kv.block_size();
             seq.tokens.extend_from_slice(tokens);
             seq.seq_len = len;
+            self.kv_window
+                .trim(seq, &mut kv, self.gpu.as_ref(), stream)?;
             seq.last_decode_ckpt_block = len / bs;
             let row = self.prefill_multi_logits_row(rows_base, i);
             let out = self.prefill_b_finalize_last_at(

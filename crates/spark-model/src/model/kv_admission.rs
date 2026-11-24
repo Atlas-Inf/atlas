@@ -285,7 +285,11 @@ impl TransformerModel {
                     stream,
                     self.levers.kv_poison,
                 )?;
-                self.reserve_aux_through(seq, (last_block + 1) * bs, stream)
+                self.reserve_aux_through(seq, (last_block + 1) * bs, stream)?;
+                // Last: a refusal past it would split off held blocks.
+                let first = seq.seq_len;
+                self.kv_window
+                    .sync(seq, first, last_block, kv, self.gpu.as_ref(), stream)
             },
         )
     }
@@ -313,11 +317,18 @@ impl TransformerModel {
                 self.levers.kv_poison,
             )
         };
+        // Last in each path: a refusal past it would split off held blocks.
+        let window = |seq: &mut SequenceState, kv: &mut PagedKvCache| {
+            let first = seq.seq_len;
+            self.kv_window
+                .sync(seq, first, abs_block_idx, kv, self.gpu.as_ref(), stream)
+        };
         // The HSS sliding window frees blocks as it grows, which a refusal
         // could not undo; it keeps the unvoted path.
         if !needs_new_block(seq, abs_block_idx) || kv_cache.config().cache_blocks_per_seq.is_some()
         {
-            return ensure(seq, kv_cache);
+            ensure(seq, kv_cache)?;
+            return window(seq, kv_cache);
         }
         let bs = kv_cache.block_size();
         admit_with(
@@ -327,7 +338,8 @@ impl TransformerModel {
             |mine| self.admission_vote(mine),
             |seq, kv| {
                 ensure(seq, kv)?;
-                self.reserve_aux_through(seq, (abs_block_idx + 1) * bs, stream)
+                self.reserve_aux_through(seq, (abs_block_idx + 1) * bs, stream)?;
+                window(seq, kv)
             },
         )
     }

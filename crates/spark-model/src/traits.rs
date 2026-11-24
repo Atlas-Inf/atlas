@@ -276,6 +276,8 @@ pub struct SequenceState {
     /// uninitialised. Length equals the model's attention layer count;
     /// empty when HSS is disabled.
     pub disk_last_offloaded_per_layer: Vec<u32>,
+    /// Logical blocks whose window rows this sequence holds (`kv_window`).
+    pub window_held: std::ops::Range<usize>,
     /// Legacy /v1/completions echo+logprobs: Some(k) = during prefill,
     /// project every prompt position's hidden state and record the actual
     /// next token's logprob plus top-k alternatives. Set by the scheduler
@@ -367,6 +369,7 @@ impl SequenceState {
             eos_ban: EosBan::default(),
             disk_block_ids: Vec::new(),
             disk_last_offloaded_per_layer: Vec::new(),
+            window_held: 0..0,
             collect_prompt_logprobs: None,
             prompt_logprobs: Vec::new(),
             // -1 = defer to the installed active adapter (see field docs).

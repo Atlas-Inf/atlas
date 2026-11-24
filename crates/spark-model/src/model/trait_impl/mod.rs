@@ -1311,8 +1311,9 @@ impl Model for TransformerModel {
         self.restore_sequence_state_dispatch(seq, num_blocks, reader)
     }
     fn swap_resumable(&self) -> bool {
-        // The spill image holds no GLM semantic-index pools or tails.
-        self.kv_cache.lock().sparse_index_config().is_none()
+        // The spill image holds no GLM semantic-index pools or tails, nor
+        // window-bounded rows.
+        self.kv_cache.lock().sparse_index_config().is_none() && !self.kv_window.is_active()
     }
     fn num_free_blocks(&self) -> usize {
         self.num_free_blocks_dispatch()
@@ -1448,6 +1449,8 @@ impl TransformerModel {
         stream: u64,
         out: &mut Vec<(u32, Vec<u8>)>,
     ) -> Result<()> {
+        // every prefix snapshot collects here: pin the window it resumes from
+        self.kv_window.queue_pin(seq);
         aux_reuse::collect_aux_reuse_into(out, self.layers.len(), |i, buf| {
             self.layers[i as usize].snapshot_aux_into(
                 seq.layer_states[i as usize].as_ref(),

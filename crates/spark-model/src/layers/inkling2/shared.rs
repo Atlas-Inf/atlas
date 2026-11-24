@@ -48,6 +48,11 @@ impl Dims {
     pub(crate) fn conv_state_bytes(&self) -> usize {
         (2 * self.kv_dim + 2 * self.hidden) * (self.conv_k - 1) * 4
     }
+
+    /// Block tables, one a row: up to `MAX_VERIFY_ROWS` rows a sequence.
+    pub(crate) fn block_table_bytes(&self) -> usize {
+        self.max_seqs * super::layer::MAX_VERIFY_ROWS * self.max_blocks_per_seq * 4
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -107,6 +112,9 @@ pub(crate) struct Shared {
     pub slots: DevicePtr,
     /// `[seqs, stride]` block tables (one shared table for a prefill chunk)
     pub block_table: DevicePtr,
+    /// The window layers' slots and tables (`inkling2_window_meta`)
+    pub local_slots: DevicePtr,
+    pub local_table: DevicePtr,
     /// `[visits, max_seqs]` conv-state base pointers, a visit's own row each
     pub state_tables: DevicePtr,
     /// Each visit's fused-projection tables, one a row count up to
@@ -190,8 +198,9 @@ impl Shared {
             positions: a.take(r * 4),
             slots: a.take(r * 8),
             // one table a row: up to MAX_VERIFY_ROWS verify rows of each sequence
-            block_table: a
-                .take(d.max_seqs * super::layer::MAX_VERIFY_ROWS * d.max_blocks_per_seq * 4),
+            block_table: a.take(d.block_table_bytes()),
+            local_slots: a.take(r * 8),
+            local_table: a.take(d.block_table_bytes()),
             state_tables: a.take(d.visits * d.max_seqs * 8),
             proj_tables: a.take(d.visits * super::glue::BATCHM_MAX_ROWS * super::proj::TABLE_BYTES),
             pad_conv: a.take(d.conv_state_bytes()),

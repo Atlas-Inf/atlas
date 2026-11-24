@@ -29,6 +29,7 @@ mod kv_budget;
 mod kv_carveout;
 mod kv_nvme;
 mod kv_summary;
+mod kv_window;
 
 pub fn build_model(
     mut config: ModelConfig,
@@ -1005,6 +1006,19 @@ pub fn build_model(
         sparse_index,
         glm_cache_plan.and_then(|p| p.shard()).map(|s| s.world),
     );
+    // Inkling 2's sliding-window layers keep only their window (`kv_window`).
+    let window_plan = kv_window::plan(
+        &config,
+        &kv_config,
+        kv_window::Exclusions {
+            high_speed_swap: hss_cache_blocks_per_seq.is_some(),
+            disk_tier: kv_nvme::config_from_env()?.is_some(),
+            multi_rank: comm.as_deref().is_some_and(|c| c.world_size() > 1),
+            glm_plan: glm_cache_plan.is_some() || sparse_index.is_some(),
+        },
+        max_batch_size,
+        max_batch_tokens,
+    );
     // ATLAS_QWEN4EXP_SNAPSHOT_SLOTS / _AUX_MB: the snapshots' host aux
     // (`ssm_snapshot_budget`), 0 by default.
     let snapshot_aux = crate::model::ssm_snapshot_budget::install(
@@ -1130,9 +1144,14 @@ pub fn build_model(
                     budget.no_room_advice(actual_free),
                 );
             }
-            let n = match joint_glm_plan {
-                Some(plan) => plan.num_blocks_for_budget(kv_budget),
-                None => kv_budget::blocks_with_aux(&kv_config, kv_budget, aux_bytes_per_token)?,
+            let n = match (joint_glm_plan, &window_plan) {
+                (Some(plan), _) => plan.num_blocks_for_budget(kv_budget),
+                (None, Some(window)) => {
+                    kv_window::primary_blocks(window, &kv_config, kv_budget, aux_bytes_per_token)?
+                }
+                (None, None) => {
+                    kv_budget::blocks_with_aux(&kv_config, kv_budget, aux_bytes_per_token)?
+                }
             };
             let max_kv_tokens = n * kv_block_size;
             let lazy_bf16_term = if derived_reserve > 0 {
@@ -1179,7 +1198,8 @@ pub fn build_model(
         auxiliary_block_bytes: native_block_bytes,
     }
     .with_per_token_aux(aux_bytes_per_token)?;
-    let (blocks, kv_placement) = if hss_cache_blocks_per_seq.is_none() {
+    // The carveout planner lays out full-length pools for every layer.
+    let (blocks, kv_placement) = if hss_cache_blocks_per_seq.is_none() && window_plan.is_none() {
         kv_carveout::extend(gpu.as_ref(), kv_shape, num_kv_blocks)
     } else {
         (num_kv_blocks, Default::default())
@@ -1258,13 +1278,19 @@ pub fn build_model(
     // reports as free (Windows gfx1151: a 102 MB KV pool alloc failed with
     // 12 GB "free"), release the balloon and retry: the pre-balloon behavior.
     let mut balloon = balloon;
-    let mut kv_cache = match glm::new_kv_cache(
-        kv_config.clone(),
-        num_kv_blocks,
-        gpu.as_ref(),
-        glm_cache_plan,
-        kv_placement.clone(),
-    ) {
+    let new_kv_cache = |config, placement| match &window_plan {
+        Some(window) => {
+            PagedKvCache::new_windowed(config, num_kv_blocks, window.clone(), gpu.as_ref())
+        }
+        None => glm::new_kv_cache(
+            config,
+            num_kv_blocks,
+            gpu.as_ref(),
+            glm_cache_plan,
+            placement,
+        ),
+    };
+    let mut kv_cache = match new_kv_cache(kv_config.clone(), kv_placement.clone()) {
         Ok(kv) => kv,
         Err(e) if balloon.is_some() => {
             tracing::warn!(
@@ -1274,13 +1300,7 @@ pub fn build_model(
             if let Some(ptr) = balloon.take() {
                 gpu.free(ptr)?;
             }
-            glm::new_kv_cache(
-                kv_config,
-                num_kv_blocks,
-                gpu.as_ref(),
-                glm_cache_plan,
-                kv_placement,
-            )?
+            new_kv_cache(kv_config, kv_placement)?
         }
         Err(e) => return Err(e),
     };

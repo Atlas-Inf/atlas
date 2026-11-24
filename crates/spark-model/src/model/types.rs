@@ -120,6 +120,8 @@ pub struct TransformerModel {
     /// keeps the decode-graph path byte-identical to today.
     pub(super) lora_rotatable: bool,
     pub(super) kv_cache: Mutex<PagedKvCache>,
+    /// The cache's window geometry and queued snapshot pins (`kv_window`).
+    pub(super) kv_window: super::kv_window::KvWindow,
     pub(super) gpu: Box<dyn GpuBackend>,
     /// TQ+ InnerQ calibration driver, when `TURBO_INNERQ` is set. Owned here
     /// rather than parked in a static: it writes `__device__` globals in THIS
