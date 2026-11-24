@@ -152,6 +152,7 @@ enum LingAttention {
 /// at stable addresses during CUDA graph capture; sequence state is not owned
 /// here and continues to live in Atlas's slot pool.
 pub struct LingDecoderLayer {
+    batch_verify: bool,
     input_norm: crate::weight_map::DenseWeight,
     post_attn_norm: crate::weight_map::DenseWeight,
     attention: LingAttention,
@@ -172,6 +173,43 @@ pub struct LingDecoderLayer {
 }
 
 impl LingDecoderLayer {
+    /// The single-layer predictor only needs K/V from historical prompt pairs.
+    pub(super) fn prime_predictor_kv(
+        &self,
+        input: DevicePtr,
+        normed: DevicePtr,
+        rows: u32,
+        metadata: AttnMetadataDev,
+        cache: &PagedKvCache,
+        ctx: &ForwardContext<'_>,
+        stream: u64,
+    ) -> Result<()> {
+        let LingAttention::Mla {
+            weights,
+            config,
+            kernels,
+            scratch,
+        } = &self.attention
+        else {
+            anyhow::bail!("Ling predictor requires MLA");
+        };
+        ops::rms_norm(
+            ctx.gpu,
+            kernels.rms_norm,
+            input,
+            &self.input_norm,
+            normed,
+            rows,
+            self.hidden_size as u32,
+            config.rms_eps,
+            stream,
+        )?;
+        weights.forward_rows(
+            *config, *kernels, ctx.gpu, cache, 0, metadata, normed, None, *scratch, rows, 0, None,
+            stream,
+        )
+    }
+
     fn routed_forward(
         &self,
         input: DevicePtr,
@@ -393,7 +431,7 @@ impl LingDecoderLayer {
                         .expect("Ling MLA layer must have a compact KV-cache index"),
                     metadata,
                     normed,
-                    ctx.buffers.attn_output(),
+                    Some(ctx.buffers.attn_output()),
                     *scratch,
                     1,
                     u32::from(!write_kv),
@@ -431,6 +469,7 @@ impl LingDecoderLayer {
         residual: DevicePtr,
         num_tokens: usize,
         states: &[LingKdaState],
+        verify_boundary: Option<(DevicePtr, DevicePtr)>,
         ctx: &ForwardContext<'_>,
         stream: u64,
     ) -> Result<()> {
@@ -496,6 +535,7 @@ impl LingDecoderLayer {
                 normed,
                 num_tokens,
                 states,
+                verify_boundary,
                 fp32_workspace,
                 scratch,
                 projection,
@@ -659,7 +699,7 @@ impl LingDecoderLayer {
                 self.attention_layer_idx.expect("Ling MLA needs a KV layer"),
                 metadata,
                 normed.offset(first * h_bytes),
-                attn.offset(first * h_bytes),
+                Some(attn.offset(first * h_bytes)),
                 scratch,
                 rows as u32,
                 kv_write_start.saturating_sub(first).min(rows) as u32,
@@ -677,3 +717,4 @@ mod ling_decoder_trait;
 #[path = "ling_decoder_load.rs"]
 mod ling_decoder_load;
 pub use ling_decoder_load::load_ling_layers;
+pub(crate) use ling_decoder_load::load_predictor_body;

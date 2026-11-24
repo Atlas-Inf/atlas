@@ -112,7 +112,9 @@ impl SsmPools {
         // first draft indexes `conv_intermediate_pools[0]` on a zero-length
         // Vec and panics. DeepSeek-V4 reaches the proposer the same way but has
         // no SSM layers, so it never exercised this.
-        let external_mtp_module = use_speculative && config.model_type == "qwen4_exp";
+        let external_mtp_module = use_speculative
+            && (config.model_type == "qwen4_exp"
+                || (config.model_type == "bailing_moe_v3_vl" && config.mtp_num_hidden_layers == 1));
         let has_mtp = self_speculative
             || (use_speculative && !mtp_weights_empty && draft_lm_head_nvfp4_present)
             || external_mtp_module

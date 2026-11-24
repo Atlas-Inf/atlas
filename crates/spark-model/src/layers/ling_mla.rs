@@ -358,7 +358,7 @@ impl LingMlaWeights {
         layer_idx: usize,
         metadata: AttnMetadataDev,
         input: DevicePtr,
-        output: DevicePtr,
+        output: Option<DevicePtr>,
         scratch: LingMlaScratch,
         rows: u32,
         write_floor: u32,
@@ -373,9 +373,10 @@ impl LingMlaWeights {
             "Ling MLA expects one sequence and a valid causal tile"
         );
         ensure!(
-            !metadata.block_table.is_null()
-                && metadata.max_blocks_per_seq > 0
-                && (prompt_offset.is_some() || !metadata.seq_len.is_null())
+            (output.is_none()
+                || (!metadata.block_table.is_null()
+                    && metadata.max_blocks_per_seq > 0
+                    && (prompt_offset.is_some() || !metadata.seq_len.is_null())))
                 && (write_floor == rows || !metadata.slot.is_null()),
             "Ling MLA requires live paged KV metadata from the first prompt token"
         );
@@ -406,8 +407,10 @@ impl LingMlaWeights {
         let vdim = config.v_head_dim as u32;
         let qdim = config.q_proj_rows() as u32;
 
-        self.q_proj
-            .forward(gpu, input, scratch.q_full, rows, scratch.projection, stream)?;
+        if output.is_some() {
+            self.q_proj
+                .forward(gpu, input, scratch.q_full, rows, scratch.projection, stream)?;
+        }
         self.kv_a_proj_with_mqa.forward(
             gpu,
             input,
@@ -447,19 +450,21 @@ impl LingMlaWeights {
 
         // Extract q RoPE channels, rotate q and the shared k RoPE row together,
         // then write q's rotated channels back into q_full.
-        ops::mla_q_rope_extract_batched(
-            gpu,
-            kernels.q_rope_extract,
-            scratch.q_full,
-            scratch.q_rope,
-            rows,
-            heads,
-            qk,
-            nope,
-            rope,
-            qdim,
-            stream,
-        )?;
+        if output.is_some() {
+            ops::mla_q_rope_extract_batched(
+                gpu,
+                kernels.q_rope_extract,
+                scratch.q_full,
+                scratch.q_rope,
+                rows,
+                heads,
+                qk,
+                nope,
+                rope,
+                qdim,
+                stream,
+            )?;
+        }
         gpu.copy_d2d_2d_async(
             scratch.kv_a.offset(rank_bytes),
             rank_bytes + rope_bytes,
@@ -478,26 +483,27 @@ impl LingMlaWeights {
             metadata.positions_h,
             metadata.positions_w,
             rows,
-            heads,
+            if output.is_some() { heads } else { 0 },
             rope,
             rope,
             self.rope_inv_freq,
             stream,
         )?;
-        ops::mla_q_rope_writeback_batched(
-            gpu,
-            kernels.q_rope_writeback,
-            scratch.q_rope,
-            scratch.q_full,
-            rows,
-            heads,
-            qk,
-            nope,
-            rope,
-            qdim,
-            stream,
-        )?;
-
+        if output.is_some() {
+            ops::mla_q_rope_writeback_batched(
+                gpu,
+                kernels.q_rope_writeback,
+                scratch.q_rope,
+                scratch.q_full,
+                rows,
+                heads,
+                qk,
+                nope,
+                rope,
+                qdim,
+                stream,
+            )?;
+        }
         self.kv_b_proj.forward(
             gpu,
             scratch.kv_norm,
@@ -537,6 +543,9 @@ impl LingMlaWeights {
                 .arg_ptr(metadata.slot.offset(write_floor as usize * 8))
                 .launch(stream)?;
         }
+        let Some(output) = output else {
+            return Ok(());
+        };
         if let Some(offset) = prompt_offset {
             ops::prefill_attention_paged_64(
                 gpu,

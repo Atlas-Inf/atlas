@@ -60,7 +60,7 @@ impl TransformerLayer for LingDecoderLayer {
     ) -> Result<()> {
         if matches!(&self.attention, LingAttention::Kda { .. }) {
             let state = self.state_kda(state, ctx.config)?;
-            return self.run_kda_rows(hidden, residual, num_tokens, &[state], ctx, stream);
+            return self.run_kda_rows(hidden, residual, num_tokens, &[state], None, ctx, stream);
         }
         if matches!(&self.attention, LingAttention::Mla { .. }) {
             return self.run_mla_prefill(
@@ -92,6 +92,22 @@ impl TransformerLayer for LingDecoderLayer {
         stream: u64,
     ) -> Result<()> {
         if matches!(&self.attention, LingAttention::Kda { .. }) {
+            if num_tokens == 2 && self.batch_verify {
+                let kda = self.state_kda(state, ctx.config)?;
+                let ssm = state
+                    .as_any_mut()
+                    .downcast_mut::<SsmLayerState>()
+                    .ok_or_else(|| anyhow::anyhow!("missing Ling verify slot"))?;
+                let snapshot = (
+                    *ssm.h_state_intermediates
+                        .first()
+                        .ok_or_else(|| anyhow::anyhow!("missing Ling verify H row"))?,
+                    *ssm.conv_state_intermediates
+                        .first()
+                        .ok_or_else(|| anyhow::anyhow!("missing Ling verify convolution row"))?,
+                );
+                return self.run_kda_rows(hidden, residual, 2, &[kda], Some(snapshot), ctx, stream);
+            }
             let h_bytes = self.hidden_size * 2;
             for token in 0..num_tokens {
                 self.decode(
@@ -106,6 +122,24 @@ impl TransformerLayer for LingDecoderLayer {
                     ctx,
                     stream,
                 )?;
+                if token + 1 < num_tokens {
+                    // A rejected suffix must restore the recurrent matrix and
+                    // the three convolution windows just after its last accepted row.
+                    let ssm = state
+                        .as_any_mut()
+                        .downcast_mut::<SsmLayerState>()
+                        .ok_or_else(|| anyhow::anyhow!("missing Ling KDA verify state"))?;
+                    let h = ssm.h_state_intermediates.get(token).ok_or_else(|| {
+                        anyhow::anyhow!("missing Ling KDA verify H snapshot {token}")
+                    })?;
+                    let conv = ssm.conv_state_intermediates.get(token).ok_or_else(|| {
+                        anyhow::anyhow!("missing Ling KDA verify convolution snapshot {token}")
+                    })?;
+                    ctx.gpu
+                        .copy_d2d_async(ssm.h_state, *h, self.h_state_bytes, stream)?;
+                    ctx.gpu
+                        .copy_d2d_async(ssm.conv_state, *conv, self.conv_state_bytes, stream)?;
+                }
             }
             return Ok(());
         }
@@ -117,6 +151,9 @@ impl TransformerLayer for LingDecoderLayer {
             "Ling MLA verify metadata has {} rows for {num_tokens} tokens",
             meta.num_seqs
         );
+        if num_tokens == 2 && self.batch_verify {
+            return self.mla_decode_rows(hidden, residual, num_tokens, kv_cache, meta, ctx, stream);
+        }
         let h_bytes = self.hidden_size * 2;
         for token in 0..num_tokens {
             self.run_one(
@@ -178,62 +215,17 @@ impl TransformerLayer for LingDecoderLayer {
                     .iter_mut()
                     .map(|state| self.state_kda(*state, ctx.config))
                     .collect::<Result<_>>()?;
-                self.run_kda_rows(hidden, residual, rows, &states, ctx, stream)
+                self.run_kda_rows(hidden, residual, rows, &states, None, ctx, stream)
             }
-            LingAttention::Mla {
-                config,
-                weights,
-                kernels,
-                scratch,
-                ..
-            } => {
-                let meta = meta.expect("validated MLA batch metadata");
-                let normed = ctx.buffers.norm_output();
-                let attn = ctx.buffers.attn_output();
-                let mut scratch = *scratch;
-                scratch.projection = LingProjectionScratch::new(
-                    ctx.buffers.fp8_act(),
-                    ctx.buffers.fp8_act_bytes(),
-                    ctx.buffers.fp8_act_scale(),
-                    ctx.buffers.sizes().fp8_act_scale,
-                );
-                ops::rms_norm_residual(
-                    ctx.gpu,
-                    self.rms_norm_residual_k,
-                    hidden,
-                    &self.input_norm,
-                    normed,
-                    residual,
-                    rows as u32,
-                    self.hidden_size as u32,
-                    ctx.config.rms_norm_eps as f32,
-                    stream,
-                )?;
-                for first in (0..rows).step_by(MLA_TILE_ROWS) {
-                    let count = MLA_TILE_ROWS.min(rows - first);
-                    let metadata = AttnMetadataDev {
-                        num_seqs: count as u32,
-                        ..Self::metadata_row(meta, first)
-                    };
-                    let offset = first * self.hidden_size * 2;
-                    weights.forward_rows(
-                        *config,
-                        *kernels,
-                        ctx.gpu,
-                        kv_cache,
-                        self.attention_layer_idx.expect("Ling MLA needs a KV layer"),
-                        metadata,
-                        normed.offset(offset),
-                        attn.offset(offset),
-                        scratch,
-                        count as u32,
-                        0,
-                        None,
-                        stream,
-                    )?;
-                }
-                self.finish_prefill_ffn(hidden, residual, attn, rows, ctx, stream)
-            }
+            LingAttention::Mla { .. } => self.mla_decode_rows(
+                hidden,
+                residual,
+                rows,
+                kv_cache,
+                meta.expect("validated MLA batch metadata"),
+                ctx,
+                stream,
+            ),
         }
     }
 
@@ -259,5 +251,75 @@ impl TransformerLayer for LingDecoderLayer {
         // pool slots and declines capture if any row lacks a stable slot.
         self.sante_ffn.is_some()
             || matches!(&self.ffn, FfnComponent::LingMoe(ffn) if !ffn.supports_batched_prefill())
+    }
+}
+
+impl LingDecoderLayer {
+    #[allow(clippy::too_many_arguments)]
+    fn mla_decode_rows(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        rows: usize,
+        kv_cache: &mut PagedKvCache,
+        meta: AttnMetadataDev,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let LingAttention::Mla {
+            config,
+            weights,
+            kernels,
+            scratch,
+            ..
+        } = &self.attention
+        else {
+            anyhow::bail!("MLA decode rows require an attention layer")
+        };
+        let normed = ctx.buffers.norm_output();
+        let attn = ctx.buffers.attn_output();
+        let mut scratch = *scratch;
+        scratch.projection = LingProjectionScratch::new(
+            ctx.buffers.fp8_act(),
+            ctx.buffers.fp8_act_bytes(),
+            ctx.buffers.fp8_act_scale(),
+            ctx.buffers.sizes().fp8_act_scale,
+        );
+        ops::rms_norm_residual(
+            ctx.gpu,
+            self.rms_norm_residual_k,
+            hidden,
+            &self.input_norm,
+            normed,
+            residual,
+            rows as u32,
+            self.hidden_size as u32,
+            ctx.config.rms_norm_eps as f32,
+            stream,
+        )?;
+        for first in (0..rows).step_by(MLA_TILE_ROWS) {
+            let count = MLA_TILE_ROWS.min(rows - first);
+            let metadata = AttnMetadataDev {
+                num_seqs: count as u32,
+                ..Self::metadata_row(meta, first)
+            };
+            let offset = first * self.hidden_size * 2;
+            weights.forward_rows(
+                *config,
+                *kernels,
+                ctx.gpu,
+                kv_cache,
+                self.attention_layer_idx.expect("Ling MLA needs a KV layer"),
+                metadata,
+                normed.offset(offset),
+                Some(attn.offset(offset)),
+                scratch,
+                count as u32,
+                0,
+                None,
+                stream,
+            )?;
+        }
+        self.finish_prefill_ffn(hidden, residual, attn, rows, ctx, stream)
     }
 }

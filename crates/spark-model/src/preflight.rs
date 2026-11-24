@@ -312,6 +312,7 @@ fn check_mtp_consumability(config: &ModelConfig) -> Result<()> {
         "qwen3_vl_moe",
         "qwen3_coder_next",
         "glm5_next",
+        "bailing_moe_v3_vl",
     ];
     if MTP_SUPPORTED_MODEL_TYPES.contains(&config.model_type.as_str()) {
         return Ok(());

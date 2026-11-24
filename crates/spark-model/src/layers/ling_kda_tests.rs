@@ -187,6 +187,7 @@ fn mock_prefill_dispatches_one_batched_kda_chain() {
             2,
             &[state],
             None,
+            None,
             prefill_scratch(),
             projection_scratch,
             9,

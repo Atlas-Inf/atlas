@@ -29,6 +29,55 @@ pub fn load_ling_layers(
     reader: Arc<Mutex<LingPagingReader>>,
     rope_inv_freq: DevicePtr,
 ) -> Result<Vec<Box<dyn TransformerLayer>>> {
+    load_range(
+        store,
+        config,
+        gpu,
+        reader,
+        rope_inv_freq,
+        0..config.num_hidden_layers,
+    )
+    .map(|layers| {
+        layers
+            .into_iter()
+            .map(|layer| Box::new(layer) as Box<dyn TransformerLayer>)
+            .collect()
+    })
+}
+
+/// The checkpoint's appended predictor is a full MLA + MoE decoder block. Its
+/// attention cache is private, so the sole layer has compact cache index zero.
+pub(crate) fn load_predictor_body(
+    store: &WeightStore,
+    config: &ModelConfig,
+    gpu: &dyn GpuBackend,
+) -> Result<LingDecoderLayer> {
+    ensure!(
+        config.mtp_num_hidden_layers == 1,
+        "Ling checkpoint has no native predictor"
+    );
+    let reader = Arc::new(Mutex::new(LingPagingReader::new(50)?));
+    let rope = crate::layers::ling_mla::alloc_rope_inv_freq(gpu, LingMlaConfig::default())?;
+    load_range(
+        store,
+        config,
+        gpu,
+        reader,
+        rope,
+        config.num_hidden_layers..config.num_hidden_layers + 1,
+    )?
+    .pop()
+    .ok_or_else(|| anyhow::anyhow!("missing Ling predictor block"))
+}
+
+fn load_range(
+    store: &WeightStore,
+    config: &ModelConfig,
+    gpu: &dyn GpuBackend,
+    reader: Arc<Mutex<LingPagingReader>>,
+    rope_inv_freq: DevicePtr,
+    indices: std::ops::Range<usize>,
+) -> Result<Vec<LingDecoderLayer>> {
     ensure!(config.model_type == "bailing_moe_v3_vl");
     ensure!(
         config.hidden_size == LING_KDA_HIDDEN_SIZE,
@@ -36,12 +85,12 @@ pub fn load_ling_layers(
         config.hidden_size
     );
     ensure!(config.layer_types.len() == config.num_hidden_layers);
-    let mut layers: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(config.num_hidden_layers);
+    let mut layers: Vec<LingDecoderLayer> = Vec::with_capacity(indices.len());
     // PagedKvCache stores only full-attention layers for Ling.  Its layer
     // index is therefore compact (0..7), not the transformer layer number
     // (5, 11, ... 41) used by the model's interleaved KDA/MLA schedule.
     let mut attention_layer_idx = 0usize;
-    for layer_idx in 0..config.num_hidden_layers {
+    for layer_idx in indices {
         let prefix = format!("model.layers.{layer_idx}");
         let input_norm = load_norm(
             store,
@@ -54,7 +103,12 @@ pub fn load_ling_layers(
             config.hidden_size,
         )?;
         let projection = LingDecoderLayer::alloc_projection_scratch(gpu, config.intermediate_size)?;
-        let (attention, cache_layer_idx) = match config.layer_type(layer_idx) {
+        let layer_type = if layer_idx == config.num_hidden_layers {
+            LayerType::FullAttention
+        } else {
+            config.layer_type(layer_idx)
+        };
+        let (attention, cache_layer_idx) = match layer_type {
             LayerType::LinearAttention => (
                 LingAttention::Kda {
                     layer: LingKdaLayer::new(
@@ -112,7 +166,12 @@ pub fn load_ling_layers(
                 FfnComponent::None,
                 Some(load_dense_ffn(store, &prefix, gpu, config)?),
             )
-        } else if config.mtp_num_hidden_layers == 0 {
+        } else if config.mtp_num_hidden_layers == 0
+            && !config
+                .quantization_config
+                .as_ref()
+                .is_some_and(|q| q.quant_method == "compressed-tensors")
+        {
             sante_ffn = Some(sante::SanteFfn::load(
                 store, gpu, &reader, layer_idx, projection,
             )?);
@@ -129,7 +188,8 @@ pub fn load_ling_layers(
                 None,
             )
         };
-        layers.push(Box::new(LingDecoderLayer {
+        layers.push(LingDecoderLayer {
+            batch_verify: std::env::var_os("ATLAS_LING_SERIAL_VERIFY").is_none(),
             input_norm,
             post_attn_norm,
             attention,
@@ -143,7 +203,7 @@ pub fn load_ling_layers(
             h_state_bytes: config.ssm_h_state_bytes(),
             conv_state_bytes: config.ssm_conv_state_bytes(),
             attention_layer_idx: cache_layer_idx,
-        }));
+        });
     }
     Ok(layers)
 }

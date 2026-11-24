@@ -22,6 +22,7 @@ pub mod ling_decoder;
 pub mod ling_kda;
 pub mod ling_mla;
 pub mod ling_moe;
+pub(crate) mod ling_mtp;
 pub mod ling_projection;
 pub mod ling_vision;
 pub mod moe;

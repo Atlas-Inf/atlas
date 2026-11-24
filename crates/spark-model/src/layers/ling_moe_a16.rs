@@ -541,45 +541,37 @@ impl LingMoeFfn {
     ) -> Result<DevicePtr> {
         ensure!(ctx.config.model_type == "bailing_moe_v3_vl");
         ensure!(ctx.config.hidden_size == self.hidden);
-        let dense_kernel = self
-            .kernels
-            .dense_gemv
-            .ok_or_else(|| anyhow::anyhow!("Ling A16 dense GEMV kernel is unavailable"))?;
         let silu_kernel = self
             .kernels
             .silu_bf16
             .ok_or_else(|| anyhow::anyhow!("Ling A16 BF16 SwiGLU kernel is unavailable"))?;
 
-        let shared_gate = self
-            .shared_gate
-            .dense()
-            .ok_or_else(|| anyhow::anyhow!("Ling A16 shared gate is not dense BF16"))?;
-        let shared_up = self
-            .shared_up
-            .dense()
-            .ok_or_else(|| anyhow::anyhow!("Ling A16 shared up is not dense BF16"))?;
-        let shared_down = self
-            .shared_down
-            .dense()
-            .ok_or_else(|| anyhow::anyhow!("Ling A16 shared down is not dense BF16"))?;
-        ops::dense_gemv(
+        let [gate, up, down] = self
+            .shared_decode
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Ling A16 shared projections missing"))?;
+        // These projections only select BF16 or weight-only NVFP4. Neither
+        // requires a dynamic input quantization workspace.
+        let scratch = crate::layers::ling_projection::LingProjectionScratch::new(
+            DevicePtr::NULL,
+            0,
+            DevicePtr::NULL,
+            0,
+        );
+        gate.forward(
             ctx.gpu,
-            dense_kernel,
             input,
-            &shared_gate,
             ctx.buffers.expert_gate_out(),
-            self.intermediate as u32,
-            self.hidden as u32,
+            1,
+            scratch,
             stream,
         )?;
-        ops::dense_gemv(
+        up.forward(
             ctx.gpu,
-            dense_kernel,
             input,
-            &shared_up,
             ctx.buffers.expert_up_out(),
-            self.intermediate as u32,
-            self.hidden as u32,
+            1,
+            scratch,
             stream,
         )?;
         ops::ling_silu_mul_bf16(
@@ -593,14 +585,12 @@ impl LingMoeFfn {
             shared_swiglu_limit(self.layer_idx),
             stream,
         )?;
-        ops::dense_gemv(
+        down.forward(
             ctx.gpu,
-            dense_kernel,
             self.activation_bf16,
-            &shared_down,
             ctx.buffers.attn_output(),
-            self.hidden as u32,
-            self.intermediate as u32,
+            1,
+            scratch,
             stream,
         )?;
 

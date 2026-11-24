@@ -89,6 +89,25 @@ impl LingMoeFfn {
             );
         }
 
+        let shared_decode = if a16 {
+            let projection = |name: &str, rows, cols| {
+                crate::layers::ling_projection::LingProjection::load(
+                    gpu,
+                    store,
+                    &format!("{shared_prefix}.{name}_proj"),
+                    rows,
+                    cols,
+                )
+            };
+            Some([
+                projection("gate", INTERMEDIATE, HIDDEN)?,
+                projection("up", INTERMEDIATE, HIDDEN)?,
+                projection("down", HIDDEN, INTERMEDIATE)?,
+            ])
+        } else {
+            None
+        };
+
         let load_routed = |prefix: &str| -> Result<LingProjection> {
             let Some(packed) = store.deferred(&format!("{prefix}.weight_packed")) else {
                 return load_projection(store, prefix, gpu);
@@ -231,11 +250,6 @@ impl LingMoeFfn {
             silu_quant: gpu.kernel("ling_ffn", "ling_silu_mul_quant_fp8")?,
             fp8_gate_up: (fp8_gate_up.0 != 0).then_some(fp8_gate_up),
             ling_down_fp8: (ling_down_fp8.0 != 0).then_some(ling_down_fp8),
-            dense_gemv: if a16 {
-                Some(gpu.kernel("gemv", "dense_gemv_bf16")?)
-            } else {
-                None
-            },
             dense_batch_gemv: if a16 {
                 Some(gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?)
             } else {
@@ -331,6 +345,7 @@ impl LingMoeFfn {
             activation_bf16,
             a16_gate_up,
             a16_tables,
+            shared_decode,
             a16,
             strict_fast,
             kernels,

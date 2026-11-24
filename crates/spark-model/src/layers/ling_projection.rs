@@ -94,10 +94,13 @@ impl LingProjection {
         );
         let format = match w.dtype {
             WeightDtype::BF16 => {
-                let decode_nvfp4 = if name.contains(".attention.")
+                let pack_attention = name.contains(".attention.")
+                    && std::env::var("ATLAS_LING_NVFP4_DECODE").as_deref() == Ok("1");
+                let pack_mlp = name.contains(".mlp.")
+                    && std::env::var("ATLAS_LING_NVFP4_MLP_DECODE").as_deref() == Ok("1");
+                let decode_nvfp4 = if (pack_attention || pack_mlp)
                     && rows >= 512
                     && cols >= 512
-                    && std::env::var("ATLAS_LING_NVFP4_DECODE").as_deref() == Ok("1")
                     && store.contains("model.layers.2.mlp.experts.0.gate_proj.weight_packed")
                 {
                     let packed = crate::weight_map::quantize_to_nvfp4(

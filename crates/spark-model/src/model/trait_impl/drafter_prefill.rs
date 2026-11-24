@@ -155,7 +155,10 @@ impl TransformerModel {
         let h = self.config.hidden_size;
         let bf16 = 2usize;
         let dst = self.mtp_prefill_hidden.offset(chunk_start * h * bf16);
-        if self.config.model_type == "glm5_next" {
+        if matches!(
+            self.config.model_type.as_str(),
+            "glm5_next" | "bailing_moe_v3_vl"
+        ) {
             // vLLM's Glm5NextModel applies its final RMSNorm before returning
             // the per-position target hiddens consumed by the MTP model. The
             // normal Atlas prefill path only final-normalizes the last row for
