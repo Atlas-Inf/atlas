@@ -253,23 +253,33 @@ impl BlockDiffusionDraftHead {
                     );
                 }
             }
-            anyhow::ensure!(
-                self.inkling_taps.is_none(),
-                "Inkling 2 DFlash2 projects its context through ctx_kv_project"
-            );
-            for i in 0..eff_ctx {
-                let src_slot = base.offset((start_slot + i) * ctx_slot_bytes);
-                let dst_slot = scratch.fc_proj.offset(i * self.hidden_size * bf16);
-                ops::dense_gemv(
+            if let Some(t) = self.inkling_taps.as_ref() {
+                // An Inkling 2 target's last tap normed first (`inkling_taps`).
+                self.inkling_tap_fc(
+                    t,
                     gpu,
-                    self.kernels.dense_gemv,
-                    src_slot,
-                    &self.fc,
-                    dst_slot,
+                    base.offset(start_slot * ctx_slot_bytes),
+                    eff_ctx as u32,
                     h,
                     target_hidden_dim as u32,
+                    scratch.fc_proj,
                     stream,
                 )?;
+            } else {
+                for i in 0..eff_ctx {
+                    let src_slot = base.offset((start_slot + i) * ctx_slot_bytes);
+                    let dst_slot = scratch.fc_proj.offset(i * self.hidden_size * bf16);
+                    ops::dense_gemv(
+                        gpu,
+                        self.kernels.dense_gemv,
+                        src_slot,
+                        &self.fc,
+                        dst_slot,
+                        h,
+                        target_hidden_dim as u32,
+                        stream,
+                    )?;
+                }
             }
             if eff_ctx > 0 {
                 dump_bf16("step0.fc_proj.pre_norm[0]", scratch.fc_proj, 10)?;

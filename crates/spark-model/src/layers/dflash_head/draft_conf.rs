@@ -21,6 +21,9 @@ use spark_runtime::gpu::{GpuBackend, KernelHandle};
 
 use super::{BlockDiffusionDraftHead, DflashScratch};
 
+/// The confidence twin a target other than GLM ships (`dflash2_selector_conf.cu`).
+const NEUTRAL_CONF_MODULE: &str = "dflash2_selector_conf";
+
 /// The confidence twin's module: `ATLAS_DFLASH2_EDGE=0.6|0.8` picks the twin
 /// that scales the selector's transition term by that weight (drafts change;
 /// verification does not). Anything else is the weight-1 production twin.
@@ -44,6 +47,7 @@ fn edge_module(edge: Option<&str>) -> &'static str {
 /// kernel. Only the 16-candidate selector has a confidence twin.
 pub(super) fn selector_kernel(
     gpu: &dyn GpuBackend,
+    glm: bool,
     want: bool,
     build: crate::layers::ops::Dflash2SelectorBuild,
 ) -> (Option<KernelHandle>, bool) {
@@ -54,11 +58,18 @@ pub(super) fn selector_kernel(
         );
     }
     let want = want && build.full_family;
+    // GLM ships its twins (and the edge-weight ones); other targets the
+    // target-neutral twin (Inkling 2). Only the target's own is looked up.
+    let module = if glm {
+        conf_module()
+    } else {
+        NEUTRAL_CONF_MODULE
+    };
     let twin = want
-        .then(|| gpu.kernel(conf_module(), "dflash2_candidate_selector_conf"))
+        .then(|| gpu.kernel(module, "dflash2_candidate_selector_conf"))
         .and_then(Result::ok)
         .filter(|kernel| kernel.0 != 0);
-    if conf_module() != "glm_dflash2_selector_conf" {
+    if glm && conf_module() != "glm_dflash2_selector_conf" {
         if want && twin.is_some() {
             tracing::info!("DFlash2 selector: edge-weight twin {}", conf_module());
         } else {

@@ -158,7 +158,10 @@ impl BlockDiffusionDraftHead {
         let inkling_conf = startup.diagnostics.draft_conf && inkling_weights.is_some();
         let (selector_kernel, draft_conf) = super::draft_conf::selector_kernel(
             gpu,
-            glm_series && startup.diagnostics.draft_conf && weights.candidate_selector.is_some(),
+            glm_series,
+            (glm_series || target_model_type == "inkling2_loop")
+                && startup.diagnostics.draft_conf
+                && weights.candidate_selector.is_some(),
             selector_build,
         );
         if weights.candidate_selector.is_some() && selector_kernel.is_none() {
