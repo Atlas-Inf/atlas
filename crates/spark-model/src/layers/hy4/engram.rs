@@ -13,6 +13,7 @@ use spark_runtime::{
 
 mod batch;
 mod forward;
+mod nvmap;
 #[cfg(test)]
 mod tests;
 pub struct Hy4Engram<'a> {
@@ -24,7 +25,12 @@ pub struct Hy4Engram<'a> {
     dim: usize,
     h: usize,
     rows: std::ops::Range<usize>,
+    fp8_table: bool,
     table: DevicePtr,
+    /// NVMe-mmap of the rank's bf16 table slice: `table` reads into it, so
+    /// it must outlive every launch. Held for its Drop (the unmap), never
+    /// read — hence the underscore name.
+    _table_nvmap: Option<nvmap::TableMap>,
     scales: DevicePtr,
     lookup_norm: DevicePtr,
     map: DevicePtr,
@@ -62,7 +68,6 @@ impl<'a> Hy4Engram<'a> {
         let cfg = config.hy4.as_ref().context("Hy4 Engram config missing")?;
         ensure!(
             cfg.engram_layer_ids.contains(&(layer + 1))
-                && cfg.engram_fp8_embedding
                 && cfg.engram_max_ngram_size == 3
                 && cfg.engram_n_head_per_ngram == 8
                 && cfg.engram_n_embed_per_ngram == 768
@@ -115,24 +120,67 @@ impl<'a> Hy4Engram<'a> {
             ..layout.sizes[..heads.end].iter().sum::<usize>();
         let dim = cfg.engram_n_embed_per_ngram / cfg.engram_n_head_per_ngram;
         let mut mem = Owned::new(gpu);
-        let table = table_slice(
-            &mut mem,
-            store,
-            &format!("{base}.multi_head_embedding.embedding.weight"),
-            &[n, dim],
-            WeightDtype::FP8E4M3,
-            rows.start * dim,
-            rows.len() * dim,
-        )?;
-        let scales = table_slice(
-            &mut mem,
-            store,
-            &format!("{base}.multi_head_embedding.embedding.weight_scale_inv"),
-            &[n],
-            WeightDtype::BF16,
-            rows.start * 2,
-            rows.len() * 2,
-        )?;
+        // fp8 tables carry a per-row bf16 weight_scale_inv (2 bytes/row); the
+        // original bf16 tables need no scales and store 2 bytes per element,
+        // so both the byte start offset and byte length double.
+        let fp8_table = cfg.engram_fp8_embedding;
+        let (dtype, width) = if fp8_table {
+            (WeightDtype::FP8E4M3, 1)
+        } else {
+            (WeightDtype::BF16, 2)
+        };
+        let table_name = format!("{base}.multi_head_embedding.embedding.weight");
+        // bf16 + deferred table + knob on: serve this rank's slice straight
+        // off NVMe via mmap (GB10 reads host memory coherently through the
+        // page cache — see nvmap) instead of copying it into device memory.
+        // fp8 tables and knob-off loads stay device-resident, as before.
+        let mut table_nvmap = None;
+        let table = match nvmap::enabled(fp8_table)
+            .then(|| store.deferred(&table_name))
+            .flatten()
+        {
+            Some(d) => {
+                let m = nvmap::TableMap::open(
+                    d,
+                    &table_name,
+                    dtype,
+                    &[n, dim],
+                    rows.start * dim * width,
+                    rows.len() * dim * width,
+                )?;
+                tracing::info!(
+                    "engram tables NVMe-mmap: rank slice rows={} bytes={} (~{:.1} GB resident-free)",
+                    rows.len(),
+                    m.bytes(),
+                    m.bytes() as f64 / 1073741824.0
+                );
+                let ptr = m.table_ptr(mem.gpu);
+                table_nvmap = Some(m);
+                ptr
+            }
+            None => table_slice(
+                &mut mem,
+                store,
+                &table_name,
+                &[n, dim],
+                dtype,
+                rows.start * dim * width,
+                rows.len() * dim * width,
+            )?,
+        };
+        let scales = if fp8_table {
+            table_slice(
+                &mut mem,
+                store,
+                &format!("{base}.multi_head_embedding.embedding.weight_scale_inv"),
+                &[n],
+                WeightDtype::BF16,
+                rows.start * 2,
+                rows.len() * 2,
+            )?
+        } else {
+            DevicePtr::NULL
+        };
         let lookup_norm = join(
             &mut mem,
             store,
@@ -215,12 +263,20 @@ impl<'a> Hy4Engram<'a> {
         )?;
         let names = [
             "hy4_engram_hash",
-            "hy4_engram_lookup",
+            if fp8_table {
+                "hy4_engram_lookup"
+            } else {
+                "hy4_engram_lookup_bf16"
+            },
             "hy4_engram_project",
             "hy4_engram_norm",
             "hy4_engram_inject",
             "hy4_engram_hash_batch",
-            "hy4_engram_lookup_batch",
+            if fp8_table {
+                "hy4_engram_lookup_batch"
+            } else {
+                "hy4_engram_lookup_batch_bf16"
+            },
             "hy4_engram_norm_batch",
             "hy4_engram_inject_batch",
         ];
@@ -237,7 +293,9 @@ impl<'a> Hy4Engram<'a> {
             dim,
             h: config.hidden_size,
             rows,
+            fp8_table,
             table,
+            _table_nvmap: table_nvmap,
             scales,
             lookup_norm,
             map,

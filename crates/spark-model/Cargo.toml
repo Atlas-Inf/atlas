@@ -23,10 +23,10 @@ metal = [
     "spark-storage/metal",
     "spark-comm/metal",
 ]
-# Pulls in the host-side example deps (tokenizers, memmap2, safetensors).
+# Pulls in the host-side example deps (tokenizers, safetensors).
 # Kept off the bare `metal` feature so a metal-feature library build
 # doesn't drag in the tokenizer crate.
-metal-example = ["metal", "dep:tokenizers", "dep:memmap2", "dep:safetensors"]
+metal-example = ["metal", "dep:tokenizers", "dep:safetensors"]
 # Opt-in gate for the GPU kernel microtest examples. NOT in `default`, so the
 # no-GPU CI `cargo test --workspace` skips building them (they link CUDA
 # driver symbols — cuGraph*/cuStream*/cuMem* — that aren't available on the
@@ -48,6 +48,8 @@ spark-comm = { path = "../spark-comm", default-features = false }
 # from silently re-enabling spark-storage's cuda default.
 spark-storage = { path = "../spark-storage", default-features = false }
 anyhow = { workspace = true }
+# NVMe-mmap serving of the bf16 Engram rank slices (layers/hy4/engram/nvmap).
+memmap2 = "0.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -65,7 +67,6 @@ self_cell = "1.2.2"
 # `required-features = ["metal-example"]` on the `[[example]]` block
 # below so default Linux builds don't pull these in.
 tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
-memmap2 = { version = "0.9", optional = true }
 safetensors = { version = "0.8", optional = true }
 
 # End-to-end Qwen3.5-4B-MLX-8bit decode driver. Loads weights via

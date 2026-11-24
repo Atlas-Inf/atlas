@@ -34,18 +34,43 @@ extern "C" __global__ void hy4_engram_hash(
     hashes[h]=(int)rem+offsets[h];
 }
 
-extern "C" __global__ void hy4_engram_lookup(
-    const int* hashes,const __nv_fp8_e4m3* table,const __nv_bfloat16* scales,
+// FP8_TABLE is a compile-time literal (HAS_BIAS precedent in
+// hy4_linear_bf16_mma.cuh): the fp8 table is multiplied row-wise by its bf16
+// weight_scale_inv, the bf16 table skips the row-scale multiply (scale
+// exactly 1). The bf16 twin omits the scales parameter entirely — a
+// NULL-guarded scales load would be hoisted out of its guard by ptxas and
+// fault on a real GPU.
+template<bool FP8_TABLE>
+static __device__ __forceinline__ void eg_lookup(
+    const int* hashes,const void* table,const __nv_bfloat16* scales,
     const __nv_bfloat16* gamma,__nv_bfloat16* output,
     unsigned first_head,unsigned base_row,unsigned local_rows,unsigned dim) {
     unsigned head=blockIdx.x;int row=hashes[first_head+head];
     bool valid=row>=0 && (unsigned)row>=base_row && (unsigned)row-base_row<local_rows;
     unsigned local=valid?(unsigned)row-base_row:0;
-    float scale=valid?__bfloat162float(scales[local]):0.f;
-    float v=(threadIdx.x<dim && valid)?(float)table[(size_t)local*dim+threadIdx.x]*scale:0.f;
+    float v;
+    if constexpr (FP8_TABLE) {
+        float scale=valid?__bfloat162float(scales[local]):0.f;
+        v=(threadIdx.x<dim && valid)?(float)((const __nv_fp8_e4m3*)table)[(size_t)local*dim+threadIdx.x]*scale:0.f;
+    } else {
+        v=(threadIdx.x<dim && valid)?__bfloat162float(((const __nv_bfloat16*)table)[(size_t)local*dim+threadIdx.x]):0.f;
+    }
     float inv=rsqrtf(eg_sum(v*v)/(float)dim+1.1920928955078125e-7f);
     if(threadIdx.x<dim)output[head*dim+threadIdx.x]=__float2bfloat16_rn(
         v*inv*__bfloat162float(gamma[head*dim+threadIdx.x]));
+}
+
+extern "C" __global__ void hy4_engram_lookup(
+    const int* hashes,const __nv_fp8_e4m3* table,const __nv_bfloat16* scales,
+    const __nv_bfloat16* gamma,__nv_bfloat16* output,
+    unsigned first_head,unsigned base_row,unsigned local_rows,unsigned dim) {
+    eg_lookup<true>(hashes,table,scales,gamma,output,first_head,base_row,local_rows,dim);
+}
+extern "C" __global__ void hy4_engram_lookup_bf16(
+    const int* hashes,const __nv_bfloat16* table,
+    const __nv_bfloat16* gamma,__nv_bfloat16* output,
+    unsigned first_head,unsigned base_row,unsigned local_rows,unsigned dim) {
+    eg_lookup<false>(hashes,table,0,gamma,output,first_head,base_row,local_rows,dim);
 }
 
 // Batched variants: one launch per stage for the whole chunk (grid y = row),
@@ -70,8 +95,9 @@ extern "C" __global__ void hy4_engram_hash_batch(
     hashes[(size_t)row*heads+h]=(int)rem+offsets[h];
 }
 
-extern "C" __global__ void hy4_engram_lookup_batch(
-    const int* hashes,const __nv_fp8_e4m3* table,const __nv_bfloat16* scales,
+template<bool FP8_TABLE>
+static __device__ __forceinline__ void eg_lookup_batch(
+    const int* hashes,const void* table,const __nv_bfloat16* scales,
     const __nv_bfloat16* gamma,__nv_bfloat16* output,
     unsigned first_head,unsigned base_row,unsigned local_rows,unsigned dim,
     unsigned hash_stride,unsigned local,unsigned rows) {
@@ -80,11 +106,33 @@ extern "C" __global__ void hy4_engram_lookup_batch(
     int h=hashes[(size_t)row*hash_stride+first_head+head];
     bool valid=h>=0 && (unsigned)h>=base_row && (unsigned)h-base_row<local_rows;
     unsigned l=valid?(unsigned)h-base_row:0;
-    float scale=valid?__bfloat162float(scales[l]):0.f;
-    float v=(threadIdx.x<dim && valid)?(float)table[(size_t)l*dim+threadIdx.x]*scale:0.f;
+    float v;
+    if constexpr (FP8_TABLE) {
+        float scale=valid?__bfloat162float(scales[l]):0.f;
+        v=(threadIdx.x<dim && valid)?(float)((const __nv_fp8_e4m3*)table)[(size_t)l*dim+threadIdx.x]*scale:0.f;
+    } else {
+        v=(threadIdx.x<dim && valid)?__bfloat162float(((const __nv_bfloat16*)table)[(size_t)l*dim+threadIdx.x]):0.f;
+    }
     float inv=rsqrtf(eg_sum(v*v)/(float)dim+1.1920928955078125e-7f);
     if(threadIdx.x<dim)output[(size_t)row*local+head*dim+threadIdx.x]=__float2bfloat16_rn(
         v*inv*__bfloat162float(gamma[head*dim+threadIdx.x]));
+}
+
+extern "C" __global__ void hy4_engram_lookup_batch(
+    const int* hashes,const __nv_fp8_e4m3* table,const __nv_bfloat16* scales,
+    const __nv_bfloat16* gamma,__nv_bfloat16* output,
+    unsigned first_head,unsigned base_row,unsigned local_rows,unsigned dim,
+    unsigned hash_stride,unsigned local,unsigned rows) {
+    eg_lookup_batch<true>(hashes,table,scales,gamma,output,first_head,base_row,
+        local_rows,dim,hash_stride,local,rows);
+}
+extern "C" __global__ void hy4_engram_lookup_batch_bf16(
+    const int* hashes,const __nv_bfloat16* table,
+    const __nv_bfloat16* gamma,__nv_bfloat16* output,
+    unsigned first_head,unsigned base_row,unsigned local_rows,unsigned dim,
+    unsigned hash_stride,unsigned local,unsigned rows) {
+    eg_lookup_batch<false>(hashes,table,0,gamma,output,first_head,base_row,
+        local_rows,dim,hash_stride,local,rows);
 }
 
 extern "C" __global__ void hy4_engram_norm_batch(

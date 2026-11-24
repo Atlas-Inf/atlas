@@ -55,12 +55,17 @@ impl Hy4Engram<'_> {
             .arg_u32(self.layout.heads_per_order as u32)
             .arg_u32(self.layout.pad)
             .launch(stream)?;
-        KernelLaunch::new(self.mem.gpu, self.kernels[1])
+        let lookup = KernelLaunch::new(self.mem.gpu, self.kernels[1])
             .grid([self.heads.len() as u32, 1, 1])
             .block([128, 1, 1])
             .arg_ptr(scratch.hashes)
-            .arg_ptr(self.table)
-            .arg_ptr(self.scales)
+            .arg_ptr(self.table);
+        let lookup = if self.fp8_table {
+            lookup.arg_ptr(self.scales)
+        } else {
+            lookup
+        };
+        lookup
             .arg_ptr(self.lookup_norm)
             .arg_ptr(scratch.lookup)
             .arg_u32(self.heads.start as u32)
