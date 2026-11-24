@@ -228,13 +228,18 @@ impl LingMoeFfn {
             } else {
                 None
             },
-            decode_union: if a16 && std::env::var("ATLAS_LING_EXPERT_UNION").as_deref() == Ok("1") {
-                Some([
-                    gpu.kernel("ling_moe_union", "moe_union_match")?,
-                    gpu.kernel("ling_moe_union", "moe_expert_gemv_wide_grouped_u")?,
-                ])
-            } else {
-                None
+            decode_union: match (a16, std::env::var("ATLAS_LING_EXPERT_UNION").as_deref()) {
+                (true, Ok(mode @ ("1" | "tensor"))) => {
+                    let project = if mode == "tensor" {
+                        super::UnionProjection::Tensor(gpu.kernel("skinny_mma", "ling_expert_mma")?)
+                    } else {
+                        super::UnionProjection::Scalar(
+                            gpu.kernel("ling_moe_union", "moe_expert_gemv_wide_grouped_u")?,
+                        )
+                    };
+                    Some((gpu.kernel("ling_moe_union", "moe_union_match")?, project))
+                }
+                _ => None,
             },
             grouped_w4a4: if a16 && std::env::var("ATLAS_LING_W4A4_PREFILL").as_deref() == Ok("1") {
                 Some([

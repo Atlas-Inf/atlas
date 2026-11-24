@@ -71,3 +71,9 @@ presence_penalty = 0.0
 frequency_penalty = 0.0
 repetition_penalty = 1.0
 dry_multiplier = 0.0
+
+[expected_absent.w4a16_gemv]
+w4a16_gemv_qg_batch4 = "Only the optional skinny kernel handle registry probes the interleaved Qwen query-plus-gate path. Ling loads separate query and gate projections."
+
+[expected_absent.w4a16]
+w4a16_gemm_t_p3 = "The optional NVFP4 vocabulary head uses the resolved two-stage w4a16_gemm_t on Ling."

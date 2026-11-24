@@ -233,11 +233,26 @@ impl LingMoeFfn {
             (4..=32).contains(&rows) && (1 + EXPERTS * (2 + 2 * 32)) * 4 <= sizes.gate_logits_f32
         });
         let workspace = ctx.buffers.gate_logits_f32();
-        if let Some([plan, _]) = union {
+        if let Some((plan, _)) = union {
             ops::moe_union_match(ctx.gpu, plan, ids, workspace, rows, TOP_K as u32, stream)?;
         }
         let project = |x, table: &ExpertPtrTable, output, n, k, stride| {
-            if let Some([_, kernel]) = union {
+            if let Some((_, super::UnionProjection::Tensor(kernel))) = union {
+                KernelLaunch::new(ctx.gpu, kernel)
+                    .grid([n / 16, (rows * TOP_K as u32).min(EXPERTS as u32), 1])
+                    .block([if k < 2048 { 128 } else { 256 }, 1, 1])
+                    .arg_ptr(x)
+                    .arg_ptr(table.packed_ptrs)
+                    .arg_ptr(table.scale_ptrs)
+                    .arg_ptr(table.scale2_vals)
+                    .arg_ptr(output)
+                    .arg_ptr(workspace)
+                    .arg_u32(n)
+                    .arg_u32(k)
+                    .arg_u32(TOP_K as u32)
+                    .arg_u32(stride)
+                    .launch(stream)
+            } else if let Some((_, super::UnionProjection::Scalar(kernel))) = union {
                 ops::moe_expert_gemv_wide_grouped_u(
                     ctx.gpu,
                     kernel,
