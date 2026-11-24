@@ -119,7 +119,7 @@ pub(crate) fn load_weight_store(
         && config
             .quantization_config
             .as_ref()
-            .is_some_and(|quant| quant.quant_method == "fp8");
+            .is_none_or(|quant| quant.quant_method == "fp8");
     anyhow::ensure!(
         !ling || use_fast_load(args),
         "Ling routed experts require the fast loader for demand paging"
@@ -152,6 +152,15 @@ pub(crate) fn load_weight_store(
                 }
             }
             loader.defer_ling_experts = ling;
+            if config.model_type == "bailing_moe_v3_vl"
+                && config
+                    .quantization_config
+                    .as_ref()
+                    .is_some_and(|q| q.quant_method == "compressed-tensors")
+                && std::env::var("ATLAS_LING_LONG_KV").as_deref() == Ok("1")
+            {
+                loader.ling_packed_page_start = Some(24);
+            }
             loader.peak_memory_multiplier = mult;
             loader.expert_tp = config.expert_tp;
             loader.demand_paged_patterns = demand_paged_patterns(config);

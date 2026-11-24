@@ -257,6 +257,7 @@ impl TransformerLayer for LingDecoderLayer {
     fn multi_seq_decode_graph_unsupported(&self) -> bool {
         // The graph cache keys recurrent pointers by the ordered vector of SSM
         // pool slots and declines capture if any row lacks a stable slot.
-        matches!(&self.ffn, FfnComponent::LingMoe(ffn) if !ffn.supports_batched_prefill())
+        self.sante_ffn.is_some()
+            || matches!(&self.ffn, FfnComponent::LingMoe(ffn) if !ffn.supports_batched_prefill())
     }
 }

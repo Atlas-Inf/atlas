@@ -106,11 +106,17 @@ pub fn load_ling_layers(
             }
             other => bail!("Ling layer {layer_idx} has unsupported type {other:?}"),
         };
+        let mut sante_ffn = None;
         let (ffn, dense_ffn) = if config.mlp_only_layers.contains(&layer_idx) {
             (
                 FfnComponent::None,
                 Some(load_dense_ffn(store, &prefix, gpu, config)?),
             )
+        } else if config.mtp_num_hidden_layers == 0 {
+            sante_ffn = Some(sante::SanteFfn::load(
+                store, gpu, &reader, layer_idx, projection,
+            )?);
+            (FfnComponent::None, None)
         } else {
             (
                 FfnComponent::LingMoe(LingMoeFfn::load(
@@ -129,6 +135,7 @@ pub fn load_ling_layers(
             attention,
             ffn,
             dense_ffn,
+            sante_ffn,
             rms_norm_residual_k: gpu.kernel("ling_norm", "ling_rms_norm_residual")?,
             residual_add_rms_norm_k: gpu.kernel("ling_norm", "ling_residual_add_rms_norm")?,
             residual_add_k: gpu.kernel("residual_add", "bf16_residual_add")?,

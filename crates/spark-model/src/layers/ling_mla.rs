@@ -5,10 +5,8 @@
 //! Ling's full-attention layers are the direct (q_lora-free) Bailing MLA:
 //! q_proj, kv_a_proj_with_mqa + RMSNorm, kv_b_proj, interleaved RoPE,
 //! paged K/V, a head-wise sigmoid gate, and the checkpoint's dense output
-//! projection. The stock paged-attention ABI has one head width for K and V;
-//! Ling's K width is 192 while V is 128. This adapter stores V in a zero-padded
-//! 192-wide row, then narrows attention output back to 128 before gating and
-//! dense. The cache layer therefore must be configured as (32, 192).
+//! projection. Each BF16 cache row stores 128 NoPE channels per head and
+//! one shared 64-channel RoPE tail. Values share an all-zero padding tail.
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -177,7 +175,6 @@ pub struct LingMlaScratch {
     pub kv_b: DevicePtr,
     pub k_token: DevicePtr,
     pub v_compact: DevicePtr,
-    pub v_padded: DevicePtr,
     pub attn_padded: DevicePtr,
     pub attn_compact: DevicePtr,
     pub attn_gated: DevicePtr,
@@ -206,7 +203,6 @@ impl LingMlaScratch {
             padded,
             compact,
             padded,
-            padded,
             compact,
             compact,
             config.num_heads,
@@ -227,7 +223,6 @@ impl LingMlaScratch {
             kv_b,
             k_token,
             v_compact,
-            v_padded,
             attn_padded,
             attn_compact,
             attn_gated,
@@ -248,7 +243,6 @@ impl LingMlaScratch {
                 kv_b,
                 k_token,
                 v_compact,
-                v_padded,
                 attn_padded,
                 attn_compact,
                 attn_gated,
@@ -286,7 +280,7 @@ impl LingMlaKernels {
             q_rope_extract: gpu.kernel("mla_absorbed", "mla_q_rope_extract_batched")?,
             q_rope_writeback: gpu.kernel("mla_absorbed", "mla_q_rope_writeback_batched")?,
             kv_assemble: gpu.kernel("mla_absorbed", "mla_kv_assemble_batched")?,
-            reshape_cache: gpu.kernel("reshape_and_cache", "reshape_and_cache_flash")?,
+            reshape_cache: gpu.kernel("ling_mla_prefill", "ling_cache_write")?,
             // Ling's absorbed K/V rows are 192-wide (qk_nope 128 + RoPE 64),
             // so resolve the target-local HDIM=192 module rather than the
             // borrowed generic HDIM=256 paged decoder.
@@ -390,7 +384,11 @@ impl LingMlaWeights {
             "Ling MLA native decode currently requires BF16 KV cache"
         );
         ensure!(
-            kv_cache.config().dims_for_layer(layer_idx) == (config.num_heads, config.qk_head_dim()),
+            kv_cache.config().dims_for_layer(layer_idx)
+                == (
+                    config.num_heads,
+                    config.qk_nope_head_dim + config.qk_rope_head_dim / config.num_heads
+                ),
             "Ling MLA cache geometry must be ({} heads, {}-wide K/V), got {:?}",
             config.num_heads,
             config.qk_head_dim(),
@@ -525,46 +523,20 @@ impl LingMlaWeights {
             stream,
         )?;
 
-        // The stock paged-attention ABI uses one width for K and V. Keep V's
-        // true 128 channels and zero-pad each head to the 192-wide cache row.
         let k_row_bytes = config.qk_head_dim() * 2;
         let v_row_bytes = config.v_head_dim * 2;
-        gpu.memset_async(
-            scratch.v_padded,
-            0,
-            rows as usize * config.num_heads * k_row_bytes,
-            stream,
-        )?;
-        gpu.copy_d2d_2d_async(
-            scratch.v_compact,
-            v_row_bytes,
-            scratch.v_padded,
-            k_row_bytes,
-            v_row_bytes,
-            rows as usize * config.num_heads,
-            stream,
-        )?;
         if write_floor < rows {
-            let offset = write_floor as usize * config.num_heads * k_row_bytes;
-            ops::reshape_and_cache(
-                gpu,
-                kernels.reshape_cache,
-                scratch.k_token.offset(offset),
-                scratch.v_padded.offset(offset),
-                kv_cache.k_pool_ptr(layer_idx),
-                kv_cache.v_pool_ptr(layer_idx),
-                metadata.slot.offset(write_floor as usize * 8),
-                rows - write_floor,
-                heads,
-                qk,
-                kv_cache.block_size() as u32,
-                heads * qk,
-                heads * qk,
-                kv_cache.cache_stride() as u64,
-                stream,
-            )?;
+            let skip = write_floor as usize * config.num_heads;
+            KernelLaunch::new(gpu, kernels.reshape_cache)
+                .grid([rows - write_floor, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(scratch.k_token.offset(skip * k_row_bytes))
+                .arg_ptr(scratch.v_compact.offset(skip * v_row_bytes))
+                .arg_ptr(kv_cache.k_pool_ptr(layer_idx))
+                .arg_ptr(kv_cache.v_pool_ptr(layer_idx))
+                .arg_ptr(metadata.slot.offset(write_floor as usize * 8))
+                .launch(stream)?;
         }
-
         if let Some(offset) = prompt_offset {
             ops::prefill_attention_paged_64(
                 gpu,

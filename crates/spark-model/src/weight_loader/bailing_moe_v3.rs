@@ -68,7 +68,18 @@ impl ModelWeightLoader for BailingMoeV3WeightLoader {
                 .all(|dtype| *dtype == KvCacheDtype::Bf16),
             "Ling attention requires a BF16 KV cache"
         );
-        let reader = Arc::new(Mutex::new(LingPagingReader::new(13)?));
+        let reader = Arc::new(Mutex::new(LingPagingReader::new(
+            if config.mtp_num_hidden_layers == 0
+                || config
+                    .quantization_config
+                    .as_ref()
+                    .is_some_and(|q| q.quant_method == "compressed-tensors")
+            {
+                50
+            } else {
+                13
+            },
+        )?));
         let frequencies = alloc_rope_inv_freq(gpu, LingMlaConfig::default())?;
         crate::layers::ling_decoder::load_ling_layers(store, config, gpu, reader, frequencies)
     }
@@ -77,7 +88,7 @@ impl ModelWeightLoader for BailingMoeV3WeightLoader {
         vec![
             (
                 config.num_attention_heads,
-                config.qk_nope_head_dim + config.qk_rope_head_dim
+                config.qk_nope_head_dim + config.qk_rope_head_dim / config.num_attention_heads
             );
             config.num_attention_layers()
         ]

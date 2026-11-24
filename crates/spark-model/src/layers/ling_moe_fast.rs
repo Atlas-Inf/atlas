@@ -164,7 +164,9 @@ fn widen_scale_bytes(kind: LingPageKind, bytes: &[u8]) -> Result<Vec<u8>> {
             ensure!(bytes.len().is_multiple_of(4));
             output.extend_from_slice(bytes)
         }
-        LingPageKind::E4M3Weight => anyhow::bail!("Ling weight page used as a scale"),
+        LingPageKind::E4M3Weight | LingPageKind::PackedByte | LingPageKind::E8M0Scale => {
+            anyhow::bail!("Ling weight page used as a scale")
+        }
     }
     Ok(output)
 }

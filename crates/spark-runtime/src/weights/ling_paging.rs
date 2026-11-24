@@ -22,6 +22,8 @@ use std::sync::Arc;
 pub enum LingPageKind {
     /// Original Ling expert weights, stored as IEEE E4M3 bytes.
     E4M3Weight,
+    PackedByte,
+    E8M0Scale,
     /// Block scales stored as BF16 bytes.
     Bf16Scale,
     /// Block scales stored as F32 bytes.
@@ -32,6 +34,8 @@ impl LingPageKind {
     fn from_dtype(dtype: WeightDtype) -> Result<Self> {
         match dtype {
             WeightDtype::FP8E4M3 => Ok(Self::E4M3Weight),
+            WeightDtype::UInt8 => Ok(Self::PackedByte),
+            WeightDtype::FP8E8M0 => Ok(Self::E8M0Scale),
             WeightDtype::BF16 => Ok(Self::Bf16Scale),
             WeightDtype::FP32 => Ok(Self::F32Scale),
             other => {
@@ -43,7 +47,7 @@ impl LingPageKind {
     /// Bytes per element in the original file representation.
     pub fn element_bytes(self) -> usize {
         match self {
-            Self::E4M3Weight => 1,
+            Self::E4M3Weight | Self::PackedByte | Self::E8M0Scale => 1,
             Self::Bf16Scale => 2,
             Self::F32Scale => 4,
         }
@@ -362,7 +366,7 @@ mod tests {
 
         assert!(
             reader
-                .page(&tensor(&path, 16, vec![4], WeightDtype::FP8E8M0))
+                .page(&tensor(&path, 16, vec![4], WeightDtype::Int32))
                 .is_err()
         );
         assert!(

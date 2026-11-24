@@ -31,13 +31,15 @@ pub(crate) struct LayerPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Plan {
     pub layers: Vec<LayerPlan>,
-    pub mtp: LayerPlan,
+    pub mtp: Option<LayerPlan>,
 }
 
 struct Expect<'a> {
     header: &'a Header,
     seen: BTreeSet<String>,
     packed_experts: bool,
+    bf16: bool,
+    sante: bool,
 }
 
 impl Expect<'_> {
@@ -52,7 +54,16 @@ impl Expect<'_> {
 
     fn tensors(&mut self, prefix: &str, suffixes: &[&str]) -> Result<()> {
         for suffix in suffixes {
-            if self.packed_experts && suffix.ends_with(".weight_scale_inv") {
+            if suffix.ends_with(".weight_scale_inv")
+                && (self.packed_experts
+                    || self.bf16
+                    || (self.sante
+                        && matches!(
+                            *suffix,
+                            "attention.kv_a_proj_with_mqa.weight_scale_inv"
+                                | "attention.kv_b_proj.weight_scale_inv"
+                        )))
+            {
                 continue;
             }
             self.tensor(&format!("{prefix}.{suffix}"))?;
@@ -147,6 +158,8 @@ fn expect_moe(e: &mut Expect<'_>, layer: usize, experts: usize) -> Result<()> {
         let ep = format!("{prefix}.mlp.experts.{expert}");
         let suffixes: &[&str] = if e.packed_experts {
             &["weight_packed", "weight_scale", "weight_global_scale"]
+        } else if e.bf16 {
+            &["weight"]
         } else {
             &["weight", "weight_scale_inv"]
         };
@@ -181,7 +194,7 @@ pub(crate) fn plan(header: &Header, config: &ModelConfig) -> Result<Plan> {
     );
     ensure!(
         config.num_hidden_layers > 0
-            && config.mtp_num_hidden_layers == 1
+            && config.mtp_num_hidden_layers <= 1
             && config.num_experts > 0
             && config.kv_lora_rank > 0
             && config.linear_num_key_heads > 0,
@@ -195,6 +208,8 @@ pub(crate) fn plan(header: &Header, config: &ModelConfig) -> Result<Plan> {
     let mut e = Expect {
         header,
         seen: BTreeSet::new(),
+        sante: config.mtp_num_hidden_layers == 0,
+        bf16: config.mtp_num_hidden_layers == 0 && config.quantization_config.is_none(),
         packed_experts: config
             .quantization_config
             .as_ref()
@@ -235,6 +250,10 @@ pub(crate) fn plan(header: &Header, config: &ModelConfig) -> Result<Plan> {
         });
     }
 
+    if config.mtp_num_hidden_layers == 0 {
+        e.finish()?;
+        return Ok(Plan { layers, mtp: None });
+    }
     let mtp_index = config.num_hidden_layers;
     let mtp_prefix = format!("model.layers.{mtp_index}");
     e.tensors(&mtp_prefix, COMMON)?;
@@ -245,11 +264,11 @@ pub(crate) fn plan(header: &Header, config: &ModelConfig) -> Result<Plan> {
     e.finish()?;
     Ok(Plan {
         layers,
-        mtp: LayerPlan {
+        mtp: Some(LayerPlan {
             index: mtp_index,
             attention: AttentionLayout::Mla,
             mlp: MlpLayout::Moe,
-        },
+        }),
     })
 }
 
@@ -431,8 +450,8 @@ mod tests {
         );
         assert_eq!(plan.layers[1].attention, AttentionLayout::Mla);
         assert_eq!(plan.layers[1].mlp, MlpLayout::Moe);
-        assert_eq!(plan.mtp.index, 2);
-        assert_eq!(plan.mtp.attention, AttentionLayout::Mla);
+        assert_eq!(plan.mtp.as_ref().unwrap().index, 2);
+        assert_eq!(plan.mtp.as_ref().unwrap().attention, AttentionLayout::Mla);
     }
 
     #[test]

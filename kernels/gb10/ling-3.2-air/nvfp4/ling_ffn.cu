@@ -397,3 +397,34 @@ extern "C" __global__ void ling_silu_down_shared_fp8(
         if (lane == 0) out[n2] = __float2bfloat16(acc2);
     }
 }
+
+// One warp per output row. Each expert has gate/up/down (weight, scale)
+// pointer pairs. BF16 maps the publisher's matrix, MXFP4 packs even K low.
+extern "C" __global__ void sante_expert_gemv(
+        const __nv_bfloat16* x, __nv_bfloat16* y,
+        const unsigned char* const* tables, const int* ids,
+        unsigned n, unsigned k, unsigned projection, unsigned mx) {
+    const unsigned slot = blockIdx.y;
+    const unsigned row = blockIdx.x * 4 + threadIdx.x / 32;
+    if (row >= n) return;
+    const unsigned lane = threadIdx.x % 32;
+    const unsigned offset = (ids[slot] * 3 + projection) * 2;
+    const unsigned char* w = tables[offset];
+    const unsigned char* scales = tables[offset + 1];
+    if (projection == 2) x += slot * k;
+    float sum = 0.0f;
+    for (unsigned col = lane; col < k; col += 32) {
+        float value;
+        if (mx) {
+            unsigned nibble = (w[(row*k+col)/2] >> (4*(col%2))) & 15;
+            constexpr float fp4[] = {0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f};
+            unsigned exp = scales[(row*k+col)/32];
+            value = ldexpf((nibble & 8 ? -1.f : 1.f) * fp4[nibble & 7], int(exp)-127);
+        } else {
+            value = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(w)[row*k+col]);
+        }
+        sum = fmaf(value,__bfloat162float(x[col]),sum);
+    }
+    for (int delta=16; delta; delta/=2) sum += __shfl_down_sync(0xffffffffu,sum,delta);
+    if (!lane) y[slot*n+row] = __float2bfloat16(sum);
+}

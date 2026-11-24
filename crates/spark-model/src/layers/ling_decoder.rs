@@ -19,6 +19,9 @@ use crate::layers::ling_mla::{
 use crate::layers::ling_projection::{LingProjection, LingProjectionScratch};
 use crate::layers::ops;
 
+#[path = "ling_sante.rs"]
+mod sante;
+
 struct LingDenseFfn {
     gate: LingProjection,
     up: LingProjection,
@@ -154,6 +157,7 @@ pub struct LingDecoderLayer {
     attention: LingAttention,
     ffn: FfnComponent,
     dense_ffn: Option<LingDenseFfn>,
+    sante_ffn: Option<sante::SanteFfn>,
     rms_norm_residual_k: spark_runtime::gpu::KernelHandle,
     residual_add_rms_norm_k: spark_runtime::gpu::KernelHandle,
     residual_add_k: spark_runtime::gpu::KernelHandle,
@@ -168,6 +172,18 @@ pub struct LingDecoderLayer {
 }
 
 impl LingDecoderLayer {
+    fn routed_forward(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext<'_>,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        match &self.sante_ffn {
+            Some(ffn) => ffn.forward(input, ctx, stream),
+            None => self.ffn.forward(input, ctx, stream),
+        }
+    }
+
     fn alloc_projection_scratch(
         gpu: &dyn GpuBackend,
         max_input_width: usize,
@@ -220,7 +236,6 @@ impl LingDecoderLayer {
             kv_b: bf16(kv_b)?,
             k_token: bf16(padded)?,
             v_compact: bf16(compact_v)?,
-            v_padded: bf16(padded)?,
             attn_padded: bf16(padded)?,
             attn_compact: bf16(compact_v)?,
             attn_gated: bf16(compact_v)?,
@@ -405,7 +420,7 @@ impl LingDecoderLayer {
         )?;
         let ffn_out = match &self.dense_ffn {
             Some(ffn) => ffn.forward(normed2, ctx, stream)?,
-            None => self.ffn.forward(normed2, ctx, stream)?,
+            None => self.routed_forward(normed2, ctx, stream)?,
         };
         ops::residual_add(ctx.gpu, self.residual_add_k, hidden, ffn_out, h, stream)
     }
@@ -552,7 +567,7 @@ impl LingDecoderLayer {
             let ffn_input = ctx.buffers.norm_output().offset(token * h_bytes);
             let ffn_out = match &self.dense_ffn {
                 Some(ffn) => ffn.forward(ffn_input, ctx, stream)?,
-                None => self.ffn.forward(ffn_input, ctx, stream)?,
+                None => self.routed_forward(ffn_input, ctx, stream)?,
             };
             ops::residual_add(
                 ctx.gpu,

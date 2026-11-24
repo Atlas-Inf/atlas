@@ -151,9 +151,14 @@ pub(crate) fn parse_bailing_moe_v3_vl(raw: &Value) -> Result<ModelConfig> {
         nullable_usize(text, "q_lora_rank")?.is_none(),
         "bailing_moe_v3_vl q_lora_rank must be null"
     );
+    let mtp = if text.get("num_nextn_predict_layers").is_some() {
+        usize_field(text, "num_nextn_predict_layers")?
+    } else {
+        0
+    };
     ensure!(
-        usize_field(text, "num_nextn_predict_layers")? == 1,
-        "bailing_moe_v3_vl requires one next-token prediction layer"
+        mtp <= 1,
+        "Ling supports up to one next-token prediction layer"
     );
     ensure!(
         usize_field(text, "num_kv_heads_for_linear_attn")? == 0,
@@ -225,7 +230,7 @@ pub(crate) fn parse_bailing_moe_v3_vl(raw: &Value) -> Result<ModelConfig> {
     config.router_logits_f32 = true;
     config.attn_gated = true;
     config.nested_config = true;
-    config.mtp_num_hidden_layers = 1;
+    config.mtp_num_hidden_layers = mtp;
     config.mrope_section = mrope_section;
     // Ling carries three position streams through Atlas metadata. Its native
     // decoder applies the checkpoint's body-diagonal channel mapping (rather

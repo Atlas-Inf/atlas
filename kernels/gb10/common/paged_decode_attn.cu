@@ -19,6 +19,12 @@
 #include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
+#ifndef ATLAS_KV_ROW_SIZE
+#define ATLAS_KV_ROW_SIZE(heads, dim) ((heads) * (dim))
+#define ATLAS_KV_COLUMN(head, dim, col) ((head) * (dim) + (col))
+#endif
+
+
 #define WARP_SIZE 32
 #ifndef HDIM
 #define HDIM 256
@@ -135,14 +141,12 @@ extern "C" __global__ void paged_decode_attn(
 
         // Get physical block pointer base
         unsigned int physical_block = (unsigned int)my_block_table[logical_block];
-        unsigned long long page_stride = (unsigned long long)block_size * num_kv_heads * head_dim;
-        unsigned long long head_stride_kv = (unsigned long long)num_kv_heads * head_dim;
+        unsigned long long page_stride = (unsigned long long)block_size * ATLAS_KV_ROW_SIZE(num_kv_heads, head_dim);
+        unsigned long long head_stride_kv = (unsigned long long)ATLAS_KV_ROW_SIZE(num_kv_heads, head_dim);
         const __nv_bfloat16* k_block_base = K_cache + (unsigned long long)physical_block * page_stride
-                                                     + (unsigned long long)block_offset * head_stride_kv
-                                                     + (unsigned long long)kv_head * head_dim;
+                                                     + (unsigned long long)block_offset * head_stride_kv;
         const __nv_bfloat16* v_block_base = V_cache + (unsigned long long)physical_block * page_stride
-                                                     + (unsigned long long)block_offset * head_stride_kv
-                                                     + (unsigned long long)kv_head * head_dim;
+                                                     + (unsigned long long)block_offset * head_stride_kv;
 
         // Process in batches of BC within this physical block
         unsigned int processed = 0;
@@ -155,10 +159,10 @@ extern "C" __global__ void paged_decode_attn(
             #pragma unroll
             for (int b = 0; b < BC; b++) {
                 const unsigned int* k32 = (const unsigned int*)(k_block_base
-                    + (unsigned long long)(processed + b) * head_stride_kv + vec_offset);
+                    + (unsigned long long)(processed + b) * head_stride_kv);
                 #pragma unroll
                 for (int i = 0; i < VEC_U32; i++)
-                    k_packed[b][i] = k32[i];
+                    k_packed[b][i] = k32[ATLAS_KV_COLUMN(kv_head, head_dim, vec_offset + 2*i)/2];
             }
 
             // Compute BC dot products
@@ -183,10 +187,10 @@ extern "C" __global__ void paged_decode_attn(
             #pragma unroll
             for (int b = 0; b < BC; b++) {
                 const unsigned int* v32 = (const unsigned int*)(v_block_base
-                    + (unsigned long long)(processed + b) * head_stride_kv + vec_offset);
+                    + (unsigned long long)(processed + b) * head_stride_kv);
                 #pragma unroll
                 for (int i = 0; i < VEC_U32; i++)
-                    v_packed[b][i] = v32[i];
+                    v_packed[b][i] = v32[ATLAS_KV_COLUMN(kv_head, head_dim, vec_offset + 2*i)/2];
             }
 
             // Batched softmax
@@ -226,12 +230,12 @@ extern "C" __global__ void paged_decode_attn(
         // Remainder: single positions
         for (; processed < batch_count; processed++) {
             const unsigned int* k32 = (const unsigned int*)(k_block_base
-                + (unsigned long long)processed * head_stride_kv + vec_offset);
+                + (unsigned long long)processed * head_stride_kv);
             float dot = 0.0f;
             #pragma unroll
             for (int i = 0; i < VEC_U32; i++) {
                 float k0, k1;
-                unpack2_pd(k32[i], k0, k1);
+                unpack2_pd(k32[ATLAS_KV_COLUMN(kv_head, head_dim, vec_offset + 2*i)/2], k0, k1);
                 dot += q_reg[2*i] * k0 + q_reg[2*i+1] * k1;
             }
             #pragma unroll
@@ -245,11 +249,11 @@ extern "C" __global__ void paged_decode_attn(
             l = l * exp_old + exp_new;
 
             const unsigned int* v32 = (const unsigned int*)(v_block_base
-                + (unsigned long long)processed * head_stride_kv + vec_offset);
+                + (unsigned long long)processed * head_stride_kv);
             #pragma unroll
             for (int i = 0; i < VEC_U32; i++) {
                 float v0, v1;
-                unpack2_pd(v32[i], v0, v1);
+                unpack2_pd(v32[ATLAS_KV_COLUMN(kv_head, head_dim, vec_offset + 2*i)/2], v0, v1);
                 o_reg[2*i]   = o_reg[2*i]   * exp_old + exp_new * v0;
                 o_reg[2*i+1] = o_reg[2*i+1] * exp_old + exp_new * v1;
             }
@@ -385,7 +389,7 @@ extern "C" __global__ void paged_decode_attn_splitk(
     #pragma unroll
     for (int i = 0; i < VEC_BF16; i++) o_reg[i] = 0.0f;
 
-    unsigned long long head_stride_kv = (unsigned long long)num_kv_heads * head_dim;
+    unsigned long long head_stride_kv = (unsigned long long)ATLAS_KV_ROW_SIZE(num_kv_heads, head_dim);
     unsigned long long page_stride = (unsigned long long)block_size * head_stride_kv;
 
     // Process positions
@@ -403,7 +407,7 @@ extern "C" __global__ void paged_decode_attn_splitk(
         #pragma unroll
         for (int i = 0; i < VEC_U32; i++) {
             float k0, k1;
-            unpack2_pd(k32[i], k0, k1);
+            unpack2_pd(k32[ATLAS_KV_COLUMN(kv_head, head_dim, vec_offset + 2*i)/2], k0, k1);
             dot += q_reg[2*i] * k0 + q_reg[2*i+1] * k1;
         }
         #pragma unroll
@@ -424,7 +428,7 @@ extern "C" __global__ void paged_decode_attn_splitk(
         #pragma unroll
         for (int i = 0; i < VEC_U32; i++) {
             float v0, v1;
-            unpack2_pd(v32[i], v0, v1);
+            unpack2_pd(v32[ATLAS_KV_COLUMN(kv_head, head_dim, vec_offset + 2*i)/2], v0, v1);
             o_reg[2*i]   = o_reg[2*i]   * exp_old + exp_new * v0;
             o_reg[2*i+1] = o_reg[2*i+1] * exp_old + exp_new * v1;
         }

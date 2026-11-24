@@ -89,12 +89,45 @@ impl LingMoeFfn {
             );
         }
 
+        let load_routed = |prefix: &str| -> Result<LingProjection> {
+            let Some(packed) = store.deferred(&format!("{prefix}.weight_packed")) else {
+                return load_projection(store, prefix, gpu);
+            };
+            ensure!(a16 && packed.dtype == WeightDtype::UInt8 && packed.shape.len() == 2);
+            let (n, k) = (packed.shape[0], packed.shape[1] * 2);
+            let scales = store.get(&format!("{prefix}.weight_scale"))?;
+            ensure!(scales.dtype == WeightDtype::FP8E4M3 && scales.shape == [n, k / 16]);
+            let global = crate::weight_map::scalar_f32(
+                store,
+                &format!("{prefix}.weight_global_scale"),
+                gpu,
+            )?;
+            ensure!(global.is_finite() && global.abs() >= f32::MIN_POSITIVE);
+            // The shared reader retains each mmap for the lifetime of all layers.
+            let page = reader
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Ling paging reader poisoned"))?
+                .page(packed)?;
+            let ptr = gpu.pageable_host_ptr_to_device(page.host_ptr())?;
+            ensure!(!ptr.is_null());
+            Ok(LingProjection::Nvfp4 {
+                n,
+                k,
+                weight: QuantizedWeight {
+                    weight: ptr,
+                    weight_scale: scales.ptr,
+                    weight_scale_2: global.recip(),
+                    input_scale: DevicePtr::NULL,
+                    weight_scale_2_vec: DevicePtr::NULL,
+                },
+            })
+        };
         let mut routed = Vec::with_capacity(EXPERTS);
         for expert in 0..EXPERTS {
             let ep = format!("{prefix}.experts.{expert}");
-            let gate = load_projection(store, &format!("{ep}.gate_proj"), gpu)?;
-            let up = load_projection(store, &format!("{ep}.up_proj"), gpu)?;
-            let down = load_projection(store, &format!("{ep}.down_proj"), gpu)?;
+            let gate = load_routed(&format!("{ep}.gate_proj"))?;
+            let up = load_routed(&format!("{ep}.up_proj"))?;
+            let down = load_routed(&format!("{ep}.down_proj"))?;
             ensure!(
                 gate.dims() == (INTERMEDIATE, HIDDEN),
                 "Ling expert {expert} gate shape mismatch"

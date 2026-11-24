@@ -149,6 +149,8 @@ pub struct FastSafetensorsLoader {
     pub expert_tp: bool,
     /// Keep routed Ling experts in the checkpoint for demand paging.
     pub defer_ling_experts: bool,
+    /// Upper Ling NVFP4 layers whose packed matrices borrow coherent shard mappings.
+    pub ling_packed_page_start: Option<usize>,
     /// Modules whose `.weight` and `.weight_scale` are stored in a format the
     /// kernels do not read (MXFP8, or NVFP4 in a tower that runs BF16). They
     /// are DEFERRED — located, not uploaded — and the model build expands
@@ -190,6 +192,7 @@ impl FastSafetensorsLoader {
             demand_paged_patterns: Vec::new(),
             expert_tp: false,
             defer_ling_experts: false,
+            ling_packed_page_start: None,
             host_decode_modules: std::collections::HashSet::new(),
         }
     }
@@ -213,6 +216,7 @@ impl FastSafetensorsLoader {
             demand_paged_patterns: Vec::new(),
             expert_tp: false,
             defer_ling_experts: false,
+            ling_packed_page_start: None,
             host_decode_modules: std::collections::HashSet::new(),
         }
     }
