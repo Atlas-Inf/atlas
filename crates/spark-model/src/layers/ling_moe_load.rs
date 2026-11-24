@@ -250,16 +250,6 @@ impl LingMoeFfn {
             silu_quant: gpu.kernel("ling_ffn", "ling_silu_mul_quant_fp8")?,
             fp8_gate_up: (fp8_gate_up.0 != 0).then_some(fp8_gate_up),
             ling_down_fp8: (ling_down_fp8.0 != 0).then_some(ling_down_fp8),
-            dense_batch_gemv: if a16 {
-                Some(gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?)
-            } else {
-                None
-            },
-            dense_gemm: if a16 {
-                Some(gpu.kernel("gemm_tc", "dense_gemm_tc")?)
-            } else {
-                None
-            },
             silu_bf16: if a16 {
                 Some(gpu.kernel("ling_ffn", "ling_silu_mul_bf16")?)
             } else {

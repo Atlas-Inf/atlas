@@ -36,14 +36,6 @@ impl LingMoeFfn {
         ensure!(ctx.config.hidden_size == self.hidden);
         let rows = u32::try_from(num_tokens)
             .map_err(|_| anyhow::anyhow!("Ling A16 prefill row count exceeds CUDA launch range"))?;
-        let dense_kernel = self
-            .kernels
-            .dense_gemm
-            .ok_or_else(|| anyhow::anyhow!("Ling A16 dense GEMM kernel is unavailable"))?;
-        let batch_gemv = self
-            .kernels
-            .dense_batch_gemv
-            .expect("Ling A16 batched BF16 projection");
         let router_gemm = self
             .kernels
             .router_gemm
@@ -64,18 +56,16 @@ impl LingMoeFfn {
             .a16_tables
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Ling A16 pointer tables are unavailable"))?;
-        let shared_gate = self
-            .shared_gate
-            .dense()
-            .ok_or_else(|| anyhow::anyhow!("Ling A16 shared gate is not dense BF16"))?;
-        let shared_up = self
-            .shared_up
-            .dense()
-            .ok_or_else(|| anyhow::anyhow!("Ling A16 shared up is not dense BF16"))?;
-        let shared_down = self
-            .shared_down
-            .dense()
-            .ok_or_else(|| anyhow::anyhow!("Ling A16 shared down is not dense BF16"))?;
+        let [gate, up, down] = self
+            .shared_decode
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Ling A16 shared projections missing"))?;
+        let scratch = crate::layers::ling_projection::LingProjectionScratch::new(
+            DevicePtr::NULL,
+            0,
+            DevicePtr::NULL,
+            0,
+        );
 
         let bf16 = std::mem::size_of::<u16>();
         let inter_bytes = num_tokens
@@ -124,28 +114,20 @@ impl LingMoeFfn {
 
         // Shared expert first.  Its gate/up buffers are intentionally reused
         // for routed rows after the down GEMM has consumed the activation.
-        crate::layers::ling_projection::bf16_prompt_rows(
+        gate.forward(
             ctx.gpu,
-            dense_kernel,
-            batch_gemv,
             input,
-            &shared_gate,
             ctx.buffers.expert_gate_out(),
             rows,
-            self.intermediate as u32,
-            self.hidden as u32,
+            scratch,
             stream,
         )?;
-        crate::layers::ling_projection::bf16_prompt_rows(
+        up.forward(
             ctx.gpu,
-            dense_kernel,
-            batch_gemv,
             input,
-            &shared_up,
             ctx.buffers.expert_up_out(),
             rows,
-            self.intermediate as u32,
-            self.hidden as u32,
+            scratch,
             stream,
         )?;
         ops::ling_silu_mul_bf16(
@@ -159,16 +141,12 @@ impl LingMoeFfn {
             shared_swiglu_limit(self.layer_idx),
             stream,
         )?;
-        crate::layers::ling_projection::bf16_prompt_rows(
+        down.forward(
             ctx.gpu,
-            dense_kernel,
-            batch_gemv,
             ctx.buffers.expert_gate_out(),
-            &shared_down,
             ctx.buffers.attn_output(),
             rows,
-            self.hidden as u32,
-            self.intermediate as u32,
+            scratch,
             stream,
         )?;
 
