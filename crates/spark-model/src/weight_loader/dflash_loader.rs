@@ -78,6 +78,10 @@ pub struct DflashWeights {
     /// Inkling 2's DSpark tensors (fuse mix, context K/V, rnn Markov head);
     /// its `fc` and `hidden_norm` are then unused NULL placeholders.
     pub inkling: Option<Inkling2DsparkWeights>,
+    /// A DFlash2 drafter on an Inkling 2 target: the target's final norm
+    /// (`model.llm.norm.weight`, as shipped) and epsilon for the last tap, set
+    /// by the factory once the target is loaded.
+    pub inkling_tap_norm: Option<(spark_runtime::gpu::DevicePtr, f32)>,
 }
 
 /// Per-drafter-layer raw weights (BF16).
@@ -377,6 +381,7 @@ pub fn load_dflash_weights(
         lm_head,
         dspine,
         inkling,
+        inkling_tap_norm: None,
     }))
 }
 

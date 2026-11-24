@@ -253,6 +253,10 @@ impl BlockDiffusionDraftHead {
                     );
                 }
             }
+            anyhow::ensure!(
+                self.inkling_taps.is_none(),
+                "Inkling 2 DFlash2 projects its context through ctx_kv_project"
+            );
             for i in 0..eff_ctx {
                 let src_slot = base.offset((start_slot + i) * ctx_slot_bytes);
                 let dst_slot = scratch.fc_proj.offset(i * self.hidden_size * bf16);
