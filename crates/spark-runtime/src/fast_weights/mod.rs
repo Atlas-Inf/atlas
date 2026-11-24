@@ -276,8 +276,8 @@ impl WeightLoader for FastSafetensorsLoader {
         let initial_free = gpu.free_memory()?;
         let mut offload_logged = false;
         let mut csf = crate::weights::nvfp4_csf::CsfAssembler::new();
-        // Linux (CUDA, O_DIRECT) only: elsewhere, and without page-locked
-        // staging, every tensor takes the copier path.
+        // Linux only (CUDA and HIP, O_DIRECT): elsewhere, and without
+        // page-locked staging, every tensor takes the copier path.
         let uploader = cfg!(target_os = "linux")
             .then(|| pinned_upload::PinnedUploader::new(gpu))
             .and_then(|r| {
