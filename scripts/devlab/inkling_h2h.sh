@@ -13,6 +13,8 @@
 #   ciru-conc    the same with --mode concurrent --seqs 8
 #   llamacpp     ggml-org/llama.cpp master (Inkling 2 merged in #32694 after the last release), GGML_HIP gfx1151,
 #                ggml-org/Inkling-2-Mini-GGUF Q8_0, 8 slots
+#   llamacpp-st995  the same llama.cpp serve (template defaults, tools through --jinja), scored on the
+#                bfcl-subset ST leg by this build's own `spark benchmark run` + the soundfile rescore fallback
 #   halogen      Peonist's halogen-flash-server asked for Inkling (it ships a Qwen3.8-Flash-Next pack): records the error
 set -uo pipefail
 OUT=${DEVLAB_OUT:-$PWD/devlab-out}; mkdir -p "$OUT"; RES="$OUT/RESULTS.txt"
@@ -87,12 +89,32 @@ PY2
       if [ -s "$OUT/rescore.sh" ]; then log "ciru bfcl rescoring"; OUT=$OUT bash "$OUT/rescore.sh" > "$OUT/rescore.out" 2>&1; log "rescore rc=$?"; tail -3 "$OUT/rescore.out" | cut -c1-600 | tee -a "$RES"; fi
       ENGINE_DOWN "$OUT/serve-$e.log"
     else legs "$e"; fi ;;
-  llamacpp|llamacpp-agentic)
+  llamacpp|llamacpp-agentic|llamacpp-st995)
     [ $e = llamacpp-agentic ] && LLAMA_AGENTIC=1
+    [ $e = llamacpp-st995 ] && LLAMA_ST995=1
     LLAMA_REF=master llama_build || continue
     GD=$(hf_get ggml-org/Inkling-2-Mini-GGUF "Inkling-2-Mini-Q8_0.gguf") || { log "gguf download failed"; continue; }
+    log "ggml-org/Inkling-2-Mini-GGUF@$(basename "$GD")"
     llama_up $PORT 8 40960 "$GD/Inkling-2-Mini-Q8_0.gguf"
-    if [ "${LLAMA_AGENTIC:-0}" = 1 ]; then wait_ready $PORT 720 && agentic_leg llamacpp-q8 "$MID"; ENGINE_DOWN "$OUT/serve-llamacpp.log"; else legs llamacpp-q8; fi ;;
+    log "llama-server cmd: $(tr '\0' ' ' < /proc/$LPID/cmdline 2>/dev/null | cut -c1-400)"
+    if [ "${LLAMA_AGENTIC:-0}" = 1 ]; then
+      wait_ready $PORT 720 && agentic_leg llamacpp-q8 "$MID"; ENGINE_DOWN "$OUT/serve-llamacpp.log"
+    elif [ "${LLAMA_ST995:-0}" = 1 ]; then
+      wait_ready $PORT 720 || { log "llamacpp-st995 SERVE FAILED"; ENGINE_DOWN "$OUT/serve-llamacpp.log"; continue; }
+      SHIM_DIR=$(ls -dt target/release/build/atlas-kernels-*/out 2>/dev/null | while read -r d; do [ -f "$d/libcuda.so" ] && { echo "$d"; break; }; done)
+      LD_LIBRARY_PATH="$SHIM_DIR:/opt/rocm/lib" target/release/spark benchmark run bfcl-subset --url http://127.0.0.1:$PORT --model "$MID" --yes --format json --quiet --no-fail-on-verdict > "$OUT/llamacpp-bfcl.json" 2> "$OUT/llamacpp-bfcl.stderr" || log "llamacpp bfcl rc!=0: $(tail -2 "$OUT/llamacpp-bfcl.stderr" | tr '\n' ' ')"
+      python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('RESULT llamacpp', d.get('benchmark_id'), d.get('run_id'), [(s['label'], s['value']) for s in d['frame']['summary']])" "$OUT/llamacpp-bfcl.json" 2>&1 | tail -1 | tee -a "$RES"
+      python3 - "$OUT/llamacpp-bfcl.json" > "$OUT/rescore-llamacpp.sh" <<'PY2'
+import json, re, sys
+r = (json.load(open(sys.argv[1]))["frame"].get("verdict") or {}).get("reason", "")
+m = re.search(r"rescored: (\S+/python) (\S+/score\.py) --dataset (\S+) --responses (\S+) failed", r)
+if m:
+    py, sc, ds, rs = m.groups()
+    print(f'"{py}" -m pip install -q soundfile && cp "{rs}" "$OUT/llamacpp-bfcl-responses.jsonl" && "{py}" "{sc}" --dataset "{ds}" --responses "{rs}"')
+PY2
+      if [ -s "$OUT/rescore-llamacpp.sh" ]; then log "llamacpp bfcl rescoring"; OUT=$OUT bash "$OUT/rescore-llamacpp.sh" > "$OUT/rescore-llamacpp.out" 2>&1; log "rescore rc=$?"; tail -3 "$OUT/rescore-llamacpp.out" | cut -c1-600 | tee -a "$RES"; fi
+      ENGINE_DOWN "$OUT/serve-llamacpp.log"
+    else legs llamacpp-q8; fi ;;
   halogen)
     HALOGEN_REPO=thinkingmachines/Inkling-2-Mini halogen_up || { log "halogen up failed"; continue; }
     PORT_SAVE=$PORT; PORT=8731; legs halogen-inkling; PORT=$PORT_SAVE ;;
