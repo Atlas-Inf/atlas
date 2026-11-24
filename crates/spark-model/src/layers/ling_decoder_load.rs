@@ -167,10 +167,10 @@ fn load_range(
                 Some(load_dense_ffn(store, &prefix, gpu, config)?),
             )
         } else if config.mtp_num_hidden_layers == 0
-            && !config
+            && config
                 .quantization_config
                 .as_ref()
-                .is_some_and(|q| q.quant_method == "compressed-tensors")
+                .is_none_or(|q| q.quant_method != "compressed-tensors")
         {
             sante_ffn = Some(sante::SanteFfn::load(
                 store, gpu, &reader, layer_idx, projection,
