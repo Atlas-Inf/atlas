@@ -684,26 +684,26 @@ fn closure_attestation(
         if sources.is_empty() {
             continue;
         }
-        let model_dir = target.model_kernel_dir.parent();
+        // The target's own MODEL.toml (a `kernel_source` target still reads its
+        // own, not the source's) and every layer's KERNEL.toml, the files
+        // `resolve_targets` reads for it; `taxon::configs` lists the same.
+        let hw_dir = workspace_root.join("kernels").join(&target.hw);
         let configs = [
-            workspace_root
-                .join("kernels")
-                .join(&target.hw)
-                .join("HARDWARE.toml"),
+            hw_dir.join("HARDWARE.toml"),
             target
                 .common_kernel_dir
                 .as_ref()
                 .map(|d| d.join("KERNEL.toml"))
                 .unwrap_or_default(),
-            model_dir.map(|d| d.join("MODEL.toml")).unwrap_or_default(),
-            target
-                .base_kernel_dir
-                .as_ref()
-                .map(|d| d.join("KERNEL.toml"))
-                .unwrap_or_default(),
-            target.model_kernel_dir.join("KERNEL.toml"),
+            hw_dir.join(&target.model).join("MODEL.toml"),
         ]
         .into_iter()
+        .chain(
+            target
+                .overlay_dirs()
+                .into_iter()
+                .map(|d| d.join("KERNEL.toml")),
+        )
         .filter(|p| p.is_file())
         .collect();
 

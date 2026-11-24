@@ -80,7 +80,8 @@ fn vendor(root: &Path, hardware: &str) -> Option<String> {
 ///
 /// Mirrors `resolve_targets()` with both wildcards expanded: a hardware dir is
 /// one holding `HARDWARE.toml`, a model dir one holding `MODEL.toml` (which is
-/// what excludes `common/`), and every subdir of a model is a quant.
+/// what excludes `common/`), and every subdir of the model's kernel source (the
+/// model itself, or the target its `[model] kernel_source` names) is a quant.
 pub fn walk(root: &Path) -> Vec<Target> {
     let kernels = root.join("kernels");
     let mut targets = Vec::new();
@@ -94,7 +95,11 @@ pub fn walk(root: &Path) -> Vec<Target> {
             if !model_dir.join("MODEL.toml").exists() {
                 continue;
             }
-            for quant in subdirs(&model_dir) {
+            let src_dir = match kernel_source(&model_dir) {
+                Ok(Some(src)) => hw_dir.join(src),
+                _ => model_dir.clone(),
+            };
+            for quant in subdirs(&src_dir) {
                 targets.push(Target {
                     hardware: hardware.clone(),
                     model: model.clone(),
@@ -106,23 +111,67 @@ pub fn walk(root: &Path) -> Vec<Target> {
     targets
 }
 
+/// A string key of a TOML file's table: `Ok(None)` when the file, table or key
+/// is absent, `Err` when the file is not valid TOML or the value not a string
+/// (the build script panics there; the gate resolves the target as affected).
+fn toml_str(path: &Path, table: &str, key: &str) -> Result<Option<String>, ()> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    let value: toml::Value = toml::from_str(&text).map_err(|_| ())?;
+    match value.get(table).and_then(|t| t.get(key)) {
+        None => Ok(None),
+        Some(v) => v.as_str().map(|s| Some(s.to_string())).ok_or(()),
+    }
+}
+
+/// `[model] kernel_source` from a model dir's MODEL.toml.
+fn kernel_source(model_dir: &Path) -> Result<Option<String>, ()> {
+    toml_str(&model_dir.join("MODEL.toml"), "model", "kernel_source")
+}
+
+/// The kernel dirs `target` compiles over `common/`, lowest first, as
+/// `resolve_targets()` layers them: the quant's `[build] base_quant` sibling,
+/// the quant dir of the model's kernel source (the target named by `[model]
+/// kernel_source`, else the model itself), and, when redirected, the model's
+/// own quant dir as an overlay. `None` when a MODEL.toml or KERNEL.toml does
+/// not parse.
+fn layers(root: &Path, target: &Target) -> Option<Vec<PathBuf>> {
+    let hw_dir = root.join("kernels").join(&target.hardware);
+    let model_dir = hw_dir.join(&target.model);
+    let src_dir = match kernel_source(&model_dir).ok()? {
+        Some(src) => hw_dir.join(src),
+        None => model_dir.clone(),
+    };
+    let quant_dir = src_dir.join(&target.quant);
+    let mut out = Vec::new();
+    if let Some(base) = toml_str(&quant_dir.join("KERNEL.toml"), "build", "base_quant").ok()? {
+        out.push(src_dir.join(base));
+    }
+    out.push(quant_dir);
+    let local = model_dir.join(&target.quant);
+    if src_dir != model_dir && local.is_dir() {
+        out.push(local);
+    }
+    Some(out)
+}
+
 /// Kernel sources for `target`, after shadowing.
 ///
-/// Mirrors `collect_cu_files`: `common/` is the base layer and the model's
-/// quant dir overrides it, keyed by file STEM — so the model dir holds
-/// overrides, not the model's kernels. Sorted, so callers get a stable order.
+/// Mirrors `collect_cu_files`: `common/` is the base layer and each of the
+/// target's [`layers`] overrides the ones before it, keyed by file STEM — so a
+/// model dir holds overrides, not the model's kernels. Sorted, so callers get a
+/// stable order.
 ///
-/// `None` means resolution failed (unknown vendor, or no source resolved at
-/// all). Callers must treat that as affected; see the fail-closed note above.
+/// `None` means resolution failed (unknown vendor, an unparseable TOML, or no
+/// source resolved at all). Callers must treat that as affected; see the
+/// fail-closed note above.
 pub fn sources(root: &Path, target: &Target) -> Option<Vec<PathBuf>> {
     let hw_dir = root.join("kernels").join(&target.hardware);
     let ext = source_ext(&vendor(root, &target.hardware)?)?;
 
     let mut by_stem: BTreeMap<String, PathBuf> = BTreeMap::new();
-    for dir in [
-        hw_dir.join("common"),
-        hw_dir.join(&target.model).join(&target.quant),
-    ] {
+    for dir in std::iter::once(hw_dir.join("common")).chain(layers(root, target)?) {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -149,18 +198,23 @@ pub fn sources(root: &Path, target: &Target) -> Option<Vec<PathBuf>> {
 ///
 /// Their contents are inside the closure hash, so editing a tuned constant in
 /// `MODEL.toml` invalidates the target that reads it — and only that target.
+///
+/// The target's own MODEL.toml (a redirected target still reads its own) and
+/// every layer's KERNEL.toml, in the order `closure_attestation` hashes them.
 pub fn configs(root: &Path, target: &Target) -> Vec<PathBuf> {
     let hw_dir = root.join("kernels").join(&target.hardware);
     [
         hw_dir.join("HARDWARE.toml"),
         hw_dir.join("common").join("KERNEL.toml"),
         hw_dir.join(&target.model).join("MODEL.toml"),
-        hw_dir
-            .join(&target.model)
-            .join(&target.quant)
-            .join("KERNEL.toml"),
     ]
     .into_iter()
+    .chain(
+        layers(root, target)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| d.join("KERNEL.toml")),
+    )
     .filter(|p| p.exists())
     .collect()
 }
@@ -194,8 +248,8 @@ pub fn model_of(path: &str) -> Option<(&str, &str)> {
 ///
 /// A path under `common/` affects every target on that hardware — it is shared,
 /// and whether a given target actually compiles it is the closure hash's
-/// question, not this one. A path under a model's quant dir affects that target
-/// alone. A path outside `kernels/` affects nothing *here*; the caller's path
+/// question, not this one. A path under a model's dir affects that model's
+/// targets and those that compile its kernels through `[model] kernel_source`. A path outside `kernels/` affects nothing *here*; the caller's path
 /// boundary already invalidates everything for those.
 pub fn affected(root: &Path, changed: &[String]) -> BTreeSet<Target> {
     let all = walk(root);
@@ -207,13 +261,28 @@ pub fn affected(root: &Path, changed: &[String]) -> BTreeSet<Target> {
         match model_of(path) {
             Some((_, model)) => out.extend(
                 all.iter()
-                    .filter(|t| t.hardware == hw && t.model == model)
+                    .filter(|t| {
+                        t.hardware == hw && (t.model == model || compiles_model_of(root, t, model))
+                    })
                     .cloned(),
             ),
             None => out.extend(all.iter().filter(|t| t.hardware == hw).cloned()),
         }
     }
     out
+}
+
+/// Whether `target` compiles another model's kernels from `model`'s dir (its
+/// `[model] kernel_source`). An unparseable MODEL.toml counts as yes.
+fn compiles_model_of(root: &Path, target: &Target, model: &str) -> bool {
+    let model_dir = root
+        .join("kernels")
+        .join(&target.hardware)
+        .join(&target.model);
+    match kernel_source(&model_dir) {
+        Ok(src) => src.as_deref() == Some(model),
+        Err(()) => true,
+    }
 }
 
 /// Hardware nodes a change spans.
