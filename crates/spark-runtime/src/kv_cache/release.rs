@@ -36,6 +36,11 @@ impl atlas_core::scope::ModelResource<dyn crate::gpu::GpuBackend> for PagedKvCac
                 }
             }
         }
+        if let Some(e) = self.window.take().and_then(|mut w| w.free_device(gpu))
+            && first_error.is_none()
+        {
+            first_error = Some(e);
+        }
         if let Some(tails) = self.tail_slots.take()
             && let Err(e) = gpu.free(tails.map)
             && first_error.is_none()

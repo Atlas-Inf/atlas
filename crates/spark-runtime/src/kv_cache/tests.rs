@@ -15,6 +15,7 @@ mod nvme_fast;
 mod nvme_shard;
 mod nvme_spill;
 mod sparse_index;
+mod window;
 mod zero_alias;
 
 fn test_config() -> KvCacheConfig {

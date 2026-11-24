@@ -462,6 +462,8 @@ pub struct PagedKvCache {
     latent_shard: Option<LatentShard>,
     /// Which pools came from the backend's carveout.
     placement: KvPlacement,
+    /// Window-bounded pools of the sliding-window layers (`window.rs`).
+    window: Option<window::WindowPool>,
 }
 
 mod block_trace;
@@ -482,11 +484,13 @@ mod release;
 mod sparse_index;
 mod sparse_index_impl;
 mod tail_slots;
+mod window;
 mod zero_impl;
 pub use latent_shard::{ExchangeLane, LatentShard, LatentShardSpec, LatentViewPlan};
 pub use placement::{KvBuffer, KvPlacement};
 pub use sparse_index::{SparseIndexCacheConfig, SparseIndexCacheDtype};
 pub use tail_slots::{NO_TAIL, TailSlotPlan};
+pub use window::{NO_WINDOW, WindowPlan};
 #[cfg(test)]
 mod tests;
 
