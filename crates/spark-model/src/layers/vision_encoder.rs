@@ -196,6 +196,7 @@ mod receive_only_tests {
 
     fn glm_vision() -> VisionConfig {
         VisionConfig {
+            is_bailing_vl: false,
             is_glm5_next: true,
             in_channels: 3,
             depth: 1,

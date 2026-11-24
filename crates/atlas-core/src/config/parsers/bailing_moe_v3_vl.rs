@@ -133,6 +133,7 @@ fn parse_vision(raw: &Value, text: &Value) -> Result<VisionConfig> {
     vision.image_end_token_id = top_u32(raw, "vision_end_token_id")?;
     vision.video_start_token_id = top_u32(text, "video_start_token")?;
     vision.video_end_token_id = vision.image_end_token_id;
+    vision.is_bailing_vl = true;
     vision.is_qwen3vl_video = true;
     Ok(vision)
 }

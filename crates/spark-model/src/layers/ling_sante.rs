@@ -67,6 +67,14 @@ impl SanteFfn {
             gpu.pageable_memory_access_uses_host_page_tables()?,
             "Air-VL on one Spark requires coherent host memory"
         );
+        // MXFP4 fits on one GB10. A single allocation per layer keeps decode
+        // on device memory and avoids a CUDA allocation for each expert tensor.
+        let resident = if mx {
+            Some(gpu.alloc(E * 3 * I * H / 32 * 17)?)
+        } else {
+            None
+        };
+        let mut resident_offset = 0;
         let mut pages = Vec::new();
         let mut ptrs = Vec::with_capacity(E * 6 * 8);
         let mut reader = reader
@@ -85,10 +93,18 @@ impl SanteFfn {
                         "unexpected dtype or shape for {name}"
                     );
                     let page = reader.page(tensor)?;
-                    let ptr = gpu.pageable_host_ptr_to_device(page.host_ptr())?;
+                    let ptr = if let Some(slab) = resident {
+                        let ptr = slab.offset(resident_offset);
+                        gpu.copy_h2d(page.bytes(), ptr)?;
+                        resident_offset += page.len();
+                        ptr
+                    } else {
+                        let ptr = gpu.pageable_host_ptr_to_device(page.host_ptr())?;
+                        pages.push(page);
+                        ptr
+                    };
                     ensure!(!ptr.is_null());
                     ptrs.extend_from_slice(&ptr.0.to_le_bytes());
-                    pages.push(page);
                     Ok(())
                 };
                 if mx {
