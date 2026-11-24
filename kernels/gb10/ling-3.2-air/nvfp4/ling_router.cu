@@ -67,3 +67,5 @@ extern "C" __global__ void ling_grouped_top8(const float* logits, const float* b
         for (int k = 0; k < 8; ++k)
             weights[row+k] = (probabilities[ids[row+k]] / (sum + 1e-20f)) * 2.5f;
 }
+
+#include "../../inkling-2-mini/nvfp4/inkling2_router_gemv.cu"

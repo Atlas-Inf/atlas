@@ -175,7 +175,20 @@ impl LingMoeFfn {
         // Keep routing entirely on device.  The existing Ling router block
         // indexes logits by blockIdx.x, so launching one block per row gives
         // exactly the one-token tie-breaking implementation for every row.
-        if rows >= 32 {
+        if rows <= ops::DENSE_GEMV_BATCHM_MAX_M {
+            ops::dense_gemv_batchm(
+                ctx.gpu,
+                self.kernels.router_batch_gemv.expect("A16 batched router"),
+                input,
+                &self.router,
+                ctx.buffers.gate_logits_f32(),
+                rows,
+                EXPERTS as u32,
+                self.hidden as u32,
+                EXPERTS as u32,
+                stream,
+            )?;
+        } else if rows >= 32 {
             ops::bf16_gemm_f32out(
                 input,
                 self.router.weight.0,
@@ -214,40 +227,68 @@ impl LingMoeFfn {
         if rows >= 128 {
             return self.grouped_a16_prefill(input, ids, weights, rows, ctx, stream);
         }
-        // The common pointer-table expert GEMV already supports a token grid
-        // in z.  Gate/up share the input row; down consumes each routed row
-        // with input_stride=intermediate.
-        ops::moe_expert_gemv_wide(
-            ctx.gpu,
-            expert_kernel,
+        // At most one slot per token can route to an expert. The union kernel
+        // owns room for 32 such matches for each of Ling's 512 experts.
+        let union = self.kernels.decode_union.filter(|_| {
+            (4..=32).contains(&rows) && (1 + EXPERTS * (2 + 2 * 32)) * 4 <= sizes.gate_logits_f32
+        });
+        let workspace = ctx.buffers.gate_logits_f32();
+        if let Some([plan, _]) = union {
+            ops::moe_union_match(ctx.gpu, plan, ids, workspace, rows, TOP_K as u32, stream)?;
+        }
+        let project = |x, table: &ExpertPtrTable, output, n, k, stride| {
+            if let Some([_, kernel]) = union {
+                ops::moe_expert_gemv_wide_grouped_u(
+                    ctx.gpu,
+                    kernel,
+                    x,
+                    table.packed_ptrs,
+                    table.scale_ptrs,
+                    table.scale2_vals,
+                    output,
+                    workspace,
+                    n,
+                    k,
+                    TOP_K as u32,
+                    stride,
+                    rows,
+                    false,
+                    stream,
+                )
+            } else {
+                ops::moe_expert_gemv_wide(
+                    ctx.gpu,
+                    expert_kernel,
+                    x,
+                    table.packed_ptrs,
+                    table.scale_ptrs,
+                    table.scale2_vals,
+                    output,
+                    ids,
+                    n,
+                    k,
+                    TOP_K as u32,
+                    stride,
+                    rows,
+                    stream,
+                )
+            }
+        };
+        project(
             input,
-            tables.gate.packed_ptrs,
-            tables.gate.scale_ptrs,
-            tables.gate.scale2_vals,
+            &tables.gate,
             ctx.buffers.expert_gate_out(),
-            ids,
             self.intermediate as u32,
             self.hidden as u32,
-            TOP_K as u32,
             0,
-            rows,
-            stream,
         )?;
-        ops::moe_expert_gemv_wide(
-            ctx.gpu,
-            expert_kernel,
+        project(
             input,
-            tables.up.packed_ptrs,
-            tables.up.scale_ptrs,
-            tables.up.scale2_vals,
+            &tables.up,
             ctx.buffers.expert_up_out(),
-            ids,
             self.intermediate as u32,
             self.hidden as u32,
-            TOP_K as u32,
             0,
-            rows,
-            stream,
         )?;
         let routed_rows = rows
             .checked_mul(TOP_K as u32)
@@ -263,21 +304,13 @@ impl LingMoeFfn {
             routed_swiglu_limit(self.layer_idx),
             stream,
         )?;
-        ops::moe_expert_gemv_wide(
-            ctx.gpu,
-            expert_kernel,
+        project(
             ctx.buffers.expert_gate_out(),
-            tables.down.packed_ptrs,
-            tables.down.scale_ptrs,
-            tables.down.scale2_vals,
+            &tables.down,
             ctx.buffers.expert_down_out(),
-            ids,
             self.hidden as u32,
             self.intermediate as u32,
-            TOP_K as u32,
             self.intermediate as u32,
-            rows,
-            stream,
         )?;
         // A null gate weight selects the common kernel's always-on shared
         // branch.  This is Ling's residual separation: shared output is added

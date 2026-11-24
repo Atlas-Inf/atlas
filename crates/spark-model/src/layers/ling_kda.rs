@@ -288,6 +288,7 @@ pub struct LingKdaLayer {
     conv_prefill_tp_k: KernelHandle,
     pack_k: KernelHandle,
     recurrent_k: KernelHandle,
+    batch_k: KernelHandle,
     preprocess_regresident_k: KernelHandle,
     recurrent_regresident_k: KernelHandle,
     subwarp_k: Option<KernelHandle>,
@@ -314,6 +315,7 @@ impl LingKdaLayer {
             ),
             pack_k: gpu.kernel("kda", "kda_pack_qkv")?,
             recurrent_k: gpu.kernel("kda", "kda_recurrent_bf16")?,
+            batch_k: gpu.kernel("ling_kda_batch", "ling_kda_batch")?,
             preprocess_regresident_k: gpu.kernel("kda", "kda_preprocess_regresident")?,
             recurrent_regresident_k: gpu.kernel("kda", "kda_recurrent_bf16_regresident")?,
             subwarp_k: if std::env::var("ATLAS_LING_W4A4_PREFILL").as_deref() == Ok("1") {

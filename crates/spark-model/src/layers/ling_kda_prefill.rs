@@ -188,6 +188,24 @@ impl LingKdaLayer {
                 LING_KDA_HEAD_DIM as u32,
                 stream,
             )?;
+        } else if rows_per_state == 1 && (2..=8).contains(&states.len()) {
+            let mut launch = spark_runtime::kernel_args::KernelLaunch::new(gpu, self.batch_k)
+                .grid([LING_KDA_HEADS as u32, rows, 1])
+                .block([128, 1, 1])
+                .arg_ptr(scratch.qkv)
+                .arg_ptr(scratch.raw_gate)
+                .arg_ptr(scratch.raw_beta)
+                .arg_ptr(self.weights.a_log.weight)
+                .arg_ptr(self.weights.dt_bias.weight)
+                .arg_ptr(scratch.recurrent);
+            for i in 0..8 {
+                launch = launch.arg_ptr(states.get(i).map_or(DevicePtr::NULL, |state| state.h));
+            }
+            launch
+                .arg_u32(LING_KDA_HEADS as u32)
+                .arg_u32(LING_KDA_HEAD_DIM as u32)
+                .arg_f32(self.config.lower_bound)
+                .launch(stream)?;
         } else {
             for (index, state) in states.iter().enumerate() {
                 let first = index * rows_per_state;

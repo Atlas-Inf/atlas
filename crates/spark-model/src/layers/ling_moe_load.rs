@@ -181,6 +181,11 @@ impl LingMoeFfn {
         let activation_bf16 = gpu.alloc(INTERMEDIATE * 2)?;
         let kernels = Kernels {
             router_gemv: gpu.kernel("gemv", "dense_gemv_bf16_fp32out")?,
+            router_batch_gemv: if a16 {
+                Some(gpu.kernel("ling_router", "dense_gemv_bf16_batchm_f32out")?)
+            } else {
+                None
+            },
             router_gemm: if a16 {
                 Some(gpu.kernel("gemm", "dense_gemm_bf16_f32out")?)
             } else {
@@ -220,6 +225,14 @@ impl LingMoeFfn {
             },
             moe_down: if a16 {
                 Some(gpu.kernel("moe_expert_gemv", "moe_expert_gemv")?)
+            } else {
+                None
+            },
+            decode_union: if a16 && std::env::var("ATLAS_LING_EXPERT_UNION").as_deref() == Ok("1") {
+                Some([
+                    gpu.kernel("ling_moe_union", "moe_union_match")?,
+                    gpu.kernel("ling_moe_union", "moe_expert_gemv_wide_grouped_u")?,
+                ])
             } else {
                 None
             },
