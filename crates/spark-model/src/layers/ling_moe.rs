@@ -104,6 +104,7 @@ struct Kernels {
     ling_down_fp8: Option<KernelHandle>,
     dense_gemv: Option<KernelHandle>,
     dense_gemm: Option<KernelHandle>,
+    dense_batch_gemv: Option<KernelHandle>,
     silu_bf16: Option<KernelHandle>,
     moe_gate_up: Option<KernelHandle>,
     moe_down: Option<KernelHandle>,

@@ -13,6 +13,7 @@ use crate::weight_map::DenseWeight;
 pub(crate) fn bf16_prompt_rows(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
+    batch_gemv: KernelHandle,
     input: DevicePtr,
     weight: &DenseWeight,
     output: DevicePtr,
@@ -21,7 +22,9 @@ pub(crate) fn bf16_prompt_rows(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    if m >= 32 {
+    if (2..=ops::DENSE_GEMV_BATCHM_MAX_M).contains(&m) {
+        ops::dense_gemv_batchm(gpu, batch_gemv, input, weight, output, m, n, k, n, stream)
+    } else if m >= 32 {
         ops::bf16_gemm(input, weight.weight.0, output, m, n, k, stream)
     } else {
         ops::dense_gemm_tc(gpu, kernel, input, weight, output, m, n, k, stream)
@@ -52,6 +55,7 @@ enum Format {
     Bf16 {
         gemv: KernelHandle,
         gemm: KernelHandle,
+        batch_gemv: KernelHandle,
     },
     Fp8 {
         scales: DevicePtr,
@@ -86,6 +90,7 @@ impl LingProjection {
         let format = match w.dtype {
             WeightDtype::BF16 => Format::Bf16 {
                 gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
+                batch_gemv: gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?,
                 gemm: gpu.kernel("gemm_tc", "dense_gemm_tc")?,
             },
             WeightDtype::FP8E4M3 => {
@@ -140,7 +145,11 @@ impl LingProjection {
             "invalid Ling projection row count {rows}"
         );
         match self.format {
-            Format::Bf16 { gemv, gemm } => {
+            Format::Bf16 {
+                gemv,
+                gemm,
+                batch_gemv,
+            } => {
                 let weight = DenseWeight {
                     weight: self.weight,
                 };
@@ -148,7 +157,7 @@ impl LingProjection {
                     ops::dense_gemv(gpu, gemv, input, &weight, output, self.n, self.k, stream)
                 } else {
                     bf16_prompt_rows(
-                        gpu, gemm, input, &weight, output, rows, self.n, self.k, stream,
+                        gpu, gemm, batch_gemv, input, &weight, output, rows, self.n, self.k, stream,
                     )
                 }
             }

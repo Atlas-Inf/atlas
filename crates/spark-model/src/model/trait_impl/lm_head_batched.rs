@@ -272,8 +272,10 @@ impl TransformerModel {
     /// weight pass, at most 8 rows) instead of the tile GEMM. Inkling 2 only:
     /// the other models keep the path they were measured on.
     pub(in crate::model) fn batched_head_gemv(&self, rows: usize) -> bool {
-        self.config.model_type == "inkling2_loop"
-            && self.dense_gemv_batchm_kernel.0 != 0
+        matches!(
+            self.config.model_type.as_str(),
+            "inkling2_loop" | "bailing_moe_v3_vl"
+        ) && self.dense_gemv_batchm_kernel.0 != 0
             && (1..=ops::DENSE_GEMV_BATCHM_MAX_M as usize).contains(&rows)
     }
 }

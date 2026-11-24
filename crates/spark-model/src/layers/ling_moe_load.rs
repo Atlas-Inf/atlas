@@ -198,6 +198,11 @@ impl LingMoeFfn {
             } else {
                 None
             },
+            dense_batch_gemv: if a16 {
+                Some(gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?)
+            } else {
+                None
+            },
             dense_gemm: if a16 {
                 Some(gpu.kernel("gemm_tc", "dense_gemm_tc")?)
             } else {

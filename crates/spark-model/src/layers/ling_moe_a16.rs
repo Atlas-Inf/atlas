@@ -40,6 +40,10 @@ impl LingMoeFfn {
             .kernels
             .dense_gemm
             .ok_or_else(|| anyhow::anyhow!("Ling A16 dense GEMM kernel is unavailable"))?;
+        let batch_gemv = self
+            .kernels
+            .dense_batch_gemv
+            .expect("Ling A16 batched BF16 projection");
         let router_gemm = self
             .kernels
             .router_gemm
@@ -123,6 +127,7 @@ impl LingMoeFfn {
         crate::layers::ling_projection::bf16_prompt_rows(
             ctx.gpu,
             dense_kernel,
+            batch_gemv,
             input,
             &shared_gate,
             ctx.buffers.expert_gate_out(),
@@ -134,6 +139,7 @@ impl LingMoeFfn {
         crate::layers::ling_projection::bf16_prompt_rows(
             ctx.gpu,
             dense_kernel,
+            batch_gemv,
             input,
             &shared_up,
             ctx.buffers.expert_up_out(),
@@ -156,6 +162,7 @@ impl LingMoeFfn {
         crate::layers::ling_projection::bf16_prompt_rows(
             ctx.gpu,
             dense_kernel,
+            batch_gemv,
             ctx.buffers.expert_gate_out(),
             &shared_down,
             ctx.buffers.attn_output(),
