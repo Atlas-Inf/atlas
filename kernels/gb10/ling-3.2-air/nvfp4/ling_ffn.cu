@@ -5,6 +5,7 @@
 // [N/128,K/128] BF16/F32 weight_scale_inv tensors.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <math.h>
 
@@ -413,6 +414,33 @@ extern "C" __global__ void sante_expert_gemv(
     const unsigned char* scales = tables[offset + 1];
     if (projection == 2) x += slot * k;
     float sum = 0.0f;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200 && !defined(__SCALE__)
+    if (mx) {
+        // Eight adjacent columns per lane share one E8M0 scale. Both routed
+        // matrix widths are divisible by 256 and every row is 16-byte aligned.
+        for (unsigned col = lane * 8; col < k; col += 256) {
+            const auto packed = *reinterpret_cast<const unsigned*>(w + (row * k + col) / 2);
+            unsigned pairs[4];
+            asm("{ .reg .b8 a,b,c,d; mov.b32 {a,b,c,d}, %4; "
+                "cvt.rn.f16x2.e2m1x2 %0,a; cvt.rn.f16x2.e2m1x2 %1,b; "
+                "cvt.rn.f16x2.e2m1x2 %2,c; cvt.rn.f16x2.e2m1x2 %3,d; }"
+                : "=r"(pairs[0]), "=r"(pairs[1]), "=r"(pairs[2]), "=r"(pairs[3])
+                : "r"(packed));
+            const uint4 activation = *reinterpret_cast<const uint4*>(x + col);
+            const unsigned a[4] = {activation.x, activation.y, activation.z, activation.w};
+            float dot = 0.f;
+            #pragma unroll
+            for (unsigned j = 0; j < 4; ++j) {
+                const float2 q = __half22float2(*reinterpret_cast<const __half2*>(&pairs[j]));
+                dot = fmaf(q.x, __uint_as_float(a[j] << 16), dot);
+                dot = fmaf(q.y, __uint_as_float(a[j] & 0xffff0000u), dot);
+            }
+            const unsigned e = scales[(row * k + col) / 32];
+            const float scale = e ? __uint_as_float(e << 23) : 0x1p-127f;
+            sum = fmaf(dot, scale, sum);
+        }
+    } else
+#endif
     for (unsigned col = lane; col < k; col += 32) {
         float value;
         if (mx) {
