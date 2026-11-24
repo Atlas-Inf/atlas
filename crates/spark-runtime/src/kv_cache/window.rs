@@ -395,6 +395,18 @@ impl PagedKvCache {
         true
     }
 
+    /// A resume read the window pinned as `blocks`: evict it last.
+    pub fn window_touch(&mut self, blocks: &[u32]) {
+        let Some(w) = self.window.as_mut() else {
+            return;
+        };
+        if let Some(i) = w.pins.iter().position(|p| p.as_slice() == blocks)
+            && let Some(pin) = w.pins.remove(i)
+        {
+            w.pins.push_back(pin);
+        }
+    }
+
     /// A primary block's refcount reached zero: what rode on it goes too.
     pub(super) fn block_freed(&mut self, block: u32) {
         self.release_tail_slot_if_freed(block);

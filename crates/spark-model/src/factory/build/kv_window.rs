@@ -7,11 +7,19 @@
 //! Inkling 2 is the model whose attention reads window layers through the
 //! window map (`layers::inkling2`), so it is the one that takes it. The pool
 //! holds every live sequence's window and one step's rows, one forward's
-//! batch of new rows, and up to `pins` snapshot windows.
+//! batch of new rows, and pinned snapshot windows: up to an eighth of the KV
+//! budget (at least [`MIN_PINS`]). A long prompt snapshots every few thousand
+//! tokens, and a resume needs its snapshot's window, so pins are what keep
+//! resume points across interleaved sessions.
 
 use anyhow::{Result, ensure};
 use atlas_core::config::ModelConfig;
 use spark_runtime::kv_cache::{KvCacheConfig, WindowPlan};
+
+/// Fewest snapshot windows kept, whatever the budget.
+const MIN_PINS: usize = 8;
+/// Pinned windows take at most this fraction (1/n) of the KV budget.
+const PIN_SHARE: usize = 8;
 
 /// What else the cache was asked for, any of which keeps full-length pools.
 #[derive(Clone, Copy, Debug)]
@@ -23,6 +31,7 @@ pub(super) struct Exclusions {
 }
 
 /// The window plan for `config`, or `None` (full-length pools, as before).
+/// Its pins are left to [`primary_blocks`], which knows the budget.
 pub(super) fn plan(
     config: &ModelConfig,
     kv: &KvCacheConfig,
@@ -51,31 +60,36 @@ pub(super) fn plan(
         return None;
     }
     let window = config.sliding_window as usize;
-    let pins = max_batch_size.clamp(8, 32);
     let blocks = WindowPlan::size_blocks(
         window,
         kv.block_size,
         max_batch_size,
         crate::layers::inkling2::layer::MAX_VERIFY_ROWS,
         max_batch_tokens,
-        pins,
+        0,
     );
     Some(WindowPlan {
         layers: config.sliding_attention_layers.clone(),
         window,
         blocks,
-        pins,
+        pins: 0,
     })
 }
 
-/// Primary blocks `budget` bytes buy beside `plan`'s window pools, with
-/// `aux_per_token` bytes riding on each primary token.
+/// Pin `plan`'s share of `budget` bytes, then the primary blocks the rest
+/// buys beside its window pools, with `aux_per_token` bytes riding on each
+/// primary token.
 pub(super) fn primary_blocks(
-    plan: &WindowPlan,
+    plan: &mut WindowPlan,
     kv: &KvCacheConfig,
     budget: usize,
     aux_per_token: usize,
 ) -> Result<usize> {
+    let pin_blocks = WindowPlan::span_blocks(plan.window, kv.block_size, 0);
+    let pin_bytes = pin_blocks * plan.local_block_bytes(kv);
+    plan.blocks -= plan.pins * pin_blocks;
+    plan.pins = (budget / PIN_SHARE / pin_bytes).max(MIN_PINS);
+    plan.blocks += plan.pins * pin_blocks;
     let window_bytes = plan.blocks * plan.local_block_bytes(kv);
     ensure!(
         window_bytes < budget,

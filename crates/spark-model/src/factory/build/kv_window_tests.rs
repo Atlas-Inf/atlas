@@ -4,7 +4,7 @@
 
 use super::{Exclusions, plan, primary_blocks};
 use atlas_core::config::ModelConfig;
-use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype};
+use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, WindowPlan};
 
 const NONE: Exclusions = Exclusions {
     high_speed_swap: false,
@@ -38,7 +38,8 @@ fn inkling_keeps_forty_window_layers_in_a_bounded_pool() {
     let (config, kv) = inkling();
     let plan = plan(&config, &kv, NONE, 32, 4128).unwrap();
     assert_eq!(plan.layers.len(), 40);
-    assert_eq!((plan.window, plan.pins), (1024, 32));
+    // pins wait for the budget (`primary_blocks`)
+    assert_eq!((plan.window, plan.pins), (1024, 0));
     // 40 layers x K+V x 16 tokens x 8 heads x 128 x 2 bytes
     assert_eq!(plan.local_block_bytes(&kv), 40 * 2 * 16 * 8 * 128 * 2);
     assert_eq!(plan.primary_block_bytes(&kv), 8 * 2 * 16 * 8 * 128 * 2);
@@ -76,11 +77,31 @@ fn anything_that_assumes_one_block_id_per_row_keeps_full_pools() {
 }
 
 #[test]
-fn the_budget_left_after_the_window_pools_buys_primary_blocks() {
+fn pins_take_an_eighth_of_the_budget_and_the_rest_buys_primary_blocks() {
     let (config, kv) = inkling();
-    let plan = plan(&config, &kv, NONE, 8, 4104).unwrap();
-    let window = plan.blocks * plan.local_block_bytes(&kv);
-    let budget = window + 1000 * (plan.primary_block_bytes(&kv) + 4);
-    assert_eq!(primary_blocks(&plan, &kv, budget, 0).unwrap(), 1000);
-    assert!(primary_blocks(&plan, &kv, window, 0).is_err());
+    let local = plan(&config, &kv, NONE, 8, 4104)
+        .unwrap()
+        .local_block_bytes(&kv);
+    let pin_bytes = WindowPlan::span_blocks(1024, 16, 0) * local;
+    let budget: usize = 64 << 30;
+    let mut p = plan(&config, &kv, NONE, 8, 4104).unwrap();
+    let base = p.blocks;
+    let blocks = primary_blocks(&mut p, &kv, budget, 0).unwrap();
+    assert_eq!(p.pins, budget / 8 / pin_bytes);
+    assert_eq!(
+        p.blocks,
+        base + p.pins * WindowPlan::span_blocks(1024, 16, 0)
+    );
+    let primary = p.primary_block_bytes(&kv) + 4;
+    assert_eq!(blocks, (budget - p.blocks * local) / primary);
+    // sizing again from the sized plan gives the same answer
+    assert_eq!(primary_blocks(&mut p, &kv, budget, 0).unwrap(), blocks);
+}
+
+#[test]
+fn a_small_budget_still_pins_eight_windows_or_refuses() {
+    let (config, kv) = inkling();
+    let mut p = plan(&config, &kv, NONE, 8, 4104).unwrap();
+    assert!(primary_blocks(&mut p, &kv, 1 << 30, 0).is_err());
+    assert_eq!(p.pins, 8);
 }

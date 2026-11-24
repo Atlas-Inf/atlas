@@ -166,7 +166,10 @@ impl super::types::TransformerModel {
             .kv_window
             .sync(seq, depth, last, kv, self.gpu.as_ref(), stream)
         {
-            Ok(()) => true,
+            Ok(()) => {
+                kv.window_touch(&seq.block_table[seq.window_held.clone()]);
+                true
+            }
             Err(e) => {
                 tracing::info!("prefix snapshot at {depth} declined: {e:#}");
                 false

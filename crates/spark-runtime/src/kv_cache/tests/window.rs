@@ -195,3 +195,19 @@ fn release_returns_the_window_pools() {
     assert_eq!(gpu.invalid_free_count(), 0);
     assert!(gpu.alloc_count() < live);
 }
+
+#[test]
+fn a_resumed_window_goes_to_the_back_of_the_pin_queue() {
+    let gpu = MockGpuBackend::new();
+    let mut cache = windowed(64, 8, 2, &gpu);
+    let blocks: Vec<u32> = (0..3).map(|_| cache.alloc_block().unwrap()).collect();
+    cache.window_hold(&blocks, &gpu, 0).unwrap();
+    assert!(cache.window_pin(&blocks[..1]));
+    assert!(cache.window_pin(&blocks[1..2]));
+    // a resume reads the oldest pin's window: it is now the newest
+    cache.window_touch(&blocks[..1]);
+    assert!(cache.window_pin(&blocks[2..]));
+    cache.window_release(&blocks, &gpu, 0).unwrap();
+    assert!(cache.window_mapped(blocks[0]) && cache.window_mapped(blocks[2]));
+    assert!(!cache.window_mapped(blocks[1]));
+}

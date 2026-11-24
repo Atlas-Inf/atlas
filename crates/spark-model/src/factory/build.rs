@@ -1007,7 +1007,7 @@ pub fn build_model(
         glm_cache_plan.and_then(|p| p.shard()).map(|s| s.world),
     );
     // Inkling 2's sliding-window layers keep only their window (`kv_window`).
-    let window_plan = kv_window::plan(
+    let mut window_plan = kv_window::plan(
         &config,
         &kv_config,
         kv_window::Exclusions {
@@ -1144,7 +1144,7 @@ pub fn build_model(
                     budget.no_room_advice(actual_free),
                 );
             }
-            let n = match (joint_glm_plan, &window_plan) {
+            let n = match (joint_glm_plan, &mut window_plan) {
                 (Some(plan), _) => plan.num_blocks_for_budget(kv_budget),
                 (None, Some(window)) => {
                     kv_window::primary_blocks(window, &kv_config, kv_budget, aux_bytes_per_token)?
