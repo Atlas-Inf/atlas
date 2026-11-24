@@ -52,7 +52,9 @@ static int cache_offset(
     int num_heads,
     int head_dim
 ) {
-    return (((physical_block * block_size + block_offset) * num_heads + head) * head_dim) + dim;
+    const int shared = head_dim - 128;
+    const int row = physical_block * block_size + block_offset;
+    return row * (num_heads * 128 + shared) + (dim < 128 ? head * 128 + dim : num_heads * 128 + dim - 128);
 }
 
 int main() {
@@ -71,7 +73,7 @@ int main() {
         {0, 2, 1},
     };
 
-    const size_t cache_elems = static_cast<size_t>(BLOCKS) * BLOCK_SIZE * HEADS * HDIM;
+    const size_t cache_elems = static_cast<size_t>(BLOCKS) * BLOCK_SIZE * (HEADS * 128 + HDIM - 128);
     std::vector<Bf16*> k_pool(CACHE_LAYERS), v_pool(CACHE_LAYERS);
     for (int layer = 0; layer < CACHE_LAYERS; ++layer) {
         CHECK(cudaMallocManaged(&k_pool[layer], cache_elems * sizeof(Bf16)));
@@ -87,10 +89,11 @@ int main() {
         for (int offset = 0; offset < BLOCK_SIZE; ++offset) {
             for (int head = 0; head < HEADS; ++head) {
                 for (int dim = 0; dim < HDIM; ++dim) {
+                    if (dim >= 128 && head != 0) continue;
                     const int i = cache_offset(
                         physical, offset, head, dim, BLOCK_SIZE, HEADS, HDIM);
                     k_cache[i] = Bf16(draw(state, 0.35f));
-                    v_cache[i] = Bf16(draw(state, 0.45f));
+                    v_cache[i] = Bf16(dim < 128 ? draw(state, 0.45f) : 0.0f);
                 }
             }
         }

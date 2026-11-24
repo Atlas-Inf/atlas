@@ -29,7 +29,8 @@ int main(int argc, char** argv) {
     if (past < 0 || past > 32768 || rows < 1 || rows > 128) return 2;
     constexpr int d=192, heads=32, block_size=16, width=heads*d;
     const int blocks=(past+rows+block_size-1)/block_size;
-    const size_t cache_size=size_t(blocks)*block_size*width;
+    constexpr int cache_width = heads * 128 + (d - 128);
+    const size_t cache_size = size_t(blocks) * block_size * cache_width;
     auto q=allocate<__nv_bfloat16>(rows*width);
     auto k=allocate<__nv_bfloat16>(cache_size);
     auto v=allocate<__nv_bfloat16>(cache_size);
@@ -44,7 +45,7 @@ int main(int argc, char** argv) {
     for (int i=0;i<rows*width;++i) q[i]=__float2bfloat16(draw(rng));
     for (size_t i=0;i<cache_size;++i) {
         k[i]=__float2bfloat16(draw(rng));
-        v[i]=__float2bfloat16(draw(rng));
+        v[i]=__float2bfloat16(i % cache_width < heads * 128 ? draw(rng) : 0.f);
     }
     float ms[2];
     for (int kernel=0;kernel<2;++kernel) {
