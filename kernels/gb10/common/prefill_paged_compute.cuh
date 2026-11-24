@@ -773,8 +773,16 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     const unsigned int causal_mask_enabled
     KERNEL_EXTRA_PARAMS
 ) {
+#ifdef ATLAS_PREFILL_GROUP_QUERY_TILES
+    // Schedule adjacent query tiles of one head together so they can reuse
+    // the historical K/V pages in L2. Preserve the existing launch ABI.
+    const unsigned int tile = blockIdx.y * gridDim.x + blockIdx.x;
+    const unsigned int q_head = tile / gridDim.y;
+    const unsigned int q_block = tile % gridDim.y;
+#else
     const unsigned int q_head = blockIdx.x;
     const unsigned int q_block = blockIdx.y;
+#endif
 #ifdef PREFILL_BATCHED
     const unsigned int b = blockIdx.z;
     if (b >= batch_size) return;
