@@ -24,7 +24,7 @@ pub(crate) fn bf16_prompt_rows(
 ) -> Result<()> {
     if (2..=ops::DENSE_GEMV_BATCHM_MAX_M).contains(&m) {
         ops::dense_gemv_batchm(gpu, batch_gemv, input, weight, output, m, n, k, n, stream)
-    } else if m >= 32 {
+    } else if m > ops::DENSE_GEMV_BATCHM_MAX_M {
         ops::bf16_gemm(input, weight.weight.0, output, m, n, k, stream)
     } else {
         ops::dense_gemm_tc(gpu, kernel, input, weight, output, m, n, k, stream)
@@ -56,6 +56,11 @@ enum Format {
         gemv: KernelHandle,
         gemm: KernelHandle,
         batch_gemv: KernelHandle,
+        decode_nvfp4: Option<(
+            crate::weight_map::QuantizedWeight,
+            KernelHandle,
+            KernelHandle,
+        )>,
     },
     Fp8 {
         scales: DevicePtr,
@@ -88,11 +93,37 @@ impl LingProjection {
             w.shape
         );
         let format = match w.dtype {
-            WeightDtype::BF16 => Format::Bf16 {
-                gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
-                batch_gemv: gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?,
-                gemm: gpu.kernel("gemm_tc", "dense_gemm_tc")?,
-            },
+            WeightDtype::BF16 => {
+                let decode_nvfp4 = if name.contains(".attention.")
+                    && rows >= 512
+                    && cols >= 512
+                    && std::env::var("ATLAS_LING_NVFP4_DECODE").as_deref() == Ok("1")
+                    && store.contains("model.layers.2.mlp.experts.0.gate_proj.weight_packed")
+                {
+                    let packed = crate::weight_map::quantize_to_nvfp4(
+                        &DenseWeight { weight: w.ptr },
+                        rows,
+                        cols,
+                        gpu,
+                        gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
+                        gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
+                        gpu.default_stream(),
+                    )?;
+                    Some((
+                        packed,
+                        gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
+                        gpu.kernel("w4a16_gemv", "w4a16_gemv_batch8")?,
+                    ))
+                } else {
+                    None
+                };
+                Format::Bf16 {
+                    decode_nvfp4,
+                    gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
+                    batch_gemv: gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?,
+                    gemm: gpu.kernel("gemm_tc", "dense_gemm_tc")?,
+                }
+            }
             WeightDtype::FP8E4M3 => {
                 ensure!(
                     cols.is_multiple_of(128),
@@ -149,7 +180,20 @@ impl LingProjection {
                 gemv,
                 gemm,
                 batch_gemv,
+                decode_nvfp4,
             } => {
+                if let Some((weight, one, batch)) = decode_nvfp4 {
+                    if rows == 1 {
+                        return ops::w4a16_gemv(
+                            gpu, one, input, &weight, output, self.n, self.k, stream,
+                        );
+                    }
+                    if rows <= 8 {
+                        return ops::w4a16_gemv_batchm(
+                            gpu, batch, input, &weight, output, rows, self.n, self.k, stream,
+                        );
+                    }
+                }
                 let weight = DenseWeight {
                     weight: self.weight,
                 };
