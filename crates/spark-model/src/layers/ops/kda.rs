@@ -288,6 +288,7 @@ pub fn kda_commit_records(
 pub fn kda_recurrent_regresident(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
+    columns_per_block: u32,
     qkv: DevicePtr,
     q_norm: DevicePtr,
     k_norm: DevicePtr,
@@ -302,7 +303,7 @@ pub fn kda_recurrent_regresident(
 ) -> Result<()> {
     const WARPS_PER_BLOCK: u32 = 4;
     KernelLaunch::new(gpu, kernel)
-        .grid([heads, div_ceil(dim, WARPS_PER_BLOCK), 1])
+        .grid([heads, div_ceil(dim, columns_per_block), 1])
         .block([32 * WARPS_PER_BLOCK, 1, 1])
         .arg_ptr(qkv)
         .arg_ptr(q_norm)

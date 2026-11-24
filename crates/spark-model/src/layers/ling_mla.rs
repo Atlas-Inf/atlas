@@ -161,6 +161,7 @@ impl LingMlaWeights {
 
 /// Maximum rows per MLA projection tile. Decode uses the first row.
 pub(super) const MLA_TILE_ROWS: usize = 128;
+const MLA_PROMPT_TILE_ROWS: usize = 2048;
 
 /// Scratch layout for a projection tile. All pointers are BF16 except
 /// projection activation/scales, whose sizes are described by the nested
@@ -181,6 +182,81 @@ pub struct LingMlaScratch {
     pub attn_compact: DevicePtr,
     pub attn_gated: DevicePtr,
     pub gate: DevicePtr,
+}
+
+impl LingMlaScratch {
+    /// Borrow the routed-expert output arena while attention is running.
+    /// FFN starts after all MLA tiles on the same stream have finished.
+    pub(super) fn prompt_tile(
+        self,
+        config: LingMlaConfig,
+        arena: DevicePtr,
+        bytes: usize,
+        tokens: usize,
+    ) -> (Self, usize) {
+        let padded = config.num_heads * config.qk_head_dim();
+        let compact = config.num_heads * config.v_head_dim;
+        let widths = [
+            config.q_proj_rows(),
+            config.kv_lora_rank + config.qk_rope_head_dim,
+            config.kv_lora_rank,
+            config.num_heads * config.qk_rope_head_dim,
+            config.qk_rope_head_dim,
+            config.kv_b_rows(),
+            padded,
+            compact,
+            padded,
+            padded,
+            compact,
+            compact,
+            config.num_heads,
+        ];
+        let row_bytes = 2 * widths.iter().sum::<usize>();
+        let rows = (bytes / row_bytes).min(MLA_PROMPT_TILE_ROWS).min(tokens) / MLA_TILE_ROWS
+            * MLA_TILE_ROWS;
+        if rows <= MLA_TILE_ROWS || arena.is_null() {
+            return (self, MLA_TILE_ROWS);
+        }
+        let mut offset = 0;
+        let [
+            q_full,
+            kv_a,
+            kv_norm,
+            q_rope,
+            k_rope,
+            kv_b,
+            k_token,
+            v_compact,
+            v_padded,
+            attn_padded,
+            attn_compact,
+            attn_gated,
+            gate,
+        ] = widths.map(|width| {
+            let ptr = arena.offset(offset);
+            offset += 2 * rows * width;
+            ptr
+        });
+        (
+            Self {
+                projection: self.projection,
+                q_full,
+                kv_a,
+                kv_norm,
+                q_rope,
+                k_rope,
+                kv_b,
+                k_token,
+                v_compact,
+                v_padded,
+                attn_padded,
+                attn_compact,
+                attn_gated,
+                gate,
+            },
+            rows,
+        )
+    }
 }
 
 /// Kernel family used by the native path. The MLA assembly kernels are shared
@@ -215,7 +291,7 @@ impl LingMlaKernels {
             // so resolve the target-local HDIM=192 module rather than the
             // borrowed generic HDIM=256 paged decoder.
             paged_attention: gpu.kernel("paged_decode_ling", "paged_decode_attn_ling")?,
-            prefill_attention: gpu.kernel("ling_mla_prefill", "ling_mla_prefill")?,
+            prefill_attention: gpu.kernel("ling_mla_prefill", "ling_mla_prefill_64")?,
             sigmoid_gate: gpu.kernel("residual_add", "sigmoid_gate_mul_head_broadcast")?,
         })
     }
@@ -298,7 +374,7 @@ impl LingMlaWeights {
         config.validate()?;
         ensure!(
             (metadata.num_seqs == 1 || metadata.num_seqs == rows)
-                && (1..=MLA_TILE_ROWS as u32).contains(&rows)
+                && (1..=MLA_PROMPT_TILE_ROWS as u32).contains(&rows)
                 && write_floor <= rows,
             "Ling MLA expects one sequence and a valid causal tile"
         );
@@ -490,7 +566,7 @@ impl LingMlaWeights {
         }
 
         if let Some(offset) = prompt_offset {
-            ops::prefill_attention_paged(
+            ops::prefill_attention_paged_64(
                 gpu,
                 kernels.prefill_attention,
                 scratch.q_full,

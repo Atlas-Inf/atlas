@@ -106,6 +106,7 @@ impl Glm5KdaLayer {
                 ops::kda_recurrent_regresident(
                     ctx.gpu,
                     self.recurrent_regresident_k,
+                    4,
                     qkv,
                     q_norm,
                     k_norm,

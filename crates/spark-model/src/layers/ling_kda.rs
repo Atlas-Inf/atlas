@@ -290,6 +290,7 @@ pub struct LingKdaLayer {
     recurrent_k: KernelHandle,
     preprocess_regresident_k: KernelHandle,
     recurrent_regresident_k: KernelHandle,
+    subwarp_k: Option<KernelHandle>,
     gated_norm_k: KernelHandle,
     residual_add_k: KernelHandle,
 }
@@ -315,6 +316,11 @@ impl LingKdaLayer {
             recurrent_k: gpu.kernel("kda", "kda_recurrent_bf16")?,
             preprocess_regresident_k: gpu.kernel("kda", "kda_preprocess_regresident")?,
             recurrent_regresident_k: gpu.kernel("kda", "kda_recurrent_bf16_regresident")?,
+            subwarp_k: if std::env::var("ATLAS_LING_W4A4_PREFILL").as_deref() == Ok("1") {
+                Some(gpu.kernel("ling_kda_subwarp", "ling_kda_subwarp")?)
+            } else {
+                None
+            },
             gated_norm_k: gpu.kernel("kda", "kda_sigmoid_gated_rms_norm")?,
             residual_add_k: gpu.kernel("residual_add", "bf16_residual_add")?,
         })

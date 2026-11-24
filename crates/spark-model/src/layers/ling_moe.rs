@@ -108,6 +108,7 @@ struct Kernels {
     moe_gate_up: Option<KernelHandle>,
     moe_down: Option<KernelHandle>,
     moe_wide: Option<KernelHandle>,
+    grouped_w4a4: Option<[KernelHandle; 3]>,
     grouped_a16: Option<[KernelHandle; 3]>,
     blend_rows: Option<KernelHandle>,
     weighted_sum: KernelHandle,

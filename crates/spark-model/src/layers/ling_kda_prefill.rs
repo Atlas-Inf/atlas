@@ -174,7 +174,8 @@ impl LingKdaLayer {
             )?;
             ops::kda_recurrent_regresident(
                 gpu,
-                self.recurrent_regresident_k,
+                self.subwarp_k.unwrap_or(self.recurrent_regresident_k),
+                if self.subwarp_k.is_some() { 16 } else { 4 },
                 scratch.qkv,
                 q_norm,
                 k_norm,

@@ -621,8 +621,14 @@ impl LingDecoderLayer {
             ctx.config.rms_norm_eps as f32,
             stream,
         )?;
-        for first in (0..num_tokens).step_by(MLA_TILE_ROWS) {
-            let rows = MLA_TILE_ROWS.min(num_tokens - first);
+        let (scratch, tile_rows) = scratch.prompt_tile(
+            *config,
+            ctx.buffers.expert_down_out(),
+            ctx.buffers.sizes().expert_down_out,
+            num_tokens,
+        );
+        for first in (0..num_tokens).step_by(tile_rows) {
+            let rows = tile_rows.min(num_tokens - first);
             let metadata = AttnMetadataDev {
                 positions: meta.positions.offset(first * 4),
                 positions_h: meta.positions_h.offset(first * 4),

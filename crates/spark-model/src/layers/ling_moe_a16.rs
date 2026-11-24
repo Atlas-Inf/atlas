@@ -168,17 +168,29 @@ impl LingMoeFfn {
         // Keep routing entirely on device.  The existing Ling router block
         // indexes logits by blockIdx.x, so launching one block per row gives
         // exactly the one-token tie-breaking implementation for every row.
-        ops::dense_gemm(
-            ctx.gpu,
-            router_gemm,
-            input,
-            &self.router,
-            ctx.buffers.gate_logits_f32(),
-            rows,
-            EXPERTS as u32,
-            self.hidden as u32,
-            stream,
-        )?;
+        if rows >= 32 {
+            ops::bf16_gemm_f32out(
+                input,
+                self.router.weight.0,
+                ctx.buffers.gate_logits_f32(),
+                rows,
+                EXPERTS as u32,
+                self.hidden as u32,
+                stream,
+            )?;
+        } else {
+            ops::dense_gemm(
+                ctx.gpu,
+                router_gemm,
+                input,
+                &self.router,
+                ctx.buffers.gate_logits_f32(),
+                rows,
+                EXPERTS as u32,
+                self.hidden as u32,
+                stream,
+            )?;
+        }
         let ids = ctx.buffers.gate_logits();
         let weights = ids.offset(num_tokens * TOP_K * std::mem::size_of::<u32>());
         ops::ling_grouped_top8_rows(
@@ -321,8 +333,65 @@ impl LingMoeFfn {
             TOP_K as u32,
             stream,
         )?;
+        let tiles = inverse.offset(expanded * 4);
+        let max_tiles = expanded.div_ceil(128) + EXPERTS;
+        if let Some([_, plan, _]) = self.kernels.grouped_w4a4 {
+            ensure!(
+                (expanded * 3 + EXPERTS + 1 + max_tiles + 1) * 4
+                    <= ctx.buffers.sizes().gate_logits_f32,
+                "Ling expert tile workspace too small"
+            );
+            KernelLaunch::new(ctx.gpu, plan)
+                .grid([1, 1, 1])
+                .block([EXPERTS as u32, 1, 1])
+                .arg_ptr(offsets)
+                .arg_ptr(tiles)
+                .arg_u32(EXPERTS as u32)
+                .launch(stream)?;
+        }
+        let quantize = |x, storage: DevicePtr, count: usize, k: usize| -> Result<[DevicePtr; 3]> {
+            let scales = storage.offset(count * k / 2);
+            let outer = scales.offset(count * k / 16);
+            if let Some([quant, _, _]) = self.kernels.grouped_w4a4 {
+                KernelLaunch::new(ctx.gpu, quant)
+                    .grid([count.div_ceil(8) as u32, 1, 1])
+                    .block([256, 1, 1])
+                    .arg_ptr(x)
+                    .arg_ptr(storage)
+                    .arg_ptr(scales)
+                    .arg_ptr(outer)
+                    .arg_u32(count as u32)
+                    .arg_u32(k as u32)
+                    .launch(stream)?;
+            }
+            Ok([storage, scales, outer])
+        };
         let chunks = expanded.div_ceil(EXPERTS * 16).clamp(1, 4) as u32;
-        let project = |x, table: &ExpertPtrTable, permutation, output, n: usize, k: usize| {
+        let project = |x,
+                       q: [DevicePtr; 3],
+                       table: &ExpertPtrTable,
+                       permutation,
+                       output,
+                       n: usize,
+                       k: usize| {
+            if let Some([_, _, lowp]) = self.kernels.grouped_w4a4 {
+                return KernelLaunch::new(ctx.gpu, lowp)
+                    .grid([(n / 128) as u32, max_tiles as u32, 1])
+                    .block([256, 1, 1])
+                    .arg_ptr(q[0])
+                    .arg_ptr(q[1])
+                    .arg_ptr(q[2])
+                    .arg_ptr(table.packed_ptrs)
+                    .arg_ptr(table.scale_ptrs)
+                    .arg_ptr(table.scale2_vals)
+                    .arg_ptr(output)
+                    .arg_ptr(offsets)
+                    .arg_ptr(tiles)
+                    .arg_ptr(permutation)
+                    .arg_u32(n as u32)
+                    .arg_u32(k as u32)
+                    .launch(stream);
+            }
             KernelLaunch::new(ctx.gpu, gemm)
                 .grid([n.div_ceil(32) as u32, chunks, EXPERTS as u32])
                 .block([128, 1, 1])
@@ -339,8 +408,16 @@ impl LingMoeFfn {
         };
         let gate = ctx.buffers.expert_gate_out();
         let up = ctx.buffers.expert_up_out();
+        // The routed down output is dead until both input projections finish.
+        let q = quantize(
+            input,
+            ctx.buffers.expert_down_out(),
+            rows as usize,
+            self.hidden,
+        )?;
         project(
             input,
+            q,
             &tables.gate,
             sorted,
             gate,
@@ -349,6 +426,7 @@ impl LingMoeFfn {
         )?;
         project(
             input,
+            q,
             &tables.up,
             sorted,
             up,
@@ -367,8 +445,11 @@ impl LingMoeFfn {
             stream,
         )?;
         let routed = ctx.buffers.expert_down_out();
+        // SwiGLU consumed the up buffer, so it can hold the quantized down input.
+        let q = quantize(gate, up, expanded, self.intermediate)?;
         project(
             gate,
+            q,
             &tables.down,
             DevicePtr::NULL,
             routed,

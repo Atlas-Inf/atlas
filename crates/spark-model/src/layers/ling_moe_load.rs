@@ -218,6 +218,15 @@ impl LingMoeFfn {
             } else {
                 None
             },
+            grouped_w4a4: if a16 && std::env::var("ATLAS_LING_W4A4_PREFILL").as_deref() == Ok("1") {
+                Some([
+                    gpu.kernel("ling_w4a4", "inkling2_quant_fp4")?,
+                    gpu.kernel("ling_w4a4", "inkling2_moe_tiles")?,
+                    gpu.kernel("ling_w4a4", "ling_w4a4")?,
+                ])
+            } else {
+                None
+            },
             grouped_a16: if a16 {
                 Some([
                     gpu.kernel("moe", "moe_sort_by_expert")?,
