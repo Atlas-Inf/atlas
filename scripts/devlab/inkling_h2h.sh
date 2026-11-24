@@ -91,7 +91,7 @@ PY2
     else legs "$e"; fi ;;
   llamacpp|llamacpp-agentic|llamacpp-st995)
     [ $e = llamacpp-agentic ] && LLAMA_AGENTIC=1
-    [ $e = llamacpp-st995 ] && LLAMA_ST995=1
+    [ $e = llamacpp-st995 ] && { LLAMA_ST995=1; THINK=default; }
     LLAMA_REF=master llama_build || continue
     GD=$(hf_get ggml-org/Inkling-2-Mini-GGUF "Inkling-2-Mini-Q8_0.gguf") || { log "gguf download failed"; continue; }
     log "ggml-org/Inkling-2-Mini-GGUF@$(basename "$GD")"

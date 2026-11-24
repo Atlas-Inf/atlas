@@ -96,9 +96,12 @@ PY
   NVFP4_GGUF=""; return 1
 }
 llama_up() { # port parallel ctx-per-slot model [extra llama-server args...]
+  # THINK=default omits --chat-template-kwargs entirely (template defaults); on/off sets enable_thinking.
   local port=$1 np=$2 ctx=$3 m=$4; shift 4
+  local tkw=()
+  [ "${THINK:-off}" != default ] && tkw=(--chat-template-kwargs "{\"enable_thinking\":$([ "${THINK:-off}" = on ] && echo true || echo false)}")
   "$LB/llama-server" -m "$m" -ngl 99 -c $(( ctx * np )) -np "$np" --jinja --host 127.0.0.1 --port "$port" \
-    --chat-template-kwargs "{\"enable_thinking\":$([ "${THINK:-off}" = on ] && echo true || echo false)}" "$@" > "$OUT/llama-server.log" 2>&1 &
+    "${tkw[@]}" "$@" > "$OUT/llama-server.log" 2>&1 &
   LPID=$!
   ENGINE_ALIVE() { kill -0 "$LPID" 2>/dev/null; }
   ENGINE_DOWN() { kill -INT "$LPID" 2>/dev/null; sleep 8; kill -9 "$LPID" 2>/dev/null; cp "$OUT/llama-server.log" "$1" 2>/dev/null; true; }
