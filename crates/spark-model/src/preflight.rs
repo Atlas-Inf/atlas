@@ -310,6 +310,11 @@ fn check_mtp_consumability(config: &ModelConfig) -> Result<()> {
         "qwen3_vl_moe",
         "qwen3_coder_next",
         "glm5_next",
+        // Ling-3.2-air (bailing): the single NEXTN module
+        // `model.layers.42` loads via
+        // `weight_loader::bailing::load_ling_mtp_module` and drafts via
+        // `layers::ling_mtp::LingMtpHead` (single draft, K=2 verify).
+        "bailing_moe_v3_vl",
     ];
     if MTP_SUPPORTED_MODEL_TYPES.contains(&config.model_type.as_str()) {
         return Ok(());

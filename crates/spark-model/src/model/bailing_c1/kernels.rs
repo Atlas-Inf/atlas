@@ -15,6 +15,11 @@ pub(crate) struct LingKernels {
     pub residual_add_k: KernelHandle,
     pub gemv_k: KernelHandle,
     pub gemm_k: KernelHandle,
+    /// `dense_gemv_bf16_batch2` (common): one weight pass for the K=2
+    /// verify rows — the bf16 projections are weight-streaming bound, so
+    /// this halves (vs two GEMVs) or better (vs the M=2 GEMM tiles) the
+    /// verify projections' time.
+    pub gemv_batch2_k: KernelHandle,
     pub conv_update_k: KernelHandle,
     pub conv_prefill_k: KernelHandle,
     pub moe_transpose_batched_k: KernelHandle,
@@ -25,6 +30,9 @@ pub(crate) struct LingKernels {
     // kda.cu
     pub kda_recurrent_k: KernelHandle,
     pub kda_gated_norm_k: KernelHandle,
+    /// `kda_recurrent_bf16_verify_snap` — the K-token verify twin
+    /// (PR #110): per-row H rollback snapshots in one launch.
+    pub kda_verify_snap_k: KernelHandle,
     // gated_mla.cu
     pub mla_kv_a_cache_k: KernelHandle,
     pub mla_q_absorb_k: KernelHandle,
@@ -67,6 +75,7 @@ impl LingKernels {
             residual_add_k: required(gpu, "residual_add", "bf16_residual_add")?,
             gemv_k: required(gpu, "gemv", "dense_gemv_bf16")?,
             gemm_k: required(gpu, "gemm", "dense_gemm_bf16")?,
+            gemv_batch2_k: required(gpu, "dense_gemv_bf16_batch2", "dense_gemv_bf16_batch2")?,
             conv_update_k: required(gpu, "causal_conv1d", "causal_conv1d_update")?,
             conv_prefill_k: required(gpu, "causal_conv1d", "causal_conv1d_update_prefill")?,
             moe_transpose_batched_k: required(
@@ -77,6 +86,7 @@ impl LingKernels {
             bf16_to_f32_k: required(gpu, "residual_add", "bf16_to_f32")?,
             kda_recurrent_k: required(gpu, "kda", "kda_recurrent_bf16")?,
             kda_gated_norm_k: required(gpu, "kda", "kda_sigmoid_gated_rms_norm")?,
+            kda_verify_snap_k: required(gpu, "kda", "kda_recurrent_bf16_verify_snap")?,
             mla_kv_a_cache_k: required(gpu, "gated_mla", "ling_mla_kv_a_norm_rope_cache")?,
             mla_q_absorb_k: required(gpu, "gated_mla", "ling_mla_q_absorb_rope")?,
             mla_paged_attn_k: required(gpu, "gated_mla", "ling_mla_paged_attn")?,

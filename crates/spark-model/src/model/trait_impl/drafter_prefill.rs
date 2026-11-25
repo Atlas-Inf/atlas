@@ -155,12 +155,16 @@ impl TransformerModel {
         let h = self.config.hidden_size;
         let bf16 = 2usize;
         let dst = self.mtp_prefill_hidden.offset(chunk_start * h * bf16);
-        if self.config.model_type == "glm5_next" {
+        if self.config.model_type == "glm5_next"
+            || self.config.model_type == "bailing_moe_v3_vl"
+        {
             // vLLM's Glm5NextModel applies its final RMSNorm before returning
-            // the per-position target hiddens consumed by the MTP model. The
-            // normal Atlas prefill path only final-normalizes the last row for
-            // logits, so a plain copy here made prompt rows use a different
-            // representation from every subsequent decode row.
+            // the per-position target hiddens consumed by the MTP model, and
+            // Ling's reference (modeling_bailing_moe_v3_vl.py) does the same
+            // for its NEXTN layer. The normal Atlas prefill path only
+            // final-normalizes the last row for logits, so a plain copy here
+            // made prompt rows use a different representation from every
+            // subsequent decode row.
             ops::rms_norm(
                 self.gpu.as_ref(),
                 self.rms_norm_kernel,

@@ -111,8 +111,15 @@ impl SsmPools {
         // layers still need the verify/checkpoint pools: without them the very
         // first draft indexes `conv_intermediate_pools[0]` on a zero-length
         // Vec and panics. DeepSeek-V4 reaches the proposer the same way but has
-        // no SSM layers, so it never exercised this.
-        let external_mtp_module = use_speculative && config.model_type == "qwen4_exp";
+        // no SSM layers, so it never exercised this. Ling-3.2-air (bailing) is
+        // the same post-construction installer; its 35 KDA layers keep the
+        // per-sequence verify snapshots in their own driver-owned slabs (the
+        // pool's per-slot regions stay unused on this family's per-seq path),
+        // but `has_mtp` ALSO gates the drafter-context capture buffer
+        // (`mtp_prefill_hidden`) the NEXTN drafter prefill builds the draft
+        // KV from — without it the first propose would attend blind.
+        let external_mtp_module = use_speculative
+            && (config.model_type == "qwen4_exp" || config.model_type == "bailing_moe_v3_vl");
         let has_mtp = self_speculative
             || (use_speculative && !mtp_weights_empty && draft_lm_head_nvfp4_present)
             || external_mtp_module

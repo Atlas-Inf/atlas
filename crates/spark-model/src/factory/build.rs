@@ -434,6 +434,37 @@ pub fn build_model(
             || q4e_mtp_loaded,
         "Qwen serving mode requires checkpoint MTP weights on rank 0"
     );
+    // Ling-3.2-air (bailing) ships one NEXTN draft module —
+    // `model.layers.42` — that is architecturally a full family layer
+    // (gated-MLA attention + its own 512-expert NVFP4 MoE) plus the four
+    // NEXTN-only tensors (eh_proj / enorm / hnorm / final_layernorm). Like
+    // the V4/qwen4_exp modules it loads through its own path and installs
+    // its proposer after construction. Rank 0 only: no other rank drafts.
+    let ling_mtp_module =
+        if config.model_type == "bailing_moe_v3_vl" && use_speculative && config.ep_rank == 0 {
+            match crate::weight_loader::bailing::load_ling_mtp_module(
+                &store,
+                &config,
+                gpu.as_ref(),
+            ) {
+                Ok(m) => {
+                    if m.is_some() {
+                        tracing::info!(
+                            "Ling-3.2-air NEXTN MTP draft module loaded OK \
+                             (num_mtp_modules={})",
+                            config.num_mtp_modules
+                        );
+                    }
+                    m
+                }
+                Err(e) => {
+                    tracing::error!("Ling-3.2-air MTP module load FAILED: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
     let q4e_mtp_embed = embed;
     let q4e_mtp_lm_head = lm_head;
 
@@ -447,6 +478,7 @@ pub fn build_model(
         && mtp_weights.is_empty()
         && v4_mtp_module.is_none()
         && !q4e_mtp_loaded
+        && ling_mtp_module.is_none()
         && !native_glm_mtp
     {
         tracing::warn!(
@@ -544,6 +576,11 @@ pub fn build_model(
     // same BF16 head via dense_gemv (drafts are re-verified by the target, so the
     // draft head only affects acceptance). DenseWeight is Copy.
     let v4_mtp_lm_head = lm_head;
+    // Ling-3.2-air drafts with the same SHARED BF16 embedding + LM head
+    // (DenseWeight, Copy): the NEXTN reference shares both with the target
+    // and every draft is re-verified anyway.
+    let ling_mtp_embed = embed;
+    let ling_mtp_lm_head = lm_head;
     // ── Step 3b: Post-load MoE prefill transpose (MiniMax EP=2 TTFT fix) ──
     //
     // MiniMax M2.7-NVFP4 EP=2 has ~46 GB free at layer-0 load time but
@@ -1268,14 +1305,16 @@ pub fn build_model(
     // dereference freed memory. Only when the NVFP4 head does not live in
     // that buffer (pre-packed checkpoints) and it is not the tied embedding.
     //
-    // Not when an MTP drafter captured the BF16 head above: `q4e_mtp_lm_head`
-    // and `v4_mtp_lm_head` are copies of this pointer, taken before this point,
-    // and the drafters project with it. Freeing it made Qwen3.8-Flash-Next's
+    // Not when an MTP drafter captured the BF16 head above: `q4e_mtp_lm_head`,
+    // `v4_mtp_lm_head` and `ling_mtp_lm_head` are copies of this pointer,
+    // taken before this point, and the drafters project with it. Freeing it made Qwen3.8-Flash-Next's
     // first propose read freed memory under `--lm-head-dtype nvfp4` (#264:
     // illegal address in run_mtp_propose_multi; the fp8 and bf16 heads never
     // reach this free, and NUM_DRAFTS=0 never reads the head).
-    let drafter_holds_bf16_head =
-        q4e_mtp_loaded || v4_mtp_module.is_some() || glm5_mtp_head.is_some();
+    let drafter_holds_bf16_head = q4e_mtp_loaded
+        || v4_mtp_module.is_some()
+        || glm5_mtp_head.is_some()
+        || ling_mtp_module.is_some();
     let lm_head = if !drafter_holds_bf16_head
         && super::lm_head_setup::bf16_lm_head_is_dead(
             lm_head.weight,
@@ -1417,6 +1456,37 @@ pub fn build_model(
                     "Failed to build qwen4_exp MTP proposer: {e:#}. Speculative decoding disabled."
                 );
             }
+        }
+    }
+
+    // ── Step 6d: Ling-3.2-air NEXTN MTP proposer (optional, post-construction) ──
+    //
+    // Same installer shape as 6b/6c: the module holds the reused family
+    // body (layer 42) and the head supplies the NEXTN-only ends
+    // (`ling_mtp_eh_norm` + `eh_proj` + final layernorm + the shared
+    // BF16 LM head + `ling_mtp_draft_pick`). The pruned capability clamps
+    // every verify to K = 2 (one draft), so the scheduler's K=2 lane serves
+    // the whole speculative step; `--speculative --num-drafts 1` is the
+    // intended spelling.
+    if let Some(module) = ling_mtp_module {
+        match crate::layers::ling_mtp::LingMtpHead::new(
+            module,
+            ling_mtp_embed,
+            ling_mtp_lm_head,
+            model.config_ref(),
+            model.gpu_backend(),
+            max_seq_len,
+        ) {
+            Ok(head) => {
+                model.set_dflash_proposer(std::sync::Arc::new(head));
+                tracing::info!(
+                    "Ling-3.2-air NEXTN MTP speculative decoding: ENABLED \
+                     (single draft, K=2 verify)"
+                );
+            }
+            Err(e) => tracing::warn!(
+                "Failed to build Ling-3.2-air MTP proposer: {e:#}. Speculative decoding disabled."
+            ),
         }
     }
 

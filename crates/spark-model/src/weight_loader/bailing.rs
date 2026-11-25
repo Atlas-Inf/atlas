@@ -31,6 +31,8 @@ mod names;
 mod plan;
 mod vision;
 
+pub use mtp::{LingMtpModule, load_ling_mtp_module};
+
 use anyhow::{Result, ensure};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
