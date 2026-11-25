@@ -105,7 +105,6 @@ fn f32_raw(store: &WeightStore, name: &str, elems: usize) -> Result<DevicePtr> {
     Ok(t.ptr)
 }
 
-
 /// FP32 weight, promoted from BF16 storage when the checkpoint stores it
 /// that way (the primitive-ai NVFP4 build ships the router gate and expert
 /// bias in BF16; the config's `router_dtype: fp32` describes the routing
@@ -381,7 +380,15 @@ fn load_expert_projection(
             ig.is_finite() && ig > 0.0,
             "ling: expert {e} {proj} input_global_scale must be positive"
         );
-        scale2.push(ig / wgs);
+        // The compressed-tensors NVFP4 convention (weight_map::quantized_v2's
+        // verified finding; magnitudes confirmed on this build: wgs ~ 1.7e4,
+        // ig ~ 2.5e3): BOTH checkpoint scalars are RECIPROCALS of the dequant
+        // multipliers — w = E2M1 * E4M3_group / weight_global_scale and the
+        // quantized activation/input dequantizes as q * sf / input_global_scale
+        // (its static recipe quantizes x * ig / sf, saturating past the
+        // calibrated amax 6 * 448 / ig). The MMA already carries both e4m3
+        // group scales into acc, so the epilogue's fold is (1/ig) * (1/wgs).
+        scale2.push(1.0 / (ig * wgs));
     }
     // The on-disk sources are dead once the transposes retired.
     let freed = (0..experts)
@@ -494,8 +501,11 @@ fn load_moe_weights(
         kernels,
     )?;
     freed.append(&mut freed_down);
-    // a2_gscale[e] = 1 / input_global_scale(down): the gate/up epilogue
-    // quantizes its silu output for the down projection.
+    // a2_gscale[e] = input_global_scale(down): the gate/up epilogue's
+    // re-quantizer (sf = e4m3(amax * g / 6), nibble = e2m1(x * g / sf))
+    // encodes the checkpoint's recipe with g = ig, so the packed
+    // intermediate's dequant global is its reciprocal 1 / ig (see the
+    // fold comment in load_expert_projection).
     let mut a2 = Vec::with_capacity(spec.experts);
     let mut a = None;
     for e in 0..spec.experts {
@@ -520,9 +530,12 @@ fn load_moe_weights(
             ig_down.is_finite() && ig_down > 0.0,
             "ling: bad down input_global_scale"
         );
-        a2.push(1.0 / ig_down);
+        a2.push(ig_down);
     }
-    let a_scale2 = a.expect("experts > 0");
+    // The route quantizer's dequant global of the packed input is the
+    // RECIPROCAL of the checkpoint's gate/up input_global_scale (see the
+    // fold comment in load_expert_projection).
+    let a_scale2 = 1.0 / a.expect("experts > 0");
     for name in &freed {
         let _ = store.reclaim(gpu, name);
     }
