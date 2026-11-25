@@ -169,3 +169,17 @@ use_sampling_preset_penalties_for_core = false
 # at exactly the long contexts the KDA/MLA split makes expensive. BF16 KV
 # is the default for this target; --kv-cache-dtype still overrides.
 default_kv_dtype = "bf16"
+
+# ── expected_absent ────────────────────────────────────────────────────────
+# Harvested 2026-11-25 from a single-Spark `--check-kernels` run: 64 lookups,
+# 1 unresolved, kernel_set_hash d594d0bbb1a1. No entry is silenced
+# speculatively; each names its dispatch site and the fallback it resolves to.
+
+[expected_absent.w4a16]
+w4a16_gemm_t_p3 = """
+3-deep weight-pipeline twin of w4a16_gemm_t, shipped only in qwen3.6-27b's
+shadow. layers::tgemm_kernel probes it on every A1 lm_head/ssm site and falls
+back to w4a16_gemm_t, which RESOLVES here (same module); runtime behaviour is
+unchanged. Ling's dense projections are BF16 (lm_head unquantized in the
+primitive-ai build), so the fast tile-GEMM path services the 157,178-token
+lm_head only; UNMEASURED for these shapes — candidate, not loss."""
