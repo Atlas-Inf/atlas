@@ -181,8 +181,13 @@ impl TransformerModel {
         }
 
         // MUST follow `free_state`: the graphs being dropped are the ones that
-        // reference the per-sequence buffers it just released.
-        if seq.slot_idx < self.ssm_pool.max_slots {
+        // reference the per-sequence buffers it just released. The Ling
+        // family EXEMPT: every address its captured decode/verify graphs
+        // reference is a pure function of (layer, slot) or serve-static
+        // (pool state zeroed at claim, fixed staging refreshed pre-graph),
+        // and `free_state` releases none of it — dropping them would
+        // re-capture on every request (see `ling_slot_graphs_retained`).
+        if seq.slot_idx < self.ssm_pool.max_slots && !self.ling_slot_graphs_retained() {
             self.invalidate_slot_graphs(seq.slot_idx);
         }
 
