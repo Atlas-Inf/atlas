@@ -857,15 +857,25 @@ fn compare_stages(
     let out_b = d2h(gpu, out, m * HIDDEN * 2)?;
 
     // ── Stage A: the quantized MoE input must be BIT-IDENTICAL to the
-    //    mirror (same f32 ops in the same order; `ffn.rs` passes
-    //    `inv = 1.0 / a_scale2`, mirrored exactly).
-    let inv_scale2 = 1.0f32 / a_scale2;
+    //    TRUE-Convention quantization of the checkpoint (the reciprocal
+    //    `input_global_scale`; see the file comment). A launcher scalar run
+    //    in the wrong direction shows up here immediately — and the
+    //    downstream reference consumes these bytes, never the GPU's, so a
+    //    zeroed quantization cannot pass against itself.
+    let ig_a = host.ig[0][0];
+    let true_scale2 = 1.0f32 / ig_a;
+    if (a_scale2 - true_scale2).abs() > true_scale2 * 1e-6 {
+        eprintln!(
+            "layer {layer}: route quantizer dequant-global a_scale2={a_scale2:e} but the checkpoint convention needs 1/input_global_scale={true_scale2:e}"
+        );
+    }
+    let inv_scale2 = 1.0f32 / true_scale2;
     let mut ref_a_packed = vec![0u8; m * HIDDEN / 2];
     let mut ref_a_scale = vec![0u8; m * HIDDEN / 16];
     for r in 0..m {
         for g in 0..HIDDEN / 16 {
             let vals = &x[r * HIDDEN + g * 16..r * HIDDEN + g * 16 + 16];
-            let (sb, pk) = quantize_group_mirror(vals, a_scale2, inv_scale2);
+            let (sb, pk) = quantize_group_mirror(vals, true_scale2, inv_scale2);
             ref_a_scale[r * HIDDEN / 16 + g] = sb;
             ref_a_packed[r * HIDDEN / 2 + g * 8..r * HIDDEN / 2 + g * 8 + 8].copy_from_slice(&pk);
         }
@@ -880,14 +890,15 @@ fn compare_stages(
         .zip(&ref_a_scale)
         .filter(|(a, b)| a != b)
         .count();
+    let a_scale_zero = a_scale.iter().filter(|b| **b == 0).count();
     eprintln!(
-        "layer {layer} M={m} stage A (input quant): {a_pack_diff}/{} packed bytes, {a_scale_diff}/{} scale bytes differ",
+        "layer {layer} M={m} stage A (input quant): {a_pack_diff}/{} packed bytes, {a_scale_diff}/{} scale bytes differ ({a_scale_zero} GPU scale bytes are ZERO)",
         ref_a_packed.len(),
         ref_a_scale.len()
     );
     ensure!(
         a_pack_diff == 0 && a_scale_diff == 0,
-        "stage A diverges: {a_pack_diff} packed + {a_scale_diff} scale bytes differ"
+        "stage A diverges: {a_pack_diff} packed + {a_scale_diff} scale bytes differ from the TRUE quantization"
     );
 
     // ── Route: selection, weights and the sort permutation.
@@ -949,16 +960,15 @@ fn compare_stages(
         "layer {layer} M={m} route: ids/perms exact, topk weight max rel diff {w_max_rel:.3e}"
     );
 
-    // The activation the GPU experts consumed: its own quantized bytes,
-    // dequantized by the TRUE input global (1 / ig — see file comment).
-    let ig_a = host.ig[0][0];
+    // The activation the reference experts consume: the TRUE quantized
+    // bytes, dequantized by `q * sf / ig`.
     let a_deq_rows: Vec<Vec<f32>> = (0..m)
         .map(|r| {
             let mut row = vec![0f32; HIDDEN];
             for g in 0..HIDDEN / 16 {
-                let sf = e4m3_unsigned(a_scale[r * HIDDEN / 16 + g]);
+                let sf = e4m3_unsigned(ref_a_scale[r * HIDDEN / 16 + g]);
                 for i in 0..8 {
-                    let (n0, n1) = nibbles(a_packed[r * HIDDEN / 2 + g * 8 + i]);
+                    let (n0, n1) = nibbles(ref_a_packed[r * HIDDEN / 2 + g * 8 + i]);
                     row[g * 16 + 2 * i] = e2m1(n0) * sf / ig_a;
                     row[g * 16 + 2 * i + 1] = e2m1(n1) * sf / ig_a;
                 }
