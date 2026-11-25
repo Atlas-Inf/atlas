@@ -96,8 +96,8 @@
 //!
 //! | module (file stem) | kernels used |
 //! |---|---|
-//! | `kda` | `kda_recurrent_bf16`, `kda_sigmoid_gated_rms_norm`, `kda_pack_qkv`, `ling_kda_conv_indexed`, `ling_kda_recurrent_indexed` |
-//! | `gated_mla` | `ling_mla_kv_a_norm_rope_cache`, `ling_mla_q_absorb_rope`, `ling_mla_paged_attn`, `ling_mla_v_extract_gated`, `ling_mla_prefill_attn` |
+//! | `kda` | `kda_recurrent_bf16`, `kda_sigmoid_gated_rms_norm`, `kda_pack_qkv`, `ling_kda_conv_indexed`, `ling_kda_recurrent_indexed` (multi-seq), `kda_preprocess_regresident` + `kda_recurrent_bf16_regresident` (packed prefill), `kda_recurrent_bf16_verify_snap` (verify) |
+//! | `gated_mla` | `ling_mla_kv_a_norm_rope_cache`, `ling_mla_q_absorb_rope`, `ling_mla_paged_attn`, `ling_mla_v_extract_gated`, `ling_mla_prefill_attn`, `ling_mla_ctx_gather` (packed prefill prefix) | origin/devin/20261125060354-ling-packed-prefill
 //! | `moe_decode` | `ling_moe_route`, `ling_moe_gate_up_silu`, `ling_moe_down`, `ling_moe_shared_gate_up_r{1,4,8,16,32}`, `ling_moe_shared_down_r{1,4,8,16,32}`, `ling_moe_unpermute` |
 //! | `causal_conv1d` | `causal_conv1d_update`, `causal_conv1d_update_prefill` |
 //! | `gemv` | `dense_gemv_bf16` |

@@ -14,6 +14,7 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 pub(crate) use super::spec::FfnKind;
 use super::{LingKernels, LingScratch};
+use crate::layers::ops;
 use crate::weight_map::DenseWeight;
 
 /// One module's routed-expert device tables: repacked packed/scale pointers
@@ -159,6 +160,45 @@ impl LingFfn {
         }
     }
 
+    /// The shared-expert / dense-FFN SwiGLU of a wide (>= 16 rows) pass on
+    /// the house BF16 tensor cores: `H = limit-swiglu(x @ gateᵀ, x @ upᵀ)`
+    /// through `ling_moe_swiglu_epilogue` (the bucket kernel's exact clamp
+    /// semantics), then `y = H @ downᵀ`. `gate` stages in `h` in place;
+    /// `up` borrows the MLA latent lane, idle in every FFN half.
+    #[allow(clippy::too_many_arguments)]
+    fn cublas_swiglu(
+        &self,
+        gpu: &dyn GpuBackend,
+        x: DevicePtr,
+        gate: &DenseWeight,
+        up: &DenseWeight,
+        down: &DenseWeight,
+        h: DevicePtr,
+        y: DevicePtr,
+        rows: usize,
+        limit: f32,
+        stream: u64,
+    ) -> Result<()> {
+        let k = &self.kernels;
+        let s = &self.scratch;
+        let m = rows as u32;
+        let inter = self.inter as u32;
+        let hidden = self.hidden as u32;
+        ops::bf16_gemm(x, gate.weight.0, h, m, inter, hidden, stream)?;
+        let up_buf = s.mla_latent;
+        ops::bf16_gemm(x, up.weight.0, up_buf, m, inter, hidden, stream)?;
+        KernelLaunch::new(gpu, k.moe_swiglu_epilogue_k)
+            .grid([div_ceil((rows * self.inter) as u32, 256), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(h)
+            .arg_ptr(up_buf)
+            .arg_ptr(h)
+            .arg_u64((rows * self.inter) as u64)
+            .arg_f32(limit)
+            .launch(stream)?;
+        ops::bf16_gemm(h, down.weight.0, y, m, hidden, inter, stream)
+    }
+
     fn forward_dense(
         &self,
         gpu: &dyn GpuBackend,
@@ -170,35 +210,40 @@ impl LingFfn {
         let w = self.dense.as_ref().expect("dense weights");
         let k = &self.kernels;
         let s = &self.scratch;
-        // Sub-batches of 32 rows (the widest shared-expert bucket).
-        for (start, batch) in row_batches(rows, 32) {
-            let h = s.shared_h.offset(start as usize * self.inter * 2);
-            shared_gate_up(
-                gpu,
-                k,
-                x.offset(start as usize * self.hidden * 2),
-                &w.gate,
-                &w.up,
-                h,
-                batch,
-                self.inter,
-                self.hidden,
-                0.0,
-                stream,
-            )?;
-            shared_down(
-                gpu,
-                k,
-                h,
-                &w.down,
-                out.offset(start as usize * self.hidden * 2),
-                batch,
-                self.hidden,
-                self.inter,
-                stream,
-            )?;
+        if rows >= 16 {
+            // Prefill shape: the GEMMs read the weights once on tensor
+            // cores instead of re-streaming them per 32-row bucket pass.
+            self.cublas_swiglu(gpu, x, &w.gate, &w.up, &w.down, s.shared_h, out, rows, 0.0, stream)
+        } else {
+            for (start, batch) in row_batches(rows, 32) {
+                let h = s.shared_h.offset(start as usize * self.inter * 2);
+                shared_gate_up(
+                    gpu,
+                    k,
+                    x.offset(start as usize * self.hidden * 2),
+                    &w.gate,
+                    &w.up,
+                    h,
+                    batch,
+                    self.inter,
+                    self.hidden,
+                    0.0,
+                    stream,
+                )?;
+                shared_down(
+                    gpu,
+                    k,
+                    h,
+                    &w.down,
+                    out.offset(start as usize * self.hidden * 2),
+                    batch,
+                    self.hidden,
+                    self.inter,
+                    stream,
+                )?;
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -213,12 +258,15 @@ impl LingFfn {
         let w = self.moe.as_ref().expect("moe weights");
         let k = &self.kernels;
         let s = &self.scratch;
-        for (start, batch) in row_batches(rows, 32) {
+        // Routed experts over full chunks: the tile kernels stream every
+        // live expert's tables per pass, so splitting the chunk re-reads
+        // the expert tables per split (at rows=512 the old 32-row splits
+        // re-read them 16x). The worklist and all row-indexed staging are
+        // sized for `scratch.rows`, which bounds chunks here.
+        for (start, batch) in row_batches(rows, self.scratch.rows as u32) {
             let batch = batch as u32;
             let base = start as usize;
             let xb = x.offset(base * self.hidden * 2);
-            let yb = out.offset(base * self.hidden * 2);
-            let hb = s.shared_h.offset(base * self.inter * 2);
             // 1. route + input quant + group-limited top-8 + sort + worklist.
             gpu.memset(s.moe_done, 0, 4)?;
             let router_ctas = div_ceil(self.experts as u32, 8);
@@ -254,7 +302,7 @@ impl LingFfn {
                 .arg_ptr(s.moe_done)
                 .launch(stream)?;
             // 2. routed experts: fused gate/up/swiglu/re-quant, then down.
-            let items = self.max_items(rows) as u32;
+            let items = self.max_items(batch as usize) as u32;
             KernelLaunch::new(gpu, k.moe_gate_up_k)
                 .grid([div_ceil(self.inter as u32, 128), items, 1])
                 .block([256, 1, 1])
@@ -294,50 +342,73 @@ impl LingFfn {
                 .arg_u32(self.inter as u32)
                 .arg_ptr(s.worklist)
                 .launch(stream)?;
-            // 3. shared expert (BF16, its own clamp list).
-            shared_gate_up(
+        }
+        // 3. shared expert (BF16, its own clamp list): bucket pass below 16
+        // rows; wide chunks run the GEMMs on tensor cores, weights read
+        // once. Its down rows land in `out` directly.
+        if rows >= 16 {
+            self.cublas_swiglu(
                 gpu,
-                k,
-                xb,
+                x,
                 &w.shared_gate,
                 &w.shared_up,
-                hb,
-                batch,
-                self.inter,
-                self.hidden,
+                &w.shared_down,
+                s.shared_h,
+                out,
+                rows,
                 w.swiglu_shared,
                 stream,
             )?;
-            shared_down(
-                gpu,
-                k,
-                hb,
-                &w.shared_down,
-                yb,
-                batch,
-                self.hidden,
-                self.inter,
-                stream,
-            )?;
-            // 4. unpermute: routed reduce + shared sum -> y. The shared
-            // rows already sit at yb (the shared down wrote them), and the
-            // kernel reads each shared element before writing the same
-            // element of Y, so Y = shared_out = yb aliases safely.
-            KernelLaunch::new(gpu, k.moe_unpermute_k)
-                .grid([batch, 1, 1])
-                .block([256, 1, 1])
-                .arg_ptr(s.expert_out.offset(base * self.top_k * self.hidden * 2))
-                .arg_ptr(yb)
-                .arg_ptr(s.token_to_perm.offset(base * self.top_k * 4))
-                .arg_ptr(s.topk_weights.offset(base * self.top_k * 4))
-                .arg_ptr(DevicePtr::NULL)
-                .arg_ptr(yb)
-                .arg_u32(batch)
-                .arg_u32(self.hidden as u32)
-                .arg_u32(self.top_k as u32)
-                .launch(stream)?;
+        } else {
+            for (start, batch) in row_batches(rows, 32) {
+                let batch = batch as u32;
+                let base = start as usize;
+                let xb = x.offset(base * self.hidden * 2);
+                let yb = out.offset(base * self.hidden * 2);
+                let hb = s.shared_h.offset(base * self.inter * 2);
+                shared_gate_up(
+                    gpu,
+                    k,
+                    xb,
+                    &w.shared_gate,
+                    &w.shared_up,
+                    hb,
+                    batch,
+                    self.inter,
+                    self.hidden,
+                    w.swiglu_shared,
+                    stream,
+                )?;
+                shared_down(
+                    gpu,
+                    k,
+                    hb,
+                    &w.shared_down,
+                    yb,
+                    batch,
+                    self.hidden,
+                    self.inter,
+                    stream,
+                )?;
+            }
         }
-        Ok(())
+        // 4. unpermute: routed reduce + shared sum -> y. The shared rows
+        // already sit at yb (the shared down wrote them), and the
+        // kernel reads each shared element before writing the same
+        // element of Y, so Y = shared_out = yb aliases safely.
+        KernelLaunch::new(gpu, k.moe_unpermute_k)
+            .grid([rows as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(s.expert_out)
+            .arg_ptr(out)
+            .arg_ptr(s.token_to_perm)
+            .arg_ptr(s.topk_weights)
+            .arg_ptr(DevicePtr::NULL)
+            .arg_ptr(out)
+            .arg_u32(rows as u32)
+            .arg_u32(self.hidden as u32)
+            .arg_u32(self.top_k as u32)
+            .launch(stream)
     }
 }
 

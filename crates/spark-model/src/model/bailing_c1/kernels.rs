@@ -30,6 +30,13 @@ pub(crate) struct LingKernels {
     // kda.cu
     pub kda_recurrent_k: KernelHandle,
     pub kda_gated_norm_k: KernelHandle,
+    /// `kda_preprocess_regresident` + `kda_recurrent_bf16_regresident`:
+    /// the register-resident prefill pair (`ATLAS_LING_KDA_REGRESIDENT_
+    /// PREFILL`, default on): one CTA-warp column loop keeps the FP32
+    /// state in registers for the whole chunk instead of streaming it
+    /// through global memory per token.
+    pub kda_preproc_reg_k: KernelHandle,
+    pub kda_reg_k: KernelHandle,
     /// `kda_recurrent_bf16_verify_snap` — the K-token verify twin
     /// (PR #110): per-row H rollback snapshots in one launch.
     pub kda_verify_snap_k: KernelHandle,
@@ -50,11 +57,19 @@ pub(crate) struct LingKernels {
     pub mla_paged_attn_k: KernelHandle,
     pub mla_v_gated_k: KernelHandle,
     pub mla_prefill_attn_k: KernelHandle,
+    /// `ling_mla_ctx_gather`: copies a sequence's cached prefix rows from
+    /// the paged pools into the layer's contiguous prefill context so a
+    /// continuing chunk can run `ling_mla_prefill_attn` over prefix+chunk.
+    pub mla_ctx_gather_k: KernelHandle,
     // moe_decode.cu
     pub moe_route_k: KernelHandle,
     pub moe_gate_up_k: KernelHandle,
     pub moe_down_k: KernelHandle,
     pub moe_unpermute_k: KernelHandle,
+    /// `ling_moe_swiglu_epilogue`: the shared/dense SwiGLU clamp epilogue
+    /// over pre-computed gate/up rows of a wide pass (the GEMMs run on the
+    /// house bf16_gemm).
+    pub moe_swiglu_epilogue_k: KernelHandle,
     pub shared_gate_up_k: [KernelHandle; 5],
     pub shared_down_k: [KernelHandle; 5],
 }
@@ -97,6 +112,8 @@ impl LingKernels {
             bf16_to_f32_k: required(gpu, "residual_add", "bf16_to_f32")?,
             kda_recurrent_k: required(gpu, "kda", "kda_recurrent_bf16")?,
             kda_gated_norm_k: required(gpu, "kda", "kda_sigmoid_gated_rms_norm")?,
+            kda_preproc_reg_k: required(gpu, "kda", "kda_preprocess_regresident")?,
+            kda_reg_k: required(gpu, "kda", "kda_recurrent_bf16_regresident")?,
             kda_verify_snap_k: required(gpu, "kda", "kda_recurrent_bf16_verify_snap")?,
             kda_pack_qkv_k: required(gpu, "kda", "kda_pack_qkv")?,
             kda_conv_indexed_k: required(gpu, "kda", "ling_kda_conv_indexed")?,
@@ -106,10 +123,12 @@ impl LingKernels {
             mla_paged_attn_k: required(gpu, "gated_mla", "ling_mla_paged_attn")?,
             mla_v_gated_k: required(gpu, "gated_mla", "ling_mla_v_extract_gated")?,
             mla_prefill_attn_k: required(gpu, "gated_mla", "ling_mla_prefill_attn")?,
+            mla_ctx_gather_k: required(gpu, "gated_mla", "ling_mla_ctx_gather")?,
             moe_route_k: required(gpu, "moe_decode", "ling_moe_route")?,
             moe_gate_up_k: required(gpu, "moe_decode", "ling_moe_gate_up_silu")?,
             moe_down_k: required(gpu, "moe_decode", "ling_moe_down")?,
             moe_unpermute_k: required(gpu, "moe_decode", "ling_moe_unpermute")?,
+            moe_swiglu_epilogue_k: required(gpu, "moe_decode", "ling_moe_swiglu_epilogue")?,
             shared_gate_up_k: five(|mr| {
                 required(gpu, "moe_decode", &format!("ling_moe_shared_gate_up_r{mr}"))
             })?,

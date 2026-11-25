@@ -366,3 +366,27 @@ extern "C" __global__ void __launch_bounds__(256) ling_moe_unpermute(
         *(uint4*)&yrow[c] = out;
     }
 }
+
+// Shared-expert / dense-FFN SwiGLU epilogue for the wide (prefill) path:
+// `ling_moe_shared_gate_up_r32`'s clamp semantics over pre-computed gate and
+// up rows — the GEMMs themselves run on the house BF16 tensor-core bf16_gemm
+// instead of the 32-row bucket GEMV re-reading the weights per batch of 32
+// rows. One thread per element:
+//   H[i] = ling_gate_up_mul(ling_silu_bf16(g[i], limit), u[i], limit)
+// (the gate/up inputs already rounded to BF16 by the GEMM's stores, one
+// round earlier than the fused kernel's in-register values; helper contracts
+// unchanged). Grid: (ceil(count / 1024), 1, 1) Block: (256, 1, 1)
+extern "C" __global__ void ling_moe_swiglu_epilogue(
+    const __nv_bfloat16* __restrict__ g,   // [M, I]
+    const __nv_bfloat16* __restrict__ u,   // [M, I]
+    __nv_bfloat16* __restrict__ H,          // [M, I]
+    const unsigned long long count,
+    const float limit
+) {
+    atlas_pdl_enter();
+    const unsigned long long i =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float s = ling_silu_bf16(__bfloat162float(g[i]), limit);
+    H[i] = __float2bfloat16(ling_gate_up_mul(s, __bfloat162float(u[i]), limit));
+}

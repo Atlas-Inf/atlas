@@ -4,10 +4,15 @@
 //! deltanet recurrence per `kernels/gb10/ling-3.2-air/nvfp4/kda.cu`.
 //!
 //! Decode: `kda_recurrent_bf16` advances the sequence's per-layer FP32
-//! state one token. Prefill: the same kernel over each sub-chunk's rows
-//! (it walks tokens serially inside the launch — the regresident pair is
-//! the follow-up). Multi-row MTP VERIFY: `decode_batched` runs the
-//! GEMM-batched projections of the prefill arm plus the verify twin
+//! state one token. Prefill chunks (rows > 1, the default) run the
+//! register-resident pair instead: `kda_preprocess_regresident` computes
+//! the row-invariant q/k L2 norms, decay and beta once per token/head, and
+//! `kda_recurrent_bf16_regresident` walks the chunk with each warp owning
+//! a state column in registers — the FP32 state loads and stores once per
+//! chunk instead of streaming 2 MiB per token
+//! (`ATLAS_LING_KDA_REGRESIDENT_PREFILL=0` restores the token-serial walk).
+//! Multi-row MTP VERIFY: `decode_batched` runs the GEMM-batched
+//! projections of the prefill arm plus the verify twin
 //! `kda_recurrent_bf16_verify_snap` (PR #110), which walks the K rows in
 //! one launch, leaves the live state after the last row (a full accept is
 //! already committed) and writes the per-row rollback snapshots
@@ -15,7 +20,7 @@
 //! the contiguous `h_state_intermediates` region, conv snapshots after
 //! each row's per-row conv launch). One NEXTN draft = K = 2 rows.
 //!
-//! MULTI-SEQUENCE DECODE (this slice): `ling_kda_conv_indexed` +
+//! MULTI-SEQUENCE DECODE: `ling_kda_conv_indexed` +
 //! `ling_kda_recurrent_indexed` address the house `SsmStatePool` through a
 //! device-resident slot-id stream (`SsmBatchView` built by
 //! `ssm_indexed_decode::prepare_runtime`), so every kernel argument of the
@@ -28,6 +33,7 @@
 //! `alloc_sequence` fixed at slot claim — stable across every decode
 //! step of that sequence, just not shared across steps like the indexed
 //! pair is).
+
 
 use std::sync::Arc;
 
@@ -45,6 +51,52 @@ use crate::weight_map::DenseWeight;
 
 /// KDA projection widths at the supported geometry: 32 heads x 128.
 const T: usize = KDA_HEADS * KDA_HEAD_DIM;
+
+/// `ATLAS_LING_KDA_REGRESIDENT_PREFILL`: unset or any value other than
+/// "0" prefills chunks on the register-resident pair
+/// (`kda_preprocess_regresident` + `kda_recurrent_bf16_regresident`);
+/// "0" restores the token-serial `kda_recurrent_bf16` walk. Read once.
+fn regresident_prefill() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_LING_KDA_REGRESIDENT_PREFILL").as_deref() != Ok("0"))
+}
+
+/// `ATLAS_LING_PROJ_GEMM_MIN_ROWS`: the smallest chunk the prefill
+/// projections take the house BF16 tensor-core GEMM for (cuBLASLt; the
+/// CUTLASS tiles of `ATLAS_BF16_GEMM_CUTLASS=1` from 256 rows inside
+/// `ops::bf16_gemm`). Default 16. Read once.
+fn proj_gemm_min_rows() -> u32 {
+    static MIN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("ATLAS_LING_PROJ_GEMM_MIN_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(16)
+            .max(1)
+    })
+}
+
+/// One prefill-shaped projection: the house BF16 tensor-core GEMM
+/// (`ops::bf16_gemm`, HF `[N, K]` weight layout) from the M threshold up,
+/// the scalar GEMM below it.
+#[allow(clippy::too_many_arguments)]
+fn proj_gemm(
+    gpu: &dyn GpuBackend,
+    k: &LingKernels,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    rows: u32,
+    n: u32,
+    k_dim: u32,
+    stream: u64,
+) -> Result<()> {
+    if rows >= proj_gemm_min_rows() {
+        ops::bf16_gemm(input, weight.weight.0, output, rows, n, k_dim, stream)
+    } else {
+        ops::dense_gemm(gpu, k.gemm_k, input, weight, output, rows, n, k_dim, stream)
+    }
+}
 
 pub(crate) struct LingKdaWeights {
     /// q/k/v_proj `[T, hidden]`; b_proj `[32, hidden]`; f/g_proj `[T, hidden]`;
@@ -169,9 +221,9 @@ impl LingKdaLayer {
             // plane regions of the staging buffer, then three strided
             // prefill-conv launches write the packed q|k|v rows.
             for (plane, proj) in [&w.q_proj, &w.k_proj, &w.v_proj].iter().enumerate() {
-                ops::dense_gemm(
+                proj_gemm(
                     gpu,
-                    k.gemm_k,
+                    k,
                     s.normed,
                     proj,
                     s.kda_preconv.offset(rows as usize * (plane * T) * 2),
@@ -239,9 +291,9 @@ impl LingKdaLayer {
                 stream,
             )?;
         } else {
-            ops::dense_gemm(
+            proj_gemm(
                 gpu,
-                k.gemm_k,
+                k,
                 s.normed,
                 &w.b_proj,
                 s.kda_beta,
@@ -250,9 +302,9 @@ impl LingKdaLayer {
                 hidden_w as u32,
                 stream,
             )?;
-            ops::dense_gemm(
+            proj_gemm(
                 gpu,
-                k.gemm_k,
+                k,
                 s.normed,
                 &w.f_proj,
                 s.kda_gate,
@@ -261,9 +313,9 @@ impl LingKdaLayer {
                 hidden_w as u32,
                 stream,
             )?;
-            ops::dense_gemm(
+            proj_gemm(
                 gpu,
-                k.gemm_k,
+                k,
                 s.normed,
                 &w.g_proj,
                 s.kda_o_g,
@@ -273,22 +325,68 @@ impl LingKdaLayer {
                 stream,
             )?;
         }
-        ops::kda_recurrent(
-            gpu,
-            k.kda_recurrent_k,
-            s.kda_qkv,
-            s.kda_gate,
-            s.kda_beta,
-            w.a_log,
-            w.dt_bias,
-            state.h_state,
-            s.kda_out,
-            rows,
-            KDA_HEADS as u32,
-            KDA_HEAD_DIM as u32,
-            self.lower_bound,
-            stream,
-        )?;
+        if rows > 1 && regresident_prefill() {
+            // Register-resident prefill recurrence: the FP32 planes sit in
+            // lanes idle inside a KDA attention half (the MLA rows are MITM
+            // between layer kinds and the MoE expert lane is only written by
+            // this layer's FFN half, which is about to overwrite it anyway).
+            // No persistent allocation is added.
+            let plane_bytes = rows as usize * T * 4;
+            let q_norm = s.mla_latent;
+            let k_norm = s.mla_q_final;
+            let decay = s.expert_out;
+            let beta = decay.offset(plane_bytes);
+            ops::kda_preprocess_regresident(
+                gpu,
+                k.kda_preproc_reg_k,
+                s.kda_qkv,
+                s.kda_gate,
+                s.kda_beta,
+                w.a_log,
+                w.dt_bias,
+                q_norm,
+                k_norm,
+                decay,
+                beta,
+                rows,
+                KDA_HEADS as u32,
+                KDA_HEAD_DIM as u32,
+                self.lower_bound,
+                stream,
+            )?;
+            ops::kda_recurrent_regresident(
+                gpu,
+                k.kda_reg_k,
+                s.kda_qkv,
+                q_norm,
+                k_norm,
+                decay,
+                beta,
+                state.h_state,
+                s.kda_out,
+                rows,
+                KDA_HEADS as u32,
+                KDA_HEAD_DIM as u32,
+                stream,
+            )?;
+        } else {
+            ops::kda_recurrent(
+                gpu,
+                k.kda_recurrent_k,
+                s.kda_qkv,
+                s.kda_gate,
+                s.kda_beta,
+                w.a_log,
+                w.dt_bias,
+                state.h_state,
+                s.kda_out,
+                rows,
+                KDA_HEADS as u32,
+                KDA_HEAD_DIM as u32,
+                self.lower_bound,
+                stream,
+            )?;
+        }
         ops::kda_sigmoid_gated_norm(
             gpu,
             k.kda_gated_norm_k,
@@ -315,9 +413,9 @@ impl LingKdaLayer {
                 stream,
             )?;
         } else {
-            ops::dense_gemm(
+            proj_gemm(
                 gpu,
-                k.gemm_k,
+                k,
                 s.kda_o,
                 &w.o_proj,
                 s.attn_out,

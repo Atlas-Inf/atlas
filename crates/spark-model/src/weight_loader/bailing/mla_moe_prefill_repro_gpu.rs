@@ -14,8 +14,8 @@
 //! ```
 //!
 //! Drives layer 5 exactly as the 512-row prefill segment does:
-//! `LingMlaLayer::attention_half_prefill` (the whole-prompt contiguous
-//! path) then the layer's own `ffn_half` (post-norm -> MoE rows=512 ->
+//! `LingMlaLayer::attention_half_prefill` (the packed default: ctx write +
+//! `ling_mla_prefill_attn`, kv_base 0 at position 0) then the layer's own `ffn_half` (post-norm -> MoE rows=512 ->
 //! residual), staging snapshots between halves and reporting a
 //! non-finite scan of every intermediate so the first bad side of the
 //! attention/FFN seam is visible directly.
@@ -87,7 +87,7 @@ fn ling_mla_moe_prefill_repro_gpu() -> Result<()> {
     report_hidden(gpu, hidden, ROWS, HIDDEN, "input hidden")?;
 
     // ── attention half: the whole-prompt contiguous prefill path.
-    layer.attention_half_prefill(gpu, hidden, &mut kv, ROWS, 0, true, &block_table, stream)?;
+    layer.attention_half_prefill(gpu, hidden, &mut kv, ROWS, 0, true, true, &block_table, stream)?;
     gpu.synchronize(stream)?;
     report_hidden(gpu, hidden, ROWS, HIDDEN, "post-attention hidden")?;
 

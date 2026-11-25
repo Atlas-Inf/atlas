@@ -47,7 +47,11 @@ const H: usize = 2560;
 const LAYERS: usize = 42;
 const ATTN_LAYERS: usize = 7; // gated-MLA layers
 const BS: usize = 8; // probe block size
-const N_BLOCKS: usize = 4; // covers 32 positions
+/// The pool the rig builds: covers the run's positions plus headroom,
+/// so a longer oracle prompt rides the same rig as the 16-token table.
+fn n_blocks(max_pos: usize) -> usize {
+    max_pos.div_ceil(BS) + 1
+}
 
 fn ckpt() -> Result<PathBuf> {
     std::env::var("ATLAS_LING_CKPT")
@@ -224,6 +228,10 @@ fn bailing_e2e_oracle_parity() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
 
     // ---- pools / arena / context ------------------------------------------
+    let (tokens, prompt) = tokens_and_prompt()?;
+    let decode_n = tokens.len() - prompt;
+    let max_pos = prompt + decode_n;
+    let kv_blocks = n_blocks(max_pos);
     let mut kv = PagedKvCache::new(
         KvCacheConfig {
             block_size: BS,
@@ -235,20 +243,16 @@ fn bailing_e2e_oracle_parity() -> Result<()> {
             layer_dims: vec![],
             cache_blocks_per_seq: None,
         },
-        N_BLOCKS,
+        kv_blocks,
         gpu,
     )?;
-    let block_table: Vec<u32> = (0..N_BLOCKS as u32).collect();
+    let block_table: Vec<u32> = (0..kv_blocks as u32).collect();
     let disk_block_ids: Vec<u32> = Vec::new();
     let disk_last_offloaded: Vec<u32> = Vec::new();
-
-    let (tokens, prompt) = tokens_and_prompt()?;
-    let decode_n = tokens.len() - prompt;
-    let max_pos = prompt + decode_n;
     ensure!(
-        N_BLOCKS * BS >= max_pos,
+        kv_blocks * BS >= max_pos,
         "block table covers only {} positions, want {max_pos}",
-        N_BLOCKS * BS
+        kv_blocks * BS
     );
 
     let arena = BufferArena::new(&config, 64, 64, BS, 1, gpu)?;
@@ -552,6 +556,7 @@ fn bailing_e2e_layer_trace() -> Result<()> {
 
     // ---- context ------------------------------------------------------------
     let (tokens, prompt) = tokens_and_prompt()?;
+    let kv_blocks = n_blocks(tokens.len());
     let mut kv = PagedKvCache::new(
         KvCacheConfig {
             block_size: BS,
@@ -563,10 +568,10 @@ fn bailing_e2e_layer_trace() -> Result<()> {
             layer_dims: vec![],
             cache_blocks_per_seq: None,
         },
-        N_BLOCKS,
+        kv_blocks,
         gpu,
     )?;
-    let block_table: Vec<u32> = (0..N_BLOCKS as u32).collect();
+    let block_table: Vec<u32> = (0..kv_blocks as u32).collect();
     let arena = BufferArena::new(&config, 64, 64, BS, 1, gpu)?;
     let dispatch = GemmDispatch::default();
     let derived = DerivedWeights::new();
