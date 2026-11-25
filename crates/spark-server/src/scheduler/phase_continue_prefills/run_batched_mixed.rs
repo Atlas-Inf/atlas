@@ -49,7 +49,7 @@ pub(super) fn run_batched_mixed_step(
     let mut is_last_flags: Vec<bool> = Vec::with_capacity(n_prefill);
     for p in prefilling.iter() {
         let remaining = p.prompt_tokens.len() - p.chunk_offset;
-        let effective_max = if model.is_mla() {
+        let effective_max = if model.is_mla() && !model.supports_chunked_mla() {
             remaining
         } else {
             max_prefill_tokens
