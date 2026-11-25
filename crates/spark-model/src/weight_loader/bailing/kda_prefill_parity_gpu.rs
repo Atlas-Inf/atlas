@@ -177,6 +177,13 @@ fn build_layer(
         &store,
         &format!("model.layers.{layer}.post_attention_layernorm.weight"),
     )?;
+    // The layer's `SsmStatePool` ordinal (KDA layers below it in the plan);
+    // the harness never enters the pool-indexed decode lane, but the value
+    // stays true to the model so the layer mirrors serve behavior.
+    let ssm_ordinal = spec.layers[..layer]
+        .iter()
+        .filter(|l| l.attention == atlas_core::config::LayerType::LinearAttention)
+        .count();
     LingKdaLayer::new(
         input_norm,
         post_norm,
@@ -184,6 +191,7 @@ fn build_layer(
         ffn,
         Arc::clone(kernels),
         Arc::clone(scratch),
+        ssm_ordinal,
         spec.lower_bound,
         spec.eps,
     )

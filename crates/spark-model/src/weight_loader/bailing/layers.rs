@@ -51,6 +51,10 @@ pub(super) fn load_all(
     )?;
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     let mut attn_idx = 0usize;
+    // The SSM (`LinearAttention`) layer counter: `SsmStatePool` ordinal of
+    // the KDA layer under construction (what both the pool-backed state
+    // construction and the indexed decode lane address it by).
+    let mut ssm_idx = 0usize;
     for (idx, layer_spec) in spec.layers.iter().enumerate() {
         let lp = format!("model.layers.{idx}");
         let input_norm = dense(store, &format!("{lp}.input_layernorm.weight"))?;
@@ -59,16 +63,19 @@ pub(super) fn load_all(
         let layer: Box<dyn TransformerLayer> =
             if layer_spec.attention == atlas_core::config::LayerType::LinearAttention {
                 let weights = load_kda_weights(store, &lp, gpu)?;
-                Box::new(LingKdaLayer::new(
+                let layer = Box::new(LingKdaLayer::new(
                     input_norm,
                     post_attn_norm,
                     weights,
                     ffn,
                     Arc::clone(&kernels),
                     Arc::clone(&scratch),
+                    ssm_idx,
                     spec.lower_bound,
                     spec.eps,
-                )?)
+                )?);
+                ssm_idx += 1;
+                layer
             } else {
                 let weights = load_mla_weights(store, &lp, gpu)?;
                 let layer = LingMlaLayer::new(
@@ -90,6 +97,11 @@ pub(super) fn load_all(
         attn_idx == spec.mla_layers,
         "ling: built {attn_idx} MLA layers, the plan has {}",
         spec.mla_layers
+    );
+    ensure!(
+        ssm_idx == spec.kda_layers,
+        "ling: built {ssm_idx} KDA layers, the plan has {}",
+        spec.kda_layers
     );
     Ok(layers)
 }

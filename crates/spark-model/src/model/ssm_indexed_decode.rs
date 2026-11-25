@@ -49,6 +49,42 @@ fn runtime_eligible_up_to(
         && config.linear_conv_kernel_dim == 4
 }
 
+/// `ATLAS_LING_KDA_INDEXED=0` opts the bailing (Ling-3.2-air) KDA layers out
+/// of the pool-indexed multi-sequence decode lane (the per-sequence loop
+/// over the pool-backed states then serves every width). Default ON: the
+/// lane is the family's pool-stable addressing — same kernels, same slot
+/// pool, only conv + recurrence submit through the slot-id stream — so it
+/// is the path a captured decode graph replays. The lane needs live FP32
+/// pool state (`SsmPoolView::new` refuses f16-sized pools), an exact-width
+/// 2..=8 row dispatch on a single rank, and no speculative drafter (the
+/// MTP arm runs the per-sequence K-row verify instead).
+pub(crate) fn ling_kda_indexed_enabled() -> bool {
+    std::env::var("ATLAS_LING_KDA_INDEXED").ok().as_deref() != Some("0")
+}
+
+fn ling_runtime_eligible(
+    config: &ModelConfig,
+    world: usize,
+    spec_free: bool,
+    rows: usize,
+    padded_rows: usize,
+) -> bool {
+    ling_kda_indexed_enabled()
+        && spec_free
+        && config.model_type == "bailing_moe_v3_vl"
+        // Single-rank serving: no EP peers to keep the width in sync.
+        && world == 0
+        && config.tp_world_size == 1
+        && config.ep_world_size == 1
+        && (2..=8).contains(&rows)
+        && padded_rows == rows
+        && config.linear_num_key_heads == 32
+        && config.linear_num_value_heads == 32
+        && config.linear_key_head_dim == 128
+        && config.linear_value_head_dim == 128
+        && config.linear_conv_kernel_dim == 4
+}
+
 /// Runs on both head and worker before graph lookup on every eligible step.
 /// Unsupported execution scopes keep the old per-row path; malformed eligible
 /// state never silently falls back. No stateful kernels are submitted here.
@@ -60,21 +96,18 @@ pub(crate) fn prepare_runtime<'a>(
     stream: u64,
 ) -> Result<Option<SsmBatchView<'a>>> {
     let independent_mode = super::glm_independent::enabled(&model.config.model_type)?;
+    let world = model.comm.as_ref().map_or(0, |c| c.world_size());
+    let spec_free = model.proposer.is_none() && !model.self_speculative;
     let selected_scope = independent_mode
-        && runtime_eligible_up_to(
-            &model.config,
-            model.comm.as_ref().map_or(0, |c| c.world_size()),
-            model.proposer.is_none() && !model.self_speculative,
-            true,
-            rows,
-            padded_rows,
-            8,
-        );
+        && runtime_eligible_up_to(&model.config, world, spec_free, true, rows, padded_rows, 8);
+    let ling_scope = !independent_mode
+        && ling_runtime_eligible(&model.config, world, spec_free, rows, padded_rows);
     if !selected_scope
+        && !ling_scope
         && !runtime_eligible(
             &model.config,
-            model.comm.as_ref().map_or(0, |c| c.world_size()),
-            model.proposer.is_none() && !model.self_speculative,
+            world,
+            spec_free,
             crate::layers::kda_multi_seq_enabled(),
             rows,
             padded_rows,

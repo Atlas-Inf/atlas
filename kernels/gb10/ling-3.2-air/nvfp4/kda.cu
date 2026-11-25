@@ -40,8 +40,11 @@
 // launch time; the supported Ling geometry is heads=32, dim=128.
 //
 // The GLM kernels renamed for Ling: glm_kda_recurrent_indexed is ported as
-// ling_kda_recurrent_indexed. Everything else keeps its entry name so the
-// existing runtime KDA layer wrappers bind with no code motion.
+// ling_kda_recurrent_indexed, glm_kda_conv_indexed as ling_kda_conv_indexed
+// (the pool-addressing decode pair of the multi-sequence lane; the conv
+// twin wraps the common causal_conv1d_update arithmetic). Everything else
+// keeps its entry name so the existing runtime KDA layer wrappers bind
+// with no code motion.
 
 #include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
@@ -113,6 +116,54 @@ extern "C" __global__ void ling_kda_recurrent_indexed(
     output += (unsigned long long)row * heads * dim;
     atlas_kda_recurrent_body(qkv, raw_gate, raw_beta, a_log, dt_bias, state, output, 1, heads, dim,
         lower_bound);
+}
+
+// Independent one-token conv rows select the FP32 conv pool by explicit
+// device slot IDs — the pool-addressing twin of the common
+// causal_conv1d_update (the GLM target's glm_kda_conv_indexed ported for
+// the Ling geometry: 3*32*128 = 12288 channels, d_conv 4, SiLU, BF16
+// output). Same per-element arithmetic as a one-token causal_conv1d_update
+// so the bytes of the indexed decode lane match the per-sequence decode.
+// Invalid slots leave all state and output untouched. Strides: rows in
+// BF16 elements, pool in FP32 elements.
+extern "C" __global__ void ling_kda_conv_indexed(
+    float* __restrict__ conv_state_pool,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weight,
+    const float* __restrict__ bias,
+    __nv_bfloat16* __restrict__ output,
+    unsigned int dim,
+    unsigned int d_conv,
+    unsigned int rows,
+    unsigned int input_stride,
+    unsigned int output_stride,
+    const int* __restrict__ state_slots,
+    unsigned int slot_count,
+    unsigned long long state_stride
+) {
+    const unsigned int row = blockIdx.y;
+    if (row >= rows || dim != 12288 || d_conv != 4 || blockDim.x != 256) return;
+    const int slot = state_slots[row];
+    if (slot < 0 || (unsigned int)slot >= slot_count
+        || state_stride < (unsigned long long)dim * d_conv) return;
+    float* conv_state = conv_state_pool + (unsigned long long)slot * state_stride;
+    input += (unsigned long long)row * input_stride;
+    output += (unsigned long long)row * output_stride;
+    const unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= dim) return;
+    float* state = conv_state + (unsigned long long)ch * d_conv;
+    for (unsigned int i = 0; i < d_conv - 1; ++i) {
+        state[i] = state[i + 1];
+    }
+    state[d_conv - 1] = (float)input[ch];
+    const __nv_bfloat16* w = weight + (unsigned long long)ch * d_conv;
+    float acc = (bias != nullptr) ? bias[ch] : 0.0f;
+    for (unsigned int k = 0; k < d_conv; ++k) {
+        acc += state[k] * (float)w[k];
+    }
+    float sigmoid_acc = 1.0f / (1.0f + __expf(-acc));
+    float silu = acc * sigmoid_acc;
+    output[ch] = __float2bfloat16(silu);
 }
 
 // Ling-3.2-air NEXTN verify twin of kda_recurrent_bf16. The recurrence and

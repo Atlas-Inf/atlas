@@ -23,13 +23,46 @@
 //!   same as GLM-5's and V4's dedicated loaders. Deeper draft counts
 //!   (`verify_max_drafts`), the KDA slot pool and captured graphs remain
 //!   out of scope.
-//! * Slot-pool KDA decode (`ling_kda_recurrent_indexed` + the GLM
-//!   `SsmStatePool` multi-seq machinery). This driver uses the GLM bring-up
-//!   pattern instead: per-sequence `SsmLayerState` from `alloc_state` on the
-//!   non-pool path; wiring the pool kernels is the MTP/verify follow-up.
-//! * CUDA-graph decode: both layer kinds report `decode_graph_unsupported`
-//!   so the scheduler stays eager (correct before fast; the pool machinery
-//!   above is the prerequisite for capture).
+//! * Slot-pool KDA decode (the pool-indexed lane; see the next bullet).
+//! * Slot-pool KDA state addressing (this slice): sequences claim
+//!   `SsmStatePool` slots (`alloc_sequence_reset`, family-generic), and the
+//!   KDA decode path addresses the pool two ways. Multi-sequence decode of
+//!   2..=8 exact-width rows (single rank, no drafter —
+//!   `ssm_indexed_decode::ling_runtime_eligible`, default on,
+//!   `ATLAS_LING_KDA_INDEXED=0` disables) runs the pool-indexed lane:
+//!   `ling_kda_conv_indexed` + `ling_kda_recurrent_indexed` take the whole
+//!   batch and read each row's slot from the device slot-id stream
+//!   (`SsmBatchView`), so no per-sequence state pointer ever becomes a
+//!   kernel argument. Every other width falls back to the per-sequence
+//!   loop over the layers' pool-backed `SsmLayerState`s (the h/conv
+//!   pointers fixed at slot claim), which covers one-prefill/decode
+//!   harness states built by `alloc_state` as well. Padding rows never
+//!   touch KDA state (the fallback bounds by the active row count).
+//!
+//!   What a CUDA-graph decode capture can rely on (the graph slice picks
+//!   this up after this PR):
+//!    * All KDA state and verify-rollback regions — h, conv, snapshots,
+//!      checkpoints — live in the boot-time `SsmStatePool`; `alloc_state`
+//!      is only used by standalone harnesses and (dummy) padding rows, no
+//!      decode-step path allocates.
+//!    * The indexed lane's kernel arguments are all fixed addresses;
+//!      per-step variance is the i32 slot stream
+//!      (`ssm_indexed_decode::prepare_runtime` refreshes it before any
+//!      replay), exactly the contract GLM's captured multiseq graphs use.
+//!    * At n = 1 (the campaign's arm) and on ineligible widths the
+//!      per-seq lane keys a decoded graph by slot: all arguments of a
+//!      step are a pure function of (layer, slot), stable across the
+//!      sequence's life (`meta.rs`: no graph invalidation on claim).
+//!    * Verify (MTP) stays per-sequence eager: pool snapshots/checkpoints
+//!      attach at claim and no verify arm allocates, so the K=2 verify
+//!      forward is capturable later the same way.
+//!    * The ling lever is `ATLAS_LING_KDA_INDEXED` (default on) —
+//!      teacher forcing via env parity is unchanged on the single rank.
+//! * CUDA-graph decode: both layer kinds still report
+//!   `decode_graph_unsupported` so the scheduler stays eager (the KDA
+//!   half of the addressing prerequisite above is done; flipping the
+//!   veto is the graph slice's move, the gated-MLA half of the pool
+//!   addressing is separate).
 //! * Vision (the loader skips `model.visual.*` / `linear_proj.*`).
 //!
 //! Decode step sequence, per layer in plan order
@@ -63,7 +96,7 @@
 //!
 //! | module (file stem) | kernels used |
 //! |---|---|
-//! | `kda` | `kda_recurrent_bf16`, `kda_sigmoid_gated_rms_norm` |
+//! | `kda` | `kda_recurrent_bf16`, `kda_sigmoid_gated_rms_norm`, `kda_pack_qkv`, `ling_kda_conv_indexed`, `ling_kda_recurrent_indexed` |
 //! | `gated_mla` | `ling_mla_kv_a_norm_rope_cache`, `ling_mla_q_absorb_rope`, `ling_mla_paged_attn`, `ling_mla_v_extract_gated`, `ling_mla_prefill_attn` |
 //! | `moe_decode` | `ling_moe_route`, `ling_moe_gate_up_silu`, `ling_moe_down`, `ling_moe_shared_gate_up_r{1,4,8,16,32}`, `ling_moe_shared_down_r{1,4,8,16,32}`, `ling_moe_unpermute` |
 //! | `causal_conv1d` | `causal_conv1d_update`, `causal_conv1d_update_prefill` |
@@ -94,6 +127,10 @@ mod spec;
 #[cfg(test)]
 #[path = "bailing_c1/kda_parity_gpu_tests.rs"]
 mod kda_parity_gpu_tests;
+
+#[cfg(test)]
+#[path = "bailing_c1/kda_indexed_gpu_tests.rs"]
+mod kda_indexed_gpu_tests;
 
 pub(crate) use ffn::{LingDenseWeights, LingExpertTable, LingFfn, LingMoeWeights};
 pub(crate) use kda::{LingKdaLayer, LingKdaWeights};
