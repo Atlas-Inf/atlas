@@ -89,11 +89,13 @@ impl LingMtp {
         let body = ling_decoder::load_predictor_body(store, c, gpu)?;
         let blocks = max_seq_len.div_ceil(16) + 1;
         let max_meta_bytes = 256 + 4 * blocks;
-        let cache = PagedKvCache::new(
+        // The predictor's one MLA layer caches the same latent rows as the
+        // target's (`ling_mla::LATENT_ROW`), V aliasing K.
+        let cache = PagedKvCache::new_with_v_alias(
             KvCacheConfig {
                 block_size: 16,
-                num_kv_heads: c.num_attention_heads,
-                head_dim: c.qk_nope_head_dim + c.qk_rope_head_dim / c.num_attention_heads,
+                num_kv_heads: 1,
+                head_dim: super::ling_mla::LATENT_ROW,
                 num_layers: 1,
                 dtype: KvCacheDtype::Bf16,
                 layer_dtypes: vec![],
@@ -102,6 +104,7 @@ impl LingMtp {
             },
             blocks,
             gpu,
+            true,
         )?;
         let tile = super::ling_mla::MLA_TILE_ROWS;
         Ok(Self {

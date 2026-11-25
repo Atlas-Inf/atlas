@@ -39,7 +39,11 @@
 #define KERNEL_NAME inferspark_prefill_paged
 #define K_CACHE_TYPE const __nv_bfloat16* __restrict__
 #define V_CACHE_TYPE const __nv_bfloat16* __restrict__
+#ifdef KERNEL_EXTRA_PARAMS_OVERRIDE
+#define KERNEL_EXTRA_PARAMS KERNEL_EXTRA_PARAMS_OVERRIDE
+#else
 #define KERNEL_EXTRA_PARAMS , const float inv_sqrt_d
+#endif
 #define KERNEL_PREAMBLE /* nothing */
 
 #include "prefill_paged_compute.cuh"

@@ -675,13 +675,6 @@ pub fn build_model(
     let glm_cache_shape = glm::cache_shape(&config, kv_dtype, &layer_dtypes)?;
     let (kv_num_heads, kv_head_dim) = if let Some(shape) = glm_cache_shape {
         (shape.num_kv_heads(), shape.head_dim())
-    } else if config.model_type == "bailing_moe_v3_vl" {
-        // Ling's initial paged-attention implementation stores expanded keys and
-        // zero-pads the narrower values to the same cache stride.
-        (
-            config.num_attention_heads,
-            config.qk_nope_head_dim + config.qk_rope_head_dim,
-        )
     } else if config.kv_lora_rank > 0 {
         let mla_cache_dim = config.kv_lora_rank + config.qk_rope_head_dim;
         tracing::info!(
@@ -706,6 +699,9 @@ pub fn build_model(
         layer_dims: config.kv_layer_dims.clone(),
         cache_blocks_per_seq: hss_cache_blocks_per_seq,
     };
+    // Ling's MLA layers write one latent row per token and read it as both
+    // key and value (`layers::ling_mla`).
+    let ling_latent = config.model_type == "bailing_moe_v3_vl";
     let (sparse_index, tail_slots, glm_cache_plan) = glm::cache_plan(
         &config,
         &kv_config,
@@ -1022,9 +1018,10 @@ pub fn build_model(
     let derived_reserve = crate::layers::ops::lazy_bf16_reserve(&store);
     // NVMe spill tiers (default off → 0): their staging, the index of a full
     // disk budget and the SSM tier's arena are all committed after this point.
+    let v_aliases_k = glm_cache_plan.is_some() || ling_latent;
     let nvme_geometry = PagedKvCache::nvme_geometry_for(
         &kv_config,
-        glm_cache_plan.is_some(),
+        v_aliases_k,
         sparse_index,
         glm_cache_plan.and_then(|p| p.shard()).map(|s| s.world),
     );
@@ -1155,7 +1152,12 @@ pub fn build_model(
             }
             let n = match joint_glm_plan {
                 Some(plan) => plan.num_blocks_for_budget(kv_budget),
-                None => kv_budget::blocks_with_aux(&kv_config, kv_budget, aux_bytes_per_token)?,
+                None => kv_budget::blocks_with_aux(
+                    &kv_config,
+                    kv_budget,
+                    aux_bytes_per_token,
+                    v_aliases_k,
+                )?,
             };
             let max_kv_tokens = n * kv_block_size;
             let lazy_bf16_term = if derived_reserve > 0 {
@@ -1193,7 +1195,7 @@ pub fn build_model(
     // Under a latent shard it holds this rank's half-size latent pools.
     let kv_shape = kv_carveout::KvShape {
         config: &kv_config,
-        v_aliases_k: glm_cache_plan.is_some(),
+        v_aliases_k,
         index: sparse_index,
         tail_slots,
         latent_shard: glm_cache_plan.and_then(|p| p.shard()),

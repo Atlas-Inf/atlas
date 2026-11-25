@@ -14,7 +14,7 @@ use crate::layers::ling_kda::{
     LingKdaPrefillScratch, LingKdaScratch, LingKdaState,
 };
 use crate::layers::ling_mla::{
-    LingMlaConfig, LingMlaKernels, LingMlaScratch, LingMlaWeights, MLA_TILE_ROWS,
+    LingLatentScratch, LingMlaConfig, LingMlaKernels, LingMlaScratch, LingMlaWeights, MLA_TILE_ROWS,
 };
 use crate::layers::ling_projection::{LingProjection, LingProjectionScratch};
 use crate::layers::ops;
@@ -276,26 +276,20 @@ impl LingDecoderLayer {
         projection: LingProjectionScratch,
     ) -> Result<LingMlaScratch> {
         let bf16 = |elements: usize| gpu.alloc(MLA_TILE_ROWS * elements * 2);
-        let qk = config.qk_head_dim();
-        let q = config.q_proj_rows();
-        let kv_a = config.kv_lora_rank + config.qk_rope_head_dim;
-        let kv_b = config.kv_b_rows();
+        let padded = config.num_heads * config.qk_head_dim();
         let compact_v = config.num_heads * config.v_head_dim;
-        let padded = config.num_heads * qk;
         Ok(LingMlaScratch {
             projection,
-            q_full: bf16(q)?,
-            kv_a: bf16(kv_a)?,
+            q_full: bf16(config.q_proj_rows())?,
+            kv_a: bf16(config.kv_lora_rank + config.qk_rope_head_dim)?,
             kv_norm: bf16(config.kv_lora_rank)?,
             q_rope: bf16(config.num_heads * config.qk_rope_head_dim)?,
             k_rope: bf16(config.qk_rope_head_dim)?,
-            kv_b: bf16(kv_b)?,
-            k_token: bf16(padded)?,
-            v_compact: bf16(compact_v)?,
             attn_padded: bf16(padded)?,
             attn_compact: bf16(compact_v)?,
             attn_gated: bf16(compact_v)?,
             gate: bf16(config.num_heads)?,
+            latent: LingLatentScratch::shared(gpu)?,
         })
     }
 

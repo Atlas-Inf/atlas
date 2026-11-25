@@ -91,7 +91,10 @@ impl LingProjection {
         );
         let format = match w.dtype {
             WeightDtype::BF16 => {
+                // kv_b_proj never runs at decode: MLA absorbs it into the
+                // query and value sides of the latent cache (`ling_mla`).
                 let pack_attention = name.contains(".attention.")
+                    && !name.ends_with(".kv_b_proj")
                     && std::env::var("ATLAS_LING_NVFP4_DECODE").as_deref() == Ok("1");
                 let pack_mlp = name.contains(".mlp.")
                     && std::env::var("ATLAS_LING_NVFP4_MLP_DECODE").as_deref() == Ok("1");
@@ -158,6 +161,22 @@ impl LingProjection {
             n: rows.try_into()?,
             k: cols.try_into()?,
         })
+    }
+
+    /// The weight as BF16 `[n, k]`: the checkpoint's own tensor, or for an
+    /// FP8 checkpoint a block-dequantized copy that lives as long as the model.
+    pub fn bf16_weight(
+        &self,
+        gpu: &dyn GpuBackend,
+        store: &WeightStore,
+        name: &str,
+    ) -> Result<DevicePtr> {
+        match self.format {
+            Format::Bf16 { .. } => Ok(self.weight),
+            Format::Fp8 { .. } => {
+                Ok(crate::weight_map::dequant_fp8_blockscaled_to_bf16(store, name, gpu)?.weight)
+            }
+        }
     }
 
     pub fn forward(

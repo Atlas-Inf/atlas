@@ -1184,6 +1184,25 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
             il1=(lv1>0)?(1.f/lv1):0;
         }
 
+#ifdef PREFILL_PARTIAL_LSE
+        // Key-tiled callers (Ling's latent MLA): FP32 normalized output and
+        // each row's softmax (max, sum), merged across tiles by the caller.
+        // Warps 0 and 1 own the row statistics and column 0 of their rows.
+        float* ob=(float*)O+q_head*head_dim;
+        #pragma unroll
+        for(int nt=0;nt<N_TILES_PER_WARP;nt++){
+            unsigned int c0=(pv_n_start+nt)*8+tid_in_group*2;
+            unsigned int gr0=q_start+r0, gr1=q_start+r1;
+            if(gr0<q_len&&r0<q_tile_len&&c0<head_dim){
+                *(float2*)&ob[gr0*q_seq_stride+c0]=make_float2(acc_o[nt][0]*il0,acc_o[nt][1]*il0);
+                if(c0==0){ prefill_ml[(gr0*num_q_heads+q_head)*2]=m_r0; prefill_ml[(gr0*num_q_heads+q_head)*2+1]=l_r0; }
+            }
+            if(gr1<q_len&&r1<q_tile_len&&c0<head_dim){
+                *(float2*)&ob[gr1*q_seq_stride+c0]=make_float2(acc_o[nt][2]*il1,acc_o[nt][3]*il1);
+                if(c0==0){ prefill_ml[(gr1*num_q_heads+q_head)*2]=m_r1; prefill_ml[(gr1*num_q_heads+q_head)*2+1]=l_r1; }
+            }
+        }
+#else
 #ifdef PREFILL_BATCHED
         __nv_bfloat16* ob=O+q_batch_off+q_head*head_dim;
 #else
@@ -1204,5 +1223,6 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
                 *(unsigned int*)&ob[gr1*q_seq_stride+c0]=lo|(hi<<16);
             }
         }
+#endif
     }
 }

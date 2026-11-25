@@ -152,15 +152,6 @@ pub(crate) fn load_weight_store(
                 }
             }
             loader.defer_ling_experts = ling;
-            if config.model_type == "bailing_moe_v3_vl"
-                && config
-                    .quantization_config
-                    .as_ref()
-                    .is_some_and(|q| q.quant_method == "compressed-tensors")
-                && std::env::var("ATLAS_LING_LONG_KV").as_deref() == Ok("1")
-            {
-                loader.ling_packed_page_start = Some(24);
-            }
             loader.peak_memory_multiplier = mult;
             loader.expert_tp = config.expert_tp;
             loader.demand_paged_patterns = demand_paged_patterns(config);

@@ -23,12 +23,17 @@ fn aux_state_is_charged_per_pool_token() {
     };
     let budget = gib(12.5);
     let plain = PagedKvCache::compute_num_blocks(&kv, budget).unwrap();
-    assert_eq!(blocks_with_aux(&kv, budget, 0).unwrap(), plain);
-    let with_qsa = blocks_with_aux(&kv, budget, 12 * 64).unwrap();
+    assert_eq!(blocks_with_aux(&kv, budget, 0, false).unwrap(), plain);
+    let with_qsa = blocks_with_aux(&kv, budget, 12 * 64, false).unwrap();
     assert_eq!(with_qsa, budget / (16 * (12 * 1024 + 12 * 64)));
     assert!(
         with_qsa * 16 >= 1_000_000,
         "12.5 GiB holds 1M tokens and their QSA keys"
+    );
+    // A latent pool whose V aliases K holds twice the tokens.
+    assert_eq!(
+        blocks_with_aux(&kv, budget, 0, true).unwrap(),
+        budget / (16 * 12 * 512)
     );
 }
 
