@@ -159,15 +159,11 @@ pub(crate) fn prefill_attn(
     );
     let q_len = u32_of(a.q_len, "q_len")?;
     let kv_heads = u32_of(a.kv_heads, "kv heads")?;
-    // AMD (strix-hip): `inkling2_flash_prefill` is mma.sync / cp.async PTX and builds as a
-    // stub there; every row count takes the per-head body below.
-    if !cfg!(atlas_scale)
-        && a.q_len >= FLASH_MIN_ROWS
-        && a.heads == FLASH_GROUP * a.kv_heads
-        && a.d_rel == FLASH_D_REL
-    {
-        // a prefill chunk: one CTA per (KV head, 64 tokens) shares each K/V tile
-        // with the group's query heads, computing the bias where it adds it
+    // a prefill chunk: one CTA per (KV head, 64 tokens) shares each K/V tile
+    // with the group's query heads — wave32 WMMA on strix-hip, mma.sync on gb10.
+    if a.q_len >= FLASH_MIN_ROWS && a.heads == FLASH_GROUP * a.kv_heads && a.d_rel == FLASH_D_REL {
+        // computing the relative bias where it is added; the per-row kernel's
+        // q_len x heads x rel_extent table is never materialised
         return KernelLaunch::new(gpu, k.flash_prefill)
             .grid([kv_heads, q_len.div_ceil(64), 1])
             .block([384, 1, 1])
