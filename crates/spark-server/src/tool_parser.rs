@@ -399,6 +399,7 @@ pub enum ToolCallFormat {
     BareJson,
     PoolsideV1,
     Hy4,
+    Ling3,
 }
 
 #[path = "tool_parser/tail.rs"]

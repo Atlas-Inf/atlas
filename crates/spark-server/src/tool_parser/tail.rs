@@ -16,8 +16,9 @@ impl std::str::FromStr for ToolCallFormat {
             "bare_json" => Ok(Self::BareJson),
             "poolside_v1" => Ok(Self::PoolsideV1),
             "hy4" => Ok(Self::Hy4),
+            "ling3" => Ok(Self::Ling3),
             other => Err(format!(
-                "Unknown tool call parser '{other}'. Supported: hermes, qwen3_coder, qwen3_xml, gemma4, mistral, minimax_xml, deepseek_v4, bare_json, poolside_v1, hy4",
+                "Unknown tool call parser '{other}'. Supported: hermes, qwen3_coder, qwen3_xml, gemma4, mistral, minimax_xml, deepseek_v4, bare_json, poolside_v1, hy4, ling3",
             )),
         }
     }
@@ -37,6 +38,7 @@ impl ToolCallFormat {
             Self::BareJson => Box::new(BareJsonParser),
             Self::PoolsideV1 => Box::new(PoolsideV1Parser),
             Self::Hy4 => Box::new(hy4::Hy4Parser),
+            Self::Ling3 => Box::new(ling3::Ling3Parser),
         }
     }
 
@@ -66,6 +68,7 @@ impl ToolCallFormat {
             Self::BareJson => "bare_json",
             Self::PoolsideV1 => "poolside_v1",
             Self::Hy4 => "hy4",
+            Self::Ling3 => "ling3",
         }
     }
 }
@@ -81,6 +84,7 @@ mod helpers_a;
 mod helpers_b;
 mod hermes;
 mod hy4;
+mod ling3;
 mod minimax_xml;
 mod mistral;
 mod parse_dispatch;
@@ -107,6 +111,7 @@ use helpers_a::*;
 use helpers_b::*;
 pub use hermes::*;
 pub use minimax_xml::*;
+pub use ling3::*;
 pub use mistral::*;
 pub use parse_dispatch::*;
 use parse_single_a::*;

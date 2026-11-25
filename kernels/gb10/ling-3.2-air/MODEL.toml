@@ -147,6 +147,12 @@ thinking_in_tools = true
 # default: the template's tool-call render iterates `_args.items()`
 # (the MiniMax-style minijinja gap jinja-templates/ exists for).
 jinja_template = "ling-3.2-air"
+# Native tool-call format, SGLang parity: the campaign brief records the
+# prior SGLang deployment serving Ling-3.2-air with --tool-call-parser
+# ling3 (reasoning + tool parsers). ling3 is the GLM-4.5 XML tag layout
+# with NEWLINE separators (the template renders multi-turn assistant
+# calls exactly this way), implemented in spark-server tool_parser/ling3.rs.
+tool_call_parser = "ling3"
 # vLLM-parity reasoning policy, as glm-5.3-flash and qwen3.8-flash-next
 # serve theirs: no server thinking budget unless the client sends one, no
 # 90% cap, no confidence early stop, and both repetition guards off.
