@@ -660,3 +660,7 @@ impl TransformerLayer for LingMlaLayer {
         Some(self)
     }
 }
+
+#[cfg(test)]
+#[path = "mla_gpu_parity_tests.rs"]
+mod mla_gpu_parity_tests;

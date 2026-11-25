@@ -173,8 +173,6 @@ impl LingSpec {
             routed_swiglu,
             shared_swiglu,
         } = spec_params(&bailing);
-        let n_group = n_group;
-        let topk_group = topk_group;
         let dense_prefix = config
             .mlp_only_layers
             .iter()
