@@ -21,6 +21,8 @@
 // tile with the paged prefill kernel, and merge tiles by their softmax state.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <math_constants.h>
 
 #define LING_HEADS 32u
@@ -114,6 +116,108 @@ extern "C" __global__ void __launch_bounds__(256) ling_q_absorb(
             q_abs[((r0 + r) * LING_HEADS + h) * LING_ROW + LING_LATENT + j] =
                 q_full[((r0 + r) * LING_HEADS + h) * LING_QK + LING_NOPE + j];
         }
+}
+
+// ---- NVFP4 absorption (Spark decode precision) -------------------------------
+//
+// Under NVFP4 decode precision the two halves of kv_b_proj are also kept as
+// NVFP4 (`quantize_bf16_to_nvfp4`: groups of 16 along the reduction, E4M3
+// group scales, one FP32 scale per matrix, low nibble first): the key half as
+// kb_t [32 * 512][128], the value half [32 * 128][512]. The kernels mirror the
+// BF16 ones (one warp per output row, coalesced, a fixed shuffle order); the
+// E2M1 table sits in shared memory because per-thread nibbles would serialize
+// constant memory.
+
+__device__ __constant__ float LING_E2M1[16] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
+                                               -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+
+__device__ __forceinline__ float ling_e4m3(unsigned char b) {
+    return __half2float(__nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(b), __NV_E4M3));
+}
+
+// grid (32 * 512 / 128, ceil(rows / 8)), block 128: thread t owns latent
+// output row h * 512 + c and reduces its 128 query channels in order.
+extern "C" __global__ void __launch_bounds__(128) ling_q_absorb_nvfp4(
+    const __nv_bfloat16* __restrict__ q_full,    // [rows][32][192], rope rotated
+    const unsigned char* __restrict__ packed,    // [32 * 512][64]
+    const unsigned char* __restrict__ scales,    // [32 * 512][8]
+    const float scale2,
+    __nv_bfloat16* __restrict__ q_abs,           // [rows][32][576]
+    const unsigned rows) {
+    const unsigned row = blockIdx.x * blockDim.x + threadIdx.x;  // h * 512 + c
+    const unsigned h = row / LING_LATENT, c = row % LING_LATENT, r0 = blockIdx.y * ABSORB_ROWS;
+    const unsigned n = min(ABSORB_ROWS, rows - r0);
+    __shared__ float q[ABSORB_ROWS][LING_NOPE];
+    __shared__ float lut[16];  // per-thread nibbles: constant memory would serialize
+    if (threadIdx.x < 16) lut[threadIdx.x] = LING_E2M1[threadIdx.x];
+    for (unsigned i = threadIdx.x; i < n * LING_NOPE; i += blockDim.x)
+        q[i / LING_NOPE][i % LING_NOPE] =
+            __bfloat162float(q_full[((r0 + i / LING_NOPE) * LING_HEADS + h) * LING_QK + i % LING_NOPE]);
+    const uint4* src = reinterpret_cast<const uint4*>(packed + static_cast<size_t>(row) * 64);
+    const uint4 w4[4] = {src[0], src[1], src[2], src[3]};
+    const uint2 sc = *reinterpret_cast<const uint2*>(scales + static_cast<size_t>(row) * 8);
+    __syncthreads();
+    float w[LING_NOPE];
+#pragma unroll
+    for (unsigned g = 0; g < 8; ++g) {
+        const float s = ling_e4m3(static_cast<unsigned char>((g < 4 ? sc.x : sc.y) >> (8 * (g % 4)))) * scale2;
+        const unsigned words[2] = {g % 2 ? w4[g / 2].z : w4[g / 2].x, g % 2 ? w4[g / 2].w : w4[g / 2].y};
+#pragma unroll
+        for (unsigned j = 0; j < 16; ++j) w[g * 16 + j] = lut[(words[j / 8] >> (4 * (j % 8))) & 0xf] * s;
+    }
+    for (unsigned r = 0; r < n; ++r) {
+        float acc = 0.f;
+#pragma unroll
+        for (unsigned d = 0; d < LING_NOPE; ++d) acc += q[r][d] * w[d];
+        __nv_bfloat16* out = q_abs + ((r0 + r) * LING_HEADS + h) * LING_ROW;
+        out[c] = __float2bfloat16(acc);
+        if (c < LING_ROPE) out[LING_LATENT + c] = q_full[((r0 + r) * LING_HEADS + h) * LING_QK + LING_NOPE + c];
+    }
+}
+
+// grid (32 * 128 / 16, ceil(rows / 8)), block 256: as ling_v_up; lane l
+// reads the eight bytes holding latent channels 16l .. 16l + 15 (group l).
+extern "C" __global__ void __launch_bounds__(256) ling_v_up_nvfp4(
+    const __nv_bfloat16* __restrict__ latent,    // [rows][32][512]
+    const unsigned char* __restrict__ packed,    // [32 * 128][256]
+    const unsigned char* __restrict__ scales,    // [32 * 128][32]
+    const float scale2,
+    __nv_bfloat16* __restrict__ out,             // [rows][32 * 128]
+    const unsigned rows) {
+    const unsigned base = blockIdx.x * 16, h = base / LING_V, r0 = blockIdx.y * ABSORB_ROWS;
+    const unsigned n = min(ABSORB_ROWS, rows - r0);
+    const unsigned warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    __shared__ float lat[ABSORB_ROWS][LING_LATENT];
+    __shared__ float lut[16];
+    if (threadIdx.x < 16) lut[threadIdx.x] = LING_E2M1[threadIdx.x];
+    for (unsigned i = threadIdx.x; i < n * LING_LATENT; i += blockDim.x)
+        lat[i / LING_LATENT][i % LING_LATENT] =
+            __bfloat162float(latent[((r0 + i / LING_LATENT) * LING_HEADS + h) * LING_LATENT + i % LING_LATENT]);
+    __syncthreads();
+    for (unsigned i = 0; i < 2; ++i) {
+        const unsigned row = base + warp * 2 + i, v = row % LING_V;
+        const uint2 word = reinterpret_cast<const uint2*>(packed + static_cast<size_t>(row) * 256)[lane];
+        const float s = ling_e4m3(scales[static_cast<size_t>(row) * 32 + lane]) * scale2;
+        float w[16];
+#pragma unroll
+        for (unsigned j = 0; j < 8; ++j) {
+            w[j] = lut[(word.x >> (4 * j)) & 0xf] * s;
+            w[8 + j] = lut[(word.y >> (4 * j)) & 0xf] * s;
+        }
+#pragma unroll
+        for (unsigned r = 0; r < ABSORB_ROWS; ++r) {
+            if (r >= n) break;
+            float acc = 0.f;
+#pragma unroll
+            for (unsigned j = 0; j < 16; ++j) acc += w[j] * lat[r][16 * lane + j];
+            acc += __shfl_xor_sync(0xffffffffu, acc, 16);
+            acc += __shfl_xor_sync(0xffffffffu, acc, 8);
+            acc += __shfl_xor_sync(0xffffffffu, acc, 4);
+            acc += __shfl_xor_sync(0xffffffffu, acc, 2);
+            acc += __shfl_xor_sync(0xffffffffu, acc, 1);
+            if (lane == 0) out[(r0 + r) * LING_HEADS * LING_V + h * LING_V + v] = __float2bfloat16(acc);
+        }
+    }
 }
 
 // ---- Absorbed paged decode ----------------------------------------------------

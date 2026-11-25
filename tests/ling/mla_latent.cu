@@ -138,6 +138,78 @@ int main() {
     std::printf("decode rows one at a time vs together: %s\n", same ? "identical" : "DIFFER");
     ok &= same;
 
+    // ---- NVFP4 absorption: kernels against the dequantized weights ----
+    {
+        // CPU NVFP4 in Atlas's layout: groups of 16 along K, E4M3 group scales,
+        // one FP32 scale per matrix, low nibble first.
+        const float lut[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+        auto pack = [&](const std::vector<float>& w, int n, int k, unsigned char* data, unsigned char* sc,
+                        std::vector<float>& deq) {
+            float top = 0;
+            for (float v : w) top = std::max(top, std::abs(v));
+            const float s2 = top / (6.f * 448.f);
+            deq.assign(w.size(), 0.f);
+            for (int r = 0; r < n; ++r)
+                for (int g = 0; g < k / 16; ++g) {
+                    float gm = 0;
+                    for (int i = 0; i < 16; ++i) gm = std::max(gm, std::abs(w[r * k + g * 16 + i]));
+                    const __nv_fp8_storage_t e = __nv_cvt_float_to_fp8(gm / 6.f / s2, __NV_SATFINITE, __NV_E4M3);
+                    sc[r * (k / 16) + g] = e;
+                    const float es = __half2float(__nv_cvt_fp8_to_halfraw(e, __NV_E4M3)) * s2;
+                    for (int i = 0; i < 16; ++i) {
+                        const float v = w[r * k + g * 16 + i] / (es > 0 ? es : 1.f);
+                        int best = 0;
+                        for (int j = 1; j < 8; ++j) if (std::abs(std::abs(v) - lut[j]) < std::abs(std::abs(v) - lut[best])) best = j;
+                        const int nib = best | (v < 0 ? 8 : 0);
+                        deq[r * k + g * 16 + i] = (v < 0 ? -lut[best] : lut[best]) * es;
+                        const int at = r * (k / 2) + (g * 16 + i) / 2;
+                        data[at] = (i % 2) ? (data[at] | (nib << 4)) : nib;
+                    }
+                }
+            return s2;
+        };
+        std::vector<float> kt(H * R * N), vb(H * 128 * R), kd, vd;
+        for (int h = 0; h < H; ++h)
+            for (int c = 0; c < R; ++c)
+                for (int d = 0; d < N; ++d) kt[(h * R + c) * N + d] = m.w[(h * 256 + d) * R + c];
+        for (int h = 0; h < H; ++h)
+            for (int v = 0; v < 128; ++v)
+                for (int c = 0; c < R; ++c) vb[(h * 128 + v) * R + c] = m.w[(h * 256 + 128 + v) * R + c];
+        auto kp = allocate<unsigned char>(kt.size() / 2), ks = allocate<unsigned char>(kt.size() / 16);
+        auto vp = allocate<unsigned char>(vb.size() / 2), vs = allocate<unsigned char>(vb.size() / 16);
+        const float k2 = pack(kt, H * R, N, kp, ks, kd), v2 = pack(vb, H * 128, R, vp, vs, vd);
+        auto qa = allocate<__nv_bfloat16>(rows * H * ROW), qa1 = allocate<__nv_bfloat16>(H * ROW);
+        auto vo = allocate<__nv_bfloat16>(rows * H * 128), vo1 = allocate<__nv_bfloat16>(H * 128);
+        ling_q_absorb_nvfp4<<<dim3(H * R / 128, 1), 128>>>(q, kp, ks, k2, qa, rows);
+        ling_q_absorb_nvfp4<<<dim3(H * R / 128, 1), 128>>>(q + 2 * H * 192, kp, ks, k2, qa1, 1);
+        ling_v_up_nvfp4<<<dim3(H * 128 / 16, 1), 256>>>(latent, vp, vs, v2, vo, rows);
+        ling_v_up_nvfp4<<<dim3(H * 128 / 16, 1), 256>>>(latent + 2 * H * R, vp, vs, v2, vo1, 1);
+        check(cudaDeviceSynchronize());
+        float qw = 0, qp = 0, vw = 0, vpk = 0;
+        for (int r = 0; r < rows; ++r)
+            for (int h = 0; h < H; ++h) {
+                for (int c = 0; c < R; ++c) {
+                    double ref = 0;
+                    for (int d = 0; d < N; ++d) ref += f(q[(r * H + h) * 192 + d]) * kd[(h * R + c) * N + d];
+                    qw = std::max(qw, float(std::abs(f(qa[(r * H + h) * ROW + c]) - ref)));
+                    qp = std::max(qp, float(std::abs(ref)));
+                }
+                for (int v = 0; v < 128; ++v) {
+                    double ref = 0;
+                    for (int c = 0; c < R; ++c) ref += f(latent[(r * H + h) * R + c]) * vd[(h * 128 + v) * R + c];
+                    vw = std::max(vw, float(std::abs(f(vo[(r * H + h) * 128 + v]) - ref)));
+                    vpk = std::max(vpk, float(std::abs(ref)));
+                }
+            }
+        const bool alone = std::equal(qa1, qa1 + H * ROW, qa + 2 * H * ROW,
+                               [](__nv_bfloat16 a, __nv_bfloat16 b) { return __bfloat16_as_ushort(a) == __bfloat16_as_ushort(b); }) &&
+                           std::equal(vo1, vo1 + H * 128, vo + 2 * H * 128,
+                               [](__nv_bfloat16 a, __nv_bfloat16 b) { return __bfloat16_as_ushort(a) == __bfloat16_as_ushort(b); });
+        std::printf("nvfp4 absorb: query worst %.6g of %.6g, value worst %.6g of %.6g, one row vs four %s\n",
+                    qw, qp, vw, vpk, alone ? "identical" : "DIFFER");
+        ok &= qw <= 0.01f * qp && vw <= 0.01f * vpk && alone;
+    }
+
     // ---- 3: a prompt tile over two key tiles ----
     const int offset = 700, prompt = 100, total = offset + prompt, split = 512;
     auto k_rows = allocate<__nv_bfloat16>(size_t(total) * EXP);

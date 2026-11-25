@@ -17,7 +17,7 @@ use spark_runtime::weights::{WeightDtype, WeightStore};
 use crate::layer::AttnMetadataDev;
 use crate::layers::ling_projection::{LingProjection, LingProjectionScratch};
 use crate::layers::ops;
-use crate::weight_map::DenseWeight;
+use crate::weight_map::{DenseWeight, QuantizedWeight, quantize_to_nvfp4};
 
 /// Current Ling 3.2 air MLA geometry.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -101,6 +101,11 @@ pub struct LingMlaWeights {
     /// The key half of `kv_b_bf16` transposed to `[heads * 512, 128]`, so each
     /// absorbed query row is one contiguous read (`ling_kb_transpose`).
     pub kb_t: DevicePtr,
+    /// Under NVFP4 decode precision (`ATLAS_LING_NVFP4_DECODE=1`), the key half
+    /// (as `kb_t`) and the value half `[heads * 128, 512]` as NVFP4; `kb_t` is
+    /// then released. Against vLLM on the same weights the decode-path
+    /// distributions match BF16 absorption and 0.1.0 within error.
+    pub absorb_nvfp4: Option<(QuantizedWeight, QuantizedWeight)>,
     /// Device table [qk_rope_head_dim / 2] for the interleaved RoPE kernel.
     pub rope_inv_freq: DevicePtr,
 }
@@ -145,6 +150,14 @@ impl LingMlaWeights {
             .arg_ptr(kv_b_bf16)
             .arg_ptr(kb_t)
             .launch(gpu.default_stream())?;
+        let (kb_t, absorb_nvfp4) = if std::env::var("ATLAS_LING_NVFP4_DECODE").as_deref() == Ok("1")
+        {
+            let packed = absorb_nvfp4(gpu, kv_b_bf16, kb_t)?;
+            gpu.free(kb_t)?;
+            (DevicePtr::NULL, Some(packed))
+        } else {
+            (kb_t, None)
+        };
         Ok(Self {
             q_proj: LingProjection::load(gpu, store, &format!("{prefix}.q_proj"), q, h)?,
             kv_a_proj_with_mqa: LingProjection::load(
@@ -158,6 +171,7 @@ impl LingMlaWeights {
             kv_b_proj,
             kv_b_bf16,
             kb_t,
+            absorb_nvfp4,
             g_proj: LingProjection::load(
                 gpu,
                 store,
@@ -175,6 +189,47 @@ impl LingMlaWeights {
             rope_inv_freq,
         })
     }
+}
+
+/// The NVFP4 copies of kv_b_proj's two halves the absorbed decode reads under
+/// NVFP4 decode precision, quantized like every Ling NVFP4 decode projection.
+fn absorb_nvfp4(
+    gpu: &dyn GpuBackend,
+    kv_b: DevicePtr,
+    key: DevicePtr,
+) -> Result<(QuantizedWeight, QuantizedWeight)> {
+    let (heads, latent, half) = (32usize, 512usize, 128usize);
+    let stream = gpu.default_stream();
+    let absmax = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
+    let quantize = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
+    let value = gpu.alloc(heads * half * latent * 2)?;
+    gpu.copy_d2d_2d_async(
+        kv_b.offset(half * latent * 2),
+        2 * half * latent * 2,
+        value,
+        half * latent * 2,
+        half * latent * 2,
+        heads,
+        stream,
+    )?;
+    let pack = |weight, rows, cols| {
+        quantize_to_nvfp4(
+            &DenseWeight { weight },
+            rows,
+            cols,
+            gpu,
+            absmax,
+            quantize,
+            stream,
+        )
+    };
+    let packed = (
+        pack(key, heads * latent, half)?,
+        pack(value, heads * half, latent)?,
+    );
+    gpu.synchronize(stream)?;
+    gpu.free(value)?;
+    Ok(packed)
 }
 
 /// Maximum rows per MLA projection tile. Decode uses the first row.
@@ -348,6 +403,8 @@ pub struct LingMlaKernels {
     pub q_rope_writeback: KernelHandle,
     pub cache_write: KernelHandle,
     pub q_absorb: KernelHandle,
+    pub q_absorb_nvfp4: KernelHandle,
+    pub v_up_nvfp4: KernelHandle,
     pub decode: KernelHandle,
     pub decode_merge: KernelHandle,
     pub v_up: KernelHandle,
@@ -370,6 +427,8 @@ impl LingMlaKernels {
             q_rope_writeback: gpu.kernel("mla_absorbed", "mla_q_rope_writeback_batched")?,
             cache_write: latent("ling_latent_cache_write")?,
             q_absorb: latent("ling_q_absorb")?,
+            q_absorb_nvfp4: latent("ling_q_absorb_nvfp4")?,
+            v_up_nvfp4: latent("ling_v_up_nvfp4")?,
             decode: latent("ling_latent_decode")?,
             decode_merge: latent("ling_latent_decode_merge")?,
             v_up: latent("ling_v_up")?,
@@ -676,14 +735,23 @@ impl LingMlaWeights {
         stream: u64,
     ) -> Result<()> {
         let l = scratch.latent;
-        KernelLaunch::new(gpu, kernels.q_absorb)
-            .grid([32 * 512 / 64, rows.div_ceil(8), 1])
-            .block([256, 1, 1])
-            .arg_ptr(scratch.q_full)
-            .arg_ptr(self.kb_t)
-            .arg_ptr(l.q_abs)
-            .arg_u32(rows)
-            .launch(stream)?;
+        match &self.absorb_nvfp4 {
+            Some((key, _)) => KernelLaunch::new(gpu, kernels.q_absorb_nvfp4)
+                .grid([32 * 512 / 128, rows.div_ceil(8), 1])
+                .block([128, 1, 1])
+                .arg_ptr(scratch.q_full)
+                .arg_ptr(key.weight)
+                .arg_ptr(key.weight_scale)
+                .arg_f32(key.weight_scale_2),
+            None => KernelLaunch::new(gpu, kernels.q_absorb)
+                .grid([32 * 512 / 64, rows.div_ceil(8), 1])
+                .block([256, 1, 1])
+                .arg_ptr(scratch.q_full)
+                .arg_ptr(self.kb_t),
+        }
+        .arg_ptr(l.q_abs)
+        .arg_u32(rows)
+        .launch(stream)?;
         let stride = if metadata.num_seqs == 1 {
             0
         } else {
@@ -716,14 +784,22 @@ impl LingMlaWeights {
                 .arg_ptr(l.latent_out.offset(at * 32 * 512 * 2))
                 .launch(stream)?;
         }
-        KernelLaunch::new(gpu, kernels.v_up)
-            .grid([32 * 128 / 16, rows.div_ceil(8), 1])
-            .block([256, 1, 1])
-            .arg_ptr(l.latent_out)
-            .arg_ptr(self.kv_b_bf16)
-            .arg_ptr(scratch.attn_compact)
-            .arg_u32(rows)
-            .launch(stream)
+        let launch = |kernel| {
+            KernelLaunch::new(gpu, kernel)
+                .grid([32 * 128 / 16, rows.div_ceil(8), 1])
+                .block([256, 1, 1])
+                .arg_ptr(l.latent_out)
+        };
+        match &self.absorb_nvfp4 {
+            Some((_, value)) => launch(kernels.v_up_nvfp4)
+                .arg_ptr(value.weight)
+                .arg_ptr(value.weight_scale)
+                .arg_f32(value.weight_scale_2),
+            None => launch(kernels.v_up).arg_ptr(self.kv_b_bf16),
+        }
+        .arg_ptr(scratch.attn_compact)
+        .arg_u32(rows)
+        .launch(stream)
     }
 
     /// A prompt tile at `offset` attends keys [0, offset + rows). Keys are
