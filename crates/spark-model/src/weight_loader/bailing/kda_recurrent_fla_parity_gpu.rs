@@ -41,6 +41,8 @@
 //! serial rows=1 launches (the decode path) AND one rows=5 launch (the
 //! prefill path's internal loop), which must agree bit-exactly.
 
+use std::sync::Arc;
+
 use anyhow::{Result, ensure};
 use atlas_core::config::parse_config;
 use atlas_core::numeric::f32_to_bf16;
@@ -442,5 +444,5 @@ fn head_cos(got: &[f32], want: &[f64]) -> f32 {
         ng += (*g as f64) * (*g as f64);
         nw += w * w;
     }
-    1.0 - dot / (ng.sqrt() * nw.sqrt() + 1e-30) as f32
+    (1.0 - dot / (ng.sqrt() * nw.sqrt() + 1e-30)) as f32
 }
