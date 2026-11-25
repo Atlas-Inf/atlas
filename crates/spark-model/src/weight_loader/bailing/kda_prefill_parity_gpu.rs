@@ -385,9 +385,7 @@ fn cmp_stage(name: &str, got: &[f32], want: &[f32]) -> (usize, usize) {
         if (g - w).abs() > (tol * scale).max(5e-3 * rms) {
             bad += 1;
         }
-        if !state {
-            worst.push(((g - w).abs() / scale, i, *w));
-        }
+        worst.push(((g - w).abs() / scale, i, *w));
     }
     worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
     for (rel, i, w) in worst.iter().take(8) {
