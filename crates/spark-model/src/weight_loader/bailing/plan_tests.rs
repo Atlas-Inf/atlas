@@ -160,10 +160,16 @@ fn a_missing_expert_member_fails_the_layer_plan() {
 
 #[test]
 fn a_missing_attention_tensor_fails_the_layer_plan() {
-    let missing = "model.layers.0.attention.A_log";
+    // The KDA signature (names.rs) is either A_log OR dt_bias: removing a
+    // single stem still classifies the layer as KDA. Remove both to reach
+    // the "neither KDA nor MLA" arm.
+    let missing = [
+        "model.layers.0.attention.A_log",
+        "model.layers.0.attention.dt_bias",
+    ];
     let mut map: HashMap<String, WeightTensor> = HashMap::new();
     for name in ling_store().names() {
-        if name == missing {
+        if missing.contains(&name) {
             continue;
         }
         map.insert(
