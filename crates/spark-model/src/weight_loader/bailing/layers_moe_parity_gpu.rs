@@ -1010,14 +1010,14 @@ fn compare_stages(
                     nib_diff += usize::from(g0 != p0) + usize::from(g1 != p1);
                     mirror_diff += usize::from(g0 != m0) + usize::from(g1 != m1);
                     // TRUE dequant of the GPU bytes vs the pre-requant h:
-                    // inside the e2m1 step of the group (amax/4 bound,
-                    // e2m1's widest step is 2 of 6, with e4m3 slack).
+                    // within one e2m1 step of the group (the widest grid
+                    // gap is 2 of 6, so half-gap = 1) scaled by sf/ig.
                     let d0 = e2m1(g0) * sf / ig_dn;
                     let d1 = e2m1(g1) * sf / ig_dn;
                     let ch = &row.h[g * 16..(g + 1) * 16];
-                    let amax = ch.iter().fold(0.0f32, |mx, v| mx.max(v.abs()));
-                    bound_hits += usize::from((d0 - ch[2 * i]).abs() > 0.30 * amax + 1e-12)
-                        + usize::from((d1 - ch[2 * i + 1]).abs() > 0.30 * amax + 1e-12);
+                    let step = sf / ig_dn;
+                    bound_hits += usize::from((d0 - ch[2 * i]).abs() > step + 1e-12)
+                        + usize::from((d1 - ch[2 * i + 1]).abs() > step + 1e-12);
                 }
                 scale_diff += usize::from(gpu_sc[g] != row.scale[g]);
             }
