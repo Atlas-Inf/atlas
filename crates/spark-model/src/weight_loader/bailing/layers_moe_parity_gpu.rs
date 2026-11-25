@@ -583,7 +583,8 @@ fn read_bf16(ckpt: &mut Ckpt, name: &str, len: usize) -> Result<Vec<f32>> {
 /// the load path's `f32_or_upcast` takes both.
 fn read_f32s(ckpt: &mut Ckpt, name: &str, len: usize) -> Result<Vec<f32>> {
     let (dt, sh, b) = ckpt.tensor(name)?;
-    ensure!(sh.len() == 2, "{name}: {sh:?}");
+    let elems = sh.iter().product::<usize>();
+    ensure!(elems == len, "{name}: {sh:?} for {len} elements");
     let expect = if dt == WeightDtype::FP32 { 4 } else { 2 };
     ensure!(b.len() == len * expect, "{name}: {dt:?} {sh:?}");
     Ok(match dt {
