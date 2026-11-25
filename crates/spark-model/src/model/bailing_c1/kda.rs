@@ -1100,14 +1100,17 @@ impl TransformerLayer for LingKdaLayer {
         }))
     }
 
-    /// Eager only — the graph slice's flag to flip. The KDA addressing is
-    /// pool-stable on every decode path this driver serves (the indexed
-    /// lane's arguments are fixed addresses over the slot pool and the
-    /// slot-id stream; the per-sequence lane's h/conv pointers are the
-    /// pool addresses fixed at slot claim, a pure function of
-    /// (layer, slot)), and no decode-path step allocates — see the family
-    /// doc in `model/bailing_c1.rs` for what a capture can rely on.
+    /// Graphable under the family switch
+    /// (`crate::model::graph_flags::ling_decode_graph`, the graph slice's
+    /// flip): every state address this layer's decode touches is a fixed
+    /// `SsmStatePool` function of `(ssm_ordinal, slot)` — the indexed lane
+    /// takes the slot-id stream refreshed before any replay, and the
+    /// per-seq lane's h/conv pointers were fixed at slot claim — and the
+    /// MTP verify's rollback snapshots attach at claim
+    /// (`attach_verify_rollback`), so no decode or verify step allocates
+    /// (the family doc's capture contract, `model/bailing_c1.rs`). With the
+    /// switch off the family stays eager, as before.
     fn decode_graph_unsupported(&self) -> bool {
-        true
+        !crate::model::graph_flags::ling_decode_graph()
     }
 }

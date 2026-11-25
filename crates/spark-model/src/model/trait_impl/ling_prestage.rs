@@ -50,4 +50,18 @@ impl TransformerModel {
         }
         Ok(())
     }
+
+    /// Scope gate for the BATCHED decode graphs (`decode_a2`): keep the Ling
+    /// family OFF them even when the family switch is on. The
+    /// pool-indexed KDA lane already serves 2..=8-row batches eagerly
+    /// (the measured multi-request win), and the Ling metadata staging
+    /// this slice prestages is SINGLE-sequence (Phase 1 of decode_dispatch
+    /// and the K=2 verify) — an a2 capture would replay MLA rows reading
+    /// seq 0's staging. Phase 1 of the flip is the n=1 decode graphs and
+    /// the single-sequence K=2 verify graphs; batching those is the
+    /// follow-up. No effect off the family or with the switch off.
+    pub(super) fn ling_batched_graphs_off(&self) -> bool {
+        self.config.model_type == "bailing_moe_v3_vl"
+            && crate::model::graph_flags::ling_decode_graph()
+    }
 }

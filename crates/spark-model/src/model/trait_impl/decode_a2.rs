@@ -277,11 +277,18 @@ impl TransformerModel {
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
         // Host-maintained QSA/PLE state cannot advance under graph replay.
         let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
+        // The Ling family stays off the BATCHED decode graphs while its
+        // single-seq staging is the prestage this slice owns
+        // (`ling_prestage.rs`): the pool-indexed lane serves 2..=8-row
+        // batches eagerly and an a2 capture would bake single-seq staging
+        // reads. No-op for every other model and while the switch is off.
+        let ling_graphs_off = self.ling_batched_graphs_off();
         let (glm_dynamic, glm_graphs_ok) = self.glm_multiseq_graph_gate()?;
         let graph_key = if glm_graphs_ok
             && !ms_profile
             && !lora_eager
             && !layer_veto
+            && !ling_graphs_off
             && crate::model::graph_flags::multiseq_graphs_enabled()
         {
             self.batch_decode_graph_key(&*seqs, padded_n)

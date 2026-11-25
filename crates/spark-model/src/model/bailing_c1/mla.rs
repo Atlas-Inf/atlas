@@ -1195,16 +1195,19 @@ impl TransformerLayer for LingMlaLayer {
         self.prestage_meta(gpu, rows, seq_len_start, block_table, block_size, stream)
     }
 
-    /// Eager while the KDA slot pool is unwired: with the pool merged and
-    /// `ATLAS_LING_DECODE_GRAPH` armed this layer's decode is capturable —
-    /// its step metadata is prestaged (see `decode_meta_prestage`), its V
-    /// pool is bound at the first prefill and allocation-stable per serve,
-    /// and its kernels read positions/slots/base_len/table from fixed
-    /// device buffers (`ling_mla_paged_attn` uses `max_blocks_per_seq` only
-    /// as the `seq` stride, 0 at single-seq). The per-seq KDA state is the
-    /// last blocker (the pool slice's `kda.rs`).
+    /// Graphable under the family switch
+    /// (`crate::model::graph_flags::ling_decode_graph`, the graph slice's
+    /// flip): the per-step metadata is prestaged pre-graph
+    /// (`decode_meta_prestage`, Phase 1 of decode_dispatch and the K=2
+    /// verify), the captured arms read the fixed scratch staging, the V
+    /// latent pool binds at the first prefill and is allocation-stable per
+    /// serve, and `ling_mla_paged_attn` walks `base_len` from a device
+    /// word (its `max_blocks_per_seq` is only the `seq` stride, 0 at
+    /// single-seq). With the switch off the family stays eager, as before
+    /// (the per-seq KDA state no longer blocks it either — the slot pool
+    /// fixed that).
     fn decode_graph_unsupported(&self) -> bool {
-        true
+        !crate::model::graph_flags::ling_decode_graph()
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
