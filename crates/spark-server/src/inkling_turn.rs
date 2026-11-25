@@ -20,7 +20,8 @@
 //!  * headers (`<|message_model|>`, the name, the content-type token) go;
 //!  * exactly one `<|end_message|>` survives, as the think end before the
 //!    answer (the thinking block's own close, or a synthetic one ahead of the
-//!    first answer block when the model did not think); with thinking off the
+//!    first answer block, or of text written with no header, when the model
+//!    did not think); with thinking off the
 //!    thinking body goes too and no think end is emitted;
 //!  * each tool block becomes a Hermes `<tool_call>` envelope with
 //!    `"arguments"`: once the body reads `{"name":NAME,"args":` the envelope
@@ -204,7 +205,12 @@ impl InklingTurn {
                 }
             }
             Block::Tool => self.call_token(tok, codec, out),
-            Block::Answer | Block::Between => out.push(tok),
+            Block::Answer => out.push(tok),
+            Block::Between => {
+                // Text with no header is the answer (a grammar-forced call).
+                self.close_thinking(out);
+                out.push(tok);
+            }
         }
     }
 
