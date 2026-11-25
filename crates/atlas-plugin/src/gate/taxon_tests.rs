@@ -277,3 +277,156 @@ fn spans_are_reported_per_node_level() {
         "two models under one hardware — the case a split check can honestly fail"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Layered targets: `[model] kernel_source` and `[build] base_quant`
+// ---------------------------------------------------------------------------
+
+/// `redirect` compiles `source`'s nvfp4 kernels plus its own nvfp4 overlay;
+/// `bare` redirects to `source` with no quant dir of its own; `source`'s `exl3`
+/// composes on its `nvfp4` sibling.
+fn layered_fixture(name: &str) -> PathBuf {
+    let root = fixture(name);
+    let hw = root.join("kernels/gb10");
+    for d in ["source/nvfp4", "source/exl3", "redirect/nvfp4", "bare"] {
+        std::fs::create_dir_all(hw.join(d)).unwrap();
+    }
+    std::fs::write(hw.join("source/MODEL.toml"), "[behavior]\n").unwrap();
+    std::fs::write(
+        hw.join("redirect/MODEL.toml"),
+        "[model]\nkernel_source = \"source\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        hw.join("bare/MODEL.toml"),
+        "[model]\nkernel_source = \"source\"\n",
+    )
+    .unwrap();
+    std::fs::write(hw.join("source/nvfp4/KERNEL.toml"), "[build]\n").unwrap();
+    std::fs::write(hw.join("source/nvfp4/gemm.cu"), "__global__ void g() {}\n").unwrap();
+    std::fs::write(hw.join("source/nvfp4/attn.cu"), "__global__ void a() {}\n").unwrap();
+    std::fs::write(
+        hw.join("source/exl3/KERNEL.toml"),
+        "[build]\nbase_quant = \"nvfp4\"\n",
+    )
+    .unwrap();
+    std::fs::write(hw.join("source/exl3/exl3.cu"), "__global__ void e() {}\n").unwrap();
+    std::fs::write(hw.join("redirect/nvfp4/KERNEL.toml"), "[build]\n").unwrap();
+    std::fs::write(
+        hw.join("redirect/nvfp4/attn.cu"),
+        "__global__ void a2() {}\n",
+    )
+    .unwrap();
+    root
+}
+
+fn target(model: &str, quant: &str) -> Target {
+    Target {
+        hardware: "gb10".into(),
+        model: model.into(),
+        quant: quant.into(),
+    }
+}
+
+fn names(paths: &[PathBuf], root: &Path) -> Vec<String> {
+    let base = root.join("kernels/gb10");
+    let mut out: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            p.strip_prefix(&base)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A `kernel_source` target compiles the source's quant dir, then its own
+/// quant dir over it by stem, as `resolve_targets` layers them.
+#[test]
+fn a_redirected_target_resolves_the_source_kernels_under_its_own_overlay() {
+    let root = layered_fixture("redirect");
+    assert_eq!(
+        names(
+            &sources(&root, &target("redirect", "nvfp4")).unwrap(),
+            &root
+        ),
+        [
+            "common/other.cu",
+            "common/shared.cu",
+            "redirect/nvfp4/attn.cu",
+            "source/nvfp4/gemm.cu"
+        ]
+    );
+}
+
+/// `base_quant` composes the sibling quant dir under the quant's own.
+#[test]
+fn a_base_quant_target_resolves_its_sibling_under_its_own_kernels() {
+    let root = layered_fixture("base");
+    assert_eq!(
+        names(&sources(&root, &target("source", "exl3")).unwrap(), &root),
+        [
+            "common/other.cu",
+            "common/shared.cu",
+            "source/exl3/exl3.cu",
+            "source/nvfp4/attn.cu",
+            "source/nvfp4/gemm.cu"
+        ]
+    );
+}
+
+/// The configs are the target's own MODEL.toml and every layer's KERNEL.toml.
+#[test]
+fn a_redirected_target_hashes_its_own_model_toml_and_every_layers_kernel_toml() {
+    let root = layered_fixture("configs");
+    assert_eq!(
+        names(&configs(&root, &target("redirect", "nvfp4")), &root),
+        [
+            "HARDWARE.toml",
+            "redirect/MODEL.toml",
+            "redirect/nvfp4/KERNEL.toml",
+            "source/nvfp4/KERNEL.toml"
+        ]
+    );
+}
+
+/// A redirected target's quants are the source's, so one with no quant dir of
+/// its own is still a target, as the build resolves it.
+#[test]
+fn a_redirected_target_takes_its_quants_from_the_source() {
+    let root = layered_fixture("walk");
+    let all: Vec<String> = walk(&root).iter().map(|t| t.to_string()).collect();
+    for key in [
+        "gb10/bare/exl3",
+        "gb10/bare/nvfp4",
+        "gb10/redirect/exl3",
+        "gb10/redirect/nvfp4",
+    ] {
+        assert!(all.contains(&key.to_string()), "{key} missing from {all:?}");
+    }
+}
+
+/// A change to the source's kernels affects every target compiling them.
+#[test]
+fn a_source_change_affects_the_targets_that_redirect_to_it() {
+    let root = layered_fixture("affected");
+    let hit = affected(&root, &["kernels/gb10/source/nvfp4/gemm.cu".to_string()]);
+    for model in ["source", "redirect", "bare"] {
+        assert!(
+            hit.contains(&target(model, "nvfp4")),
+            "{model} must be affected: {hit:?}"
+        );
+    }
+    assert!(!hit.contains(&target("modelA", "nvfp4")));
+}
+
+/// An unreadable MODEL.toml fails closed: the target resolves as affected.
+#[test]
+fn a_malformed_model_toml_resolves_to_none() {
+    let root = layered_fixture("malformed");
+    std::fs::write(root.join("kernels/gb10/redirect/MODEL.toml"), "[model\n").unwrap();
+    assert!(sources(&root, &target("redirect", "nvfp4")).is_none());
+}
