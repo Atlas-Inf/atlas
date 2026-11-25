@@ -115,7 +115,7 @@ echo "serve-inkling2-strix-linux sha=$(git -C "$REPO" rev-parse --short=9 HEAD) 
 serve_args=(serve "$MODEL_DIR" --model-name "$NAME" --bind 127.0.0.1 --port "$PORT" --no-tui
   --max-seq-len "${MAX_SEQ_LEN:-32768}" --max-batch-size "${MAX_BATCH:-1}" --max-num-seqs "${MAX_BATCH:-1}"
   --kv-cache-dtype bf16 --gpu-memory-utilization "$GPU_UTIL" --max-prefill-tokens 4096
-  --enable-prefix-caching true --request-timeout 0 "${DRAFT_ARGS[@]}")
+  --enable-prefix-caching "${PREFIX_CACHE:-true}" --request-timeout 0 "${DRAFT_ARGS[@]}")
 CURL="curl -s http://127.0.0.1:$PORT/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"$NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 17 * 23?\"}],\"max_tokens\":256,\"temperature\":0}'"
 cd "$REPO"
 run_serve() { exec env RUST_LOG=${RUST_LOG:-info} ATLAS_KV_EXTERNAL_RESERVE_GB=0 ATLAS_OOM_WATCHDOG_MB=400 "$BIN" "${serve_args[@]}"; }
