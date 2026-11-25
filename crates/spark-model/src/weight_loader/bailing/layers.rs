@@ -552,3 +552,7 @@ fn load_moe_weights(
         swiglu_shared,
     })
 }
+
+#[cfg(test)]
+#[path = "layers_moe_parity_gpu.rs"]
+mod layers_moe_parity_gpu;
