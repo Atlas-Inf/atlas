@@ -193,42 +193,31 @@ extern "C" __global__ void __launch_bounds__(FP_THREADS, 1) inkling2_flash_prefi
             }
         }
 
-        // per-row max over the row's 16 keys: rows sit in lane_hi halves,
-        // so the reduce is shfl_xor 1,2,4,8 inside each half-warp.
-        float tm[8];
+        // Per row (element e): half-warp shfl_xor max over the row's 16 keys
+        // (rows sit in lane_hi halves), the online-softmax update, and the P
+        // store — Ps[warp][2e+lane_hi][n*16+lane_lo] transposes the fragment
+        // layout's [key=lane_lo] into the A operand's [row][key] rows. Keeping
+        // tm/pv out of arrays saves ~24 live VGPRs; hipcc 7.16 spilled otherwise.
 #pragma unroll
         for (int e = 0; e < 8; e++) {
             float x = fmaxf(acc_s[0][e], acc_s[FP_BC / 16 - 1][e]);
             for (int o = 1; o < 16; o <<= 1) x = fmaxf(x, __shfl_xor_sync(0xffffffffull, x, o));
-            tm[e] = x;
-        }
-        float pv[FP_BC / 16][8];
-#pragma unroll
-        for (int e = 0; e < 8; e++) {
-            const float nm = fmaxf(m_st[e], tm[e]);
+            const float nm = fmaxf(m_st[e], x);
             const float sc = __expf(m_st[e] - nm);
             m_st[e] = nm;
             float rs = 0.0f;
 #pragma unroll
             for (int n = 0; n < FP_BC / 16; n++) {
                 const float s = acc_s[n][e];
-                pv[n][e] = s <= -1e29f ? 0.0f : __expf(s - nm);
-                rs += pv[n][e];
+                const float p = s <= -1e29f ? 0.0f : __expf(s - nm);
+                Ps[warp][2 * e + lane_hi][n * 16 + lane_lo] = (__fp16)p;
+                rs += p;
             }
             for (int o = 1; o < 16; o <<= 1) rs += __shfl_xor_sync(0xffffffffull, rs, o);
             l_st[e] = l_st[e] * sc + rs;
 #pragma unroll
             for (int d = 0; d < FP_HD / 16; d++) acc_o[d][e] *= sc;
         }
-
-        // Stage P (fp16) per warp so the A fragments read a row's 16 keys
-        // contiguously — the softmax layout (row 2e+lane_hi, key lane_lo) is
-        // transposed vs the A operand's [row=lane_lo][key] rows.
-#pragma unroll
-        for (int n = 0; n < FP_BC / 16; n++)
-#pragma unroll
-            for (int e = 0; e < 8; e++)
-                Ps[warp][2 * e + lane_hi][n * 16 + lane_lo] = (__fp16)pv[n][e];
         fp_wave_sync();
 #pragma unroll
         for (int nt = 0; nt < FP_BC / 16; nt++) {
