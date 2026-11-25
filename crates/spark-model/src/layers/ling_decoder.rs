@@ -210,6 +210,24 @@ impl LingDecoderLayer {
         )
     }
 
+    /// Whether serial decode runs its FFN at one row of the batched path, so
+    /// that a two-row verify reproduces it byte for byte: every A16 (Spark
+    /// mode) layer. Strict FP8 and Air-VL keep their one-token FFN.
+    fn rows_decode(&self, ctx: &ForwardContext<'_>) -> bool {
+        self.sante_ffn.is_none()
+            && ctx
+                .config
+                .quantization_config
+                .as_ref()
+                .is_some_and(|q| q.quant_method != "fp8")
+            && match &self.ffn {
+                FfnComponent::LingMoe(ffn) => {
+                    self.dense_ffn.is_some() || ffn.supports_batched_prefill()
+                }
+                _ => self.dense_ffn.is_some(),
+            }
+    }
+
     fn routed_forward(
         &self,
         input: DevicePtr,
@@ -442,6 +460,12 @@ impl LingDecoderLayer {
             }
         };
 
+        if self.rows_decode(ctx) {
+            // One row through the batched FFN a verify and a batched decode
+            // run: the single-token kernels round the routed sum before the
+            // shared expert is added, the batched blend after.
+            return self.finish_prefill_ffn(hidden, residual, attn, 1, ctx, stream);
+        }
         let normed2 = ctx.buffers.norm_output();
         ops::residual_add_rms_norm(
             ctx.gpu,
