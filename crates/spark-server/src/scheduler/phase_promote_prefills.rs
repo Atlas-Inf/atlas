@@ -40,7 +40,16 @@ pub(super) fn promote_completed_prefills(
             // operation.  Complete the request before releasing its owner;
             // otherwise the scheduler frees/reallocates the slot while the
             // client waits forever behind SSE keepalives.
-            super::lifecycle::send_error_to_sink(&mut p.sink, "prefill failed");
+            //
+            // `invalid_request` marks a request that can NEVER be served as
+            // sent (an unchunkable-MLA prompt past the buffer arena cap):
+            // `/400`, which agent clients do not retry, where `/500` sends
+            // them round again (#180 precedent).
+            if let Some(msg) = p.invalid_request.take() {
+                super::lifecycle::send_invalid_request_to_sink(&mut p.sink, &msg);
+            } else {
+                super::lifecycle::send_error_to_sink(&mut p.sink, "prefill failed");
+            }
             let mut seq = p.seq;
             if let Err(e) = model.free_sequence(&mut seq) {
                 tracing::error!("phase_promote_prefills: free_sequence (error path): {e:#}");

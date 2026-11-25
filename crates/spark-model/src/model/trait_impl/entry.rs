@@ -127,8 +127,21 @@ impl TransformerModel {
     }
 
     pub(super) fn supports_chunked_mla_impl(&self) -> bool {
+        // GLM-5's packed prefill pipe carries the paged-MLA index across
+        // chunks; the Ling (bailing_moe_v3_vl) driver's gated-MLA prefill
+        // carries a packed context — the chunk's rows append to the layer's
+        // contiguous K/V mirror, one `ling_mla_prefill_attn` covers prefix
+        // + chunk-local causal, and the prefix is refilled from the paged
+        // pools per pass (PR #130; P48 3-chunk e2e oracle parity + the
+        // multi-turn deep-prefix smoke are the chunk-boundary gates).
+        //
+        // Without this entry a bailing prompt OVER the arena cap dead-ends:
+        // the scheduler forces single-chunk for unsupported MLA ("correct
+        // only whole-prompt") and sizes the continuation chunk to the whole
+        // remaining prompt — which then exceeds the buffer arena and fails.
         self.config.model_type == "glm5_next"
             && self.config.index_kpool > 0
             && self.config.index_topk > 0
+            || self.config.model_type == "bailing_moe_v3_vl"
     }
 }

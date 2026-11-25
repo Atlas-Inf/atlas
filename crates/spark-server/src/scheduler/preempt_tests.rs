@@ -28,6 +28,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod chunk_retry;
+mod continuation_cap;
 mod kv_refusal;
 mod min_tokens_ban;
 mod mixed_gate;
@@ -75,6 +76,11 @@ struct PreemptStubModel {
     packed_calls: Mutex<Vec<Vec<Vec<u32>>>>,
     /// A multi-rank world without shared-prefix admission.
     ep: bool,
+    /// An MLA model whose prefill cannot chunk (no chunk-correct MLA
+    /// prefill): `is_mla()` true, `supports_chunked_mla()` false — the
+    /// scheduler must then serve whole prompts in one chunk, and reject
+    /// cleanly any prompt past the buffer arena.
+    mla_unchunkable: bool,
 }
 
 /// A token that marks a prompt as a prefix-cache hit for the packed stub.
@@ -340,6 +346,11 @@ impl Model for PreemptStubModel {
     fn is_ep(&self) -> bool {
         self.ep || self.inflight_min.is_some()
     }
+    fn is_mla(&self) -> bool {
+        self.mla_unchunkable
+    }
+    // supports_chunked_mla: trait default (`false`) — matches an MLA family
+    // without a chunk-correct prefill.
     fn reclaim_prefix_blocks(&self, num_blocks: usize) -> usize {
         let take = num_blocks.min(self.reclaimable.load(Ordering::SeqCst));
         self.reclaimable.fetch_sub(take, Ordering::SeqCst);
