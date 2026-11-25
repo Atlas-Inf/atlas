@@ -940,6 +940,7 @@ fn compare_stages(
     let mut expert_cache: HashMap<usize, ExpertWeights> = HashMap::new();
     let mut slot_y: Vec<Vec<f32>> = vec![Vec::new(); flat.len()];
     let mut nib_diff = 0usize;
+    let mut mirror_diff = 0usize;
     let mut nib_total = 0usize;
     let mut scale_diff = 0usize;
     let mut bound_hits = 0usize;
@@ -962,8 +963,10 @@ fn compare_stages(
                 let sf = e4m3_unsigned(gpu_sc[g]);
                 for i in 0..8 {
                     let (g0, g1) = nibbles(gpu_pk[g * 8 + i]);
+                    let (p0, p1) = nibbles(row.packed[g * 8 + i]);
                     let (m0, m1) = nibbles(row.mirror_packed[g * 8 + i]);
-                    nib_diff += usize::from(g0 != m0) + usize::from(g1 != m1);
+                    nib_diff += usize::from(g0 != p0) + usize::from(g1 != p1);
+                    mirror_diff += usize::from(g0 != m0) + usize::from(g1 != m1);
                     // TRUE dequant of the GPU bytes vs the pre-requant h:
                     // inside the e2m1 step of the group (amax/4 bound,
                     // e2m1's widest step is 2 of 6, with e4m3 slack).
@@ -992,7 +995,7 @@ fn compare_stages(
     let nib_pct = 100.0 * nib_diff as f64 / nib_total as f64;
     let down_rms = (down_err2 / down_ref2.max(f64::MIN_POSITIVE)).sqrt();
     eprintln!(
-        "layer {layer} M={m} gate/up: {nib_diff}/{nib_total} nibbles ({nib_pct:.3}%) differ, {scale_diff} scale bytes, {bound_hits} outside the e2m1 bound"
+        "layer {layer} M={m} gate/up: {nib_diff}/{nib_total} nibbles ({nib_pct:.3}%) differ from the true pack ({mirror_diff} mirror), {scale_diff} scale bytes, {bound_hits} outside the e2m1 bound"
     );
     eprintln!("layer {layer} M={m} down rows: rel RMS {down_rms:.5}");
     ensure!(
