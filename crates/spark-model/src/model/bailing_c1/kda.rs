@@ -68,10 +68,20 @@ fn regresident_prefill() -> bool {
 fn proj_gemm_min_rows() -> u32 {
     static MIN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *MIN.get_or_init(|| {
+        // DEFAULT OFF (u32::MAX never engages the tensor-core lane):
+        // from a serve's SECOND request on, the cuBLASLt algo the lane
+        // picked for these small-M shapes corrupted every projection (the
+        // first use, on freshly zeroed scratch, was correct) — short chat
+        // prompts committed 156892 (eot) as their first token and answered
+        // empty. Reproduces with spec on/off and both head dtypes;
+        // pre-zeroing the output D did NOT help, so the fault is inside
+        // the cuBLASLt call (suspect: per-lane workspace reuse by the
+        // split-K reduction), for the runtime owner. Opt-in with 16 to
+        // restore the packed-prefill lane.
         std::env::var("ATLAS_LING_PROJ_GEMM_MIN_ROWS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(16)
+            .unwrap_or(u32::MAX)
             .max(1)
     })
 }
