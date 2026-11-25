@@ -25,6 +25,20 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+// The full-warp mask for the __shfl_*_sync reductions below. HIP's intrinsics
+// take a 64-bit mask and static_assert on a narrower one. A strix-hip build
+// widens these literals itself, but only in a kernel directory it mirrors: a
+// kernel elsewhere that #includes this file by a parent-relative path
+// (inkling2_proj_gemv.cu) gets the file as written. On CUDA this is the same
+// literal as before, so the PTX is unchanged.
+#ifndef W4A16_WARP_MASK
+#if defined(__HIP_PLATFORM_AMD__)
+#define W4A16_WARP_MASK 0xFFFFFFFFULL
+#else
+#define W4A16_WARP_MASK 0xFFFFFFFF
+#endif
+#endif
+
 // Standard E4M3 (1-4-3, bias 7) decode via pure bit-math. On real NVIDIA this is
 // byte-identical to (float)__nv_fp8_e4m3; on SCALE/gfx1151 the built-in
 // __nv_fp8_e4m3->float decode is a NON-STANDARD narrow format which mismatches the
@@ -235,7 +249,7 @@ extern "C" __global__ void w4a16_gemv(
 
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+        acc += __shfl_down_sync(W4A16_WARP_MASK, acc, offset);
     }
 
     if (warp_lane == 0) {
@@ -315,8 +329,8 @@ extern "C" __global__ void w4a16_gemv_sw(
     // Reduce each accumulator within the warp in the SAME tree order as orig.
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        acc_a += __shfl_down_sync(0xFFFFFFFF, acc_a, offset);
-        acc_b += __shfl_down_sync(0xFFFFFFFF, acc_b, offset);
+        acc_a += __shfl_down_sync(W4A16_WARP_MASK, acc_a, offset);
+        acc_b += __shfl_down_sync(W4A16_WARP_MASK, acc_b, offset);
     }
 
     // lane 0 holds reduced warp-A (acc_a) and warp-B (acc_b). Final combine ==
@@ -410,7 +424,7 @@ extern "C" __global__ void w4a16_gemv_logits(
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+        acc += __shfl_down_sync(W4A16_WARP_MASK, acc, offset);
     if (warp_lane == 0) {
         unsigned int smem_idx = local_out * 2 + (lane / WARP_SIZE);
         smem[smem_idx] = acc;
@@ -691,7 +705,7 @@ __device__ __forceinline__ void w4a16_gemv_batchm_impl(
         #pragma unroll
         for (int t = 0; t < MAX_M; t++) {
             if ((unsigned int)t >= M) continue;
-            const float v = acc[t] + __shfl_xor_sync(0xFFFFFFFF, acc[t], 1);
+            const float v = acc[t] + __shfl_xor_sync(W4A16_WARP_MASK, acc[t], 1);
             if ((lane & 1u) == 0u) {
                 s_vl[t][local_out][phase * WARP_SIZE + (lane >> 1)] = v;
             }
@@ -707,7 +721,7 @@ __device__ __forceinline__ void w4a16_gemv_batchm_impl(
         float a = s_vl[t][local_out][lane];
         #pragma unroll
         for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-            a += __shfl_down_sync(0xFFFFFFFF, a, offset);
+            a += __shfl_down_sync(W4A16_WARP_MASK, a, offset);
         }
         if (lane % WARP_SIZE == 0) smem[t][local_out * 2 + warp_in_out] = a;
     }
@@ -1040,7 +1054,7 @@ extern "C" __global__ void w4a16_gemv_qg(
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+        acc += __shfl_down_sync(W4A16_WARP_MASK, acc, offset);
     }
 
     if (warp_lane == 0) {
@@ -1155,7 +1169,7 @@ extern "C" __global__ void w4a16_gemv_qkvz(
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+        acc += __shfl_down_sync(W4A16_WARP_MASK, acc, offset);
     }
 
     if (warp_lane == 0) {
@@ -1289,8 +1303,8 @@ extern "C" __global__ void w4a16_gemv_qg_batch2(
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
-        acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
+        acc0 += __shfl_down_sync(W4A16_WARP_MASK, acc0, offset);
+        acc1 += __shfl_down_sync(W4A16_WARP_MASK, acc1, offset);
     }
 
     if (warp_lane == 0) {
@@ -1412,8 +1426,8 @@ extern "C" __global__ void w4a16_gemv_dual_batch2(
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
-        acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
+        acc0 += __shfl_down_sync(W4A16_WARP_MASK, acc0, offset);
+        acc1 += __shfl_down_sync(W4A16_WARP_MASK, acc1, offset);
     }
 
     if (warp_lane == 0) {
@@ -1547,9 +1561,9 @@ extern "C" __global__ void w4a16_gemv_qg_batch3(
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
-        acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
-        acc2 += __shfl_down_sync(0xFFFFFFFF, acc2, offset);
+        acc0 += __shfl_down_sync(W4A16_WARP_MASK, acc0, offset);
+        acc1 += __shfl_down_sync(W4A16_WARP_MASK, acc1, offset);
+        acc2 += __shfl_down_sync(W4A16_WARP_MASK, acc2, offset);
     }
 
     if (warp_lane == 0) {
@@ -1670,7 +1684,7 @@ extern "C" __global__ void w4a16_gemv_qg_batch4(
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
         #pragma unroll
-        for (int r = 0; r < M; r++) acc[r] += __shfl_down_sync(0xFFFFFFFF, acc[r], offset);
+        for (int r = 0; r < M; r++) acc[r] += __shfl_down_sync(W4A16_WARP_MASK, acc[r], offset);
     }
 
     if (warp_lane == 0) {
@@ -1800,9 +1814,9 @@ extern "C" __global__ void w4a16_gemv_dual_batch3(
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
-        acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
-        acc2 += __shfl_down_sync(0xFFFFFFFF, acc2, offset);
+        acc0 += __shfl_down_sync(W4A16_WARP_MASK, acc0, offset);
+        acc1 += __shfl_down_sync(W4A16_WARP_MASK, acc1, offset);
+        acc2 += __shfl_down_sync(W4A16_WARP_MASK, acc2, offset);
     }
 
     if (warp_lane == 0) {
