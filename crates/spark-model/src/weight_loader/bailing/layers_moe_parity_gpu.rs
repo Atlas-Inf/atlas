@@ -567,6 +567,38 @@ fn shared_reference(host: &LayerHost, x: &[f32], m: usize) -> Vec<Vec<f32>> {
         .collect()
 }
 
+/// BF16 tensor read to f32 (widened exactly).
+fn read_bf16(ckpt: &mut Ckpt, name: &str, len: usize) -> Result<Vec<f32>> {
+    let (dt, sh, b) = ckpt.tensor(name)?;
+    ensure!(
+        dt == WeightDtype::BF16 && sh.len() == 2 && b.len() == len * 2,
+        "{name}: {dt:?} {sh:?}"
+    );
+    Ok(b.chunks_exact(2)
+        .map(|c| widen(u16::from_le_bytes([c[0], c[1]])))
+        .collect())
+}
+
+/// Router tensor read to f32: BF16 (widened exactly) or FP32 on disk —
+/// the load path's `f32_or_upcast` takes both.
+fn read_f32s(ckpt: &mut Ckpt, name: &str, len: usize) -> Result<Vec<f32>> {
+    let (dt, sh, b) = ckpt.tensor(name)?;
+    ensure!(sh.len() == 2, "{name}: {sh:?}");
+    let expect = if dt == WeightDtype::FP32 { 4 } else { 2 };
+    ensure!(b.len() == len * expect, "{name}: {dt:?} {sh:?}");
+    Ok(match dt {
+        WeightDtype::BF16 => b
+            .chunks_exact(2)
+            .map(|c| widen(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        WeightDtype::FP32 => b
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        other => anyhow::bail!("{name}: {other:?}"),
+    })
+}
+
 // ── Input rows: deterministic, with hotter rows so the clamps and the
 //    saturation band of the static activation scale bind ────────────────────
 
@@ -682,27 +714,21 @@ fn parity_one_layer(
     }
     let store = WeightStore::from_map(map);
 
-    let mut read_bf16 = |name: &str, len: usize| -> Result<Vec<f32>> {
-        let (dt, sh, b) = ckpt.tensor(name)?;
-        ensure!(
-            dt == WeightDtype::BF16 && sh.len() == 2 && b.len() == len * 2,
-            "{name}: {dt:?} {sh:?}"
-        );
-        Ok(b.chunks_exact(2)
-            .map(|c| widen(u16::from_le_bytes([c[0], c[1]])))
-            .collect())
-    };
-    let gate_w = read_bf16(&format!("{lp}.mlp.gate.weight"), EXPERTS * HIDDEN)?;
-    let bias = read_bf16(&format!("{lp}.mlp.gate.expert_bias"), EXPERTS)?;
+    let gate_w = read_f32s(ckpt, &format!("{lp}.mlp.gate.weight"), EXPERTS * HIDDEN)?;
+    let bias = read_f32s(ckpt, &format!("{lp}.mlp.gate.expert_bias"), EXPERTS)?;
+    // Shared expert weights are BF16.
     let shared_gate = read_bf16(
+        ckpt,
         &format!("{lp}.mlp.shared_experts.gate_proj.weight"),
         INTER * HIDDEN,
     )?;
     let shared_up = read_bf16(
+        ckpt,
         &format!("{lp}.mlp.shared_experts.up_proj.weight"),
         INTER * HIDDEN,
     )?;
     let shared_down = read_bf16(
+        ckpt,
         &format!("{lp}.mlp.shared_experts.down_proj.weight"),
         HIDDEN * INTER,
     )?;
