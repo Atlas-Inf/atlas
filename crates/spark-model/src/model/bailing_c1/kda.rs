@@ -93,7 +93,7 @@ impl LingKdaLayer {
 
     /// The attention half of `rows` rows: reads `hidden` (rows x hidden),
     /// adds the attention output into it, returns nothing (state advanced).
-    fn attention_half(
+    pub(crate) fn attention_half(
         &self,
         gpu: &dyn GpuBackend,
         hidden: DevicePtr,

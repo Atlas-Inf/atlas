@@ -577,3 +577,11 @@ mod layers_moe_parity_gpu;
 #[cfg(test)]
 #[path = "mla_moe_prefill_repro_gpu.rs"]
 mod mla_moe_prefill_repro_gpu;
+
+#[cfg(test)]
+#[path = "layers_dense_parity_gpu.rs"]
+mod layers_dense_parity_gpu;
+
+#[cfg(test)]
+#[path = "kda_prefill_parity_gpu.rs"]
+mod kda_prefill_parity_gpu;
