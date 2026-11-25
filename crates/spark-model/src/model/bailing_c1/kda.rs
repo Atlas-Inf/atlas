@@ -161,8 +161,12 @@ impl LingKdaLayer {
                     spark_runtime::gpu::KernelHandle(0),
                     state.conv_state.offset(plane * T * 4 * 4),
                     s.kda_preconv.offset(rows as usize * (plane * T) * 2),
+                    // The conv blob is [3T channels][4 taps] bf16: each
+                    // plane's taps start at channel plane*T, i.e. byte
+                    // offset plane*T*4*2 — matching the conv_state slice
+                    // above (plane*T*4 fp32 elements).
                     &DenseWeight {
-                        weight: w.conv.weight.offset((plane * T) * 2),
+                        weight: w.conv.weight.offset((plane * T) * 4 * 2),
                     },
                     DevicePtr::NULL,
                     s.kda_qkv.offset((plane * T) * 2),
