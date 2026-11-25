@@ -1288,6 +1288,7 @@ pub fn build_model(
         num_kv_blocks,
         gpu.as_ref(),
         glm_cache_plan,
+        v_aliases_k,
         kv_placement.clone(),
     ) {
         Ok(kv) => kv,
@@ -1304,6 +1305,7 @@ pub fn build_model(
                 num_kv_blocks,
                 gpu.as_ref(),
                 glm_cache_plan,
+                v_aliases_k,
                 kv_placement,
             )?
         }

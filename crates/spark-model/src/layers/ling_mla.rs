@@ -176,6 +176,9 @@ pub(crate) const LATENT_ROW: usize = 512 + 64;
 const DECODE_ROWS: usize = 32;
 /// Key splits per decode row (`DEC_SPLITS` in the kernel).
 const DECODE_SPLITS: usize = 64;
+/// `LING_DECODE_SMEM`: two 32-key tiles at a 584-value stride, two score
+/// halves, P and per-head softmax state.
+const DECODE_SMEM: u32 = 2 * 32 * 584 * 2 + 2 * 32 * 32 * 4 + 32 * 40 * 2 + 3 * 32 * 4;
 /// Keys a prompt tile rebuilds from the latent before attending them. The
 /// last tile also holds the prompt's own rows, up to MLA_PROMPT_TILE_ROWS.
 const PROMPT_KEY_TILE: usize = 8192;
@@ -681,6 +684,7 @@ impl LingMlaWeights {
             KernelLaunch::new(gpu, kernels.decode)
                 .grid([DECODE_SPLITS as u32, n, 1])
                 .block([256, 1, 1])
+                .shared_mem(DECODE_SMEM)
                 .arg_ptr(l.q_abs.offset(at * 32 * LATENT_ROW * 2))
                 .arg_ptr(pool)
                 .arg_ptr(metadata.block_table.offset(at * stride as usize * 4))

@@ -84,16 +84,6 @@ impl ModelWeightLoader for BailingMoeV3WeightLoader {
         crate::layers::ling_decoder::load_ling_layers(store, config, gpu, reader, frequencies)
     }
 
-    fn kv_layer_dims(&self, config: &ModelConfig) -> Vec<(usize, usize)> {
-        vec![
-            (
-                config.num_attention_heads,
-                config.qk_nope_head_dim + config.qk_rope_head_dim / config.num_attention_heads
-            );
-            config.num_attention_layers()
-        ]
-    }
-
     fn load_embedding(
         &self,
         store: &WeightStore,

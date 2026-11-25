@@ -29,6 +29,11 @@ pub(crate) fn quant_multiplier(config: &ModelConfig) -> Option<f64> {
         Some(1.05)
     } else if config.model_type == "minimax_m2" || config.model_type == "step3p7" {
         Some(1.02)
+    } else if config.model_type == "bailing_moe_v3_vl" {
+        // Ling-3.2-air NVFP4A16 on GB10 (2026-11-25): 72.51 GB on disk, 73.75
+        // GB in use after the last shard (1.02). The generic 1.3 projected a
+        // 94.3 GB peak and refused to load beside 20 GB of other work.
+        Some(1.05)
     } else if config
         .quantization_config
         .as_ref()

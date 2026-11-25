@@ -90,10 +90,14 @@ extern "C" __global__ void __launch_bounds__(512) ling_q_absorb(
 #define DEC_SPLITS 64u
 #define DEC_MIN_CHUNK 256u
 #define DEC_TILE 32u
-#define DEC_WORDS (LING_ROW / 2u)          // 288 bf16x2 words per cached row
-#define DEC_SLICES 8u                      // threads per head
-#define DEC_QWORDS (DEC_WORDS / DEC_SLICES)  // 36 words of the row per thread
-#define DEC_VWORDS (LING_LATENT / 2u / DEC_SLICES)  // 32 latent words per thread
+// Shared row stride: 576 values + 8 of padding (1,168 bytes, an odd number of
+// 16-byte units) so ldmatrix rows fall in different banks.
+#define DEC_STRIDE (LING_ROW + 8u)
+#define DEC_P_STRIDE (DEC_TILE + 8u)
+// Dynamic shared memory: two key tiles, two partial score halves, P, and
+// per-head running max, sum and correction.
+#define LING_DECODE_SMEM (2u * DEC_TILE * DEC_STRIDE * 2u + 2u * LING_HEADS * DEC_TILE * 4u + \
+                          LING_HEADS * DEC_P_STRIDE * 2u + 3u * LING_HEADS * 4u)
 
 // Keys per split, from the sequence length alone.
 __device__ __forceinline__ unsigned ling_decode_chunk(unsigned len) {
@@ -106,9 +110,26 @@ __device__ __forceinline__ float2 bf2(unsigned w) {
     return make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u));
 }
 
-// grid (DEC_SPLITS, rows), block 256 = 32 heads x 8 slices. A slice owns the
-// row's 32-bit words j*8 + slice, so the eight slices of a head read eight
-// different shared-memory banks.
+__device__ __forceinline__ void ling_cp16(void* dst, const void* src, bool valid) {
+    const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d), "l"(src), "r"(valid ? 16 : 0));
+}
+
+__device__ __forceinline__ void ling_mma(float* c, const unsigned* a, unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// grid (DEC_SPLITS, rows), block 256, LING_DECODE_SMEM dynamic shared bytes.
+// Tensor-core absorbed attention over one split of one row's latent cache:
+//   scores [32 heads x 32 keys] = q_abs [32 x 576] . keys^T: warp w owns
+//     heads (w & 1) * 16.., keys ((w >> 1) & 1) * 16.., and half (w >> 2) of
+//     the 576 channels, its query fragments held in registers;
+//   one pass of the online softmax per head over the tile (fixed order);
+//   latent [32 x 512] += P . keys[:, 0:512]: warp w owns heads (w & 1) * 16..
+//     and channels (w >> 1) * 128...
+// Two tiles are in flight: the next one loads while this one computes.
 extern "C" __global__ void __launch_bounds__(256) ling_latent_decode(
     const __nv_bfloat16* __restrict__ q_abs,     // [rows][32][576]
     const __nv_bfloat16* __restrict__ pool,      // [blocks][block_size][576]
@@ -125,75 +146,176 @@ extern "C" __global__ void __launch_bounds__(256) ling_latent_decode(
     const unsigned begin = split * chunk;
     if (begin >= len) return;
     const unsigned end = min(begin + chunk, len);
-    const unsigned head = threadIdx.x / DEC_SLICES, slice = threadIdx.x % DEC_SLICES;
+    const unsigned tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+    const unsigned g = lane / 4, tig = lane % 4;
     const int* table = block_table + row * bt_stride;
 
-    __shared__ unsigned keys[DEC_TILE][DEC_WORDS];
-    __shared__ float scores[LING_HEADS][DEC_TILE];
+    extern __shared__ __align__(16) unsigned char smem[];
+    __nv_bfloat16* tiles = reinterpret_cast<__nv_bfloat16*>(smem);
+    float* part = reinterpret_cast<float*>(smem + 2u * DEC_TILE * DEC_STRIDE * 2u);  // [2][32][32]
+    __nv_bfloat16* P = reinterpret_cast<__nv_bfloat16*>(part + 2u * LING_HEADS * DEC_TILE);
+    float* run_m = reinterpret_cast<float*>(P + LING_HEADS * DEC_P_STRIDE);
+    float* run_l = run_m + LING_HEADS;
+    float* corr = run_l + LING_HEADS;
+    if (tid < LING_HEADS) {
+        run_m[tid] = -CUDART_INF_F;
+        run_l[tid] = 0.f;
+    }
 
-    unsigned q[DEC_QWORDS];
-    const unsigned* qrow = reinterpret_cast<const unsigned*>(q_abs + (row * LING_HEADS + head) * LING_ROW);
+    // Query fragments: heads m0..m0+15, channel k-steps kh*18 .. kh*18+17.
+    const unsigned m0 = (warp & 1u) * 16u, n0 = ((warp >> 1) & 1u) * 16u, kh = warp >> 2;
+    unsigned qa[18][4];
+    {
+        const __nv_bfloat16* q = q_abs + static_cast<size_t>(row) * LING_HEADS * LING_ROW;
 #pragma unroll
-    for (unsigned j = 0; j < DEC_QWORDS; ++j) q[j] = qrow[j * DEC_SLICES + slice];
-
-    float acc[2 * DEC_VWORDS];
+        for (unsigned ks = 0; ks < 18; ++ks) {
+            const unsigned k = (kh * 18u + ks) * 16u + tig * 2u;
+            const __nv_bfloat16* r0 = q + (m0 + g) * LING_ROW + k;
+            const __nv_bfloat16* r1 = q + (m0 + g + 8u) * LING_ROW + k;
+            qa[ks][0] = *reinterpret_cast<const unsigned*>(r0);
+            qa[ks][1] = *reinterpret_cast<const unsigned*>(r1);
+            qa[ks][2] = *reinterpret_cast<const unsigned*>(r0 + 8);
+            qa[ks][3] = *reinterpret_cast<const unsigned*>(r1 + 8);
+        }
+    }
+    float acc[16][4];
 #pragma unroll
-    for (unsigned i = 0; i < 2 * DEC_VWORDS; ++i) acc[i] = 0.f;
-    float m = -CUDART_INF_F, l = 0.f;
+    for (unsigned i = 0; i < 16; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
 
-    for (unsigned t0 = begin; t0 < end; t0 += DEC_TILE) {
-        const unsigned n = min(DEC_TILE, end - t0);
-        for (unsigned i = threadIdx.x; i < n * DEC_WORDS; i += blockDim.x) {
-            const unsigned k = i / DEC_WORDS, w = i % DEC_WORDS, t = t0 + k;
+    auto load = [&](unsigned buf, unsigned t0) {
+        __nv_bfloat16* dst = tiles + buf * DEC_TILE * DEC_STRIDE;
+        for (unsigned i = tid; i < DEC_TILE * (LING_ROW / 8u); i += blockDim.x) {
+            const unsigned k = i / (LING_ROW / 8u), c = (i % (LING_ROW / 8u)) * 8u, t = t0 + k;
+            const bool valid = t < end;
+            const unsigned tt = valid ? t : begin;
             const unsigned long long slot =
-                static_cast<unsigned long long>(table[t / block_size]) * block_size + t % block_size;
-            keys[k][w] = reinterpret_cast<const unsigned*>(pool + slot * LING_ROW)[w];
+                static_cast<unsigned long long>(table[tt / block_size]) * block_size + tt % block_size;
+            ling_cp16(dst + k * DEC_STRIDE + c, pool + slot * LING_ROW + c, valid);
+        }
+        asm volatile("cp.async.commit_group;\n");
+    };
+
+    load(0, begin);
+    unsigned buf = 0;
+    for (unsigned t0 = begin; t0 < end; t0 += DEC_TILE, buf ^= 1u) {
+        if (t0 + DEC_TILE < end) {
+            load(buf ^ 1u, t0 + DEC_TILE);
+            asm volatile("cp.async.wait_group 1;\n");
+        } else {
+            asm volatile("cp.async.wait_group 0;\n");
         }
         __syncthreads();
-        float tile_max = -CUDART_INF_F;
-        for (unsigned k = 0; k < n; ++k) {
-            float s = 0.f;
+        const __nv_bfloat16* K = tiles + buf * DEC_TILE * DEC_STRIDE;
+
+        // Scores: two key tiles of 8 per warp, half the channels.
+        float s[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
 #pragma unroll
-            for (unsigned j = 0; j < DEC_QWORDS; ++j) {
-                const float2 a = bf2(q[j]), b = bf2(keys[k][j * DEC_SLICES + slice]);
-                s += a.x * b.x;
-                s += a.y * b.y;
-            }
-            s += __shfl_xor_sync(0xffffffffu, s, 1);
-            s += __shfl_xor_sync(0xffffffffu, s, 2);
-            s += __shfl_xor_sync(0xffffffffu, s, 4);
-            s *= scale;
-            if (slice == 0) scores[head][k] = s;
-            tile_max = fmaxf(tile_max, s);
+        for (unsigned ks = 0; ks < 18; ++ks) {
+            const unsigned kb = (kh * 18u + ks) * 16u;
+            const unsigned mi = lane / 8u, r = lane % 8u;
+            const unsigned key = n0 + (mi >> 1) * 8u + r;
+            const unsigned addr = static_cast<unsigned>(
+                __cvta_generic_to_shared(K + key * DEC_STRIDE + kb + (mi & 1u) * 8u));
+            unsigned b[4];
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n"
+                         : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3]) : "r"(addr));
+            ling_mma(s[0], qa[ks], b[0], b[1]);
+            ling_mma(s[1], qa[ks], b[2], b[3]);
         }
-        __syncwarp();
-        const float next = fmaxf(m, tile_max);
-        const float correction = expf(m - next);
-        l *= correction;
 #pragma unroll
-        for (unsigned i = 0; i < 2 * DEC_VWORDS; ++i) acc[i] *= correction;
-        m = next;
-        for (unsigned k = 0; k < n; ++k) {
-            const float p = expf(scores[head][k] - m);
-            l += p;
+        for (unsigned nt = 0; nt < 2; ++nt) {
+            float* dst = part + (kh * LING_HEADS) * DEC_TILE;
+            const unsigned col = n0 + nt * 8u + tig * 2u;
+            dst[(m0 + g) * DEC_TILE + col] = s[nt][0];
+            dst[(m0 + g) * DEC_TILE + col + 1] = s[nt][1];
+            dst[(m0 + g + 8u) * DEC_TILE + col] = s[nt][2];
+            dst[(m0 + g + 8u) * DEC_TILE + col + 1] = s[nt][3];
+        }
+        __syncthreads();
+
+        // Online softmax: eight threads per head, four keys each.
+        {
+            const unsigned head = tid / 8u, k0 = (tid % 8u) * 4u;
+            float v[4], top = -CUDART_INF_F;
 #pragma unroll
-            for (unsigned j = 0; j < DEC_VWORDS; ++j) {
-                const float2 v = bf2(keys[k][j * DEC_SLICES + slice]);
-                acc[2 * j] += p * v.x;
-                acc[2 * j + 1] += p * v.y;
+            for (unsigned j = 0; j < 4; ++j) {
+                const unsigned k = k0 + j;
+                v[j] = t0 + k < end
+                    ? (part[head * DEC_TILE + k] + part[(LING_HEADS + head) * DEC_TILE + k]) * scale
+                    : -CUDART_INF_F;
+                top = fmaxf(top, v[j]);
+            }
+            top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, 1));
+            top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, 2));
+            top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, 4));
+            const float old = run_m[head], next = fmaxf(old, top);
+            float sum = 0.f;
+#pragma unroll
+            for (unsigned j = 0; j < 4; ++j) {
+                const float p = expf(v[j] - next);
+                const __nv_bfloat16 pb = __float2bfloat16(p);
+                P[head * DEC_P_STRIDE + k0 + j] = pb;
+                sum += __bfloat162float(pb);
+            }
+            sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+            sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+            sum += __shfl_xor_sync(0xffffffffu, sum, 4);
+            __syncwarp();
+            if (tid % 8u == 0) {
+                const float c = expf(old - next);
+                corr[head] = c;
+                run_l[head] = run_l[head] * c + sum;
+                run_m[head] = next;
+            }
+        }
+        __syncthreads();
+
+        // latent += P . V for heads m0.., channels (warp >> 1) * 128...
+        {
+            const float c0 = corr[m0 + g], c1 = corr[m0 + g + 8u];
+#pragma unroll
+            for (unsigned nt = 0; nt < 16; ++nt) {
+                acc[nt][0] *= c0;
+                acc[nt][1] *= c0;
+                acc[nt][2] *= c1;
+                acc[nt][3] *= c1;
+            }
+            const unsigned d0 = (warp >> 1) * 128u;
+#pragma unroll
+            for (unsigned ks = 0; ks < DEC_TILE / 16u; ++ks) {
+                const unsigned mi = lane / 8u, r = lane % 8u;
+                unsigned a[4];
+                const unsigned pa = static_cast<unsigned>(__cvta_generic_to_shared(
+                    P + (m0 + (mi & 1u) * 8u + r) * DEC_P_STRIDE + ks * 16u + (mi >> 1) * 8u));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n"
+                             : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(pa));
+#pragma unroll
+                for (unsigned np = 0; np < 8; ++np) {
+                    const unsigned key = ks * 16u + (mi & 1u) * 8u + r;
+                    const unsigned dim = d0 + (np * 2u + (mi >> 1)) * 8u;
+                    const unsigned va = static_cast<unsigned>(__cvta_generic_to_shared(K + key * DEC_STRIDE + dim));
+                    unsigned b[4];
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3},[%4];\n"
+                                 : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3]) : "r"(va));
+                    ling_mma(acc[np * 2u], a, b[0], b[1]);
+                    ling_mma(acc[np * 2u + 1u], a, b[2], b[3]);
+                }
             }
         }
         __syncthreads();
     }
 
-    const unsigned base = (row * DEC_SPLITS + split) * LING_HEADS + head;
-    float2* out = reinterpret_cast<float2*>(part_o + base * LING_LATENT);
+    const unsigned base = (row * DEC_SPLITS + split) * LING_HEADS;
+    const unsigned d0 = (warp >> 1) * 128u;
 #pragma unroll
-    for (unsigned j = 0; j < DEC_VWORDS; ++j)
-        out[j * DEC_SLICES + slice] = make_float2(acc[2 * j], acc[2 * j + 1]);
-    if (slice == 0) {
-        part_ml[base * 2] = m;
-        part_ml[base * 2 + 1] = l;
+    for (unsigned nt = 0; nt < 16; ++nt) {
+        const unsigned col = d0 + nt * 8u + tig * 2u;
+        *reinterpret_cast<float2*>(part_o + (base + m0 + g) * LING_LATENT + col) = make_float2(acc[nt][0], acc[nt][1]);
+        *reinterpret_cast<float2*>(part_o + (base + m0 + g + 8u) * LING_LATENT + col) = make_float2(acc[nt][2], acc[nt][3]);
+    }
+    if (tid < LING_HEADS) {
+        part_ml[(base + tid) * 2] = run_m[tid];
+        part_ml[(base + tid) * 2 + 1] = run_l[tid];
     }
 }
 

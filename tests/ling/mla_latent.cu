@@ -74,6 +74,7 @@ static void reference(const Model& m, const __nv_bfloat16* q, int len, float sca
 }
 
 int main() {
+    check(cudaFuncSetAttribute(ling_latent_decode, cudaFuncAttributeMaxDynamicSharedMemorySize, LING_DECODE_SMEM));
     std::mt19937 rng(576);
     std::uniform_real_distribution<float> draw(-1.f, 1.f);
     const int tokens = 5000, blocks = (tokens + BS - 1) / BS;
@@ -110,7 +111,7 @@ int main() {
     auto out = allocate<__nv_bfloat16>(rows * H * 128);
     auto run = [&](int first, int n) {
         ling_q_absorb<<<dim3(H, (n + 7) / 8), 512>>>(q + first * H * 192, w, q_abs, n);
-        ling_latent_decode<<<dim3(DEC_SPLITS, n), 256>>>(q_abs, pool, table, seq + first, 0, BS, scale,
+        ling_latent_decode<<<dim3(DEC_SPLITS, n), 256, LING_DECODE_SMEM>>>(q_abs, pool, table, seq + first, 0, BS, scale,
                                                          part_o, part_ml);
         ling_latent_decode_merge<<<dim3(H, n), 128>>>(part_o, part_ml, seq + first, latent);
         ling_v_up<<<dim3(H, (n + 7) / 8), 256>>>(latent, w, out + first * H * 128, n);
