@@ -67,6 +67,19 @@ fn an_image_holds_t_constant_and_advances_by_its_long_side() {
     assert_eq!(*t.last().unwrap(), 4);
 }
 
+#[test]
+fn branch_positions_after_a_2x3_image_match_the_complete_prompt() {
+    let mut tokens = vec![TXT, TXT];
+    tokens.extend(std::iter::repeat_n(IMG, 6));
+    tokens.extend([TXT, TXT]);
+    let prefix_len = tokens.len();
+    tokens.extend([TXT, TXT]);
+    let (t, h, w) = run(&tokens, &[(1, 2, 3)], 0);
+    assert_eq!(&t[prefix_len..], [7, 8]);
+    assert_eq!(&h[prefix_len..], [7, 8]);
+    assert_eq!(&w[prefix_len..], [7, 8]);
+}
+
 /// The independent statement of the same guarantee: an image is the t_len = 1
 /// case, so introducing the temporal axis must not have moved a single
 /// position. Computed here from the OLD rule directly rather than from a

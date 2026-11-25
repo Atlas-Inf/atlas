@@ -99,6 +99,8 @@ pub struct TransformerModel {
     pub(super) score_head_rows: super::trait_impl::prefill_b::score_head::HeadRows,
     /// Score passes' held knowledge packs (`score_pack.rs`).
     pub(super) score_packs: super::trait_impl::prefill_b::score_pack::ScorePacks,
+    /// Compressed copies of built packs (`ATLAS_SCORE_STORE_GB`).
+    pub(super) score_store: super::trait_impl::prefill_b::score_store::ScoreStore,
     pub(super) layers: Vec<Box<dyn TransformerLayer>>,
     pub(super) buffers: BufferArena,
     /// `ATLAS_GLM_PREFILL_PIPE2`: the second half-chunk's arena and stream
@@ -665,6 +667,7 @@ impl TransformerModel {
         self.score_head_rows.clear();
         // Packs hold KV blocks and SSM slots: return them before the pools go.
         attempt("score packs", self.score_packs_release());
+        attempt("score store", self.score_store_release());
         attempt("derived weights", self.derived.release(gpu));
         attempt("ssm snapshots", self.ssm_snapshots.release(gpu));
         // The pool is Arc'd because slots are handed out to sequences. A live

@@ -8,10 +8,10 @@
 /// scratch buffer: every chunk encodes the items it splices right before its
 /// embed, and nothing in it survives to the next chunk. All empty/zero for a
 /// text prompt.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SeqVision {
-    /// The request's images (host pixels). Head only; a worker receives rows
-    /// by broadcast. Released when the last prompt chunk succeeds.
+    /// The request's images (host pixels), shared by its prompt streams. A
+    /// worker receives rows by broadcast. Released when the prompt completes.
     pub items: Vec<crate::VisionItem>,
     /// Per-item `(t_len, grid_h_post_merge, grid_w_post_merge)`. MRoPE
     /// positions from these; `t_len` is TEMPORAL GROUPS (1 for a still), not
@@ -44,11 +44,12 @@ pub struct SeqVision {
     /// splice/MRoPE: when a tick batches >=2 image requests into one
     /// `buf_out`, `row_base` = first `buf_out` row, `grid_base` = first
     /// `grids` index, and `owned_images` bounds the grid scan. All 0 ⇒ the
-    /// sequence's own encode (row 0 / grid 0). Set by the scheduler.
+    /// sequence's own encode (row 0 / grid 0). Set by the scheduler's
+    /// co-dispatch or score path.
     pub row_base: usize,
     pub grid_base: usize,
     pub owned_images: usize,
-    /// Encoded rows owned by this sequence's co-dispatched slice; 0 for its
-    /// own encode.
+    /// Encoded rows owned by this sequence's row slice; 0 when no slice bound
+    /// is needed.
     pub slice_rows: usize,
 }

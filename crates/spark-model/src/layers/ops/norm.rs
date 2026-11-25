@@ -222,7 +222,7 @@ pub fn rms_norm_residual(
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
         .grid([num_tokens, 1, 1])
-        .block([hidden_size.min(1024), 1, 1])
+        .block([row_norm_threads(num_tokens, hidden_size), 1, 1])
         .arg_ptr(input)
         .arg_ptr(weight.weight)
         .arg_ptr(output)
@@ -255,7 +255,7 @@ pub fn residual_add_rms_norm(
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
         .grid([num_tokens, 1, 1])
-        .block([hidden_size.min(1024), 1, 1])
+        .block([row_norm_threads(num_tokens, hidden_size), 1, 1])
         .arg_ptr(hidden)
         .arg_ptr(src)
         .arg_ptr(weight.weight)
@@ -264,6 +264,37 @@ pub fn residual_add_rms_norm(
         .arg_u32(hidden_size)
         .arg_f32(eps)
         .launch(stream)
+}
+
+/// Whether the loaded norm module reduces `rms_norm_residual` /
+/// `residual_add_rms_norm` in the 1024-thread order at any block size
+/// (`block_sum_as`, marked by `rms_norm_rows_any_block`; a model's own
+/// rms_norm.cu without it does not). Set at model load, where kernels are
+/// resolved before the boot audit seals ([`resolve_row_norm_any_block`]);
+/// unset, launches keep 1024 threads. One model a process.
+static ROW_NORM_ANY_BLOCK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Resolve [`ROW_NORM_ANY_BLOCK`] for the loaded kernels (model load only).
+pub fn resolve_row_norm_any_block(gpu: &dyn GpuBackend) {
+    let marked = crate::layers::try_shipped_kernel(gpu, "norm", "rms_norm_rows_any_block").0 != 0;
+    if ROW_NORM_ANY_BLOCK.set(marked).is_ok() {
+        let threads = if marked { "256" } else { "1024" };
+        tracing::info!(
+            "residual RMS norms: {threads}-thread blocks for prefill rows (same bits either way)"
+        );
+    }
+}
+
+/// Threads a row for `rms_norm_residual` / `residual_add_rms_norm`: their
+/// `min(hidden_size, 1024)`, or 256 for prefill-sized calls where the kernels
+/// keep the 1024-thread bits at any block size ([`ROW_NORM_ANY_BLOCK`]): one
+/// 1024-thread CTA a row left a CTA an SM (107 us for 685 rows of 5120).
+fn row_norm_threads(num_tokens: u32, hidden_size: u32) -> u32 {
+    let any_block = ROW_NORM_ANY_BLOCK.get() == Some(&true);
+    match any_block && num_tokens >= 128 && hidden_size >= 1024 && hidden_size.is_multiple_of(32) {
+        true => 256,
+        false => hidden_size.min(1024),
+    }
 }
 
 /// Dual-output fused residual add + RMS norm (ATLAS_FP32_ROUTING).
@@ -341,10 +372,12 @@ pub fn gated_rms_norm(
 ///
 /// Grid: (heads_per_token, num_actual_tokens, 1)
 /// Block: (min(head_dim, 1024), 1, 1)
+/// `warp` (zero if absent) is the kernel's one-warp-a-head twin, used for
+/// head_dim a multiple of 32 up to 128, where it gives the same bits.
 #[allow(clippy::too_many_arguments)]
 pub fn gated_rms_norm_prefill(
     gpu: &dyn GpuBackend,
-    kernel: KernelHandle,
+    [kernel, warp]: [KernelHandle; 2],
     input: DevicePtr,
     gate: DevicePtr,
     weight: &DenseWeight,
@@ -357,6 +390,25 @@ pub fn gated_rms_norm_prefill(
     gate_token_stride: u32,
     stream: u64,
 ) -> Result<()> {
+    // The one-warp-a-head twin where it reproduces the CTA kernel (a quad a
+    // lane): 8 heads a CTA instead of a mostly idle 128-thread CTA each.
+    if warp.0 != 0 && head_dim.is_multiple_of(32) && head_dim <= 128 {
+        let items = heads_per_token * num_actual_tokens;
+        return KernelLaunch::new(gpu, warp)
+            .grid([items.div_ceil(8), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(input)
+            .arg_ptr(gate)
+            .arg_ptr(weight.weight)
+            .arg_ptr(output)
+            .arg_u32(head_dim)
+            .arg_f32(eps)
+            .arg_u32(input_token_stride)
+            .arg_u32(gate_token_stride)
+            .arg_u32(heads_per_token)
+            .arg_u32(num_actual_tokens)
+            .launch(stream);
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([heads_per_token, num_actual_tokens, 1])
         .block([head_dim.min(1024), 1, 1])

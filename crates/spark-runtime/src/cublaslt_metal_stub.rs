@@ -29,6 +29,26 @@ pub fn version() -> usize {
     0
 }
 
+/// Mirrors `cublaslt::Bf16Epilogue`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Bf16Epilogue {
+    pub bias: u64,
+    pub resid: u64,
+    pub gelu: bool,
+}
+
+/// No cuBLASLt on metal: the caller keeps its own kernel.
+pub fn bf16_gemm_act_weight_t_epi(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _mnk: [u32; 3],
+    _epi: Bf16Epilogue,
+    _stream: u64,
+) -> Result<()> {
+    anyhow::bail!("cuBLASLt is cuda-only")
+}
+
 pub fn bf16_gemm_act_weight_t_f32out(
     _act: u64,
     _weight: u64,

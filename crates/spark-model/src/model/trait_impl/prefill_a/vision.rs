@@ -42,11 +42,19 @@ impl TransformerModel {
         seq: &mut SequenceState,
         images: Vec<crate::VisionItem>,
     ) -> Result<()> {
+        self.prepare_vision_embed_dispatch_on_stream(seq, images, self.gpu.default_stream())
+    }
+
+    pub(in crate::model) fn prepare_vision_embed_dispatch_on_stream(
+        &self,
+        seq: &mut SequenceState,
+        images: Vec<crate::VisionItem>,
+        stream: u64,
+    ) -> Result<()> {
         let ve = match &self.vision_encoder {
             Some(ve) => ve,
             None => return Ok(()),
         };
-        let stream = self.gpu.default_stream();
         // ONE batched ViT forward over all images in this request — block GEMM
         // weights read once over Σpatches instead of N× (the per-image loop also
         // overwrote buf_out row 0 every call, corrupting multi-image requests).
@@ -118,11 +126,20 @@ impl TransformerModel {
         &self,
         per_request: &[Vec<crate::VisionItem>],
     ) -> Result<Vec<(usize, usize, usize, usize)>> {
+        self.prepare_vision_embed_batched_on_stream(per_request, self.gpu.default_stream())
+    }
+
+    /// [`Self::prepare_vision_embed_batched_dispatch`] on `stream` (the score
+    /// path encodes on its pass's stream).
+    pub(in crate::model) fn prepare_vision_embed_batched_on_stream(
+        &self,
+        per_request: &[Vec<crate::VisionItem>],
+        stream: u64,
+    ) -> Result<Vec<(usize, usize, usize, usize)>> {
         let ve = match &self.vision_encoder {
             Some(ve) => ve,
             None => return Ok(Vec::new()),
         };
-        let stream = self.gpu.default_stream();
         // Flatten all requests' images, recording each request's (start, count).
         let mut flat_items: Vec<&crate::VisionItem> = Vec::new();
         let mut req_bounds: Vec<(usize, usize)> = Vec::with_capacity(per_request.len());

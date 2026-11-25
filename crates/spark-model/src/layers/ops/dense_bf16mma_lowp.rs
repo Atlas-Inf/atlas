@@ -207,6 +207,8 @@ pub(super) struct Twin {
     pub smem: u32,
     /// `chunks`' per-CTA cost.
     pub fixed: u32,
+    /// Reads K-tiled tokens (`dl_quant_nvfp4_kt`).
+    pub tiled: bool,
 }
 
 impl DenseBf16mma {
@@ -216,26 +218,31 @@ impl DenseBf16mma {
         let [w8_gate_up, w8_nvfp4] = self.w4a8ws;
         let [z_gate_up, z_nvfp4, zl_gate_up, zl_nvfp4] = self.w4a4ws;
         let long = m >= Z_LONG_ROWS;
-        let (twin, threads, smem, fixed) = match kernel.0 {
+        // The W4A4 twins (dz_body) read K-tiled tokens (`tiled`).
+        let (twin, threads, smem, fixed, tiled) = match kernel.0 {
             k if k == self.w4a8_gate_up.0 && m >= WS_ROWS => {
-                (w8_gate_up, WS_THREADS, SMEM_W4A8_WS, WS_FIXED)
+                (w8_gate_up, WS_THREADS, SMEM_W4A8_WS, WS_FIXED, false)
             }
-            k if k == self.w4a8.0 && m >= WS_ROWS => (w8_nvfp4, WS_THREADS, SMEM_W4A8_WS, WS_FIXED),
+            k if k == self.w4a8.0 && m >= WS_ROWS => {
+                (w8_nvfp4, WS_THREADS, SMEM_W4A8_WS, WS_FIXED, false)
+            }
             k if k == self.w4a4_gate_up.0 && m >= Z_ROWS => match long {
-                true => (z_gate_up, Z_THREADS, SMEM_W4A4_WS, super::CTA_FIXED),
-                false => (zl_gate_up, Z_THREADS, SMEM_W4A4_WSL, super::CTA_FIXED),
+                true => (z_gate_up, Z_THREADS, SMEM_W4A4_WS, super::CTA_FIXED, true),
+                false => (zl_gate_up, Z_THREADS, SMEM_W4A4_WSL, super::CTA_FIXED, true),
             },
             k if k == self.w4a4.0 && m >= Z_ROWS => match long {
-                true => (z_nvfp4, Z_THREADS, SMEM_W4A4_WS, super::CTA_FIXED),
-                false => (zl_nvfp4, Z_THREADS, SMEM_W4A4_WSL, super::CTA_FIXED),
+                true => (z_nvfp4, Z_THREADS, SMEM_W4A4_WS, super::CTA_FIXED, true),
+                false => (zl_nvfp4, Z_THREADS, SMEM_W4A4_WSL, super::CTA_FIXED, true),
             },
             _ => return None,
         };
-        (twin.0 != 0).then_some(Twin {
+        // Without the tiled quantizer the W4A4 twins are not offered.
+        (twin.0 != 0 && (!tiled || self.quant_nvfp4_kt.0 != 0)).then_some(Twin {
             kernel: twin,
             threads,
             smem,
             fixed,
+            tiled,
         })
     }
 
@@ -317,14 +324,16 @@ impl DenseBf16mma {
         &self,
         gpu: &dyn GpuBackend,
         nvfp4: bool,
+        tiled: bool,
         input: DevicePtr,
         lowp: &LowpArgs,
         [m, k]: [u32; 2],
         stream: u64,
     ) -> Result<DevicePtr> {
-        let (kernel, block_scales) = match nvfp4 {
-            true => (self.quant_nvfp4, m as usize * (k as usize / 16)),
-            false => (self.quant_fp8, 0),
+        let (kernel, block_scales) = match (nvfp4, tiled) {
+            (true, false) => (self.quant_nvfp4, m as usize * (k as usize / 16)),
+            (true, true) => (self.quant_nvfp4_kt, m as usize * (k as usize / 16)),
+            (false, _) => (self.quant_fp8, 0),
         };
         let token_scales = lowp.scales.offset(block_scales.next_multiple_of(16));
         let launch = KernelLaunch::new(gpu, kernel)
@@ -336,7 +345,11 @@ impl DenseBf16mma {
             true => launch.arg_ptr(lowp.scales),
             false => launch,
         };
-        launch.arg_ptr(token_scales).arg_u32(k).launch(stream)?;
+        let launch = launch.arg_ptr(token_scales).arg_u32(k);
+        match nvfp4 && tiled {
+            true => launch.arg_u32(m).launch(stream)?,
+            false => launch.launch(stream)?,
+        }
         Ok(token_scales)
     }
 

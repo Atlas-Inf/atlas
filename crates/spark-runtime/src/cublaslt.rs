@@ -36,6 +36,7 @@ mod tf32;
 pub use tf32::tf32_gemm_act_weight_t;
 mod fixed_algo;
 mod gemm_bf16;
+pub use gemm_bf16::{Bf16Epilogue, bf16_gemm_act_weight_t_epi};
 mod kchain_pin;
 pub use fixed_algo::{bf16_fixed_algo_description, bf16_gemm_act_weight_t_fixed};
 use gemm_bf16::gemm_bf16;
@@ -81,6 +82,11 @@ const SCALE_MODE_OUTER_VEC_32F: i32 = 3;
 const SCALE_MODE_VEC128_32F: i32 = 4;
 const SCALE_MODE_BLK128X128_32F: i32 = 5;
 const PREF_MAX_WORKSPACE_BYTES: u32 = 1;
+const DESC_EPILOGUE: u32 = 7;
+const DESC_BIAS_POINTER: u32 = 8;
+const DESC_BIAS_DATA_TYPE: u32 = 26;
+const EPILOGUE_BIAS: i32 = 4;
+const EPILOGUE_GELU_BIAS: i32 = 36;
 
 unsafe extern "C" {
     fn cublasLtGetVersion() -> usize;
@@ -387,6 +393,7 @@ pub fn bf16_gemm_act_weight_t_f32out(
         CUBLAS_OP_T,
         pick,
         CUDA_R_32F,
+        gemm_bf16::Bf16Epilogue::default(),
         stream,
     )
     .map(|_| ())

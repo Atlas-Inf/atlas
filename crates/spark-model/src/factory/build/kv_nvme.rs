@@ -318,7 +318,7 @@ fn ssm_swap_dir(dir: Option<String>) -> Option<PathBuf> {
 /// `dir` (created if missing) is on a real disk and this process can create
 /// files in it — checked with a throwaway file, so a read-only or foreign
 /// mount fails here, by name, instead of inside a tier.
-fn usable_disk_dir(var: &str, dir: &std::path::Path) -> Result<()> {
+pub(crate) fn usable_disk_dir(var: &str, dir: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(dir)
         .map_err(|e| anyhow::anyhow!("{var}={}: cannot create: {e}", dir.display()))?;
     if let Some(kind) = atlas_tier::unsuitable_swap_fs(dir) {

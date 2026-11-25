@@ -13,15 +13,20 @@ use crate::layers::bf16mma_test_ref::*;
 use anyhow::ensure;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 
+#[path = "dense_bf16mma_lowp_bench_gpu.rs"]
+mod bench;
+
 /// The activations a low-precision kernel multiplied, read back from the
 /// scratch: NVFP4 (`k / 16` block scales per row) or E4M3 codes, each times
 /// its row's power-of-two token scale. Checks the quantizer on the way: the
 /// token scale is the smallest power of two that fits the row, each block
 /// scale is within E4M3 rounding of the block's amax / 6, and every code is
-/// a nearest grid point.
+/// a nearest grid point. `tiled`: NVFP4 codes and block scales in the
+/// K-tiled layout of `dl_quant_nvfp4_kt` (what the W4A4 twins read).
 fn lowp_activations(
     gpu: &dyn GpuBackend,
     nvfp4: bool,
+    tiled: bool,
     x: &[u16],
     [m, k]: [usize; 2],
     scratch: [DevicePtr; 2],
@@ -35,6 +40,15 @@ fn lowp_activations(
     };
     let mut sc = vec![0u8; nb + m * 4];
     gpu.copy_d2h(scratch[1], &mut sc)?;
+    if nvfp4 && tiled {
+        // Back to row-major: stage st of row r is 32 code bytes at
+        // (st * m + r) * 32 and 4 scale bytes at (st * m + r) * 4.
+        let (tq, ts) = (codes.clone(), sc[..m * k / 16].to_vec());
+        for (r, st) in (0..m).flat_map(|r| (0..k / 64).map(move |st| (r, st))) {
+            codes[r * (k / 2) + 32 * st..][..32].copy_from_slice(&tq[(st * m + r) * 32..][..32]);
+            sc[r * (k / 16) + 4 * st..][..4].copy_from_slice(&ts[(st * m + r) * 4..][..4]);
+        }
+    }
     let ts = |r: usize| f32::from_le_bytes(sc[nb + 4 * r..][..4].try_into().unwrap()) as f64;
     let lim = if nvfp4 { 6.0 * 448.0 } else { 448.0 };
     let mut out = vec![0u16; m * k];
@@ -179,6 +193,8 @@ fn lowp_case(mix: &str, a8: bool, slots: Option<u32>) -> Result<()> {
             scales: scratch[1],
         };
         let mu = m as u32;
+        // Whether the W4A4 launch for `kernel` ran a twin on K-tiled tokens.
+        let tiled = |kernel| !a8 && kernels.lowp_twin(kernel, mu).is_some_and(|t| t.tiled);
         kernels.gate_up_silu(
             &gpu,
             x_d,
@@ -189,7 +205,7 @@ fn lowp_case(mix: &str, a8: bool, slots: Option<u32>) -> Result<()> {
             stream,
         )?;
         gpu.synchronize(stream)?;
-        let xq = lowp_activations(&gpu, !a8, &x, [m, H], scratch)?;
+        let xq = lowp_activations(&gpu, !a8, tiled(kernels.w4a4_gate_up), &x, [m, H], scratch)?;
         let act_h = read_u16(&gpu, act, (m + SPARE_ROWS) * I)?;
         kernels.nvfp4(
             &gpu,
@@ -201,7 +217,7 @@ fn lowp_case(mix: &str, a8: bool, slots: Option<u32>) -> Result<()> {
             stream,
         )?;
         gpu.synchronize(stream)?;
-        let aq = lowp_activations(&gpu, !a8, &act_h, [m, I], scratch)?;
+        let aq = lowp_activations(&gpu, !a8, tiled(kernels.w4a4), &act_h, [m, I], scratch)?;
         kernels.fp8(
             &gpu,
             act,
@@ -213,7 +229,7 @@ fn lowp_case(mix: &str, a8: bool, slots: Option<u32>) -> Result<()> {
             stream,
         )?;
         gpu.synchronize(stream)?;
-        let act8 = lowp_activations(&gpu, false, &act_h, [m, I], scratch)?;
+        let act8 = lowp_activations(&gpu, false, false, &act_h, [m, I], scratch)?;
         // W8A8 on the transposed copy: the same MMA operands, bit for bit.
         let out8t = upload(&gpu, &bytes_of(&poison))?;
         kernels.fp8(
@@ -341,7 +357,7 @@ fn dense_mx_handoff_matches_reference() -> Result<()> {
             stream,
         )?;
         gpu.synchronize(stream)?;
-        let xq = lowp_activations(&gpu, false, &x, [m, H], scratch)?;
+        let xq = lowp_activations(&gpu, false, false, &x, [m, H], scratch)?;
         kernels.nvfp4(
             &gpu,
             act,

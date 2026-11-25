@@ -387,7 +387,10 @@ impl Qwen3SsmLayer {
         let z_base = deinterleaved.offset((key_dim * 2 + value_dim) * bf16);
         ops::gated_rms_norm_prefill(
             ctx.gpu,
-            self.gated_rms_norm_prefill_k,
+            [
+                self.gated_rms_norm_prefill_k,
+                self.gated_rms_norm_prefill_warp_k,
+            ],
             gdn_out_buf,
             z_base,
             &self.ssm.norm,

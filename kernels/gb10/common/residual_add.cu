@@ -251,3 +251,75 @@ extern "C" __global__ void bf16_sigmoid_blend_device(
         output[i] = __float2bfloat16(o + sigmoid_val * s);
     }
 }
+
+// Round-trip `rows` rows of `len` contiguous elements in place through a
+// narrower storage format, as a compressed score-pack cache would hold them
+// (ATLAS_SCORE_PACK_ROUNDTRIP): `fmt` 0 = E4M3 with a per-row FP32 scale
+// (amax / 448), 1 = BF16, 2 = FP16. `dtype`: 0 = FP32 data, 1 = BF16 data.
+// One warp a row. Grid: (ceil(rows / 8), 1, 1)  Block: (256, 1, 1)
+#include <cuda_fp8.h>
+#include <cuda_fp16.h>
+extern "C" __global__ void __launch_bounds__(256) roundtrip_rows(
+    void* __restrict__ data, unsigned int rows, unsigned int len, unsigned int dtype, unsigned int fmt
+) {
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned long long row = (unsigned long long)blockIdx.x * 8 + threadIdx.x / 32;
+    if (row >= rows) return;
+    float* f = (float*)data + row * len;
+    __nv_bfloat16* b = (__nv_bfloat16*)data + row * len;
+    auto load = [&](unsigned int i) { return dtype == 0 ? f[i] : __bfloat162float(b[i]); };
+    auto store = [&](unsigned int i, float v) {
+        if (dtype == 0) f[i] = v; else b[i] = __float2bfloat16(v);
+    };
+    float amax = 0.0f;
+    for (unsigned int i = lane; i < len; i += 32) amax = fmaxf(amax, fabsf(load(i)));
+    for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float scale = amax > 0.0f ? amax / 448.0f : 1.0f;
+    for (unsigned int i = lane; i < len; i += 32) {
+        const float x = load(i);
+        float y;
+        if (fmt == 0) y = float(__nv_fp8_e4m3(x / scale)) * scale;
+        else if (fmt == 1) y = __bfloat162float(__float2bfloat16(x));
+        else y = __half2float(__float2half(x));
+        store(i, y);
+    }
+}
+
+// The score pack store's FP8 rows (score_store.rs): `rows` rows of `len`
+// contiguous elements (`dtype` 0 = FP32, 1 = BF16) as E4M3 codes [rows, len]
+// and a per-row FP32 scale (amax / 448), and back. rows_from_fp8 after
+// rows_to_fp8 gives exactly roundtrip_rows' fmt 0. One warp a row.
+// Grid: (ceil(rows / 8), 1, 1)  Block: (256, 1, 1)
+extern "C" __global__ void __launch_bounds__(256) rows_to_fp8(
+    const void* __restrict__ src, __nv_fp8_e4m3* __restrict__ codes, float* __restrict__ scales,
+    unsigned int rows, unsigned int len, unsigned int dtype
+) {
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned long long row = (unsigned long long)blockIdx.x * 8 + threadIdx.x / 32;
+    if (row >= rows) return;
+    const float* f = (const float*)src + row * len;
+    const __nv_bfloat16* b = (const __nv_bfloat16*)src + row * len;
+    auto load = [&](unsigned int i) { return dtype == 0 ? f[i] : __bfloat162float(b[i]); };
+    float amax = 0.0f;
+    for (unsigned int i = lane; i < len; i += 32) amax = fmaxf(amax, fabsf(load(i)));
+    for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float scale = amax > 0.0f ? amax / 448.0f : 1.0f;
+    if (lane == 0) scales[row] = scale;
+    for (unsigned int i = lane; i < len; i += 32) codes[row * len + i] = __nv_fp8_e4m3(load(i) / scale);
+}
+
+extern "C" __global__ void __launch_bounds__(256) rows_from_fp8(
+    const __nv_fp8_e4m3* __restrict__ codes, const float* __restrict__ scales, void* __restrict__ dst,
+    unsigned int rows, unsigned int len, unsigned int dtype
+) {
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned long long row = (unsigned long long)blockIdx.x * 8 + threadIdx.x / 32;
+    if (row >= rows) return;
+    const float scale = scales[row];
+    float* f = (float*)dst + row * len;
+    __nv_bfloat16* b = (__nv_bfloat16*)dst + row * len;
+    for (unsigned int i = lane; i < len; i += 32) {
+        const float y = float(codes[row * len + i]) * scale;
+        if (dtype == 0) f[i] = y; else b[i] = __float2bfloat16(y);
+    }
+}

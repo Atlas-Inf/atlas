@@ -82,7 +82,19 @@ impl VisionEncoder {
         k: u32,
         stream: u64,
     ) -> Result<()> {
-        if self.k_gemm_pipelined.0 != 0 && self.k_add_bias.0 != 0 {
+        if self.vit_fused() {
+            self.vit_gemm_epi(
+                gpu,
+                a,
+                b,
+                bias,
+                DevicePtr::NULL,
+                c,
+                (m, n, k),
+                false,
+                stream,
+            )
+        } else if self.k_gemm_pipelined.0 != 0 && self.k_add_bias.0 != 0 {
             KernelLaunch::new(gpu, self.k_gemm_pipelined)
                 .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
                 .block([256, 1, 1])
@@ -116,6 +128,171 @@ impl VisionEncoder {
         }
     }
 
+    /// ViT GEMM with a fused epilogue: C = [gelu](A·Bᵀ + bias) [+ resid], one
+    /// BF16 rounding (`dense_gemm_bf16_pipelined_epi`). `resid` may alias C.
+    #[allow(clippy::too_many_arguments)]
+    fn vit_gemm_epi(
+        &self,
+        gpu: &dyn GpuBackend,
+        a: DevicePtr,
+        b: DevicePtr,
+        bias: DevicePtr,
+        resid: DevicePtr,
+        c: DevicePtr,
+        (m, n, k): (u32, u32, u32),
+        gelu: bool,
+        stream: u64,
+    ) -> Result<()> {
+        if vit_lt() {
+            let epi = spark_runtime::cublaslt::Bf16Epilogue {
+                bias: bias.0,
+                resid: resid.0,
+                gelu,
+            };
+            match spark_runtime::cublaslt::bf16_gemm_act_weight_t_epi(
+                a.0,
+                b.0,
+                c.0,
+                [m, n, k],
+                epi,
+                stream,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    static LOGGED: std::sync::Once = std::sync::Once::new();
+                    LOGGED.call_once(|| {
+                        tracing::warn!(
+                            "ViT cuBLASLt GEMM unavailable ({e}); using the Atlas kernel"
+                        )
+                    });
+                }
+            }
+        }
+        KernelLaunch::new(gpu, self.k_gemm_epi)
+            .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
+            .block([256, 1, 1])
+            .arg_ptr(a)
+            .arg_ptr(b)
+            .arg_ptr(c)
+            .arg_ptr(bias)
+            .arg_ptr(resid)
+            .arg_u32(m)
+            .arg_u32(n)
+            .arg_u32(k)
+            .arg_u32(u32::from(gelu))
+            .launch(stream)
+    }
+
+    /// Whether the fused-epilogue kernels serve the ViT ([`vit_fused_opt_in`]).
+    fn vit_fused(&self) -> bool {
+        self.k_gemm_epi.0 != 0 && vit_fused_opt_in()
+    }
+
+    /// Steps 5-13 of a block with the fused epilogue. The residual stream stays
+    /// in buf_h1 and the attention output is in buf_h2: proj + bias + residual
+    /// in place in buf_h1 (x'), norm2 of x' into buf_h2, fc1 + bias + GELU into
+    /// buf_wide, fc2 + bias + x' in place in buf_h1. Each output is rounded to
+    /// BF16 once, and no rows are copied.
+    fn vit_block_fused_tail(
+        &self,
+        blk: &ViTBlock,
+        pt: u32,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let h = self.hidden_size as u32;
+        let inter = self.intermediate_size as u32;
+        self.vit_gemm_epi(
+            gpu,
+            self.buf_h2,
+            self.vit_weight_ptr(gpu, &blk.proj_w, stream)?,
+            blk.proj_b,
+            self.buf_h1,
+            self.buf_h1,
+            (pt, h, h),
+            false,
+            stream,
+        )?;
+        self.vit_norm(
+            gpu,
+            self.buf_h1,
+            self.buf_h2,
+            [blk.norm2_w, blk.norm2_b],
+            pt,
+            stream,
+        )?;
+        self.vit_gemm_epi(
+            gpu,
+            self.buf_h2,
+            self.vit_weight_ptr(gpu, &blk.fc1_w, stream)?,
+            blk.fc1_b,
+            DevicePtr::NULL,
+            self.buf_wide,
+            (pt, inter, h),
+            true,
+            stream,
+        )?;
+        self.vit_gemm_epi(
+            gpu,
+            self.buf_wide,
+            self.vit_weight_ptr(gpu, &blk.fc2_w, stream)?,
+            blk.fc2_b,
+            self.buf_h1,
+            self.buf_h1,
+            (pt, h, inter),
+            false,
+            stream,
+        )
+    }
+
+    /// LayerNorm of `rows` rows of `hidden_size` from `src` into `dst` (may be
+    /// `src`): `vision_layer_norm_to` where it reproduces `vision_layer_norm`'s
+    /// bits (1024-thread launch, all warps full), else a copy and the in-place
+    /// kernel.
+    pub(super) fn vit_norm(
+        &self,
+        gpu: &dyn GpuBackend,
+        src: DevicePtr,
+        dst: DevicePtr,
+        [w, b]: [DevicePtr; 2],
+        rows: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let h = self.hidden_size as u32;
+        if self.k_norm_to.0 != 0 && h >= 1024 && h.is_multiple_of(32) {
+            return KernelLaunch::new(gpu, self.k_norm_to)
+                .grid([rows, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(src)
+                .arg_ptr(dst)
+                .arg_ptr(w)
+                .arg_ptr(b)
+                .arg_u32(rows)
+                .arg_u32(h)
+                .arg_f32(1e-6)
+                .launch(stream);
+        }
+        if src != dst {
+            KernelLaunch::new(gpu, self.k_copy)
+                .grid([div_ceil(rows * h, 256), 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(src)
+                .arg_ptr(dst)
+                .arg_u32(rows * h)
+                .launch(stream)?;
+        }
+        KernelLaunch::new(gpu, self.k_norm)
+            .grid([rows, 1, 1])
+            .block([h.min(1024), 1, 1])
+            .arg_ptr(dst)
+            .arg_ptr(w)
+            .arg_ptr(b)
+            .arg_u32(rows)
+            .arg_u32(h)
+            .arg_f32(1e-6)
+            .launch(stream)
+    }
+
     /// GEMM-based SDPA for one image's [seq, 3*H*D] QKV slice → O[seq, H*D].
     /// Fast replacement for the warp-per-query `vision_attention_rope`. Once per
     /// call: rope + deinterleave + V-transpose (all heads). Then per head:
@@ -145,14 +322,18 @@ impl VisionEncoder {
         let d = self.head_dim as u32; // 72
         let hd = self.hidden_size as u32; // H*D = 1152
 
-        // (1) rope + deinterleave + V-transpose → buf_qr/buf_kr/buf_vt (all heads)
+        // One fused launch over every head (head_dim 72, [`vit_fused_opt_in`]).
+        // It reads V from the QKV rows, so it needs no transposed copy.
+        let flash = self.k_flash72.0 != 0 && d == 72 && vit_fused_opt_in();
+
+        // (1) rope + deinterleave [+ V-transpose] → buf_qr/buf_kr[/buf_vt] (all heads)
         KernelLaunch::new(gpu, self.k_rope_deint)
             .grid([div_ceil(seq * d, 256), h_n, 1])
             .block([256, 1, 1])
             .arg_ptr(qkv)
             .arg_ptr(self.buf_qr)
             .arg_ptr(self.buf_kr)
-            .arg_ptr(self.buf_vt)
+            .arg_ptr(if flash { DevicePtr::NULL } else { self.buf_vt })
             .arg_ptr(cos)
             .arg_ptr(sin)
             .arg_u32(seq)
@@ -160,6 +341,18 @@ impl VisionEncoder {
             .arg_u32(d)
             .launch(stream)?;
 
+        if flash {
+            return KernelLaunch::new(gpu, self.k_flash72)
+                .grid([div_ceil(seq, 64), h_n, 1])
+                .block([128, 1, 1])
+                .arg_ptr(self.buf_qr)
+                .arg_ptr(self.buf_kr)
+                .arg_ptr(qkv)
+                .arg_ptr(o)
+                .arg_u32(seq)
+                .arg_u32(h_n)
+                .launch(stream);
+        }
         let qk_head = (seq * d) as usize; // Qr/Kr head stride (seq*D elems)
         let v_head = (d * seq) as usize; // Vt head stride (D*seq elems)
         for head in 0..self.num_heads {
@@ -233,6 +426,10 @@ impl VisionEncoder {
         let n_h = p * self.hidden_size;
         // Attention-kernel shared memory: scores[p] + q_rope[head_dim].
         let sm_bytes = (p + self.head_dim) * std::mem::size_of::<f32>();
+        if self.vit_fused() {
+            // One image's batched block emits the same kernels on the same rows.
+            return self.vit_block_batched(blk, p, &[p], &[0], gpu, stream);
+        }
 
         // --- Attention sub-block ---
         // 1. save residual
@@ -406,30 +603,38 @@ impl VisionEncoder {
         let inter = self.intermediate_size as u32; // 4304
         let n_h = p_total * self.hidden_size;
 
+        // With the fused epilogues the residual stays in buf_h1 and norm1 /
+        // the attention output go to buf_h2 (no residual copies); otherwise
+        // buf_h2 saves the residual and buf_h1 is normed in place.
+        let fused = self.vit_fused();
+        let (resid, work) = match fused {
+            true => (self.buf_h1, self.buf_h2),
+            false => (self.buf_h2, self.buf_h1),
+        };
+
         // --- Attention sub-block ---
-        // 1. save residual
-        KernelLaunch::new(gpu, self.k_copy)
-            .grid([div_ceil(n_h as u32, 256), 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(self.buf_h1)
-            .arg_ptr(self.buf_h2)
-            .arg_u32(n_h as u32)
-            .launch(stream)?;
-        // 2. norm1 in-place (per-row, M-agnostic)
-        KernelLaunch::new(gpu, self.k_norm)
-            .grid([pt, 1, 1])
-            .block([h.min(1024), 1, 1])
-            .arg_ptr(self.buf_h1)
-            .arg_ptr(blk.norm1_w)
-            .arg_ptr(blk.norm1_b)
-            .arg_u32(pt)
-            .arg_u32(h)
-            .arg_f32(1e-6)
-            .launch(stream)?;
+        // 1-2. norm1 of buf_h1 into `work` (the residual is in `resid`)
+        if !fused {
+            KernelLaunch::new(gpu, self.k_copy)
+                .grid([div_ceil(n_h as u32, 256), 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(self.buf_h1)
+                .arg_ptr(resid)
+                .arg_u32(n_h as u32)
+                .launch(stream)?;
+        }
+        self.vit_norm(
+            gpu,
+            self.buf_h1,
+            work,
+            [blk.norm1_w, blk.norm1_b],
+            pt,
+            stream,
+        )?;
         // 3. QKV GEMM over M=p_total → buf_wide
         self.vit_gemm_bias(
             gpu,
-            self.buf_h1,
+            work,
             self.vit_weight_ptr(gpu, &blk.qkv_w, stream)?,
             blk.qkv_b,
             self.buf_wide,
@@ -454,7 +659,7 @@ impl VisionEncoder {
             }
             let p32 = p as u32;
             let qkv = self.buf_wide.offset(p_off[i] * qkv_n as usize * 2);
-            let o = self.buf_h1.offset(p_off[i] * self.hidden_size * 2);
+            let o = work.offset(p_off[i] * self.hidden_size * 2);
             let cos = self.buf_rope_cos.offset(p_off[i] * self.head_dim * 2);
             let sin = self.buf_rope_sin.offset(p_off[i] * self.head_dim * 2);
             if legacy_attn {
@@ -474,6 +679,9 @@ impl VisionEncoder {
             } else {
                 self.vit_attention_gemm(gpu, qkv, o, cos, sin, p32, stream)?;
             }
+        }
+        if fused {
+            return self.vit_block_fused_tail(blk, pt, gpu, stream);
         }
         // 5. proj GEMM over M=p_total → buf_wide (reuse)
         self.vit_gemm_bias(
@@ -564,4 +772,21 @@ impl VisionEncoder {
             .arg_u32(n_h as u32)
             .launch(stream)
     }
+}
+
+/// Whether the ViT runs its fused kernels (`ATLAS_VISION_FUSED=1`): the
+/// all-head flash attention and the bias / GELU / residual GEMM epilogues. They
+/// round differently from the separate passes (one BF16 rounding per output,
+/// a different softmax accumulation order), so vision outputs change; off by
+/// default, which keeps every target's vision tower on its existing kernels.
+fn vit_fused_opt_in() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_VISION_FUSED").is_ok_and(|v| v == "1"))
+}
+
+/// Whether the ViT's fused-epilogue GEMMs go to cuBLASLt (`ATLAS_VISION_LT=1`,
+/// with `ATLAS_VISION_FUSED=1`).
+fn vit_lt() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_VISION_LT").is_ok_and(|v| v == "1"))
 }

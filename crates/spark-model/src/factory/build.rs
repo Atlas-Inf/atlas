@@ -30,6 +30,8 @@ mod kv_carveout;
 mod kv_nvme;
 mod kv_summary;
 
+pub(crate) use kv_nvme::usable_disk_dir;
+
 pub fn build_model(
     mut config: ModelConfig,
     // BY VALUE. Every reader below still takes `&WeightStore` — the change is

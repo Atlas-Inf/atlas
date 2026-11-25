@@ -387,6 +387,21 @@ mod tests {
     }
 
     #[test]
+    fn branch_replayed_tail_image_pads_keep_their_encoder_rows() {
+        let mut tokens = vec![TEXT; 6];
+        tokens.extend([
+            TEXT, IMAGE, IMAGE, IMAGE, IMAGE, IMAGE, IMAGE, TEXT, TEXT, TEXT,
+        ]);
+        let head = vision_splice_plan(&tokens, 0, 8, pad, 0, 0, 0, 0, 6).unwrap();
+        let tail = vision_splice_plan(&tokens, 8, tokens.len() - 8, pad, 0, 0, 8, 0, 6).unwrap();
+        assert_eq!(head.iter().map(|(_, row)| *row).collect::<Vec<_>>(), [0]);
+        assert_eq!(
+            tail.iter().map(|(_, row)| *row).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
     fn cached_items_shift_rows_down_by_the_skipped_rows() {
         // Item 0 (2 rows, cached) at 1..3, item 1 (2 rows, encoded) at 4..6.
         let tokens = [TEXT, IMAGE, IMAGE, TEXT, IMAGE, IMAGE, TEXT];

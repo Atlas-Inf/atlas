@@ -36,6 +36,36 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
+// The block sum a launch of `vb` threads forms from its threads' partials
+// (`partial(t)` = thread t's own sum), computed by a launch of blockDim.x
+// threads: real warp w replays the virtual warps w, w + blockDim.x / 32, ...
+// with the same shuffle trees, so the sum is that launch's bits. blockDim.x
+// == vb is the plain kernel; a smaller block (a multiple of 32, vb % 32 == 0)
+// runs more rows an SM. Ends with a barrier; every thread gets the sum.
+template <typename Partial>
+__device__ __forceinline__ float block_sum_as(unsigned int vb, Partial partial) {
+    __shared__ float warp_sums[32];
+    const unsigned int warp_id = threadIdx.x / 32, lane_id = threadIdx.x % 32, nvw = (vb + 31) / 32;
+    for (unsigned int v = warp_id; v < nvw; v += blockDim.x / 32) {
+        float sum = warp_reduce_sum(partial(v * 32 + lane_id));
+        if (lane_id == 0) warp_sums[v] = sum;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        float val = (lane_id < nvw) ? warp_sums[lane_id] : 0.0f;
+        val = warp_reduce_sum(val);
+        if (lane_id == 0) warp_sums[0] = val;
+    }
+    __syncthreads();
+    return warp_sums[0];
+}
+
+// Marker: rms_norm_residual and residual_add_rms_norm in this module reduce with block_sum_as, so a launch
+// of any block size (a multiple of 32) gives the 1024-thread launch's bits. ops/norm.rs launches them
+// smaller only when the loaded norm module has this (resolved at model load); a model's own rms_norm.cu
+// without it keeps 1024.
+extern "C" __global__ void rms_norm_rows_any_block() {}
+
 // RMS Normalization: out = x * (1 + weight) / sqrt(mean(x^2) + eps)
 //
 // Qwen3-Next uses (1 + weight) scaling: weight is initialized to 0 and stored
@@ -342,7 +372,8 @@ extern "C" __global__ void rms_norm_f32_grouped(
 // 96 kernel launches eliminated per decode step (2 per layer × 48 layers).
 //
 // Grid: (num_tokens, 1, 1)
-// Block: (min(hidden_size, 1024), 1, 1)
+// Block: (min(hidden_size, 1024), 1, 1), or 256 for many rows (hidden_size
+// >= 1024, a multiple of 32): the same bits, see block_sum_as.
 extern "C" __global__ void rms_norm_residual(
     const __nv_bfloat16* __restrict__ input,     // [num_tokens, hidden_size]
     const __nv_bfloat16* __restrict__ weight,    // [hidden_size]
@@ -359,44 +390,27 @@ extern "C" __global__ void rms_norm_residual(
     __nv_bfloat16* out = output + token * hidden_size;
     __nv_bfloat16* res = residual + token * hidden_size;
 
-    // Step 1: Compute sum of squares — vectorized 2-wide BF16 loads
-    float sum_sq = 0.0f;
+    // Steps 1-2: sum of squares (vectorized 2-wide BF16 loads), reduced as a
+    // min(hidden_size, 1024)-thread launch does at any block size.
     const unsigned int half_size = hidden_size / 2;
     const unsigned int* x32 = (const unsigned int*)x;
-
-    for (unsigned int i = tid; i < half_size; i += blockDim.x) {
-        float v0, v1;
-        unpack_bf16x2(x32[i], v0, v1);
-        sum_sq += v0 * v0 + v1 * v1;
-    }
-    if ((hidden_size & 1) && tid == 0) {
-        float val = __bfloat162float(x[hidden_size - 1]);
-        sum_sq += val * val;
-    }
-
-    // Step 2: Block-level reduction
-    sum_sq = warp_reduce_sum(sum_sq);
-
-    __shared__ float warp_sums[32];
-    unsigned int warp_id = tid / 32;
-    unsigned int lane_id = tid % 32;
-
-    if (lane_id == 0) {
-        warp_sums[warp_id] = sum_sq;
-    }
-    __syncthreads();
-
-    if (warp_id == 0) {
-        float val = (lane_id < (blockDim.x + 31) / 32) ? warp_sums[lane_id] : 0.0f;
-        val = warp_reduce_sum(val);
-        if (lane_id == 0) {
-            warp_sums[0] = val;
+    const unsigned int vb = hidden_size < 1024 ? hidden_size : 1024;
+    const float total = block_sum_as(vb, [&](unsigned int t) {
+        float sum_sq = 0.0f;
+        for (unsigned int i = t; i < half_size; i += vb) {
+            float v0, v1;
+            unpack_bf16x2(x32[i], v0, v1);
+            sum_sq += v0 * v0 + v1 * v1;
         }
-    }
-    __syncthreads();
+        if ((hidden_size & 1) && t == 0) {
+            float val = __bfloat162float(x[hidden_size - 1]);
+            sum_sq += val * val;
+        }
+        return sum_sq;
+    });
 
     // Step 3: Compute normalization factor
-    float rms = rsqrtf(warp_sums[0] / (float)hidden_size + eps);
+    float rms = rsqrtf(total / (float)hidden_size + eps);
 
     // Step 4: Apply normalization + weight, AND copy raw input to residual
     const unsigned int* w32 = (const unsigned int*)weight;
@@ -466,7 +480,8 @@ extern "C" __global__ void rms_norm_residual_vanilla(
 // (residual_add wrote it, rms_norm_residual re-reads it).
 //
 // Grid: (num_tokens, 1, 1)
-// Block: (min(hidden_size, 1024), 1, 1)
+// Block: (min(hidden_size, 1024), 1, 1), or 256 for many rows (hidden_size
+// >= 1024, a multiple of 32): the same bits, see block_sum_as.
 extern "C" __global__ void residual_add_rms_norm(
     __nv_bfloat16* __restrict__ hidden,      // [num_tokens, hidden_size] in/out (hidden += src)
     const __nv_bfloat16* __restrict__ src,    // [num_tokens, hidden_size] added to hidden
@@ -485,51 +500,34 @@ extern "C" __global__ void residual_add_rms_norm(
     __nv_bfloat16* out = output + token * hidden_size;
     __nv_bfloat16* res = residual + token * hidden_size;
 
-    // Pass 1: Add src to hidden, compute sum of squares — vectorized 2-wide
-    float sum_sq = 0.0f;
+    // Pass 1: Add src to hidden, compute sum of squares — vectorized 2-wide;
+    // reduced as a min(hidden_size, 1024)-thread launch does at any block size.
     const unsigned int half_size = hidden_size / 2;
     unsigned int* h32 = (unsigned int*)h;
     const unsigned int* s32 = (const unsigned int*)s;
-
-    for (unsigned int i = tid; i < half_size; i += blockDim.x) {
-        float hv0, hv1, sv0, sv1;
-        unpack_bf16x2(h32[i], hv0, hv1);
-        unpack_bf16x2(s32[i], sv0, sv1);
-        float new0 = hv0 + sv0;
-        float new1 = hv1 + sv1;
-        h32[i] = pack_bf16x2(new0, new1);  // Write updated hidden
-        sum_sq += new0 * new0 + new1 * new1;
-    }
-    if ((hidden_size & 1) && tid == 0) {
-        float hv = __bfloat162float(h[hidden_size - 1]);
-        float sv = __bfloat162float(s[hidden_size - 1]);
-        float nv = hv + sv;
-        h[hidden_size - 1] = __float2bfloat16(nv);
-        sum_sq += nv * nv;
-    }
-
-    // Block-level reduction
-    sum_sq = warp_reduce_sum(sum_sq);
-
-    __shared__ float warp_sums[32];
-    unsigned int warp_id = tid / 32;
-    unsigned int lane_id = tid % 32;
-
-    if (lane_id == 0) {
-        warp_sums[warp_id] = sum_sq;
-    }
-    __syncthreads();
-
-    if (warp_id == 0) {
-        float val = (lane_id < (blockDim.x + 31) / 32) ? warp_sums[lane_id] : 0.0f;
-        val = warp_reduce_sum(val);
-        if (lane_id == 0) {
-            warp_sums[0] = val;
+    const unsigned int vb = hidden_size < 1024 ? hidden_size : 1024;
+    const float total = block_sum_as(vb, [&](unsigned int t) {
+        float sum_sq = 0.0f;
+        for (unsigned int i = t; i < half_size; i += vb) {
+            float hv0, hv1, sv0, sv1;
+            unpack_bf16x2(h32[i], hv0, hv1);
+            unpack_bf16x2(s32[i], sv0, sv1);
+            float new0 = hv0 + sv0;
+            float new1 = hv1 + sv1;
+            h32[i] = pack_bf16x2(new0, new1);  // Write updated hidden
+            sum_sq += new0 * new0 + new1 * new1;
         }
-    }
-    __syncthreads();
+        if ((hidden_size & 1) && t == 0) {
+            float hv = __bfloat162float(h[hidden_size - 1]);
+            float sv = __bfloat162float(s[hidden_size - 1]);
+            float nv = hv + sv;
+            h[hidden_size - 1] = __float2bfloat16(nv);
+            sum_sq += nv * nv;
+        }
+        return sum_sq;
+    });
 
-    float rms = rsqrtf(warp_sums[0] / (float)hidden_size + eps);
+    float rms = rsqrtf(total / (float)hidden_size + eps);
 
     // Pass 2: Apply normalization + weight, AND copy updated hidden to residual
     // NOTE: Qwen3-Next uses (1 + weight) offset scaling.
@@ -1632,6 +1630,88 @@ extern "C" __global__ void gated_rms_norm_prefill_sigmoid(
         out64[i] = ((unsigned long long)hi << 32) | (unsigned long long)lo;
     }
 }
+
+// One warp a (head, token) twin of gated_rms_norm_prefill[_sigmoid], for
+// head_dim % 4 == 0 and head_dim / 4 <= 32 (one 4-element quad a lane).
+// The CTA-per-head kernels launch head_dim threads, of which only warp 0
+// holds data when head_dim <= 128: its shuffle tree is the whole sum (the
+// other warps and the second stage add exact zeros), so this warp's tree on
+// the same quads gives the same sum, rms and output bits. 8 heads a CTA
+// instead of one 128-thread CTA each: 32880 CTAs became 4110 at 685 tokens.
+// Grid: (ceil(heads * tokens / 8), 1, 1)  Block: (256, 1, 1)
+template <bool SIGMOID>
+__device__ __forceinline__ void gated_rms_norm_prefill_warp_body(
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ output,
+    unsigned int head_dim,
+    float eps,
+    unsigned int input_token_stride,
+    unsigned int gate_token_stride,
+    unsigned int heads,
+    unsigned int tokens
+) {
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned long long item = (unsigned long long)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (item >= (unsigned long long)heads * tokens) return;
+    const unsigned int head = (unsigned int)(item % heads), token = (unsigned int)(item / heads);
+
+    const __nv_bfloat16* x = input + (unsigned long long)token * input_token_stride + head * head_dim;
+    const __nv_bfloat16* g = gate + (unsigned long long)token * gate_token_stride + head * head_dim;
+    __nv_bfloat16* out = output + (unsigned long long)token * input_token_stride + head * head_dim;
+    const unsigned int quad_size = head_dim / 4;
+    const bool mine = lane < quad_size;
+
+    float f0 = 0.0f, f1 = 0.0f, f2 = 0.0f, f3 = 0.0f;
+    float sum_sq = 0.0f;
+    if (mine) {
+        unsigned long long v = ((const unsigned long long*)x)[lane];
+        unpack_bf16x2((unsigned int)v, f0, f1);
+        unpack_bf16x2((unsigned int)(v >> 32), f2, f3);
+        sum_sq += f0 * f0 + f1 * f1 + f2 * f2 + f3 * f3;
+    }
+    sum_sq = warp_reduce_sum(sum_sq);
+    float rms = rsqrtf(sum_sq / (float)head_dim + eps);
+    if (!mine) return;
+
+    unsigned long long wv = ((const unsigned long long*)weight)[lane];
+    float w0, w1, w2, w3;
+    unpack_bf16x2((unsigned int)wv, w0, w1);
+    unpack_bf16x2((unsigned int)(wv >> 32), w2, w3);
+    unsigned long long gv = ((const unsigned long long*)g)[lane];
+    float g0, g1, g2, g3;
+    unpack_bf16x2((unsigned int)gv, g0, g1);
+    unpack_bf16x2((unsigned int)(gv >> 32), g2, g3);
+    float s0, s1, s2, s3;
+    if (SIGMOID) {
+        s0 = 1.0f / (1.0f + expf(-g0));
+        s1 = 1.0f / (1.0f + expf(-g1));
+        s2 = 1.0f / (1.0f + expf(-g2));
+        s3 = 1.0f / (1.0f + expf(-g3));
+    } else {
+        s0 = g0 / (1.0f + expf(-g0));
+        s1 = g1 / (1.0f + expf(-g1));
+        s2 = g2 / (1.0f + expf(-g2));
+        s3 = g3 / (1.0f + expf(-g3));
+    }
+    unsigned int lo = pack_bf16x2(f0 * rms * w0 * s0, f1 * rms * w1 * s1);
+    unsigned int hi = pack_bf16x2(f2 * rms * w2 * s2, f3 * rms * w3 * s3);
+    ((unsigned long long*)out)[lane] = ((unsigned long long)hi << 32) | (unsigned long long)lo;
+}
+
+#define GATED_RMS_NORM_PREFILL_WARP(NAME, SIGMOID)                                          \
+    extern "C" __global__ void __launch_bounds__(256) NAME(                                  \
+        const __nv_bfloat16* __restrict__ input, const __nv_bfloat16* __restrict__ gate,     \
+        const __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ output,        \
+        unsigned int head_dim, float eps, unsigned int input_token_stride,                   \
+        unsigned int gate_token_stride, unsigned int heads, unsigned int tokens) {           \
+        gated_rms_norm_prefill_warp_body<SIGMOID>(input, gate, weight, output, head_dim, eps, \
+            input_token_stride, gate_token_stride, heads, tokens);                           \
+    }
+GATED_RMS_NORM_PREFILL_WARP(gated_rms_norm_prefill_warp, false)
+GATED_RMS_NORM_PREFILL_WARP(gated_rms_norm_prefill_warp_sigmoid, true)
+
 
 // L2 Normalization (in-place): x[i] = x[i] / sqrt(sum(x^2) + eps)
 //

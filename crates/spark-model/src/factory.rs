@@ -158,6 +158,7 @@ mod lm_head_setup;
 mod m2_setup;
 
 pub use build::build_model;
+pub(crate) use build::usable_disk_dir;
 
 #[cfg(test)]
 mod tests {

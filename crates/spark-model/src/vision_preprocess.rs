@@ -12,12 +12,14 @@ use image::{DynamicImage, ImageDecoder, ImageReader, Limits, Rgb, RgbImage};
 
 mod glm_sizing;
 mod qwen_sizing;
+mod score_image;
 pub(crate) use glm_sizing::glm_pixel_budget;
 pub(crate) use glm_sizing::{
     derive_glm_max_patches, glm_max_item_tokens, glm_max_sequence_patches, glm_resize_or_pad,
     glm_target_size,
 };
 pub(crate) use qwen_sizing::qwen_fit;
+pub use score_image::{MAX_SCORE_IMAGE_BYTES, MAX_SCORE_IMAGE_PIXELS, preprocess_score_image};
 
 /// SigLIP normalization — matches HF's Qwen2VLImageProcessor
 /// (`image_mean = image_std = (0.5, 0.5, 0.5)` → pixels mapped to [-1, 1]).
@@ -326,13 +328,23 @@ fn preprocess_probed(probed: ProbedImage, vcfg: &VisionConfig) -> Result<(Vec<f3
         probed.target.1
     );
 
+    patchify_rgb(img, vcfg, th, tw, max_pixels)
+}
+
+fn patchify_rgb(
+    img: RgbImage,
+    vcfg: &VisionConfig,
+    th: u32,
+    tw: u32,
+    max_pixels: Option<usize>,
+) -> Result<(Vec<f32>, usize, usize)> {
+    let (orig_w, orig_h) = (img.width(), img.height());
     let img = if vcfg.is_glm5_next {
         let allow_upscale = vcfg.temporal_patch_size * orig_h as usize * (orig_w as usize)
             < glm_pixel_budget(vcfg, max_pixels, false).0;
         glm_resize_or_pad(&img, th, tw, allow_upscale)
     } else {
-        // Resize with CatmullRom — closest BICUBIC match in the `image` crate,
-        // matching HF's `Qwen2VLImageProcessor` which uses PIL resample=3 (BICUBIC).
+        // CatmullRom is the `image` crate's closest match to HF's PIL bicubic resampler.
         image::imageops::resize(&img, tw, th, image::imageops::FilterType::CatmullRom)
     };
 

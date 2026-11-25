@@ -124,7 +124,7 @@ dependencies = [
  "cudarc",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -444,6 +444,15 @@ name = "clap_lex"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
+
+[[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "color_quant"
@@ -1014,6 +1023,12 @@ dependencies = [
  "pin-project-lite",
  "slab",
 ]
+
+[[package]]
+name = "gcd"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d758ba1b47b00caf47f24925c0074ecb20d6dfcffe7f6d53395c0465674841a"
 
 [[package]]
 name = "generic-array"
@@ -1924,7 +1939,7 @@ dependencies = [
  "lazy_static",
  "memchr",
  "parking_lot",
- "thiserror",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -2429,6 +2444,7 @@ dependencies = [
  "spark-storage",
  "tokenizers",
  "tracing",
+ "turbojpeg",
 ]
 
 [[package]]
@@ -2503,7 +2519,7 @@ dependencies = [
  "spark-runtime",
  "spark-storage",
  "tempfile",
- "thiserror",
+ "thiserror 2.0.19",
  "tokenizers",
  "tokio",
  "tokio-stream",
@@ -2659,11 +2675,31 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+dependencies = [
+ "thiserror-impl 1.0.69",
+]
+
+[[package]]
+name = "thiserror"
 version = "2.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09a43598840e33d5b0331f38c5e30d13bb11c11210a4b58f0d9b18a5a5eefcd9"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 2.0.19",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2778,7 +2814,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spm_precompiled",
- "thiserror",
+ "thiserror 2.0.19",
  "unicode-normalization-alignments",
  "unicode-segmentation",
  "unicode_categories",
@@ -3001,6 +3037,30 @@ dependencies = [
  "crossterm",
  "ratatui",
  "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "turbojpeg"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81313fcd64aaa30ddfd59eaa122968136b2dd9cd41d9619b126cf71e67a01702"
+dependencies = [
+ "gcd",
+ "libc",
+ "thiserror 1.0.69",
+ "turbojpeg-sys",
+]
+
+[[package]]
+name = "turbojpeg-sys"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49b5a974bc59382d35927e3a07eef2ba9a24fe7227cefe52ec44b508e1b90f86"
+dependencies = [
+ "anyhow",
+ "cmake",
+ "libc",
+ "pkg-config",
 ]
 
 [[package]]
@@ -3403,7 +3463,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

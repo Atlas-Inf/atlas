@@ -296,6 +296,12 @@ impl GpuBackend for AtlasCudaBackend {
         }
     }
 
+    fn ships_kernel(&self, module: &str, func_name: &str) -> bool {
+        self.registry()
+            .raw_function_cached(&OnceLock::new(), module, func_name)
+            .is_ok()
+    }
+
     fn copy_h2d_async(&self, src: &[u8], dst: DevicePtr, stream: u64) -> Result<()> {
         h2d_enqueue(src, dst, stream)?;
         // The trait promises the caller may drop `src` right now. From PAGEABLE

@@ -23,7 +23,12 @@
 //!   scan and conv1d (`score_ssm.rs`); only a layer without them copies the
 //!   pack's state into the stream's slot first.
 //!
-//! Packs are content-addressed (tokens and attention mode), held up to a
+//! An image pack holds images (the image pads among its tokens): its build
+//! pass encodes them, and it keeps their merged grids and content hashes,
+//! which a stream on it stages for its MRoPE positions (`score_vision.rs`);
+//! nothing of the images is encoded again.
+//!
+//! Packs are content-addressed (tokens, image hashes and attention mode), held up to a
 //! caller's limit and evicted least recently used first. Every score pass and
 //! every build runs under the registry lock, so a pack is never dropped while
 //! a pass reads it.
@@ -33,18 +38,22 @@ use std::hash::{Hash, Hasher};
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::DevicePtr;
-use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
+use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::super::ssm_batched_copy::{StateCopy, run_state_copies};
 use super::super::super::types::TransformerModel;
 use super::score_plan::ScorePlan;
+use super::score_store::PackMeta;
 use crate::layer::{BatchedAttnMetadata, SsmLayerState};
-use crate::traits::{ScorePackInfo, SequenceState};
+use crate::traits::SequenceState;
 
 /// One held pack.
 pub(in crate::model) struct Pack {
     pub tokens: Vec<u32>,
     pub bidir: bool,
+    /// Its images' merged (t, h, w) grids and content hashes, in pad order.
+    pub grids: Vec<(usize, usize, usize)>,
+    pub hashes: Vec<u128>,
     /// Its KV blocks (`ceil(P / block)`) and its SSM slot.
     pub seq: SequenceState,
     last_use: u64,
@@ -67,9 +76,10 @@ impl ScorePacks {
 }
 
 /// A pack's content address.
-pub(in crate::model) fn pack_id(tokens: &[u32], bidir: bool) -> u64 {
+pub(in crate::model) fn pack_id(tokens: &[u32], hashes: &[u128], bidir: bool) -> u64 {
     let mut h = std::hash::DefaultHasher::new();
     tokens.hash(&mut h);
+    hashes.hash(&mut h);
     bidir.hash(&mut h);
     h.finish()
 }
@@ -184,45 +194,66 @@ impl TransformerModel {
         Ok(off + ((n * 4 + 63) & !63))
     }
 
-    /// See [`crate::traits::Model::score_pack`].
-    pub(in crate::model) fn score_pack_impl(
+    /// See [`crate::traits::Model::score_pack_by_id`].
+    pub(in crate::model) fn score_pack_by_id_impl(
         &self,
-        tokens: &[u32],
-        bidir: bool,
+        id: u64,
         limit: usize,
         stream: u64,
-    ) -> Result<ScorePackInfo> {
-        ensure!(
-            limit > 0,
-            "score: packs are off on this server (start it with --score-packs N)"
-        );
-        ensure!(!tokens.is_empty(), "score: an empty pack");
-        let v = self.config.vocab_size as u32;
-        if let Some(t) = tokens.iter().find(|&&t| t >= v) {
-            anyhow::bail!("score: pack token id {t} outside the model's vocabulary ({v} rows)");
-        }
-        let id = pack_id(tokens, bidir);
+    ) -> Result<bool> {
         let mut guard = self.score_packs.lock();
-        if let Ok(p) = touch(&mut guard, id) {
-            ensure!(
-                p.tokens == tokens,
-                "score: pack address collision ({id:016x})"
-            );
-            return Ok(ScorePackInfo {
-                id,
-                tokens: tokens.len(),
-                built: false,
-            });
+        if touch(&mut guard, id).is_ok() {
+            return Ok(true);
         }
-        // Build first (a failed build keeps every held pack), then evict the
-        // least recently used down to the limit.
-        let seq = self.score_build_pack(tokens, bidir, guard.0.len(), stream)?;
+        let Some((meta, seq)) = self.store_restore(id, stream)? else {
+            return Ok(false);
+        };
+        self.hold_pack(&mut guard, id, meta, seq, limit.max(1))?;
+        Ok(true)
+    }
+
+    /// See [`crate::traits::Model::score_packs_prefetch`].
+    pub(in crate::model) fn score_packs_prefetch_impl(
+        &self,
+        packs: &[crate::traits::ScorePackKey<'_>],
+    ) -> (Vec<bool>, bool) {
+        use crate::traits::ScorePackKey;
+        let ids: Vec<u64> = packs
+            .iter()
+            .map(|k| match k {
+                ScorePackKey::Id(id) => *id,
+                ScorePackKey::Spec(s) => {
+                    let hashes: Vec<u128> = s.images.iter().map(|it| it.content_hash).collect();
+                    pack_id(s.tokens, &hashes, s.prefix_bidir)
+                }
+            })
+            .collect();
+        let held: Vec<bool> = {
+            let guard = self.score_packs.lock();
+            ids.iter().map(|id| guard.0.contains_key(id)).collect()
+        };
+        self.store_prefetch(&ids, &held)
+    }
+
+    /// Hold `seq` as pack `id`, then evict the least recently used other
+    /// packs down to `limit`.
+    pub(super) fn hold_pack(
+        &self,
+        guard: &mut PackGuard<'_>,
+        id: u64,
+        meta: PackMeta,
+        seq: SequenceState,
+        limit: usize,
+    ) -> Result<()> {
+        guard.1 += 1;
         let tick = guard.1;
         guard.0.insert(
             id,
             Pack {
-                tokens: tokens.to_vec(),
-                bidir,
+                tokens: meta.tokens,
+                bidir: meta.bidir,
+                grids: meta.grids,
+                hashes: meta.hashes,
                 seq,
                 last_use: tick,
             },
@@ -240,69 +271,7 @@ impl TransformerModel {
                 self.free_sequence_dispatch(&mut p.seq, false)?;
             }
         }
-        Ok(ScorePackInfo {
-            id,
-            tokens: tokens.len(),
-            built: true,
-        })
-    }
-
-    /// Encode `tokens` in a pass of their own and keep the sequence (`held`:
-    /// packs already held, the registry being locked by the caller).
-    fn score_build_pack(
-        &self,
-        tokens: &[u32],
-        bidir: bool,
-        held: usize,
-        stream: u64,
-    ) -> Result<SequenceState> {
-        ensure!(
-            self.score_supported(),
-            "score: single-rank models with BF16 logits only"
-        );
-        ensure!(
-            !bidir
-                || self
-                    .layers
-                    .iter()
-                    .all(|l| l.is_ssm_layer() || l.honours_state_end()),
-            "score: attention \"prefix_bidir\" is not supported by this model's attention layers"
-        );
-        {
-            let kv = self.kv_cache.lock();
-            ensure!(
-                (0..kv.num_layers()).all(|l| matches!(
-                    kv.dtype_for_layer(l),
-                    KvCacheDtype::Bf16 | KvCacheDtype::Fp8
-                )),
-                "score: packs need a bf16 or fp8 KV cache"
-            );
-        }
-        let (max_rows, max_streams) = self.score_capacity_held(held);
-        ensure!(
-            tokens.len() <= max_rows && max_streams > 0,
-            "score: a {}-token pack exceeds one pass ({max_rows} rows, {max_streams} free \
-             sequences)",
-            tokens.len()
-        );
-        let plan = ScorePlan::pack(tokens, bidir);
-        let mut seqs = vec![self.alloc_sequence_reset(false)?];
-        let slot = seqs[0].slot_idx;
-        let run = self
-            .ssm_pool
-            .zero_slot(slot, self.gpu.as_ref(), stream)
-            .and_then(|()| self.score_forward(&plan, &mut seqs, &[], stream))
-            .and_then(|()| self.gpu.synchronize(stream));
-        if let Err(e) = run {
-            if let Err(s) = self.gpu.synchronize(stream) {
-                tracing::error!("score pack: synchronize after a failed build: {s:#}");
-            }
-            if let Err(f) = self.free_sequence_dispatch(&mut seqs[0], false) {
-                tracing::error!("score pack: free_sequence: {f:#}");
-            }
-            return Err(e);
-        }
-        Ok(seqs.pop().expect("one sequence"))
+        Ok(())
     }
 
     /// The pass's tail-block copies: each stream that reads its pack directly
@@ -374,5 +343,44 @@ impl TransformerModel {
             }
         }
         first
+    }
+}
+
+impl TransformerModel {
+    /// `prefix_bidir`: upload each stream's state end and the heads' widened
+    /// KV extents (a head with a partial tail reads up to S, not F). Returns
+    /// the scratch cursor past the staged array.
+    pub(super) fn score_stage_bidir(
+        &self,
+        plan: &super::score_plan::ScorePlan,
+        meta: &mut crate::layer::BatchedAttnMetadata,
+        cursor: usize,
+        stream: u64,
+    ) -> Result<usize> {
+        let n = plan.streams();
+        let off = (cursor + 63) & !63;
+        ensure!(
+            off + n * 4 <= self.buffers.scratch_bytes(),
+            "score: state-end staging exceeds scratch ({n} streams)"
+        );
+        let as_bytes = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let dst = self.buffers.scratch().offset(off);
+        self.gpu
+            .copy_h2d_async_retained(&as_bytes(&plan.state_end), dst, stream)?;
+        meta.state_end = dst;
+        let mut changed = false;
+        for i in 0..n {
+            let want = plan.kv_len[i] as i32;
+            if meta.kv_lens_host[i] != want {
+                meta.kv_lens_host[i] = want;
+                changed = true;
+            }
+        }
+        if changed {
+            let bytes = as_bytes(&meta.kv_lens_host);
+            self.gpu
+                .copy_h2d_async_retained(&bytes, meta.kv_lens, stream)?;
+        }
+        Ok(off + ((n * 4 + 63) & !63))
     }
 }
