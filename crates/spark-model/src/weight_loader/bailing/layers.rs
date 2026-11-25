@@ -179,7 +179,11 @@ fn load_kda_weights(store: &WeightStore, lp: &str, gpu: &dyn GpuBackend) -> Resu
     })
 }
 
-pub(super) fn load_mla_weights(store: &WeightStore, lp: &str, gpu: &dyn GpuBackend) -> Result<LingMlaWeights> {
+pub(super) fn load_mla_weights(
+    store: &WeightStore,
+    lp: &str,
+    gpu: &dyn GpuBackend,
+) -> Result<LingMlaWeights> {
     let attn = |stem: &str| format!("{lp}.attention.{stem}.weight");
     let kv_b = dense(store, &attn("kv_b_proj"))?;
     Ok(LingMlaWeights {
@@ -569,3 +573,7 @@ fn load_moe_weights(
 #[cfg(test)]
 #[path = "layers_moe_parity_gpu.rs"]
 mod layers_moe_parity_gpu;
+
+#[cfg(test)]
+#[path = "mla_moe_prefill_repro_gpu.rs"]
+mod mla_moe_prefill_repro_gpu;

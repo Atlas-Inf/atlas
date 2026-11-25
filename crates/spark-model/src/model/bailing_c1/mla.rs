@@ -368,7 +368,8 @@ impl LingMlaLayer {
         seq_len: usize,
         block_table: &[u32],
         stream: u64,
-    ) -> Result<()> {        let s = &self.scratch;
+    ) -> Result<()> {
+        let s = &self.scratch;
         let k = &self.kernels;
         let hidden_w = s.hidden as u32;
         ops::rms_norm(
@@ -435,7 +436,7 @@ impl LingMlaLayer {
         ops::residual_add(gpu, k.residual_add_k, hidden, s.ffn_in, hidden_w, stream)
     }
 
-    fn ffn_half(
+    pub(crate) fn ffn_half(
         &self,
         gpu: &dyn GpuBackend,
         hidden: DevicePtr,
@@ -530,7 +531,7 @@ impl LingMlaLayer {
     /// Prefill attention over `rows` rows starting at `seq_len_start`.
     /// Single-pass fast path only when this sub-chunk IS the whole prompt.
     #[allow(clippy::too_many_arguments)]
-    fn attention_half_prefill(
+    pub(crate) fn attention_half_prefill(
         &self,
         gpu: &dyn GpuBackend,
         hidden: DevicePtr,
