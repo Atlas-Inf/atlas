@@ -51,44 +51,75 @@ extern "C" __global__ void ling_latent_cache_write(
 
 // ---- Query absorption -------------------------------------------------------
 
+__device__ __forceinline__ float2 bf2(unsigned w) {
+    return make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u));
+}
+
 #define ABSORB_ROWS 8u
 
-// grid (heads, ceil(rows / ABSORB_ROWS)), block 512: thread c owns latent
-// channel c of every row in its group.
-extern "C" __global__ void __launch_bounds__(512) ling_q_absorb(
+// kv_b key rows h*256 + d -> kb_t [h*512 + c][d], once at load, so each
+// absorbed output row is one contiguous 256-byte read. grid (32 * 512 / 256),
+// block 256.
+extern "C" __global__ void ling_kb_transpose(const __nv_bfloat16* __restrict__ kv_b,
+                                             __nv_bfloat16* __restrict__ out) {
+    const unsigned row = blockIdx.x * blockDim.x + threadIdx.x;  // h * 512 + c
+    const unsigned h = row / LING_LATENT, c = row % LING_LATENT;
+    for (unsigned d = 0; d < LING_NOPE; ++d)
+        out[row * LING_NOPE + d] = kv_b[(h * LING_KVB + d) * LING_LATENT + c];
+}
+
+// grid (32 * 512 / 64, ceil(rows / 8)), block 256: warp w of the block owns
+// latent output rows base + w * 8 .. +7 of one head; lane l reads query
+// channels 4l .. 4l + 3 of each row (coalesced) and the warp reduces in a
+// fixed shuffle order.
+extern "C" __global__ void __launch_bounds__(256) ling_q_absorb(
     const __nv_bfloat16* __restrict__ q_full,    // [rows][32][192], rope rotated
-    const __nv_bfloat16* __restrict__ kv_b,      // [32*256][512]
+    const __nv_bfloat16* __restrict__ kb_t,      // [32 * 512][128]
     __nv_bfloat16* __restrict__ q_abs,           // [rows][32][576]
     const unsigned rows) {
-    const unsigned h = blockIdx.x, r0 = blockIdx.y * ABSORB_ROWS, c = threadIdx.x;
+    const unsigned base = blockIdx.x * 64, h = base / LING_LATENT, r0 = blockIdx.y * ABSORB_ROWS;
     const unsigned n = min(ABSORB_ROWS, rows - r0);
-    __shared__ float q[ABSORB_ROWS][LING_NOPE];
-    for (unsigned i = threadIdx.x; i < ABSORB_ROWS * LING_NOPE; i += blockDim.x) {
-        const unsigned r = i / LING_NOPE, d = i % LING_NOPE;
-        q[r][d] = r < n ? __bfloat162float(q_full[((r0 + r) * LING_HEADS + h) * LING_QK + d]) : 0.f;
-    }
-    __syncthreads();
-    float acc[ABSORB_ROWS];
+    const unsigned warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    float q[ABSORB_ROWS][4];
 #pragma unroll
-    for (unsigned r = 0; r < ABSORB_ROWS; ++r) acc[r] = 0.f;
-    const __nv_bfloat16* w = kv_b + (h * LING_KVB) * LING_LATENT + c;
-    for (unsigned d = 0; d < LING_NOPE; ++d) {
-        const float wv = __bfloat162float(w[d * LING_LATENT]);
+    for (unsigned r = 0; r < ABSORB_ROWS; ++r) {
+        const uint2 v = r < n ? *reinterpret_cast<const uint2*>(
+                                    q_full + ((r0 + r) * LING_HEADS + h) * LING_QK + 4 * lane)
+                              : make_uint2(0, 0);
+        const float2 a = bf2(v.x), b = bf2(v.y);
+        q[r][0] = a.x, q[r][1] = a.y, q[r][2] = b.x, q[r][3] = b.y;
+    }
+    for (unsigned i = 0; i < 8; ++i) {
+        const unsigned row = base + warp * 8 + i, c = row % LING_LATENT;
+        const uint2 wv = reinterpret_cast<const uint2*>(kb_t + static_cast<size_t>(row) * LING_NOPE)[lane];
+        const float2 w0 = bf2(wv.x), w1 = bf2(wv.y);
 #pragma unroll
-        for (unsigned r = 0; r < ABSORB_ROWS; ++r) acc[r] += q[r][d] * wv;
+        for (unsigned r = 0; r < ABSORB_ROWS; ++r) {
+            if (r >= n) break;
+            float acc = q[r][0] * w0.x;
+            acc += q[r][1] * w0.y;
+            acc += q[r][2] * w1.x;
+            acc += q[r][3] * w1.y;
+            acc += __shfl_xor_sync(0xffffffffu, acc, 16);
+            acc += __shfl_xor_sync(0xffffffffu, acc, 8);
+            acc += __shfl_xor_sync(0xffffffffu, acc, 4);
+            acc += __shfl_xor_sync(0xffffffffu, acc, 2);
+            acc += __shfl_xor_sync(0xffffffffu, acc, 1);
+            if (lane == 0) q_abs[((r0 + r) * LING_HEADS + h) * LING_ROW + c] = __float2bfloat16(acc);
+        }
     }
-    for (unsigned r = 0; r < n; ++r) {
-        __nv_bfloat16* out = q_abs + ((r0 + r) * LING_HEADS + h) * LING_ROW;
-        out[c] = __float2bfloat16(acc[r]);
-        if (c < LING_ROPE)
-            out[LING_LATENT + c] = q_full[((r0 + r) * LING_HEADS + h) * LING_QK + LING_NOPE + c];
-    }
+    if (base % LING_LATENT == 0)
+        for (unsigned i = threadIdx.x; i < n * LING_ROPE; i += blockDim.x) {
+            const unsigned r = i / LING_ROPE, j = i % LING_ROPE;
+            q_abs[((r0 + r) * LING_HEADS + h) * LING_ROW + LING_LATENT + j] =
+                q_full[((r0 + r) * LING_HEADS + h) * LING_QK + LING_NOPE + j];
+        }
 }
 
 // ---- Absorbed paged decode ----------------------------------------------------
 
 #define DEC_SPLITS 64u
-#define DEC_MIN_CHUNK 256u
+#define DEC_MIN_CHUNK 64u
 #define DEC_TILE 32u
 // Shared row stride: 576 values + 8 of padding (1,168 bytes, an odd number of
 // 16-byte units) so ldmatrix rows fall in different banks.
@@ -106,9 +137,6 @@ __device__ __forceinline__ unsigned ling_decode_chunk(unsigned len) {
     return (chunk + DEC_TILE - 1) / DEC_TILE * DEC_TILE;
 }
 
-__device__ __forceinline__ float2 bf2(unsigned w) {
-    return make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u));
-}
 
 __device__ __forceinline__ void ling_cp16(void* dst, const void* src, bool valid) {
     const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
@@ -354,51 +382,45 @@ extern "C" __global__ void __launch_bounds__(128) ling_latent_decode_merge(
 
 // ---- Value up-projection ------------------------------------------------------
 
-#define VUP_ROWS 8u
-
-// grid (heads, ceil(rows / VUP_ROWS)), block 256: warp w produces value
-// channels w, w + 8, ...; lane l reduces latent channels 16l..16l+15.
+// grid (32 * 128 / 16, ceil(rows / 8)), block 256: warp w owns value output
+// rows base + w * 2 .. +1 of one head; lane l reads latent channels
+// 16l .. 16l + 15 of each row (coalesced) and the warp reduces in a fixed
+// shuffle order.
 extern "C" __global__ void __launch_bounds__(256) ling_v_up(
     const __nv_bfloat16* __restrict__ latent,    // [rows][32][512]
     const __nv_bfloat16* __restrict__ kv_b,      // [32*256][512]
     __nv_bfloat16* __restrict__ out,             // [rows][32*128]
     const unsigned rows) {
-    const unsigned h = blockIdx.x, r0 = blockIdx.y * VUP_ROWS;
-    const unsigned n = min(VUP_ROWS, rows - r0);
+    const unsigned base = blockIdx.x * 16, h = base / LING_V, r0 = blockIdx.y * ABSORB_ROWS;
+    const unsigned n = min(ABSORB_ROWS, rows - r0);
     const unsigned warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    __shared__ float lat[VUP_ROWS][LING_LATENT];
-    for (unsigned i = threadIdx.x; i < VUP_ROWS * LING_LATENT; i += blockDim.x) {
-        const unsigned r = i / LING_LATENT, c = i % LING_LATENT;
-        lat[r][c] = r < n ? __bfloat162float(latent[((r0 + r) * LING_HEADS + h) * LING_LATENT + c]) : 0.f;
-    }
+    __shared__ float lat[ABSORB_ROWS][LING_LATENT];
+    for (unsigned i = threadIdx.x; i < n * LING_LATENT; i += blockDim.x)
+        lat[i / LING_LATENT][i % LING_LATENT] =
+            __bfloat162float(latent[((r0 + i / LING_LATENT) * LING_HEADS + h) * LING_LATENT + i % LING_LATENT]);
     __syncthreads();
-    for (unsigned v = warp; v < LING_V; v += 8) {
+    for (unsigned i = 0; i < 2; ++i) {
+        const unsigned row = base + warp * 2 + i, v = row % LING_V;
         const uint4* w = reinterpret_cast<const uint4*>(
-            kv_b + (h * LING_KVB + LING_NOPE + v) * LING_LATENT + 16 * lane);
+            kv_b + (static_cast<size_t>(h) * LING_KVB + LING_NOPE + v) * LING_LATENT + 16 * lane);
         const uint4 w0 = w[0], w1 = w[1];
         const unsigned words[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
-        float acc[VUP_ROWS];
 #pragma unroll
-        for (unsigned r = 0; r < VUP_ROWS; ++r) acc[r] = 0.f;
+        for (unsigned r = 0; r < ABSORB_ROWS; ++r) {
+            if (r >= n) break;
+            float acc = 0.f;
 #pragma unroll
-        for (unsigned j = 0; j < 8; ++j) {
-            const float2 wv = bf2(words[j]);
-#pragma unroll
-            for (unsigned r = 0; r < VUP_ROWS; ++r) {
-                acc[r] += wv.x * lat[r][16 * lane + 2 * j];
-                acc[r] += wv.y * lat[r][16 * lane + 2 * j + 1];
+            for (unsigned j = 0; j < 8; ++j) {
+                const float2 wv = bf2(words[j]);
+                acc += wv.x * lat[r][16 * lane + 2 * j];
+                acc += wv.y * lat[r][16 * lane + 2 * j + 1];
             }
-        }
-#pragma unroll
-        for (unsigned r = 0; r < VUP_ROWS; ++r) {
-            float s = acc[r];
-            s += __shfl_xor_sync(0xffffffffu, s, 16);
-            s += __shfl_xor_sync(0xffffffffu, s, 8);
-            s += __shfl_xor_sync(0xffffffffu, s, 4);
-            s += __shfl_xor_sync(0xffffffffu, s, 2);
-            s += __shfl_xor_sync(0xffffffffu, s, 1);
-            if (lane == 0 && r < n)
-                out[(r0 + r) * LING_HEADS * LING_V + h * LING_V + v] = __float2bfloat16(s);
+            acc += __shfl_xor_sync(0xffffffffu, acc, 16);
+            acc += __shfl_xor_sync(0xffffffffu, acc, 8);
+            acc += __shfl_xor_sync(0xffffffffu, acc, 4);
+            acc += __shfl_xor_sync(0xffffffffu, acc, 2);
+            acc += __shfl_xor_sync(0xffffffffu, acc, 1);
+            if (lane == 0) out[(r0 + r) * LING_HEADS * LING_V + h * LING_V + v] = __float2bfloat16(acc);
         }
     }
 }

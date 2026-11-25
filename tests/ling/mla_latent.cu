@@ -109,12 +109,14 @@ int main() {
     auto part_ml = allocate<float>(size_t(rows) * DEC_SPLITS * H * 2);
     auto latent = allocate<__nv_bfloat16>(rows * H * R);
     auto out = allocate<__nv_bfloat16>(rows * H * 128);
+    auto kb_t = allocate<__nv_bfloat16>(H * R * N);
+    ling_kb_transpose<<<H * R / 256, 256>>>(w, kb_t);
     auto run = [&](int first, int n) {
-        ling_q_absorb<<<dim3(H, (n + 7) / 8), 512>>>(q + first * H * 192, w, q_abs, n);
+        ling_q_absorb<<<dim3(H * R / 64, (n + 7) / 8), 256>>>(q + first * H * 192, kb_t, q_abs, n);
         ling_latent_decode<<<dim3(DEC_SPLITS, n), 256, LING_DECODE_SMEM>>>(q_abs, pool, table, seq + first, 0, BS, scale,
                                                          part_o, part_ml);
         ling_latent_decode_merge<<<dim3(H, n), 128>>>(part_o, part_ml, seq + first, latent);
-        ling_v_up<<<dim3(H, (n + 7) / 8), 256>>>(latent, w, out + first * H * 128, n);
+        ling_v_up<<<dim3(H * 128 / 16, (n + 7) / 8), 256>>>(latent, w, out + first * H * 128, n);
         check(cudaDeviceSynchronize());
     };
     run(0, rows);

@@ -98,6 +98,9 @@ pub struct LingMlaWeights {
     /// kv_b_proj as BF16 `[heads * 256, 512]`: the absorbed query and value
     /// sides of the latent cache.
     pub kv_b_bf16: DevicePtr,
+    /// The key half of `kv_b_bf16` transposed to `[heads * 512, 128]`, so each
+    /// absorbed query row is one contiguous read (`ling_kb_transpose`).
+    pub kb_t: DevicePtr,
     /// Device table [qk_rope_head_dim / 2] for the interleaved RoPE kernel.
     pub rope_inv_freq: DevicePtr,
 }
@@ -134,6 +137,14 @@ impl LingMlaWeights {
             config.kv_lora_rank,
         )?;
         let kv_b_bf16 = kv_b_proj.bf16_weight(gpu, store, &format!("{prefix}.kv_b_proj"))?;
+        let kb_t =
+            gpu.alloc(config.num_heads * config.kv_lora_rank * config.qk_nope_head_dim * 2)?;
+        KernelLaunch::new(gpu, gpu.kernel("ling_mla_latent", "ling_kb_transpose")?)
+            .grid([(config.num_heads * config.kv_lora_rank / 256) as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(kv_b_bf16)
+            .arg_ptr(kb_t)
+            .launch(gpu.default_stream())?;
         Ok(Self {
             q_proj: LingProjection::load(gpu, store, &format!("{prefix}.q_proj"), q, h)?,
             kv_a_proj_with_mqa: LingProjection::load(
@@ -146,6 +157,7 @@ impl LingMlaWeights {
             kv_a_layernorm: DenseWeight { weight: norm.ptr },
             kv_b_proj,
             kv_b_bf16,
+            kb_t,
             g_proj: LingProjection::load(
                 gpu,
                 store,
@@ -665,10 +677,10 @@ impl LingMlaWeights {
     ) -> Result<()> {
         let l = scratch.latent;
         KernelLaunch::new(gpu, kernels.q_absorb)
-            .grid([32, rows.div_ceil(8), 1])
-            .block([512, 1, 1])
+            .grid([32 * 512 / 64, rows.div_ceil(8), 1])
+            .block([256, 1, 1])
             .arg_ptr(scratch.q_full)
-            .arg_ptr(self.kv_b_bf16)
+            .arg_ptr(self.kb_t)
             .arg_ptr(l.q_abs)
             .arg_u32(rows)
             .launch(stream)?;
@@ -705,7 +717,7 @@ impl LingMlaWeights {
                 .launch(stream)?;
         }
         KernelLaunch::new(gpu, kernels.v_up)
-            .grid([32, rows.div_ceil(8), 1])
+            .grid([32 * 128 / 16, rows.div_ceil(8), 1])
             .block([256, 1, 1])
             .arg_ptr(l.latent_out)
             .arg_ptr(self.kv_b_bf16)
