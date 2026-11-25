@@ -205,3 +205,23 @@ fn a_slab_holds_no_stream_bytes() {
     // One slab for the plain tensor, one allocation for the scale.
     assert_eq!(gpu.alloc_count(), 2);
 }
+
+/// A plain tensor whose device allocation fails is not lost: it falls back to
+/// the copier path (managed memory when the retry fails too) and lands intact
+/// beside the tensors the uploader placed.
+#[test]
+fn a_tensor_whose_allocation_fails_still_lands() {
+    let dir = Dir::new("allocfail");
+    let tensors: Vec<T> = (0..3u8)
+        .map(|i| plain(&format!("t{i}"), vec![i + 1; 5000 + i as usize]))
+        .collect();
+    checkpoint(&dir.0, std::slice::from_ref(&tensors));
+    let gpu = MockGpuBackend::new();
+    gpu.fail_alloc_after(1);
+    let store = load(&dir.0, &gpu).unwrap();
+    assert_eq!(store.len(), tensors.len());
+    for (name, _, _, bytes) in &tensors {
+        let t = store.get(name).unwrap();
+        assert_eq!(&gpu.read_alloc(t.ptr).unwrap(), bytes, "{name}");
+    }
+}

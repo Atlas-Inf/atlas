@@ -89,20 +89,32 @@ pub(crate) fn resolve_model_dir(args: &cli::ServeArgs) -> Result<std::path::Path
     }
 }
 
-pub(crate) fn cap_vocab_size_to_tokenizer(model_dir: &Path, config: &mut ModelConfig) {
+/// The vocabulary size (special tokens included) of `model_dir`'s
+/// `tokenizer.json`, if it has one that parses. A full tokenizer parse
+/// (~0.27 s for Qwen3.8's 248K vocabulary), so the caller runs it off the
+/// critical path and hands the result to [`cap_vocab_size_to_tokenizer`].
+pub(crate) fn tokenizer_vocab_size(model_dir: &Path) -> Option<usize> {
     let tok_path = model_dir.join("tokenizer.json");
-    if tok_path.exists()
-        && let Ok(tok) = tokenizers::Tokenizer::from_file(&tok_path)
+    if !tok_path.exists() {
+        return None;
+    }
+    let tok = tokenizers::Tokenizer::from_file(&tok_path).ok()?;
+    Some(tok.get_vocab_size(true))
+}
+
+/// Cap `config.vocab_size` to the tokenizer's (from
+/// [`tokenizer_vocab_size`]) when the tokenizer's is smaller.
+pub(crate) fn cap_vocab_size_to_tokenizer(tok_vocab: Option<usize>, config: &mut ModelConfig) {
+    if let Some(tok_vocab) = tok_vocab
+        && tok_vocab > 0
+        && tok_vocab < config.vocab_size
     {
-        let tok_vocab = tok.get_vocab_size(true);
-        if tok_vocab > 0 && tok_vocab < config.vocab_size {
-            tracing::info!(
-                "Capping vocab_size from {} to {} (tokenizer)",
-                config.vocab_size,
-                tok_vocab,
-            );
-            config.vocab_size = tok_vocab;
-        }
+        tracing::info!(
+            "Capping vocab_size from {} to {} (tokenizer)",
+            config.vocab_size,
+            tok_vocab,
+        );
+        config.vocab_size = tok_vocab;
     }
 }
 

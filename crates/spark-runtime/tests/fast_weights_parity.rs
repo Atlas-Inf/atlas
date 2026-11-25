@@ -314,7 +314,11 @@ fn tempdir_like() -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let p = std::env::temp_dir().join(format!("atlas-fwp-{pid}-{ns}"));
+    // Tests run on parallel threads and each removes its dir at the end: a
+    // counter keeps two that read the same clock value from sharing one.
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let p = std::env::temp_dir().join(format!("atlas-fwp-{pid}-{ns}-{n}"));
     std::fs::create_dir_all(&p).unwrap();
     p
 }

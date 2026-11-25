@@ -42,12 +42,21 @@ fn a_common_kernel_change_reopens_every_target_on_that_hardware() {
     assert!(!v.whole_repo, "a kernels-only diff is not whole-repo");
 }
 
+/// A model's kernels reopen that model and the models compiled from them:
+/// qwen3.8-27b builds qwen3.6-27b's kernels (`[model] kernel_source`).
 #[test]
-fn a_model_specific_change_reopens_only_that_model() {
+fn a_model_specific_change_reopens_that_model_and_the_models_built_on_it() {
     let root = repo_root();
     let v = &views(&root, &[pr(2, &[FLAGSHIP])])[0];
-    assert_eq!(v.targets.len(), 1);
-    assert_eq!(v.targets.iter().next().unwrap().model, "qwen3.6-27b");
+    let models: std::collections::BTreeSet<&str> =
+        v.targets.iter().map(|t| t.model.as_str()).collect();
+    assert_eq!(
+        models,
+        ["qwen3.6-27b", "qwen3.8-27b"].into_iter().collect(),
+        "{:?}",
+        v.targets
+    );
+    assert!(v.targets.iter().all(|t| t.hardware == "gb10"));
 }
 
 /// ★ A diff that reaches outside `kernels/` re-opens everything, and must be
@@ -88,8 +97,10 @@ fn two_prs_touching_one_target_collide() {
     let root = repo_root();
     let v = views(&root, &[pr(1, &[FLAGSHIP]), pr(2, &[FLAGSHIP])]);
     let c = collisions(&v);
-    assert_eq!(c.len(), 1);
     assert_eq!(c["gb10/qwen3.6-27b/nvfp4"], vec![1, 2]);
+    // qwen3.8-27b compiles the same kernels, so both PRs collide there too.
+    assert_eq!(c["gb10/qwen3.8-27b/nvfp4"], vec![1, 2]);
+    assert!(c.values().all(|prs| prs == &vec![1, 2]), "{c:?}");
 }
 
 #[test]

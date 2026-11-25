@@ -52,13 +52,26 @@ fn the_baked_attestation_reproduces_from_the_tree() {
     // 21 of 22 entries verified, the test passed, and the one target the whole
     // scheme exists to spare had no attestation at all. A silently absent entry
     // is fail-closed, which is why nothing else catches it.
-    let gb10: Vec<_> = taxon::walk(&root)
+    //
+    // A build of every model (`ATLAS_TARGET_MODEL` unset or `*`) must have
+    // resolved the whole tree, so the tree is what it must attest. A one-model
+    // build, as product images build, resolves only that model's targets
+    // (#250); those must all be attested.
+    let expected: Vec<String> = if atlas_kernels::TARGET_MODEL_SPEC == "*" {
+        taxon::walk(&root)
+            .into_iter()
+            .filter(|t| t.hardware == "gb10" && t.quant == "nvfp4")
+            .map(|t| t.to_string())
+            .collect()
+    } else {
+        resolved_targets()
+    };
+    assert!(
+        !expected.is_empty(),
+        "the build resolved no targets to attest"
+    );
+    let missing: Vec<String> = expected
         .into_iter()
-        .filter(|t| t.hardware == "gb10" && t.quant == "nvfp4")
-        .collect();
-    let missing: Vec<String> = gb10
-        .iter()
-        .map(|t| t.to_string())
         .filter(|k| !baked.contains_key(k))
         .collect();
     assert!(
@@ -115,6 +128,30 @@ fn the_baked_attestation_reproduces_from_the_tree() {
     // this verified 22 targets or 1, and the count is the only thing that
     // distinguishes a real check from a nearly-empty one.
     eprintln!("closure attestation: {checked} target(s) reproduced from the tree");
+}
+
+fn resolved_targets() -> Vec<String> {
+    atlas_kernels::TARGETS_RESOLVED
+        .split(',')
+        .filter(|k| !k.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Every attested target is one the build resolved: the two lists come from
+/// one `resolve_targets` call, so an attestation for anything else means the
+/// lists are out of step.
+#[test]
+fn every_attested_target_was_resolved() {
+    let baked: Attestation = serde_json::from_str(atlas_kernels::TARGET_CLOSURES)
+        .expect("TARGET_CLOSURES must parse into the type the gate reads");
+    let resolved = resolved_targets();
+    for key in baked.keys() {
+        assert!(
+            resolved.contains(key),
+            "{key} is attested but not among the resolved targets {resolved:?}"
+        );
+    }
 }
 
 /// The JSON build.rs writes by hand must deserialize into the struct the gate

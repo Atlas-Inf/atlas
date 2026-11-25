@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 mod deferred_slice;
 mod direct_io;
 mod header;
+mod pinned_upload;
 mod shard;
 mod shard_readers;
 
@@ -275,6 +276,14 @@ impl WeightLoader for FastSafetensorsLoader {
         let initial_free = gpu.free_memory()?;
         let mut offload_logged = false;
         let mut csf = crate::weights::nvfp4_csf::CsfAssembler::new();
+        // Linux only (CUDA and HIP, O_DIRECT): elsewhere, and without
+        // page-locked staging, every tensor takes the copier path.
+        let uploader = cfg!(target_os = "linux")
+            .then(|| pinned_upload::PinnedUploader::new(gpu))
+            .and_then(|r| {
+                r.inspect_err(|e| tracing::warn!("pinned upload unavailable ({e:#}); copier path"))
+                    .ok()
+            });
 
         // Index entries grouped by the shard path they name, ONCE, keyed by
         // `model_dir.join(<index string>)` — the very expression
@@ -325,6 +334,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 self.direct_io_tensor_cap,
                 self.prefetch_shards,
                 self.pack_slab,
+                uploader.as_ref(),
                 &mut weights,
                 &mut deferred,
                 &mut offload_logged,
@@ -375,6 +385,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 self.direct_io_tensor_cap,
                 self.prefetch_shards,
                 self.pack_slab,
+                uploader.as_ref(),
                 &mut weights,
                 &mut deferred,
                 &mut extra_offload,

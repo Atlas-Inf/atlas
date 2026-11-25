@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Single-shard buffered/direct I/O and upload; extracted without changing order.
+use super::pinned_upload::PinnedUploader;
 use super::shard_readers::ShardReaders;
 use super::{direct_io, header::parse_header};
 use crate::gpu::GpuBackend;
@@ -12,7 +13,8 @@ use std::path::Path;
 
 /// Load a single shard with O_DIRECT + pipelined read/copy.
 ///
-/// Pipeline:
+/// Plain tensors, with an `uploader`: allocated up front, then read and
+/// copied by its workers in parallel ([`PinnedUploader`]). Every other tensor:
 ///   reader threads: pread tensors into aligned buffers ([`ShardReaders`]) ──▶
 ///   main thread:    recv, in tensor order → copy_h2d → store tensor
 #[allow(clippy::too_many_arguments)]
@@ -26,6 +28,7 @@ pub(super) fn load_shard_fast(
     direct_io_tensor_cap: usize,
     prefetch_shards: bool,
     pack_slab: bool,
+    uploader: Option<&PinnedUploader>,
     out: &mut HashMap<String, WeightTensor>,
     deferred_out: &mut HashMap<String, crate::weights::DeferredTensor>,
     offload_logged: &mut bool,
@@ -131,11 +134,6 @@ pub(super) fn load_shard_fast(
     };
 
     let _ = file_size; // retained for future use (tail-fragment buffered read)
-    let mut readers = ShardReaders::spawn(
-        raw_fd,
-        using_direct,
-        tensors.iter().map(|t| (t.abs_offset, t.len)).collect(),
-    );
 
     // Pack mode (opt-in): one cuMemAlloc per shard, tensors carved out at
     // 4096-byte-aligned interior offsets. Skips the ≥1MB→2MB page rounding
@@ -165,10 +163,58 @@ pub(super) fn load_shard_fast(
         None
     };
 
+    // Plain tensors (stored as they are on disk) are allocated in order and
+    // filled by the uploader's workers in parallel. The rest — CSF scales, F16
+    // converts, and any whose allocation failed (managed-memory fallback
+    // below) — go through the reader/copier path.
+    let (plain_idx, mut copier_idx): (Vec<usize>, Vec<usize>) =
+        (0..tensors.len()).partition(|&i| {
+            uploader.is_some() && csf_part(&tensors[i].name).is_none() && !tensors[i].from_f16
+        });
+    if let Some(up) = uploader {
+        let spans: Vec<(u64, usize)> = plain_idx
+            .iter()
+            .map(|&i| (tensors[i].abs_offset, tensors[i].len))
+            .collect();
+        let ptrs = up.upload(raw_fd, using_direct, &spans, |k| {
+            let idx = plain_idx[k];
+            match slab.as_ref() {
+                Some((base, offsets)) => Some(base.offset(offsets[idx])),
+                None => gpu.alloc(tensors[idx].len).ok(),
+            }
+        })?;
+        for (&idx, ptr) in plain_idx.iter().zip(ptrs) {
+            let meta = &tensors[idx];
+            let Some(ptr) = ptr else {
+                copier_idx.push(idx);
+                continue;
+            };
+            csf.note_plain(&meta.name)?;
+            out.insert(
+                meta.name.clone(),
+                WeightTensor {
+                    ptr,
+                    shape: meta.shape.clone(),
+                    dtype: meta.dtype,
+                },
+            );
+        }
+    }
+
+    let mut readers = ShardReaders::spawn(
+        raw_fd,
+        using_direct,
+        copier_idx
+            .iter()
+            .map(|&i| (tensors[i].abs_offset, tensors[i].len))
+            .collect(),
+    );
+
     // Copier: drains the reads in order, does gpu alloc + copy_h2d, inserts
     // into the map.
     for result in &mut readers {
-        let (idx, buf, slice_start) = result?;
+        let (k, buf, slice_start) = result?;
+        let idx = copier_idx[k];
         let meta = &tensors[idx];
         let raw = &buf.as_slice()[slice_start..slice_start + meta.len];
         // CSF-compressed NVFP4 scales (either encoding): the components are
