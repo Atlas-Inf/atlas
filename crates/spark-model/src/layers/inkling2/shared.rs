@@ -150,7 +150,7 @@ impl Shared {
             rel_table: a.take(r * d.heads * super::ops::MAX_REL_EXTENT * b),
             attn_partials: a.take(
                 super::ops::attn_partials_len(
-                    r.max(d.max_seqs * super::ops::DECODE_ATTN_SPLITS),
+                    super::ops::attn_slots(r, d.max_seqs),
                     d.heads,
                     d.q_dim / d.heads,
                 ) * f,

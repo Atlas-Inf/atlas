@@ -51,6 +51,8 @@ impl BlockDiffusionDraftHead {
         let mut batch_block_tables = Vec::with_capacity(n);
         let mut batch_ctx_counts = Vec::with_capacity(n);
         let mut ban_depths: Vec<u32> = Vec::with_capacity(n);
+        // Inkling 2: each sequence's context accumulator, for its f_rnn row.
+        let mut ink_accs: Vec<Option<(DevicePtr, usize)>> = Vec::with_capacity(n);
         for (sequence, state) in states.iter_mut().enumerate() {
             let dstate = state
                 .as_any_mut()
@@ -70,6 +72,7 @@ impl BlockDiffusionDraftHead {
                     self.gamma.saturating_sub(1),
                 )
             }));
+            ink_accs.push((dstate.ctx_len > 0).then_some((dstate.ctx_hidden_acc, dstate.ctx_len)));
             let block_table_dev = dstate.block_table_dev.unwrap_or(DevicePtr::NULL);
             block_table_ptrs.push(block_table_dev.0);
             batch_ctx_counts.push(dstate.ctx_count_drafter);
@@ -217,6 +220,8 @@ impl BlockDiffusionDraftHead {
             self.hidden_size as u32,
             stream,
         )?;
+        // Inkling 2: the block input and each sequence's f_rnn row.
+        self.inkling_batch_prepare(ctx.gpu, &ink_accs, stream)?;
         let batch_rows = u32::try_from(batch_inputs.total_rows())
             .map_err(|_| anyhow::anyhow!("DFlash batch row count exceeds u32"))?;
         let batch_size =
@@ -301,35 +306,42 @@ impl BlockDiffusionDraftHead {
                     );
                 }
             }
-            if !walked {
-                self.run_batched_tail_base(batch_rows, ctx, stream)?;
-            }
-            self.mask_batched_draft_logits(n, grammar_bitmasks, ctx, stream)?;
-            if self.candidate_selector.is_some() {
-                // ATLAS_GLM_DRAFT_TP_TOPK: the split swapped candidate lists.
-                let lists = batch_split
-                    .filter(|(split, _)| split.plan().topk)
-                    .and_then(|(split, _)| split.topk.as_ref());
-                self.run_batched_dflash2_tail(
-                    batch_size,
-                    last_tokens,
-                    ban_depths.iter().any(|&depth| depth > 0),
-                    lists,
-                    ctx,
-                    stream,
-                )?;
-            } else if let Some(d) = self.dspine.as_ref() {
-                self.dspine_tail(
-                    ctx.gpu,
-                    self.batch_logits,
-                    batch_rows,
-                    self.dspine_batch_blocks(),
-                    &d.batch,
-                    self.batch_tokens,
-                    stream,
-                )?;
+            if self.inkling.is_some() {
+                // Inkling 2: the head and its recurrent tail (`inkling_batch.rs`).
+                anyhow::ensure!(!walked, "Inkling 2 DSpark has no rank-split batch");
+                let inputs = (batch_rows, n, num_drafts);
+                self.inkling_batch_head_tail(inputs, grammar_bitmasks, ctx, stream)?;
             } else {
-                self.run_batched_markov(batch_size, ctx, stream)?;
+                if !walked {
+                    self.run_batched_tail_base(batch_rows, ctx, stream)?;
+                }
+                self.mask_batched_draft_logits(n, grammar_bitmasks, ctx, stream)?;
+                if self.candidate_selector.is_some() {
+                    // ATLAS_GLM_DRAFT_TP_TOPK: the split swapped candidate lists.
+                    let lists = batch_split
+                        .filter(|(split, _)| split.plan().topk)
+                        .and_then(|(split, _)| split.topk.as_ref());
+                    self.run_batched_dflash2_tail(
+                        batch_size,
+                        last_tokens,
+                        ban_depths.iter().any(|&depth| depth > 0),
+                        lists,
+                        ctx,
+                        stream,
+                    )?;
+                } else if let Some(d) = self.dspine.as_ref() {
+                    self.dspine_tail(
+                        ctx.gpu,
+                        self.batch_logits,
+                        batch_rows,
+                        self.dspine_batch_blocks(),
+                        &d.batch,
+                        self.batch_tokens,
+                        stream,
+                    )?;
+                } else {
+                    self.run_batched_markov(batch_size, ctx, stream)?;
+                }
             }
         }
 

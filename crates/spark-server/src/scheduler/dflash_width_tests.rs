@@ -133,6 +133,21 @@ fn batch_depth_keeps_long_blocks_at_two_and_eight_rows_past_two() {
 }
 
 #[test]
+fn an_operator_table_bounds_two_sequences_too() {
+    use super::batch_depth_with;
+    // No table: two sequences keep the drafter's block.
+    assert_eq!(batch_depth_with(7, 2, [7, 7].into_iter(), None), 7);
+    assert_eq!(batch_depth_with(15, 2, [15, 15].into_iter(), None), 15);
+    // A table's entry for two narrows them: 4 rows each, 8 in the verify.
+    assert_eq!(batch_depth_with(7, 2, [7, 7].into_iter(), Some(3)), 3);
+    assert_eq!(batch_depth_with(15, 2, [15, 15].into_iter(), Some(7)), 7);
+    // Never to nothing (0 means no speculation, decided by `spec_width_ok`).
+    assert_eq!(batch_depth_with(7, 2, [7, 7].into_iter(), Some(0)), 1);
+    // One sequence is the drafter's own depth whatever the table says.
+    assert_eq!(batch_depth_with(7, 1, [7].into_iter(), Some(3)), 7);
+}
+
+#[test]
 fn wide_batches_narrow_then_decode_plain() {
     use super::{WIDE_DEPTHS, depth_for, parse_depths};
     assert_eq!(depth_for(&WIDE_DEPTHS, 8), 7);

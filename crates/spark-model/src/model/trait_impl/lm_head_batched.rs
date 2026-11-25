@@ -39,6 +39,11 @@ pub(crate) fn lm_head_batch_gemv_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_NO_LM_HEAD_BATCH_GEMV").as_deref() != Ok("1"))
 }
 
+/// Rows up to which Inkling 2's verify head runs in passes of the batch GEMV
+/// tiers ([`TransformerModel::inkling_head_passes`]): eight sequences of a
+/// whole DSpark block.
+const INKLING_EXACT_HEAD_ROWS: usize = 64;
+
 #[derive(Debug, Clone, Copy)]
 enum LmHeadNvfp4Route {
     BatchGemv(KernelHandle),
@@ -266,6 +271,69 @@ impl TransformerModel {
             )?;
         }
         Ok(logits)
+    }
+
+    /// Inkling 2's head over 9..=[`INKLING_EXACT_HEAD_ROWS`] verify rows, in
+    /// passes of the batch GEMV tiers (8 rows a BF16 pass, 16 an NVFP4 one):
+    /// each row the single-row decode head's bytes, where the tile GEMM it
+    /// replaces sums in another order and could turn a tie the verify then
+    /// accepts differently from serial decode. `false`: another model or row
+    /// count, or no tier; nothing launched.
+    pub(in crate::model) fn inkling_head_passes(
+        &self,
+        normed: DevicePtr,
+        logits: DevicePtr,
+        rows: usize,
+        stream: u64,
+    ) -> Result<bool> {
+        if self.config.model_type != "inkling2_loop"
+            || !(9..=INKLING_EXACT_HEAD_ROWS).contains(&rows)
+            || self.lm_head_fp8.is_some()
+        {
+            return Ok(false);
+        }
+        let (h, v, bf16) = (self.config.hidden_size, self.config.vocab_size, 2usize);
+        let width = if self.lm_head_nvfp4.is_some() { 16 } else { 8 };
+        let kernel = match self.lm_head_nvfp4 {
+            Some(_) => self.w4a16_gemv_batch16_kernel,
+            None => self.dense_gemv_batchm_kernel,
+        };
+        if kernel.0 == 0 {
+            return Ok(false);
+        }
+        for first in (0..rows).step_by(width) {
+            let part = (rows - first).min(width) as u32;
+            let (x, y) = (
+                normed.offset(first * h * bf16),
+                logits.offset(first * v * bf16),
+            );
+            match self.lm_head_nvfp4.as_ref() {
+                Some(nvfp4) => ops::w4a16_gemv_batchm(
+                    self.gpu.as_ref(),
+                    kernel,
+                    x,
+                    nvfp4,
+                    y,
+                    part,
+                    v as u32,
+                    h as u32,
+                    stream,
+                )?,
+                None => ops::dense_gemv_batchm(
+                    self.gpu.as_ref(),
+                    kernel,
+                    x,
+                    &self.lm_head_weight,
+                    y,
+                    part,
+                    v as u32,
+                    h as u32,
+                    v as u32,
+                    stream,
+                )?,
+            }
+        }
+        Ok(true)
     }
 
     /// Whether a batched BF16 head of `rows` rows runs the batch GEMV (one

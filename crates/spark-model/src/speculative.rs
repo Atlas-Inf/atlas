@@ -626,6 +626,25 @@ pub trait DraftProposer: Send + Sync {
         1
     }
 
+    /// Bracket the next `members` per-sequence [`Self::propose`] calls of
+    /// `drafts` drafts each, for a proposer that can share work between
+    /// them without a batched forward (Inkling 2's DSpark: one vocabulary
+    /// head pass). `true`: a bracketed propose may return no drafts, and
+    /// [`Self::group_finish`] returns them. Default: no group.
+    fn group_begin(&self, _members: usize, _drafts: usize) -> bool {
+        false
+    }
+
+    /// Close [`Self::group_begin`]'s bracket: the drafts of the proposes that
+    /// returned none, in the order they ran.
+    fn group_finish(
+        &self,
+        _gpu: &dyn spark_runtime::gpu::GpuBackend,
+        _stream: u64,
+    ) -> Result<Vec<Vec<u32>>> {
+        Ok(Vec::new())
+    }
+
     /// Minimum group width admitted to [`Self::propose_batch`]. Normal batched
     /// proposers require two sequences; explicit parity diagnostics may use one.
     fn propose_batch_min(&self) -> usize {

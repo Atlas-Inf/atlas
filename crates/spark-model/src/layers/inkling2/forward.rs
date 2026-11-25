@@ -37,6 +37,10 @@ impl Inkling2Layer {
             self.visit_idx
         );
         let (n, seqs) = (batch.rows(), batch.seqs.len());
+        // A verify run (journaled rows) takes decode's kernels at any row
+        // count, so each verified token is the one serial decode picks; prefill
+        // rows take the prefill kernels and the checkpoint's declared numerics.
+        let exact = !batch.journals.is_empty();
         let (h, rb, rf) = (d.hidden, n * d.hidden * 2, n * d.hidden * 4);
         let bstride = d.block_stride() * 2; // bytes between stack blocks
         let bs = kv_cache.block_size();
@@ -103,7 +107,7 @@ impl Inkling2Layer {
             let row_elems = n * h;
             self.msg_gates(
                 gpu,
-                n,
+                (n, exact),
                 0..3,
                 (res(0), if v.full { row_elems } else { 0 }),
                 (s.msg4, row_elems),
@@ -134,7 +138,7 @@ impl Inkling2Layer {
             p.eps,
             stream,
         )?;
-        self.project(gpu, n, stream)?;
+        self.project(gpu, n, exact, stream)?;
 
         // k/v convs, then the per-head epilogues
         // each state: k, v, post-attention, post-MLP convs (fp32 elements)
@@ -207,8 +211,14 @@ impl Inkling2Layer {
         gm.kv_write(
             gpu, n, s.kn, s.vn, k_pool, v_pool, meta.slots, p.kv_heads, p.head_dim, bs, stream,
         )?;
-        if batch.seqs.len() == 1 && batch.rows_per_seq > 1 {
-            // a prefill chunk (or verify run) of one sequence: tensor cores
+        let body = ops::attn_body(
+            batch.seqs.len(),
+            batch.rows_per_seq,
+            super::layer::MAX_VERIFY_ROWS,
+            ops::attn_slots(d.max_rows, d.max_seqs),
+        );
+        if body == ops::AttnBody::Prefill {
+            // a prefill chunk of one sequence: tensor cores
             ops::prefill_attn(
                 gpu,
                 &self.k,
@@ -236,11 +246,11 @@ impl Inkling2Layer {
                 stream,
             )?;
         } else {
-            // decode rows split their keys over the GPU; prefill rows have rows enough
-            let splits = if batch.rows_per_seq == 1 {
-                ops::DECODE_ATTN_SPLITS
-            } else {
-                1
+            // decode and verify rows split their keys over the GPU; prefill
+            // rows have rows enough
+            let splits = match body {
+                ops::AttnBody::Decode { splits } => splits,
+                ops::AttnBody::Prefill => 1,
             };
             ops::decode_attn(
                 gpu,
@@ -273,7 +283,7 @@ impl Inkling2Layer {
             )?;
         }
         gm.gate_mul(gpu, s.attn, s.gate, s.gated, n * d.q_dim, stream)?;
-        gm.proj(gpu, n, s.gated, w.wo, s.proj, h, d.q_dim, stream)?;
+        gm.proj(gpu, (n, exact), s.gated, w.wo, s.proj, h, d.q_dim, stream)?;
         self.journal_inputs(gpu, batch, [s.proj], 2, stream)?;
         self.conv(
             gpu,
@@ -314,7 +324,7 @@ impl Inkling2Layer {
             let mlp_msg = s.msg4.offset(3 * rf);
             self.msg_gates(
                 gpu,
-                n,
+                (n, exact),
                 3..4,
                 (s.mlp_in, 0),
                 (mlp_msg, 0),
@@ -337,7 +347,7 @@ impl Inkling2Layer {
         // router, experts, post-MLP conv, layer output
         gm.proj_f32(
             gpu,
-            n,
+            (n, exact),
             s.mlp_normed,
             w.router,
             s.logits,
@@ -357,7 +367,7 @@ impl Inkling2Layer {
             p.route_scale,
             stream,
         )?;
-        self.routed_experts(gpu, n, stream)?;
+        self.routed_experts(gpu, n, exact, stream)?;
         self.journal_inputs(gpu, batch, [s.moe_out], 3, stream)?;
         self.conv(
             gpu,

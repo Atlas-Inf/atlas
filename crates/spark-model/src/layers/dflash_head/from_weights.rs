@@ -153,6 +153,8 @@ impl BlockDiffusionDraftHead {
             Some(selector) => ops::dflash2_selector_build(selector.top_k)?,
             None => ops::DFLASH2_SELECTOR_BASE,
         };
+        // Inkling 2's tail reports its own confidences (`inkling_tail.rs`).
+        let inkling_conf = startup.diagnostics.draft_conf && inkling_weights.is_some();
         let (selector_kernel, draft_conf) = super::draft_conf::selector_kernel(
             gpu,
             glm_series && startup.diagnostics.draft_conf && weights.candidate_selector.is_some(),
@@ -164,7 +166,7 @@ impl BlockDiffusionDraftHead {
                 selector_build.module
             );
         }
-        startup.diagnostics.draft_conf = draft_conf;
+        startup.diagnostics.draft_conf = draft_conf || inkling_conf;
         let dense_gemv_tc = dense_gemv_tc_kernels(gpu, glm_series);
         let kernels = DflashKernels {
             // DFlash drafter uses HF's vanilla RMSNorm convention
@@ -1037,7 +1039,10 @@ impl BlockDiffusionDraftHead {
                 head.lm_head_shared,
                 head.vocab_size,
                 head.hidden_size,
+                head.gamma,
+                head.batch_capacity,
                 head.kernels.dense_gemm,
+                head.startup.diagnostics.draft_conf,
                 gpu,
             )?);
         }
