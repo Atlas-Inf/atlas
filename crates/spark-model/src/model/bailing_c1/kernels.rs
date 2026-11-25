@@ -33,6 +33,17 @@ pub(crate) struct LingKernels {
     /// `kda_recurrent_bf16_verify_snap` — the K-token verify twin
     /// (PR #110): per-row H rollback snapshots in one launch.
     pub kda_verify_snap_k: KernelHandle,
+    /// `kda_pack_qkv` — plane-major projection staging packed to the
+    /// token-major q|k|v rows the pool-indexed decode pair (and the verify
+    /// conv staging) read.
+    pub kda_pack_qkv_k: KernelHandle,
+    /// `ling_kda_conv_indexed` — the pool-addressed one-token conv twin of
+    /// the common `causal_conv1d_update` (multi-sequence decode lane).
+    pub kda_conv_indexed_k: KernelHandle,
+    /// `ling_kda_recurrent_indexed` — the pool-addressed one-token twin of
+    /// `kda_recurrent_bf16`: each row advances the slot its device slot-id
+    /// names (multi-sequence decode lane, capture-stable by construction).
+    pub kda_recurrent_indexed_k: KernelHandle,
     // gated_mla.cu
     pub mla_kv_a_cache_k: KernelHandle,
     pub mla_q_absorb_k: KernelHandle,
@@ -87,6 +98,9 @@ impl LingKernels {
             kda_recurrent_k: required(gpu, "kda", "kda_recurrent_bf16")?,
             kda_gated_norm_k: required(gpu, "kda", "kda_sigmoid_gated_rms_norm")?,
             kda_verify_snap_k: required(gpu, "kda", "kda_recurrent_bf16_verify_snap")?,
+            kda_pack_qkv_k: required(gpu, "kda", "kda_pack_qkv")?,
+            kda_conv_indexed_k: required(gpu, "kda", "ling_kda_conv_indexed")?,
+            kda_recurrent_indexed_k: required(gpu, "kda", "ling_kda_recurrent_indexed")?,
             mla_kv_a_cache_k: required(gpu, "gated_mla", "ling_mla_kv_a_norm_rope_cache")?,
             mla_q_absorb_k: required(gpu, "gated_mla", "ling_mla_q_absorb_rope")?,
             mla_paged_attn_k: required(gpu, "gated_mla", "ling_mla_paged_attn")?,

@@ -535,6 +535,9 @@ fn bailing_e2e_layer_trace() -> Result<()> {
         std::sync::Arc::clone(&scratch),
         std::sync::Arc::clone(&kernels),
     )?;
+    let ssm_ordinal = (0..layer)
+        .filter(|i| config.layer_type(*i) == atlas_core::config::LayerType::LinearAttention)
+        .count();
     let kda = LingKdaLayer::new(
         dense(&store, &format!("{lp}.input_layernorm.weight"))?,
         dense(&store, &format!("{lp}.post_attention_layernorm.weight"))?,
@@ -542,6 +545,7 @@ fn bailing_e2e_layer_trace() -> Result<()> {
         ffn,
         std::sync::Arc::clone(&kernels),
         std::sync::Arc::clone(&scratch),
+        ssm_ordinal,
         config.kda_gate_lower_bound,
         config.rms_norm_eps as f32,
     )?;

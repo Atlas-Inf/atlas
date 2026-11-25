@@ -6,9 +6,7 @@
 //! Decode: `kda_recurrent_bf16` advances the sequence's per-layer FP32
 //! state one token. Prefill: the same kernel over each sub-chunk's rows
 //! (it walks tokens serially inside the launch — the regresident pair is
-//! the follow-up). The slot-pool twin `ling_kda_recurrent_indexed` is the
-//! multi-seq/graph seam, deliberately unwired in this PR (see
-//! `model/bailing_c1.rs`). Multi-row MTP VERIFY: `decode_batched` runs the
+//! the follow-up). Multi-row MTP VERIFY: `decode_batched` runs the
 //! GEMM-batched projections of the prefill arm plus the verify twin
 //! `kda_recurrent_bf16_verify_snap` (PR #110), which walks the K rows in
 //! one launch, leaves the live state after the last row (a full accept is
@@ -16,6 +14,20 @@
 //! `rollback_ssm_states` indexes on a partial accept (`k - 1` H slabs into
 //! the contiguous `h_state_intermediates` region, conv snapshots after
 //! each row's per-row conv launch). One NEXTN draft = K = 2 rows.
+//!
+//! MULTI-SEQUENCE DECODE (this slice): `ling_kda_conv_indexed` +
+//! `ling_kda_recurrent_indexed` address the house `SsmStatePool` through a
+//! device-resident slot-id stream (`SsmBatchView` built by
+//! `ssm_indexed_decode::prepare_runtime`), so every kernel argument of the
+//! decode lane is a fixed address and the only per-step state is the
+//! i32 slot stream the scheduler refreshes before replay — the contract a
+//! captured decode graph needs. The lane runs when `ctx.ssm_batch` was
+//! prepared (2..=8 unlatched rows on a single rank); otherwise
+//! `decode_multi_seq` keeps the per-sequence loop over the pool-backed
+//! per-slot states (the sequences' h/conv pointers are the pool addresses
+//! `alloc_sequence` fixed at slot claim — stable across every decode
+//! step of that sequence, just not shared across steps like the indexed
+//! pair is).
 
 use std::sync::Arc;
 
@@ -25,8 +37,10 @@ use spark_runtime::kv_cache::PagedKvCache;
 
 use super::spec::{KDA_HEAD_DIM, KDA_HEADS};
 use super::{LingFfn, LingKernels, LingScratch};
+use crate::layer::ssm_batch::SsmBatchLayer;
 use crate::layer::{ForwardContext, LayerState, SsmLayerState, TransformerLayer};
 use crate::layers::ops;
+use crate::layers::ops::{KdaBuffer, KdaIndexedConv, KdaIndexedRecurrent, KdaIndexedShape};
 use crate::weight_map::DenseWeight;
 
 /// KDA projection widths at the supported geometry: 32 heads x 128.
@@ -56,6 +70,10 @@ pub(crate) struct LingKdaLayer {
     ffn: LingFfn,
     kernels: Arc<LingKernels>,
     scratch: Arc<LingScratch>,
+    /// This layer's index among the SSM (`LinearAttention`) layers — the
+    /// `SsmStatePool` ordinal both the pool state construction and the
+    /// indexed decode lane address the layer by.
+    ssm_ordinal: usize,
     lower_bound: f32,
     eps: f32,
 }
@@ -76,6 +94,7 @@ impl LingKdaLayer {
         ffn: LingFfn,
         kernels: Arc<LingKernels>,
         scratch: Arc<LingScratch>,
+        ssm_ordinal: usize,
         lower_bound: f32,
         eps: f32,
     ) -> Result<Self> {
@@ -86,6 +105,7 @@ impl LingKdaLayer {
             ffn,
             kernels,
             scratch,
+            ssm_ordinal,
             lower_bound,
             eps,
         })
@@ -379,13 +399,13 @@ impl LingKdaLayer {
         let conv_bytes = 3 * T * 4 * 4;
         if state.h_state_intermediates.len() < inter {
             let slab = gpu.alloc(inter * h_bytes)?;
-            state.h_state_intermediates =
-                (0..inter).map(|t| slab.offset(t * h_bytes)).collect();
+            state.h_state_intermediates = (0..inter).map(|t| slab.offset(t * h_bytes)).collect();
         }
         anyhow::ensure!(
-            state.h_state_intermediates.windows(2).all(|w| {
-                w[1].0.saturating_sub(w[0].0) == h_bytes as u64
-            }),
+            state
+                .h_state_intermediates
+                .windows(2)
+                .all(|w| { w[1].0.saturating_sub(w[0].0) == h_bytes as u64 }),
             "ling KDA: verify H snapshots must be contiguous with the H stride \
              (kda_recurrent_bf16_verify_snap state_inter layout)"
         );
@@ -403,13 +423,18 @@ impl LingKdaLayer {
     /// (live state advanced through every row, snapshots after rows
     /// 0..k-2), and per-row conv launches so the conv state can be
     /// snapshotted between rows.
-    fn verify_rows(
+    /// The shared multi-row projection head: RMS-norm of `rows` hidden rows
+    /// into `scratch.normed`, planar q|k|v projections into the
+    /// `kda_preconv` plane regions, and the b/f/g gate rows into
+    /// `kda_beta` / `kda_gate` / `kda_o_g` (`[rows, width]` row-major).
+    /// Both K=2 verify rows and the multi-sequence decode lane start here;
+    /// at rows == 2 the batch2 GEMV is bit-identical to two decode GEMVs,
+    /// wider rows take the GEMM arm.
+    fn project_rows(
         &self,
         gpu: &dyn GpuBackend,
         hidden: DevicePtr,
-        state: &mut SsmLayerState,
         rows: usize,
-        _ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
         let s = &self.scratch;
@@ -417,12 +442,6 @@ impl LingKdaLayer {
         let w = &self.weights;
         let hidden_w = s.hidden as u32;
         let rows_u32 = rows as u32;
-        let inter = rows - 1;
-        self.ensure_verify_slabs(gpu, state, inter)?;
-        // Attention half. Projections: GEMM into the planar staging (the
-        // prefill arm), GEMM gates, then per-row conv launches — the
-        // multi-row prefill conv folds all rows at once and gives no
-        // mid-window conv state.
         ops::rms_norm(
             gpu,
             k.rms_norm_k,
@@ -441,7 +460,7 @@ impl LingKdaLayer {
         // Wider rows keep the GEMM arm.
         let batch2 = rows == 2;
         for (plane, proj) in [&w.q_proj, &w.k_proj, &w.v_proj].iter().enumerate() {
-            let dst = s.kda_preconv.offset(rows as usize * (plane * T) * 2);
+            let dst = s.kda_preconv.offset(rows * (plane * T) * 2);
             if batch2 {
                 ops::dense_gemv_batch2(
                     gpu,
@@ -456,21 +475,12 @@ impl LingKdaLayer {
                 )?;
             } else {
                 ops::dense_gemm(
-                    gpu,
-                    k.gemm_k,
-                    s.normed,
-                    proj,
-                    dst,
-                    rows_u32,
-                    T as u32,
-                    hidden_w,
-                    stream,
+                    gpu, k.gemm_k, s.normed, proj, dst, rows_u32, T as u32, hidden_w, stream,
                 )?;
             }
         }
         for (plane, proj) in [&w.b_proj, &w.f_proj, &w.g_proj].iter().enumerate() {
-            let (dst, width) = match plane
-            {
+            let (dst, width) = match plane {
                 0 => (s.kda_beta, 32),
                 1 => (s.kda_gate, T),
                 _ => (s.kda_o_g, T),
@@ -501,6 +511,218 @@ impl LingKdaLayer {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    /// The pool-indexed multi-sequence decode lane of this layer, if this
+    /// step prepared a `SsmBatchView` whose width matches the dispatch —
+    /// a whole-batch attention half whose conv and recurrence address the
+    /// slot pool through the device slot-id stream (`ling_kda_conv_indexed`
+    /// + `ling_kda_recurrent_indexed`). Returns `None` when the step must
+    /// fall back to the per-sequence loop (the prepared view's layer row
+    /// count disagreeing with the dispatch is a hard error, not a silent
+    /// fallback: the owner of `ctx.ssm_batch` — `prepare_runtime` — and the
+    /// decoder agree on eligibility before either runs).
+    fn indexed_decode_lane(
+        &self,
+        num_seqs: usize,
+        active_seqs: usize,
+        ctx: &ForwardContext,
+    ) -> Result<Option<(KdaIndexedShape, SsmBatchLayer)>> {
+        let Some(batch) = ctx.ssm_batch else {
+            return Ok(None);
+        };
+        let layer = batch
+            .layer(self.ssm_ordinal)
+            .map_err(|e| anyhow::anyhow!("ling KDA layer {} slot view: {e:#}", self.ssm_ordinal))?;
+        if layer.rows() as usize != num_seqs {
+            anyhow::bail!(
+                "ling KDA: prepared SSM batch rows {} disagree with a \
+                 {num_seqs}-row decode dispatch",
+                layer.rows()
+            );
+        }
+        if active_seqs != num_seqs || !(2..=8).contains(&num_seqs) {
+            return Ok(None);
+        }
+        let Some(shape) = KdaIndexedShape::select(num_seqs, KDA_HEADS, KDA_HEAD_DIM, 4) else {
+            return Ok(None);
+        };
+        static LANE_LOGGED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !LANE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                rows = num_seqs,
+                ordinal = self.ssm_ordinal,
+                "ling KDA pool-indexed decode lane selected (device slot-id \
+                 addressing; per-sequence rows are the fallback)"
+            );
+        }
+        Ok(Some((shape, layer)))
+    }
+
+    /// The attention half of the pool-indexed lane: the `project_rows`
+    /// head over all rows, `kda_pack_qkv` staging into token-major q|k|v
+    /// rows, the conv + recurrent indexed pair (pool slots addressed by
+    /// the device slot-id stream — every kernel argument is a fixed
+    /// address), then gated norm, o_proj and the residual add for all
+    /// rows.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_half_indexed(
+        &self,
+        gpu: &dyn GpuBackend,
+        hidden: DevicePtr,
+        rows: usize,
+        shape: KdaIndexedShape,
+        layer: SsmBatchLayer,
+        stream: u64,
+    ) -> Result<()> {
+        let s = &self.scratch;
+        let k = &self.kernels;
+        let w = &self.weights;
+        let hidden_w = s.hidden as u32;
+        let rows_u32 = rows as u32;
+        self.project_rows(gpu, hidden, rows, stream)?;
+        ops::kda_pack_qkv(
+            gpu,
+            k.kda_pack_qkv_k,
+            s.kda_preconv,
+            s.kda_qkv,
+            rows_u32,
+            T as u32,
+            stream,
+        )?;
+        let qkv_bytes = rows * 3 * T * 2;
+        let conv = KdaIndexedConv {
+            input: KdaBuffer {
+                ptr: s.kda_qkv,
+                bytes: qkv_bytes,
+            },
+            weight: KdaBuffer {
+                ptr: w.conv.weight,
+                bytes: 3 * T * 4 * 2,
+            },
+            bias: None,
+            output: KdaBuffer {
+                ptr: s.kda_qkv,
+                bytes: qkv_bytes,
+            },
+            input_stride: 3 * T,
+            output_stride: 3 * T,
+        };
+        let recurrent = KdaIndexedRecurrent {
+            qkv: KdaBuffer {
+                ptr: s.kda_qkv,
+                bytes: qkv_bytes,
+            },
+            gate: KdaBuffer {
+                ptr: s.kda_gate,
+                bytes: rows * T * 2,
+            },
+            beta: KdaBuffer {
+                ptr: s.kda_beta,
+                bytes: rows * 32 * 2,
+            },
+            a_log: KdaBuffer {
+                ptr: w.a_log,
+                bytes: 32 * 4,
+            },
+            dt_bias: KdaBuffer {
+                ptr: w.dt_bias,
+                bytes: T * 4,
+            },
+            output: KdaBuffer {
+                ptr: s.kda_out,
+                bytes: rows * T * 2,
+            },
+            lower_bound: self.lower_bound,
+        };
+        // The pair could validate once per layer construction; it is
+        // cheap, host-only, and guarantees a mid-capture failure cannot
+        // come from a drifted descriptor, so it stays per-step like the
+        // GLM lane's `prepare_indexed_core`.
+        ops::validate_kda_indexed_pair(
+            shape,
+            layer,
+            k.kda_conv_indexed_k,
+            k.kda_recurrent_indexed_k,
+            conv,
+            recurrent,
+        )?;
+        ops::kda_conv_indexed(gpu, k.kda_conv_indexed_k, shape, layer, conv, stream)?;
+        ops::kda_recurrent_indexed(
+            gpu,
+            k.kda_recurrent_indexed_k,
+            shape,
+            layer,
+            recurrent,
+            stream,
+        )?;
+        ops::kda_sigmoid_gated_norm(
+            gpu,
+            k.kda_gated_norm_k,
+            s.kda_out,
+            s.kda_o_g,
+            w.o_norm.weight,
+            s.kda_o,
+            rows_u32,
+            KDA_HEADS as u32,
+            KDA_HEAD_DIM as u32,
+            self.eps,
+            stream,
+        )?;
+        // o_proj: T -> hidden, then hidden += attn_out (all rows).
+        if rows == 2 {
+            ops::dense_gemv_batch2(
+                gpu,
+                k.gemv_batch2_k,
+                s.kda_o,
+                &w.o_proj,
+                s.attn_out,
+                hidden_w,
+                T as u32,
+                hidden_w,
+                stream,
+            )?;
+        } else {
+            ops::dense_gemm(
+                gpu, k.gemm_k, s.kda_o, &w.o_proj, s.attn_out, rows_u32, hidden_w, T as u32, stream,
+            )?;
+        }
+        ops::residual_add(
+            gpu,
+            k.residual_add_k,
+            hidden,
+            s.attn_out,
+            rows_u32 * hidden_w,
+            stream,
+        )
+    }
+
+    fn verify_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        hidden: DevicePtr,
+        state: &mut SsmLayerState,
+        rows: usize,
+        _ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let s = &self.scratch;
+        let k = &self.kernels;
+        let w = &self.weights;
+        let hidden_w = s.hidden as u32;
+        let rows_u32 = rows as u32;
+        let inter = rows - 1;
+        self.ensure_verify_slabs(gpu, state, inter)?;
+        // Attention half. Projections via the shared multi-row staging
+        // (normed rows + planar q|k|v + b/f/g gates), then per-row conv
+        // launches — the multi-row prefill conv folds all rows at once and
+        // gives no mid-window conv state.
+        self.project_rows(gpu, hidden, rows, stream)?;
+        // The K=2 verify keeps the batch2 GEMV for the o_proj as well
+        // (bit-identical to the two decode GEMVs; see `project_rows`).
+        let batch2 = rows == 2;
         let h_bytes = KDA_HEADS * KDA_HEAD_DIM * KDA_HEAD_DIM * 4;
         let conv_bytes = 3 * T * 4 * 4;
         for t in 0..rows {
@@ -510,8 +732,7 @@ impl LingKdaLayer {
                     k.conv_prefill_k,
                     spark_runtime::gpu::KernelHandle(0),
                     state.conv_state.offset(plane * T * 4 * 4),
-                    s.kda_preconv
-                        .offset((rows * (plane * T) + t * T) * 2),
+                    s.kda_preconv.offset((rows * (plane * T) + t * T) * 2),
                     &DenseWeight {
                         weight: w.conv.weight.offset((plane * T) * 4 * 2),
                     },
@@ -583,15 +804,7 @@ impl LingKdaLayer {
             )?;
         } else {
             ops::dense_gemm(
-                gpu,
-                k.gemm_k,
-                s.kda_o,
-                &w.o_proj,
-                s.attn_out,
-                rows_u32,
-                hidden_w,
-                T as u32,
-                stream,
+                gpu, k.gemm_k, s.kda_o, &w.o_proj, s.attn_out, rows_u32, hidden_w, T as u32, stream,
             )?;
         }
         ops::residual_add(
@@ -622,6 +835,66 @@ impl TransformerLayer for LingKdaLayer {
     ) -> Result<()> {
         let state = state_of(state)?;
         self.forward_rows(hidden, state, 1, ctx, stream)
+    }
+
+    /// Whole-batch decode of one layer: when the dispatcher prepared an
+    /// `SsmBatchView` (see `indexed_decode_lane`), every row's conv +
+    /// recurrence run through the two pool-indexed kernels in one launch
+    /// pair, addressing slots on device — no per-sequence pointers reach
+    /// kernel arguments. Otherwise the per-sequence loop over the
+    /// pool-backed `SsmLayerState`s (the previous behavior, bit-identical)
+    /// runs instead; the loop is bounded by `active_seqs`, so padding rows
+    /// never touch KDA state (their hidden rows are zeroed and discarded,
+    /// and the dummy `alloc_state` regions some dispatch paths create for
+    /// them stay unread).
+    fn decode_multi_seq<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_seqs: usize,
+        active_seqs: usize,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            states.len() >= num_seqs,
+            "ling KDA: state batch is truncated ({}/{} rows)",
+            states.len(),
+            num_seqs
+        );
+        if let Some((shape, batch_layer)) = self.indexed_decode_lane(num_seqs, active_seqs, ctx)? {
+            let rows = num_seqs;
+            self.attention_half_indexed(ctx.gpu, hidden, rows, shape, batch_layer, stream)?;
+            self.ffn_half(ctx.gpu, hidden, rows as u32, stream)?;
+            return Ok(());
+        }
+        // Per-sequence fallback (the `TransformerLayer` default loop,
+        // bounded by the active rows; padding rows skip this layer).
+        let row_bytes = self.scratch.hidden * 2;
+        for i in 0..active_seqs.min(num_seqs) {
+            let mut block_table = block_tables.get(i).cloned().unwrap_or_default();
+            // Phase 6.1: per-seq disk_block_ids aren't threaded through
+            // this fallback (same stubs as the trait default).
+            let mut stub_disk = Vec::<u32>::new();
+            let mut stub_last_offloaded = Vec::<u32>::new();
+            self.decode(
+                hidden.offset(i * row_bytes),
+                residual.offset(i * row_bytes),
+                states[i],
+                kv_cache,
+                seq_lens.get(i).copied().unwrap_or(0),
+                &mut block_table,
+                &mut stub_disk,
+                &mut stub_last_offloaded,
+                ctx,
+                stream,
+            )?;
+        }
+        Ok(())
     }
 
     /// The MTP/K-token verify of one sequence: rows `0..num_tokens` of
@@ -719,8 +992,13 @@ impl TransformerLayer for LingKdaLayer {
         }))
     }
 
-    /// Eager only: the per-seq state path is not pool-slot-stable yet (the
-    /// `ling_kda_recurrent_indexed` seam above).
+    /// Eager only — the graph slice's flag to flip. The KDA addressing is
+    /// pool-stable on every decode path this driver serves (the indexed
+    /// lane's arguments are fixed addresses over the slot pool and the
+    /// slot-id stream; the per-sequence lane's h/conv pointers are the
+    /// pool addresses fixed at slot claim, a pure function of
+    /// (layer, slot)), and no decode-path step allocates — see the family
+    /// doc in `model/bailing_c1.rs` for what a capture can rely on.
     fn decode_graph_unsupported(&self) -> bool {
         true
     }
