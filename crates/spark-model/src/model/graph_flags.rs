@@ -58,6 +58,70 @@ pub(crate) fn debug_no_graph() -> bool {
     std::env::var("ATLAS_DEBUG_NO_GRAPH").as_deref() == Ok("1")
 }
 
+/// `ATLAS_LING_DECODE_GRAPH=1`: the bailing (Ling-3.2-air) family's decode
+/// and K=2 MTP verify steps may run as CUDA graphs — both layer kinds drop
+/// their `decode_graph_unsupported` veto. Prerequisite: the KDA slot-pool
+/// PR (per-seq state must be pool-slot-stable). Strict `== "1"`, read once;
+/// `startup_parity` carries it to every rank. See `docs/ling-decode-graphs.md`.
+pub(crate) fn ling_decode_graph() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_LING_DECODE_GRAPH").as_deref() == Ok("1"))
+}
+
+/// `ATLAS_LING_DECODE_GRAPH_DEBUG_STAGE=1`: the bailing family prestages its
+/// step metadata (`TransformerLayer::decode_meta_prestage`) and the Ling
+/// layers read the staging EAGERLY, without capturing — the in-process A/B
+/// arm for the staged-metadata refactor (`docs/ling-decode-graphs.md`).
+/// Strict `== "1"`, read once.
+pub(crate) fn ling_graph_stage_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_LING_DECODE_GRAPH_DEBUG_STAGE").as_deref() == Ok("1")
+    })
+}
+
+/// Whether the dispatches WRITE the Ling family's staged metadata this step:
+/// the family switch or its staging-debug arm is on. Read once per process.
+pub(crate) fn ling_staging_writes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| ling_decode_graph() || ling_graph_stage_debug())
+}
+
+/// Whether a Ling layer consumes the staged metadata on THIS forward: a
+/// capturing step under the family switch, or any step in the staging-debug
+/// arm. `graph_capture` is `ForwardContext::graph_capture`.
+pub(crate) fn ling_meta_staged(graph_capture: bool) -> bool {
+    ling_meta_staged_core(ling_decode_graph(), ling_graph_stage_debug(), graph_capture)
+}
+
+/// Pure core of [`ling_meta_staged`]: staged reads iff the dispatch wrote
+/// the staging for this configuration — a capturing step under the family
+/// switch (`ling_decode_graph`), or any step in the staging-debug arm,
+/// which exercises the staged path eagerly by construction.
+fn ling_meta_staged_core(switch_on: bool, debug_on: bool, graph_capture: bool) -> bool {
+    (switch_on && graph_capture) || debug_on
+}
+
+#[cfg(test)]
+mod ling_graph_tests {
+    use super::ling_meta_staged_core as core;
+
+    #[test]
+    fn staged_only_under_the_switch_and_capture_or_the_debug_arm() {
+        // Off everywhere: whatever a ctx says, the eager uploads run.
+        assert!(!core(false, false, false));
+        assert!(!core(false, false, true));
+        // The switch alone never stages an EAGER step (uploads stay in the
+        // layer: %64 capture deferral, suppressed steps, warm-ups).
+        assert!(!core(true, false, false));
+        assert!(core(true, false, true));
+        // The debug arm stages every step EAGERLY — that is its purpose.
+        assert!(core(false, true, false));
+        assert!(core(false, true, true));
+        assert!(core(true, true, true));
+    }
+}
+
 // Diagnostics that run a step eager which would otherwise be captured.
 
 /// `ATLAS_SSM_SAVE_DUMP` (presence): a request's first decode step.

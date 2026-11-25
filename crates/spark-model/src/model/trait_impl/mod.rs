@@ -40,6 +40,7 @@ pub(crate) mod gdn_commit_fuse;
 mod graph_borrow;
 mod kda_commit;
 mod lm_head_batched;
+mod ling_prestage;
 pub(crate) use lm_head_batched::lm_head_batch_gemv_enabled;
 mod lm_head_dp4a;
 mod meta;

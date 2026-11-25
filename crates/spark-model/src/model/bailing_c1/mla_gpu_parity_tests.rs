@@ -604,7 +604,8 @@ fn mla_layer5_parity() -> Result<()> {
         12,
         0,
         false,
-        false, // legacy paged groups (the packed path runs in phase 4)
+        false, // packed: legacy paged groups (the packed path runs in phase 4)
+        false, // staged
         &rig.block_table,
         stream,
     )?;
@@ -682,7 +683,8 @@ fn mla_layer5_parity() -> Result<()> {
         4,
         12,
         false,
-        false, // legacy paged groups (the packed path runs in phase 4)
+        false, // packed: legacy paged groups (the packed path runs in phase 4)
+        false, // staged
         &rig.block_table,
         stream,
     )?;
@@ -739,7 +741,7 @@ fn mla_layer5_parity() -> Result<()> {
     // ---- phase 3: one decode row at position 16 (context 16 + self).
     let dec = DevicePtr(hidden.0 + (16 * HID * 2) as u64);
     rig.layer
-        .attention_half_decode(gpu, dec, &mut rig.kv, 16, &rig.block_table, stream)?;
+        .attention_half_decode(gpu, dec, &mut rig.kv, 16, &rig.block_table, false, stream)?;
     gpu.synchronize(stream)?;
     stages.push(check_stage(
         "decode pool K row",
@@ -781,7 +783,8 @@ fn mla_layer5_parity() -> Result<()> {
         12,
         0,
         false,
-        true, // packed
+        true,  // packed
+        false, // staged
         &rig.block_table,
         stream,
     )?;
@@ -831,6 +834,7 @@ fn mla_layer5_parity() -> Result<()> {
         12,
         false,
         true, // packed: the gather refills prefix rows [0, 12) from the pool
+        false, // staged
         &rig.block_table,
         stream,
     )?;
@@ -909,8 +913,9 @@ fn mla_layer5_prefill_fast_parity() -> Result<()> {
         N,
         0,
         true, // whole prompt: contiguous K/V + ling_mla_prefill_attn
-        false, // the legacy fast path (the packed default runs in phase 4
+        false, // packed: legacy fast path (the packed default runs in phase 4
                // of mla_layer5_parity and end to end in the e2e gate)
+        false, // staged
         &rig.block_table,
         stream,
     )?;

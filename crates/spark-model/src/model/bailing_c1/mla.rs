@@ -488,6 +488,44 @@ impl LingMlaLayer {
         Ok((s.mla_pos, s.mla_slots, block_table.len() as u32))
     }
 
+    /// The pre-graph form of the same uploads (`TransformerLayer::
+    /// decode_meta_prestage`): ONE sequence's `rows` rows at positions
+    /// `seq_len_start..`, plus the `base_len` word (cache entries before the
+    /// block) and the i32 block table, all into the FIXED scratch staging the
+    /// captured kernels then read. Byte-identical to the in-layer uploads of
+    /// the decode and K=2 verify arms it replaces, issued from the
+    /// dispatch's Phase 1 instead — pageable H2D inside a CUDA-graph capture
+    /// is illegal (status 900); `docs/ling-decode-graphs.md`.
+    fn prestage_meta(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: usize,
+        seq_len_start: usize,
+        block_table: &[u32],
+        block_size: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let s = &self.scratch;
+        self.upload_meta(gpu, 0, rows, seq_len_start, block_table, block_size, stream)?;
+        let base = (seq_len_start as u32).to_le_bytes();
+        gpu.copy_h2d_async(&base, s.mla_base_len, stream)?;
+        let table_i32: Vec<i32> = block_table.iter().map(|&b| b as i32).collect();
+        ensure!(
+            table_i32.len() <= s.max_blocks,
+            "ling MLA: block table ({} entries) exceeds the staging cap {}",
+            table_i32.len(),
+            s.max_blocks
+        );
+        gpu.copy_h2d_async(
+            unsafe {
+                std::slice::from_raw_parts(table_i32.as_ptr() as *const u8, table_i32.len() * 4)
+            },
+            s.mla_block_table,
+            stream,
+        )?;
+        Ok(())
+    }
+
     /// Fast-path causal prefill attention over the packed context
     /// (`ling_mla_prefill_attn`): the chunk's `seq_len` query rows against
     /// the context rows [0, kv_base + seq_len), causal inside the chunk —
@@ -556,6 +594,7 @@ impl LingMlaLayer {
         kv_cache: &mut PagedKvCache,
         seq_len: usize,
         block_table: &[u32],
+        staged: bool,
         stream: u64,
     ) -> Result<()> {
         let s = &self.scratch;
@@ -573,33 +612,45 @@ impl LingMlaLayer {
             stream,
         )?;
         self.project(gpu, 1, s.normed, stream)?;
-        let (positions, slots, max_blocks) = self.upload_meta(
-            gpu,
-            0,
-            1,
-            seq_len,
-            block_table,
-            kv_cache.block_size(),
-            stream,
-        )?;
+        // Staged steps (decode_meta_prestage ran in Phase 1) read the fixed
+        // staging — including `mla_block_table`/`mla_base_len` below — and
+        // skip the pageable uploads, which a capture would refuse.
+        let (positions, slots, max_blocks) = if staged {
+            (s.mla_pos, s.mla_slots, s.max_blocks as u32)
+        } else {
+            self.upload_meta(
+                gpu,
+                0,
+                1,
+                seq_len,
+                block_table,
+                kv_cache.block_size(),
+                stream,
+            )?
+        };
         let v_pool = self.write_cache(gpu, 1, kv_cache, None, slots, positions, stream)?;
         self.q_absorb(gpu, 1, positions, stream)?;
-        let base = (seq_len as u32).to_le_bytes();
-        gpu.copy_h2d_async(&base, s.mla_base_len, stream)?;
-        let table_i32: Vec<i32> = block_table.iter().map(|&b| b as i32).collect();
-        ensure!(
-            table_i32.len() <= s.max_blocks,
-            "ling MLA: block table ({} entries) exceeds the staging cap {}",
-            table_i32.len(),
-            s.max_blocks
-        );
-        gpu.copy_h2d_async(
-            unsafe {
-                std::slice::from_raw_parts(table_i32.as_ptr() as *const u8, table_i32.len() * 4)
-            },
-            s.mla_block_table,
-            stream,
-        )?;
+        if !staged {
+            let base = (seq_len as u32).to_le_bytes();
+            gpu.copy_h2d_async(&base, s.mla_base_len, stream)?;
+            let table_i32: Vec<i32> = block_table.iter().map(|&b| b as i32).collect();
+            ensure!(
+                table_i32.len() <= s.max_blocks,
+                "ling MLA: block table ({} entries) exceeds the staging cap {}",
+                table_i32.len(),
+                s.max_blocks
+            );
+            gpu.copy_h2d_async(
+                unsafe {
+                    std::slice::from_raw_parts(
+                        table_i32.as_ptr() as *const u8,
+                        table_i32.len() * 4,
+                    )
+                },
+                s.mla_block_table,
+                stream,
+            )?;
+        }
         self.paged_attn(
             gpu,
             1,
@@ -723,7 +774,11 @@ impl LingMlaLayer {
     /// into the layer's ctx and the chunk runs `ling_mla_prefill_attn`
     /// with `kv_base = seq_len_start`. `whole_prompt` is the legacy
     /// single-pass fast path, valid only for a position-0 whole prompt
-    /// (assembled here when the packed path is off).
+    /// (assembled here when the packed path is off). `staged`
+    /// (decode/verify captures only): the step metadata was prestaged in
+    /// Phase 1 and the in-layer uploads are skipped — reachable with
+    /// `staged` only from `decode_batched`, i.e. `rows <= 8` = one group
+    /// of the paged loop.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn attention_half_prefill(
         &self,
@@ -734,6 +789,7 @@ impl LingMlaLayer {
         seq_len_start: usize,
         whole_prompt: bool,
         packed: bool,
+        staged: bool,
         block_table: &[u32],
         stream: u64,
     ) -> Result<()> {
@@ -769,15 +825,19 @@ impl LingMlaLayer {
             stream,
         )?;
         self.project(gpu, rows_u32, s.normed, stream)?;
-        let (positions, slots, max_blocks) = self.upload_meta(
-            gpu,
-            0,
-            rows,
-            seq_len_start,
-            block_table,
-            kv_cache.block_size(),
-            stream,
-        )?;
+        let (positions, slots, max_blocks) = if staged {
+            (s.mla_pos, s.mla_slots, s.max_blocks as u32)
+        } else {
+            self.upload_meta(
+                gpu,
+                0,
+                rows,
+                seq_len_start,
+                block_table,
+                kv_cache.block_size(),
+                stream,
+            )?
+        };
         let v_pool = self.write_cache(
             gpu,
             rows_u32,
@@ -802,23 +862,30 @@ impl LingMlaLayer {
                 stream,
             )?;
         } else {
-            // Continuing chunk: 8-row groups over the paged cache.
-            let base = (seq_len_start as u32).to_le_bytes();
-            gpu.copy_h2d_async(&base, s.mla_base_len, stream)?;
-            let table_i32: Vec<i32> = block_table.iter().map(|&b| b as i32).collect();
-            ensure!(
-                table_i32.len() <= s.max_blocks,
-                "ling MLA: block table ({} entries) exceeds the staging cap {}",
-                table_i32.len(),
-                s.max_blocks
-            );
-            gpu.copy_h2d_async(
-                unsafe {
-                    std::slice::from_raw_parts(table_i32.as_ptr() as *const u8, table_i32.len() * 4)
-                },
-                s.mla_block_table,
-                stream,
-            )?;
+            // Continuing chunk: 8-row groups over the paged cache. A staged
+            // step reads the prestaged base_len/table instead (`staged`
+            // never reaches the start > 0 group re-uploads: rows <= 8).
+            if !staged {
+                let base = (seq_len_start as u32).to_le_bytes();
+                gpu.copy_h2d_async(&base, s.mla_base_len, stream)?;
+                let table_i32: Vec<i32> = block_table.iter().map(|&b| b as i32).collect();
+                ensure!(
+                    table_i32.len() <= s.max_blocks,
+                    "ling MLA: block table ({} entries) exceeds the staging cap {}",
+                    table_i32.len(),
+                    s.max_blocks
+                );
+                gpu.copy_h2d_async(
+                    unsafe {
+                        std::slice::from_raw_parts(
+                            table_i32.as_ptr() as *const u8,
+                            table_i32.len() * 4,
+                        )
+                    },
+                    s.mla_block_table,
+                    stream,
+                )?;
+            }
             for start in (0..rows).step_by(MLA_MAX_ROWS_PAGED) {
                 let batch = (rows - start).min(MLA_MAX_ROWS_PAGED) as u32;
                 // base_len must name the CACHE ENTRIES BEFORE this group —
@@ -984,7 +1051,16 @@ impl TransformerLayer for LingMlaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        self.attention_half_decode(ctx.gpu, hidden, kv_cache, seq_len, block_table, stream)?;
+        let staged = crate::model::graph_flags::ling_meta_staged(ctx.graph_capture);
+        self.attention_half_decode(
+            ctx.gpu,
+            hidden,
+            kv_cache,
+            seq_len,
+            block_table,
+            staged,
+            stream,
+        )?;
         self.ffn_half(ctx.gpu, hidden, 1, stream)
     }
 
@@ -1008,7 +1084,16 @@ impl TransformerLayer for LingMlaLayer {
         stream: u64,
     ) -> Result<()> {
         if num_tokens <= 1 {
-            self.attention_half_decode(ctx.gpu, hidden, kv_cache, seq_len, block_table, stream)?;
+            let staged = crate::model::graph_flags::ling_meta_staged(ctx.graph_capture);
+            self.attention_half_decode(
+                ctx.gpu,
+                hidden,
+                kv_cache,
+                seq_len,
+                block_table,
+                staged,
+                stream,
+            )?;
             return self.ffn_half(ctx.gpu, hidden, 1, stream);
         }
         anyhow::ensure!(
@@ -1016,6 +1101,7 @@ impl TransformerLayer for LingMlaLayer {
             "ling MLA: verify {num_tokens} rows exceeds the paged kernel's {}",
             MLA_MAX_ROWS_PAGED
         );
+        let staged = crate::model::graph_flags::ling_meta_staged(ctx.graph_capture);
         self.attention_half_prefill(
             ctx.gpu,
             hidden,
@@ -1026,6 +1112,7 @@ impl TransformerLayer for LingMlaLayer {
             // The packed path is a prefill shape: a per-verify gather of
             // the prompt prefix would run on every decode step.
             false,
+            staged,
             block_table,
             stream,
         )?;
@@ -1072,6 +1159,7 @@ impl TransformerLayer for LingMlaLayer {
                 seq_len_start + chunk,
                 fast && n == 0 && num_tokens <= cap,
                 packed,
+                false,
                 block_table,
                 stream,
             )?;
@@ -1089,8 +1177,32 @@ impl TransformerLayer for LingMlaLayer {
         Ok(Box::new(crate::layer::EmptyLayerState))
     }
 
-    /// Eager only in this PR: the per-step uploads (positions / slots /
-    /// block table) are host-side, and the layer-owned V pool binds late.
+    /// The Ling family's step-metadata staging (`decode_meta_prestage`):
+    /// positions, paged slots, `base_len` and the block table for ONE
+    /// sequence's `rows` rows, into the fixed scratch a captured step reads
+    /// (`docs/ling-decode-graphs.md`). Called from the dispatch's Phase 1,
+    /// pre-graph; single-sequence decode (`rows = 1`) and the K=2 MTP verify
+    /// (`rows = k`) are the capture targets.
+    fn decode_meta_prestage(
+        &self,
+        rows: usize,
+        seq_len_start: usize,
+        block_table: &[u32],
+        block_size: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        self.prestage_meta(gpu, rows, seq_len_start, block_table, block_size, stream)
+    }
+
+    /// Eager while the KDA slot pool is unwired: with the pool merged and
+    /// `ATLAS_LING_DECODE_GRAPH` armed this layer's decode is capturable —
+    /// its step metadata is prestaged (see `decode_meta_prestage`), its V
+    /// pool is bound at the first prefill and allocation-stable per serve,
+    /// and its kernels read positions/slots/base_len/table from fixed
+    /// device buffers (`ling_mla_paged_attn` uses `max_blocks_per_seq` only
+    /// as the `seq` stride, 0 at single-seq). The per-seq KDA state is the
+    /// last blocker (the pool slice's `kda.rs`).
     fn decode_graph_unsupported(&self) -> bool {
         true
     }

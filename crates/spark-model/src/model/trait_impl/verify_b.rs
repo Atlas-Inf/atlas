@@ -262,6 +262,14 @@ impl TransformerModel {
             )?;
         }
 
+        // Ling family: the K=2 window's gated-MLA step metadata staged
+        // pre-graph (docs/ling-decode-graphs.md) — the verify rows' rope
+        // positions, paged slots, `base_len`, block table at their fixed
+        // addresses. No-op off the family or while the switch is off.
+        if self.ling_meta_prestage_armed() {
+            self.ling_prestage_meta(seq, &kv_cache, k, stream)?;
+        }
+
         let ctx = ForwardContext {
             ssm_batch: None,
             buffers: &self.buffers,
