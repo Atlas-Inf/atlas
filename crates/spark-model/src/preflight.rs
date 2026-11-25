@@ -114,11 +114,20 @@ fn check_embedding_and_head(store: &WeightStore) -> Result<()> {
     // Scan discovery-based so future families that adopt yet-another
     // spelling only need to appear as a new suffix here — no enumerated
     // prefix list to maintain.
-    const EMBED_SUFFIXES: &[&str] = &[".embed_tokens.weight", ".embeddings.weight"];
+    const EMBED_SUFFIXES: &[&str] = &[
+        ".embed_tokens.weight",
+        ".embeddings.weight",
+        // Bailing family (Ling-3.2-air): the embedding ships as
+        // `model.word_embeddings.weight`.
+        ".word_embeddings.weight",
+    ];
     const EMBED_EXACTS: &[&str] = &[
         "tok_embeddings.weight",
         "embed_tokens.weight",
         "embed.weight",
+        // Bailing family (Ling-3.2-air): the embedding ships as
+        // `model.word_embeddings.weight`.
+        "word_embeddings.weight",
     ];
     let has_embed = store
         .names()
