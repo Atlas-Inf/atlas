@@ -25,6 +25,15 @@ pub(crate) struct LingScratch {
     /// `[rows, hidden]` BF16 — the attention-normed copy of `hidden`.
     pub normed: DevicePtr,
     /// `[rows, hidden]` BF16 — attention output before the residual add.
+    ///
+    /// The width is `max(hidden, heads * v_dim)`: the KDA layers write it
+    /// post-o_proj as `[rows, hidden]` (2560), but the gated-MLA layers
+    /// write it from `ling_mla_v_extract_gated` (and read it back in the
+    /// o_proj GEMM) as `[rows, heads * v_dim]` = `[rows, 4096]` —
+    /// rows*4096 elements, not rows*hidden. With the KDA-sized
+    /// allocation, any MLA prefill using more than 5/8 of the scratch
+    /// row cap (e.g. the serve's 512-row cap: >320 rows) wrote past the
+    /// buffer and killed the CUDA context.
     pub attn_out: DevicePtr,
     /// `[rows, hidden]` BF16 — FFN output before the residual add.
     pub ffn_out: DevicePtr,
@@ -108,6 +117,13 @@ impl LingScratch {
         Self::alloc(gpu, elems * 2)
     }
 
+    /// Scratch width of `attn_out` (see the field doc): the KDA layers
+    /// stride it `[rows, hidden]`, the gated-MLA layers `[rows, heads *
+    /// v_dim]`; heads*v_dim is 32*128 here.
+    fn attn_out_width(hidden: usize) -> usize {
+        hidden.max(32 * 128)
+    }
+
     /// Allocate for `rows` prompt rows, `hidden` model dim, `experts` /
     /// `top_k` / `inter` (the WIDEST FFN intermediate — the dense-MLP
     /// layers 0-1 share the shared-expert scratch lanes).
@@ -127,7 +143,7 @@ impl LingScratch {
             hidden,
             max_blocks,
             normed: Self::bf16(gpu, rows * hidden)?,
-            attn_out: Self::bf16(gpu, rows * hidden)?,
+            attn_out: Self::bf16(gpu, rows * attn_out_width(hidden))?,
             ffn_out: Self::bf16(gpu, rows * hidden)?,
             kda_qkv: Self::bf16(gpu, rows * 3 * kda_t)?,
             kda_preconv: Self::bf16(gpu, rows * 3 * kda_t)?,
