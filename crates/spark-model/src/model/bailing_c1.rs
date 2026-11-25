@@ -75,6 +75,10 @@ mod mla;
 mod scratch;
 mod spec;
 
+#[cfg(test)]
+#[path = "bailing_c1/kda_parity_gpu_tests.rs"]
+mod kda_parity_gpu_tests;
+
 pub(crate) use ffn::{LingDenseWeights, LingExpertTable, LingFfn, LingMoeWeights};
 pub(crate) use kda::{LingKdaLayer, LingKdaWeights};
 pub(crate) use kernels::LingKernels;
