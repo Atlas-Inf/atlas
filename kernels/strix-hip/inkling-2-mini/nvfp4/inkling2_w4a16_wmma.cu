@@ -129,10 +129,12 @@ extern "C" __global__ __launch_bounds__(256, 4) void w4a16_wmma(
     const unsigned int* r0_base = Raw + (long long)n_blk * n_kt64 * 128 + row0;
     const unsigned int* r1_base = Raw + (long long)n_blk * n_kt64 * 128 + row1;
 
-    // Prologue: issue this group's first weight tile immediately.
-    uint4 p0_nxt, p1_nxt;
-    unsigned int r0_nxt, r1_nxt;
-    {
+    // Prologue: issue this group's first weight tile immediately. A K group
+    // whose parity has no tile in a short last slice (e.g. ktiles == 1)
+    // must not touch memory past the buffer.
+    uint4 p0_nxt = make_uint4(0, 0, 0, 0), p1_nxt = make_uint4(0, 0, 0, 0);
+    unsigned int r0_nxt = 0, r1_nxt = 0;
+    if (kgrp < ktiles) {
         const long long t0 = (long long)(kbase + kgrp) * 128;
         p0_nxt = *reinterpret_cast<const uint4*>(p0_base + t0 * 8);
         p1_nxt = *reinterpret_cast<const uint4*>(p1_base + t0 * 8);
