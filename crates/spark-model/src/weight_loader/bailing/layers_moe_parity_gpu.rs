@@ -138,7 +138,7 @@ impl Ckpt {
         let t = &header[name];
         let shape: Vec<usize> = serde_json::from_value(t["shape"].clone())?;
         let [lo, hi]: [u64; 2] = serde_json::from_value(t["data_offsets"].clone())?;
-        file.seek(SeekFrom::Start(8 + header_len + lo))?;
+        file.seek(SeekFrom::Start(8 + *header_len + lo))?;
         let mut data = vec![0u8; (hi - lo) as usize];
         file.read_exact(&mut data)?;
         let dtype = WeightDtype::from_safetensors_str(t["dtype"].as_str().unwrap_or(""))?;
@@ -235,7 +235,7 @@ fn e4m3_signed(b: u8) -> f32 {
     } else if exp == 15 && man == 7 {
         0.0
     } else {
-        f32::from_bits(((exp + 120) << 23) | ((man as u32) << 20))
+        f32::from_bits((((exp as u32) + 120) << 23) | ((man as u32) << 20))
     };
     if sign == 1 { -mag } else { mag }
 }
