@@ -360,13 +360,14 @@ fn concat_runs(runs: &[Run]) -> Run {
 /// are noisy — the sibling harness measured ~4e-2 rel on ~4e-9 cells).
 ///
 /// Near-zero cells need an ABSOLUTE band too: when the reference itself
-/// lands at ~1e-5 by cancellation (o_proj sums K=4096 bf16 products, and
-/// the prefill/decode recurrences accumulate in different orders), the
+/// lands at ~1e-5 by cancellation (o_proj sums K=4096 bf16 products, and the
+/// prefill/decode recurrences accumulate in different orders), the
 /// per-element relative band can flag a 32% "error" on a 1e-5 cell whose
-/// absolute drift is 5e-6. The floor is 0.2% of the reference stage's RMS
-/// — two orders below bug-scale shifts: the conv plane-stride bug moved
-/// whole k/v planes by O(stage RMS) and every real layout bug shifts
-/// whole rows, so the floor cannot mask one.
+/// absolute drift is 5e-6 — one band-width kda_o drift (2.5% of a ~2e-3
+/// cell) through one o_proj tap. The floor is 0.5% of the reference
+/// stage's RMS, two orders below bug-scale shifts: the conv plane-stride
+/// bug moved whole k/v planes by O(stage RMS) — 200x the floor — and every
+/// real layout bug shifts whole rows, so the floor cannot mask one.
 fn cmp_stage(name: &str, got: &[f32], want: &[f32]) -> (usize, usize) {
     assert_eq!(got.len(), want.len(), "{name}: length mismatch");
     let state = name == "h_state" || name == "conv_state";
@@ -381,7 +382,7 @@ fn cmp_stage(name: &str, got: &[f32], want: &[f32]) -> (usize, usize) {
         }
         let scale = w.abs().max(if state { 1e-6 } else { 1e-5 });
         let tol = if state { 0.03 } else { 0.025 };
-        if (g - w).abs() > (tol * scale).max(2e-3 * rms) {
+        if (g - w).abs() > (tol * scale).max(5e-3 * rms) {
             bad += 1;
         }
         if !state {
