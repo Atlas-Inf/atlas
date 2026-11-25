@@ -95,6 +95,15 @@ fn proj_gemm_min_rows() -> u32 {
 /// One prefill-shaped projection: the house BF16 tensor-core GEMM
 /// (`ops::bf16_gemm`) from the M threshold up, the scalar one below it.
 #[allow(clippy::too_many_arguments)]
+/// Whether a `decode_multi_seq_rows` window is `num_rows` rows of ONE
+/// sequence: exactly one state and every row names it (the MTP verify's
+/// `row_owner = [0; k]` with the sequence's own layer state). Distinct
+/// sequences per row (the a2 multi-request lane) keep the trait's default
+/// per-row loop.
+fn single_owner_window(states_len: usize, row_owner: &[usize]) -> bool {
+    states_len == 1 && !row_owner.is_empty() && row_owner.iter().all(|&o| o == 0)
+}
+
 fn proj_gemm(
     gpu: &dyn GpuBackend,
     k: &LingKernels,
@@ -729,9 +738,18 @@ impl LingMlaLayer {
         let k = &self.kernels;
         let hidden_w = s.hidden as u32;
         let rows_u32 = rows as u32;
+        // `seq_len_start` is an ABSOLUTE sequence position — the NEXTN
+        // drafter's context prefill walks the whole prompt in chunks, so any
+        // position-constrained bound here refuses every chunk past the
+        // scratch row count ("64 rows at 128 exceed the scratch cap" —
+        // speculation silently died for real-context prompts and the serve
+        // fell to serial decode). Only the CHUNK width occupies scratch;
+        // positions beyond the table fail properly in `upload_meta` when
+        // the block table is shorter than the chunk's last position.
         ensure!(
-            rows <= s.rows && seq_len_start + rows <= s.rows,
-            "ling MLA kv-only: {rows} rows at {seq_len_start} exceed the scratch cap"
+            rows <= s.rows,
+            "ling MLA kv-only: {rows} rows exceed the scratch cap {cap}",
+            cap = s.rows
         );
         ops::rms_norm(
             gpu,
@@ -1069,7 +1087,72 @@ impl TransformerLayer for LingMlaLayer {
     /// serves rows 1..=8 with per-row causal over the just-written block —
     /// PR #112's verify-row support), base_len naming the entries before
     /// the window. A single row runs the plain decode path unchanged.
-    fn decode_batched(
+    /// The K=2 MTP verify arrives here as `num_rows` rows of ONE sequence:
+    /// `row_owner` all-zero, one shared layer state. The trait default
+    /// would decode each row separately — correct eagerly (each row
+    /// uploads its own position), exactly wrong under a captured graph:
+    /// the staged arm keys every row to the ROW-0 entries of the
+    /// prestaged metadata (`ling_meta_staged` carries no row index), so
+    /// draft/bonus rows computed at the row-0 position. That was the
+    /// ARM-after replay nondeterminism — the first divergence lands at
+    /// the FIRST gated-MLA layer's verify (`ATLAS_LING_CAP_TRACE` staged
+    /// dumps read `pos=[base, 1]`: row 1 keyed to warmup-era staging).
+    /// Fan the single-owner window through the multi-row arm instead —
+    /// the same `decode_batched` route the verify's SSM branch already
+    /// takes — so an eager or captured step alike reads the `rows`-wide
+    /// prestage Phase 1 wrote (`decode_meta_prestage(rows = k)`):
+    /// positions/slots/base_len/block table as a K-row window.
+    fn decode_multi_seq_rows<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_rows: usize,
+        seq_states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        row_owner: &[usize],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if single_owner_window(seq_states.len(), row_owner) {
+            let mut block_table = block_tables.first().cloned().unwrap_or_default();
+            let mut disk_block_ids = Vec::new();
+            let mut disk_last = Vec::new();
+            return self.decode_batched(
+                hidden,
+                residual,
+                num_rows,
+                seq_states[0],
+                kv_cache,
+                seq_lens.first().copied().unwrap_or(0),
+                &mut block_table,
+                &mut disk_block_ids,
+                &mut disk_last,
+                ctx,
+                stream,
+            );
+        }
+        let mut owned: Vec<Box<dyn LayerState>> = (0..num_rows)
+            .map(|_| self.alloc_state(ctx.gpu))
+            .collect::<Result<_>>()?;
+        let mut refs: Vec<&mut (dyn LayerState + 'static)> =
+            owned.iter_mut().map(|s| s.as_mut()).collect();
+        self.decode_multi_seq(
+            hidden,
+            residual,
+            num_rows,
+            num_rows,
+            &mut refs,
+            kv_cache,
+            seq_lens,
+            block_tables,
+            ctx,
+            stream,
+        )
+    }
+
+        fn decode_batched(
         &self,
         hidden: DevicePtr,
         _residual: DevicePtr,
@@ -1271,6 +1354,43 @@ impl TransformerLayer for LingMlaLayer {
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
+    }
+}
+
+#[cfg(test)]
+mod verify_rows_routing_tests {
+    use super::single_owner_window;
+
+    #[test]
+    fn mtp_verify_window_is_single_owner() {
+        // The K=2 verify: k rows, one shared state, every row owner 0.
+        assert!(single_owner_window(1, &[0]));
+        assert!(single_owner_window(1, &[0, 0]));
+    }
+
+    #[test]
+    fn distinct_owners_and_degenerate_windows_are_not() {
+        // The a2 multi-request lane names different states per row.
+        assert!(!single_owner_window(1, &[0, 1]));
+        assert!(!single_owner_window(2, &[0, 1]));
+        assert!(!single_owner_window(2, &[0, 0]));
+        // No rows to own: keep the default loop.
+        assert!(!single_owner_window(1, &[]));
+    }
+
+    /// The verify must keep fanning single-owner windows through the
+    /// multi-row arm — if this file ever loses the override, the captured
+    /// draft rows key to row-0 staging and the replay diverges (see the
+    /// override's doc comment).
+    #[test]
+    fn decode_multi_seq_rows_overrides_the_default_loop() {
+        let src = include_str!("mla.rs");
+        assert!(src.contains("fn decode_multi_seq_rows"));
+        assert!(src.contains("single_owner_window(seq_states.len()"));
+        assert!(
+            src.contains("return self.decode_batched("),
+            "single-owner windows must fan through decode_batched"
+        );
     }
 }
 
