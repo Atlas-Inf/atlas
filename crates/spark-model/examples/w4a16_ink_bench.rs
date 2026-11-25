@@ -1,0 +1,490 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! W4A16 batched-GEMV M-sweep bench + correctness gate for the chain-verify
+//! widening (K=5..8 → M=5..8 rows) — decides whether `w4a16_gemv_batch8`
+//! removes the M>4 projection cliff (the documented 19.3 ms lm_head tile-GEMM
+//! fallback) before any dispatch gate is widened.
+//!
+//! Compares, at M ∈ {1,3,4,5,6,8} on the real Qwen3.6-27B shapes
+//! (qkv/o 5120×5120, ffn gate/up 17408×5120, ffn down 5120×17408,
+//! lm_head 248320×5120):
+//!   w4a16_gemv_batch4   (M<=4, shipping verify kernel)
+//!   w4a16_gemv_batch8   (M<=8, NEW — acc[8]/smem[8][8])
+//!   w4a16_gemv_batch16  (M<=16, exists but unused at M=5..8)
+//!   w4a16_gemm          (M64-tile GEMM — the current lm_head M>4 fallback)
+//!   w4a16_gemm_t        (N128/M64 small-M tile GEMM — what dense
+//!                        forward_prefill dispatches at M<=64, i.e. the FFN
+//!                        arm the missing n==4 branch falls onto; timed with
+//!                        the same buffers — content is timing-irrelevant)
+//!
+//! COLD WEIGHTS: iterations cycle across enough weight copies to exceed L2,
+//! so every launch streams weights from DRAM like a real verify step.
+//!
+//! CORRECTNESS GATE (references stated):
+//!   1. batch8 vs batch4 at M ∈ {1,3,4}: BIT-EXACT (batch4 is the shipping,
+//!      production-proven kernel; same template `w4a16_gemv_batchm_impl`).
+//!   2. batch8 vs batch16 at M ∈ {5,6,8}: BIT-EXACT (independent
+//!      instantiation of the same template — per-row FP32 order identical).
+//!   3. batch8 at M=8 vs CPU f64 dequant reference (first 256 N rows):
+//!      tolerance gate (catches a template-wide bug that 1/2 would miss;
+//!      the tile GEMM epilogue has a different FP order, so bit-exactness
+//!      vs the GEMM is not expected and not used).
+//!
+//!   cargo run -p spark-model --release --example batchm_bench \
+//!       --features cuda,gpu-examples
+//!
+//! Env: ATLAS_PEAK_GBPS (default 273 — GB10 LPDDR5x) for the %-of-peak column.
+
+mod refs;
+
+use anyhow::{Result, bail};
+use refs::*;
+use spark_runtime::cuda_backend::AtlasCudaBackend;
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
+use std::time::Instant;
+
+const WARMUP: usize = 10;
+const ITERS: usize = 50;
+/// Weight bytes to cycle through so back-to-back launches miss L2/SLC.
+const COLD_CYCLE_BYTES: usize = 256 << 20;
+const M_SWEEP: &[u32] = &[1, 2, 4, 8, 16];
+const M_MAX: usize = 16;
+/// N rows checked against the CPU reference (full N for GPU-GPU bit checks).
+const CPU_CHECK_ROWS: usize = 256;
+
+/// Launch a batchm GEMV (batch4/8/16): grid ceil(N/4), block 256, args
+/// (A, B_packed, B_scale, scale2, C, M, N, K) — mirrors ops::w4a16_gemv_batchm.
+#[allow(clippy::too_many_arguments)]
+fn launch_batchm(
+    g: &dyn GpuBackend,
+    kh: KernelHandle,
+    a: DevicePtr,
+    b: DevicePtr,
+    bs: DevicePtr,
+    c: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<()> {
+    KernelLaunch::new(g, kh)
+        .grid([div_ceil(n, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(b)
+        .arg_ptr(bs)
+        .arg_f32(1.0)
+        .arg_ptr(c)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(0)
+}
+
+/// Launch a tile GEMM: base w4a16_gemm grid (N/64, M/64) or transposed
+/// w4a16_gemm_t grid (N/128, M/64), block 128 — mirrors ops::w4a16_gemm /
+/// ops::w4a16_gemm_n128. `w4a16_gemm_t` takes a 9th argument, the B row
+/// stride `ldb` (N here, as `w4a16_gemm_n128` passes): launching it with 8
+/// made the driver read a kernel-parameter pointer past the argument array
+/// — the host segfault this bench hit on its first shape.
+#[allow(clippy::too_many_arguments)]
+fn launch_gemm(
+    g: &dyn GpuBackend,
+    kh: KernelHandle,
+    n_tile: u32,
+    a: DevicePtr,
+    b: DevicePtr,
+    bs: DevicePtr,
+    c: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<()> {
+    let launch = KernelLaunch::new(g, kh)
+        .grid([div_ceil(n, n_tile), div_ceil(m, 64), 1])
+        .block([128, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(b)
+        .arg_ptr(bs)
+        .arg_f32(1.0)
+        .arg_ptr(c)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k);
+    if n_tile == 128 {
+        launch.arg_u32(n)
+    } else {
+        launch
+    }
+    .launch(0)
+}
+
+/// Launch the strix-hip WMMA projection on PRETILED weights (pk = packed
+/// replay, ps = scale words): grid (N/128, 2) block 256 writing f32 partials,
+/// then the reduce pass — mirrors the `Linear::Nvfp4` rows 2..=16 arm in
+/// glue.rs::proj.
+#[allow(clippy::too_many_arguments)]
+fn launch_wmma(
+    g: &dyn GpuBackend,
+    kh: KernelHandle,
+    rd: KernelHandle,
+    a: DevicePtr,
+    pk: DevicePtr,
+    ps: DevicePtr,
+    part: DevicePtr,
+    c: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<()> {
+    let mn = m * n;
+    let n_split = std::env::var("WMMA_SPLIT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_else(|| (64 / (n / 128)).clamp(1, (k / 64) / 2).min(8));
+    KernelLaunch::new(g, kh)
+        .grid([n / 128, n_split, 1])
+        .block([256, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(pk)
+        .arg_ptr(ps)
+        .arg_ptr(part)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(0)?;
+    KernelLaunch::new(g, rd)
+        .grid([div_ceil(mn, 512), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(part)
+        .arg_f32(1.0)
+        .arg_ptr(c)
+        .arg_u32(mn)
+        .arg_u32(n_split)
+        .launch(0)
+}
+
+#[derive(Clone, Copy)]
+enum Kind {
+    Batchm {
+        max_m: u32,
+    },
+    /// Base w4a16_gemm: grid (N/64, M/64).
+    Gemm,
+    /// strix-hip inkling WMMA: grid (N/16), block 256, batchm-style args.
+    Wmma,
+    /// Transposed small-M w4a16_gemm_t: grid (N/128, M/64). Timing only —
+    /// takes the same (non-transposed) buffers; GEMM time is not
+    /// data-dependent and buffer SIZES are exact.
+    GemmT,
+}
+
+fn read_c(g: &dyn GpuBackend, c: DevicePtr, elems: usize) -> Result<Vec<u16>> {
+    let mut raw = vec![0u8; elems * 2];
+    g.copy_d2h(c, &mut raw)?;
+    Ok(raw
+        .chunks_exact(2)
+        .map(|p| u16::from_le_bytes([p[0], p[1]]))
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn correctness_gate(
+    g: &dyn GpuBackend,
+    kernels: &[(&str, KernelHandle, Kind)],
+    rd: KernelHandle,
+    part: DevicePtr,
+    a: DevicePtr,
+    b: DevicePtr,
+    bs: DevicePtr,
+    pk: DevicePtr,
+    ps: DevicePtr,
+    c: DevicePtr,
+    n: u32,
+    k: u32,
+    a_host: &[u16],
+    b_host: &[u8],
+    bs_host: &[u8],
+) -> Result<()> {
+    let (n_us, k_us) = (n as usize, k as usize);
+    let zero_c = |g: &dyn GpuBackend| g.memset(c, 0, M_MAX * n_us * 2);
+
+    // Gate 1: batch16 bit-exact vs batch8 at M<=8.
+    let handle = |name: &str| -> Result<KernelHandle> {
+        kernels
+            .iter()
+            .find(|(kn, _, _)| *kn == name)
+            .map(|&(_, h, _)| h)
+            .ok_or_else(|| anyhow::anyhow!("kernel {name} missing"))
+    };
+    let (b8, b16) = (handle("batch8")?, handle("batch16")?);
+    for &m in M_SWEEP {
+        if m > 8 {
+            continue;
+        }
+        zero_c(g)?;
+        launch_batchm(g, b8, a, b, bs, c, m, n, k)?;
+        g.synchronize(0)?;
+        let reference = read_c(g, c, m as usize * n_us)?;
+        zero_c(g)?;
+        launch_batchm(g, b16, a, b, bs, c, m, n, k)?;
+        g.synchronize(0)?;
+        let got = read_c(g, c, m as usize * n_us)?;
+        if reference != got {
+            let bad = reference.iter().zip(&got).filter(|(x, y)| x != y).count();
+            bail!(
+                "GATE FAIL: batch16 != batch8 at M={m} ({bad}/{} elems differ)",
+                got.len()
+            );
+        }
+    }
+    eprintln!("  gate 1   PASS: batch16 BIT-EXACT vs batch8 @M<=8");
+
+    // Gate 3: batch8 @M=8 vs CPU f64 dequant reference (first CPU_CHECK_ROWS).
+    zero_c(g)?;
+    launch_batchm(g, b8, a, b, bs, c, 8, n, k)?;
+    g.synchronize(0)?;
+    let got = read_c(g, c, 8 * n_us)?;
+    let rows = CPU_CHECK_ROWS.min(n_us);
+    let groups = k_us / 16;
+    let mut worst = 0.0f64;
+    for row in 0..rows {
+        let mut wf = vec![0.0f64; k_us];
+        for kk in 0..k_us {
+            let byte = b_host[row * k_us / 2 + kk / 2];
+            let nib = if kk % 2 == 0 { byte & 0xF } else { byte >> 4 };
+            let scale = e4m3_to_f32(bs_host[row * groups + kk / 16]) as f64;
+            wf[kk] = E2M1_LUT[nib as usize] as f64 * scale;
+        }
+        for t in 0..8usize {
+            let mut acc = 0.0f64;
+            for kk in 0..k_us {
+                acc += bf16_bits_to_f32(a_host[t * k_us + kk]) as f64 * wf[kk];
+            }
+            let out = bf16_bits_to_f32(got[t * n_us + row]) as f64;
+            let tol = (0.02 * acc.abs()).max(0.25);
+            let diff = (out - acc).abs();
+            worst = worst.max(diff / tol);
+            if diff > tol {
+                bail!("GATE FAIL: batch8 vs CPU ref at row={row} t={t}: got {out} want {acc}");
+            }
+        }
+    }
+    eprintln!(
+        "  gate 3   PASS: batch8 @M=8 vs CPU f64 ref, {rows} rows (worst {:.2}x tol)",
+        worst
+    );
+
+    // Gate 4: every other kernel vs batch8 at M=8 — WMMA accumulation order
+    // differs, so compare with a BF16-noise tolerance, not bits.
+    for &(kname, kh, kind) in kernels {
+        if matches!(kind, Kind::Batchm { .. }) {
+            continue;
+        }
+        zero_c(g)?;
+        match kind {
+            Kind::Wmma => launch_wmma(g, kh, rd, a, pk, ps, part, c, 8, n, k)?,
+            Kind::Gemm => launch_gemm(g, kh, 64, a, b, bs, c, 8, n, k)?,
+            _ => continue,
+        }
+        g.synchronize(0)?;
+        let got2 = read_c(g, c, 8 * n_us)?;
+        let mut md = 0.0f64;
+        let mut bad = 0usize;
+        for (r, (&x, &y)) in got.iter().zip(&got2).enumerate() {
+            let d = (bf16_bits_to_f32(x) as f64 - bf16_bits_to_f32(y) as f64).abs();
+            md = md.max(d);
+            let tol = (0.02 * bf16_bits_to_f32(x) as f64).abs().max(0.25);
+            if d > tol {
+                bad += 1;
+                if bad < 4 {
+                    eprintln!(
+                        "    {kname} diff at {r}: got {} ref {}",
+                        bf16_bits_to_f32(y),
+                        bf16_bits_to_f32(x)
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "  gate 4 {kname}: max|d| {md:.4}  over-tol {bad}/{}",
+            got2.len()
+        );
+        if bad > 0 {
+            bail!("GATE FAIL: {kname} vs batch8 beyond tolerance");
+        }
+    }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let g0 = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
+    let g: &dyn GpuBackend = &g0;
+    let peak_gbps: f64 = std::env::var("ATLAS_PEAK_GBPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(273.0);
+
+    let kernels: Vec<(&str, KernelHandle, Kind)> = [
+        (
+            "batch8",
+            "w4a16_gemv",
+            "w4a16_gemv_batch8",
+            Kind::Batchm { max_m: 8 },
+        ),
+        (
+            "batch16",
+            "w4a16_gemv",
+            "w4a16_gemv_batch16",
+            Kind::Batchm { max_m: 16 },
+        ),
+        ("gemm_m64", "w4a16", "w4a16_gemm", Kind::Gemm),
+        ("wmma", "inkling2_w4a16_wmma", "w4a16_wmma", Kind::Wmma),
+        ("gemm_t", "w4a16", "w4a16_gemm_t", Kind::GemmT),
+    ]
+    .into_iter()
+    .filter_map(|(name, module, func, kind)| match g.kernel(module, func) {
+        Ok(h) => Some((name, h, kind)),
+        Err(_) => {
+            eprintln!("SKIP {name}: {module}::{func} not in this target's module set");
+            None
+        }
+    })
+    .collect();
+
+    eprintln!(
+        "W4A16 batchm M-sweep (chain-verify widening)  peak {peak_gbps:.0} GB/s, \
+         {ITERS} iters, cold-cycled weights\n"
+    );
+
+    let pretile = g.kernel("inkling2_w4a16_wmma", "w4a16_wmma_pretile").ok();
+    let wmma_reduce = g
+        .kernel("inkling2_w4a16_wmma", "w4a16_wmma_reduce")
+        .unwrap_or(KernelHandle(0));
+    let partials = g.alloc(8 * M_MAX * 4096 * 4)?;
+
+    let mut rng = XorShift(0x9E3779B97F4A7C15);
+    for &(label, n, k) in SHAPES {
+        let (n_us, k_us) = (n as usize, k as usize);
+        let packed_bytes = n_us * k_us / 2;
+        let scale_bytes = n_us * k_us / 16;
+        let weight_bytes = packed_bytes + scale_bytes;
+        let copies = (COLD_CYCLE_BYTES.div_ceil(weight_bytes)).clamp(1, 16);
+
+        // Random activations (bf16 in [-1,1)) + random weights. Scale bytes in
+        // [0x18,0x28) → E4M3 2^-4..2^-2 range: keeps |C| ~O(10), no NaN/inf.
+        let a_host: Vec<u16> = (0..M_MAX * k_us)
+            .map(|_| f32_to_bf16_bits(rng.unit_f32()))
+            .collect();
+        let b_host: Vec<u8> = (0..packed_bytes).map(|_| rng.byte()).collect();
+        let bs_host: Vec<u8> = (0..scale_bytes)
+            .map(|_| 0x18 + (rng.byte() & 0x0F))
+            .collect();
+
+        let a = g.alloc(M_MAX * k_us * 2)?;
+        let c = g.alloc(M_MAX * n_us * 2)?;
+        let a_bytes: Vec<u8> = a_host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        g.copy_h2d(&a_bytes, a)?;
+        let mut b_copies = Vec::with_capacity(copies);
+        for _ in 0..copies {
+            let b = g.alloc(packed_bytes)?;
+            let bs = g.alloc(scale_bytes)?;
+            g.copy_h2d(&b_host, b)?;
+            g.copy_h2d(&bs_host, bs)?;
+            let mut entry = (b, bs, DevicePtr::NULL, DevicePtr::NULL);
+            if let Some(pt) = pretile {
+                let pk = g.alloc(packed_bytes)?;
+                let ps = g.alloc(scale_bytes)?;
+                KernelLaunch::new(g, pt)
+                    .grid([(n / 128) * (k / 64), 1, 1])
+                    .block([128, 1, 1])
+                    .arg_ptr(b)
+                    .arg_ptr(bs)
+                    .arg_ptr(pk)
+                    .arg_ptr(ps)
+                    .arg_u32(n)
+                    .arg_u32(k)
+                    .launch(0)?;
+                g.synchronize(0)?;
+                entry.2 = pk;
+                entry.3 = ps;
+            }
+            b_copies.push(entry);
+        }
+
+        let floor_us = weight_bytes as f64 / (peak_gbps * 1e9) * 1e6;
+        eprintln!(
+            "── {label}  weights {:.1} MB × {copies} copies, floor {floor_us:.0} us ──",
+            weight_bytes as f64 / 1e6
+        );
+
+        let (b0, bs0, pk0, ps0) = b_copies[0];
+        correctness_gate(
+            g,
+            &kernels,
+            wmma_reduce,
+            partials,
+            a,
+            b0,
+            bs0,
+            pk0,
+            ps0,
+            c,
+            n,
+            k,
+            &a_host,
+            &b_host,
+            &bs_host,
+        )?;
+
+        for &(kname, kh, kind) in &kernels {
+            for &m in M_SWEEP {
+                if let Kind::Batchm { max_m } = kind
+                    && m > max_m
+                {
+                    continue;
+                }
+                let launch = |i: usize| -> Result<()> {
+                    let (b, bs, pk, ps) = b_copies[i % copies];
+                    match kind {
+                        Kind::Batchm { .. } => launch_batchm(g, kh, a, b, bs, c, m, n, k),
+                        Kind::Gemm => launch_gemm(g, kh, 64, a, b, bs, c, m, n, k),
+                        Kind::GemmT => launch_gemm(g, kh, 128, a, b, bs, c, m, n, k),
+                        Kind::Wmma => {
+                            launch_wmma(g, kh, wmma_reduce, a, pk, ps, partials, c, m, n, k)
+                        }
+                    }
+                };
+                for i in 0..WARMUP {
+                    launch(i)?;
+                }
+                g.synchronize(0)?;
+                let t0 = Instant::now();
+                for i in 0..ITERS {
+                    launch(WARMUP + i)?;
+                }
+                g.synchronize(0)?;
+                let us = t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
+                let gbps = weight_bytes as f64 / (us * 1e-6) / 1e9;
+                eprintln!(
+                    "  {kname:<9} M={m}  {us:>9.1} us  {gbps:>6.1} GB/s  {:>5.1}% peak  {:>5.2}x floor",
+                    100.0 * gbps / peak_gbps,
+                    us / floor_us,
+                );
+            }
+            eprintln!();
+        }
+
+        g.free(a)?;
+        g.free(c)?;
+        for (b, bs, pk, ps) in b_copies {
+            g.free(b)?;
+            g.free(bs)?;
+            if pk != DevicePtr::NULL {
+                g.free(pk)?;
+                g.free(ps)?;
+            }
+        }
+    }
+    Ok(())
+}

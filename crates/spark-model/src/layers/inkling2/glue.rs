@@ -39,6 +39,14 @@ pub(crate) struct GlueKernels {
     /// AMD (strix-hip): the single-warp `w4a16_gemv_sw` (bit-identical to `w4a16_gemv`,
     /// 8 outputs a block); NULL elsewhere or when the kernel is absent
     pub w4a16_gemv_sw: KernelHandle,
+    /// AMD (strix-hip): WMMA batched projection `w4a16_wmma` for rows 2..=16;
+    /// NULL elsewhere or when the kernel is absent.
+    pub w4a16_wmma: KernelHandle,
+    /// Its split-K reduce pass (`w4a16_wmma_reduce`) and the shared
+    /// `[8 splits, 16 rows, 4096]` f32 partials scratch; NULL/unset with the
+    /// main kernel.
+    pub w4a16_wmma_reduce: KernelHandle,
+    pub w4a16_wmma_partials: DevicePtr,
     pub w4a16_gemv_b8: KernelHandle,
     pub w4a16_gemv_b16: KernelHandle,
 }
@@ -46,6 +54,20 @@ pub(crate) struct GlueKernels {
 impl GlueKernels {
     pub(crate) fn resolve(gpu: &dyn GpuBackend) -> Result<Self> {
         let m = |f: &str| gpu.kernel("inkling2_misc", f);
+        // The WMMA batched projection needs its 8 MB split-K scratch only when
+        // the kernel is present; an allocation failure is a hard error, not a
+        // silent NULL.
+        let w4a16_wmma = if cfg!(atlas_scale) {
+            crate::layers::try_kernel(gpu, "inkling2_w4a16_wmma", "w4a16_wmma")
+        } else {
+            KernelHandle(0)
+        };
+        let w4a16_wmma_partials = if w4a16_wmma.0 != 0 {
+            gpu.alloc(8 * 16 * 4096 * 4)
+                .map_err(|e| anyhow::anyhow!("w4a16_wmma split-K partials: {e}"))?
+        } else {
+            DevicePtr::NULL
+        };
         Ok(Self {
             rmsnorm: m("inkling2_rmsnorm")?,
             gate_mul: m("inkling2_gate_mul")?,
@@ -66,6 +88,13 @@ impl GlueKernels {
             } else {
                 KernelHandle(0)
             },
+            w4a16_wmma,
+            w4a16_wmma_reduce: if cfg!(atlas_scale) {
+                crate::layers::try_kernel(gpu, "inkling2_w4a16_wmma", "w4a16_wmma_reduce")
+            } else {
+                KernelHandle(0)
+            },
+            w4a16_wmma_partials,
             w4a16_gemv_b8: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch8")?,
             w4a16_gemv_b16: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch16")?,
         })
@@ -165,6 +194,48 @@ impl GlueKernels {
             }
             Linear::Nvfp4 { q, .. } if rows == 1 => {
                 ops::w4a16_gemv(gpu, self.w4a16_gemv, x, &q, y, n as u32, k as u32, s)
+            }
+            // AMD (strix-hip): one block per 128 outputs x K slice on the
+            // pretiled weight replay — K64 software-pipelined WMMA with an
+            // f32 partials reduce — replaces batch8/16's issue-bound rows.
+            // Rows 2-3 and the narrow rel-bias projection stay on batch8:
+            // WMMA's fixed per-launch cost only pays off from M ~4 / N ~1K.
+            Linear::Nvfp4 {
+                q,
+                wmma_packed,
+                wmma_scales,
+                ..
+            } if (4..=16).contains(&rows)
+                && n >= 1024
+                && self.w4a16_wmma.0 != 0
+                && wmma_packed != DevicePtr::NULL
+                && self.w4a16_wmma_partials != DevicePtr::NULL
+                && n <= 4096 =>
+            {
+                let mn = (rows * n) as u32;
+                // Fill ~40 CUs: small-N projections split K deeper. Each
+                // slice needs >= 2 K64 tiles to keep the pipeline fed.
+                let n_split = (64 / (n / 128)).clamp(1, (k / 64) / 2).min(8) as u32;
+                KernelLaunch::new(gpu, self.w4a16_wmma)
+                    .grid([(n as u32) / 128, n_split, 1])
+                    .block([256, 1, 1])
+                    .arg_ptr(x)
+                    .arg_ptr(wmma_packed)
+                    .arg_ptr(wmma_scales)
+                    .arg_ptr(self.w4a16_wmma_partials)
+                    .arg_u32(rows as u32)
+                    .arg_u32(n as u32)
+                    .arg_u32(k as u32)
+                    .launch(s)?;
+                KernelLaunch::new(gpu, self.w4a16_wmma_reduce)
+                    .grid([mn.div_ceil(512), 1, 1])
+                    .block([256, 1, 1])
+                    .arg_ptr(self.w4a16_wmma_partials)
+                    .arg_f32(q.weight_scale_2)
+                    .arg_ptr(y)
+                    .arg_u32(mn)
+                    .arg_u32(n_split)
+                    .launch(s)
             }
             // a decode batch: Atlas's batched GEMV reads the weight once for all rows
             Linear::Nvfp4 { q, .. } if rows < super::moe_ops::MOE_GROUPED_MIN_ROWS => {
