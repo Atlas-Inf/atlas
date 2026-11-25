@@ -329,7 +329,8 @@ fn snapshot(
 /// FP32 states are cumulative: the reference run carries the LAST token's
 /// state).
 fn concat_runs(runs: &[Run]) -> Run {
-    let cat = |get: fn(&Run) -> &[f32]| -> Vec<f32> { runs.iter().flat_map(get).collect() };
+    let cat =
+        |get: fn(&Run) -> &[f32]| -> Vec<f32> { runs.iter().flat_map(get).copied().collect() };
     Run {
         normed: cat(|r| &r.normed),
         qkv: cat(|r| &r.qkv),
