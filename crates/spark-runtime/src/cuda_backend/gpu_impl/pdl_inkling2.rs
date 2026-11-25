@@ -42,6 +42,7 @@ pub(super) const INKLING2_PDL_KERNELS: &[&str] = &[
     "inkling2_dspark_rnn_ctx",
     "inkling2_dspark_rnn_raw",
     "inkling2_dspark_rnn_gate",
+    "inkling2_proj_gemv",
     "dense_gemv_bf16",
     "w4a16_gemv",
     "moe_topk_sigmoid_batched_f32",

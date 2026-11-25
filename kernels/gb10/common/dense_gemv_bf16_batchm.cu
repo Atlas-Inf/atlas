@@ -56,13 +56,14 @@ __device__ __forceinline__ void dense_gemv_bf16_batchm_body(
     unsigned int M,
     unsigned int N,
     unsigned int K,
-    unsigned int out_stride                // BF16 elements between output rows
+    unsigned int out_stride,               // BF16 elements between output rows
+    unsigned int block                     // this block's index over N (blockIdx.x)
 ) {
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
     const unsigned int local_out = threadIdx.x / threads_per_out;
     const unsigned int lane = threadIdx.x % threads_per_out;
 
-    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const unsigned int n = block * N_PER_BLOCK + local_out;
 #if defined(__HIP_PLATFORM_AMD__)
     // The staged loop below has block-wide barriers, so out-of-range outputs
     // stay until it ends (they load nothing and store nothing).
@@ -238,5 +239,5 @@ extern "C" __global__ void dense_gemv_bf16_batchm(
     const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B, __nv_bfloat16* __restrict__ C,
     unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride
 ) {
-    dense_gemv_bf16_batchm_body(A, B, C, M, N, K, out_stride);
+    dense_gemv_bf16_batchm_body(A, B, C, M, N, K, out_stride, blockIdx.x);
 }

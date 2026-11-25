@@ -10,5 +10,5 @@ extern "C" __global__ void dense_gemv_bf16_batchm_f32out(
     const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B, float* __restrict__ C,
     unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride
 ) {
-    dense_gemv_bf16_batchm_body(A, B, C, M, N, K, out_stride);
+    dense_gemv_bf16_batchm_body(A, B, C, M, N, K, out_stride, blockIdx.x);
 }
