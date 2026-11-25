@@ -1,10 +1,24 @@
 # Ling-3.2-air decode: CUDA graph capture
 
-Status: design + non-behavioral prep (this document, prestage refactor, flag
-plumbing). Capture flips only after the KDA slot-pool prerequisite merges and
-the e2e oracle passes on it. Target: >= 36 tok/s single-stream greedy on one
-GB10 Spark (vLLM single-node 35.8), from ~33 tok/s today — an nsys 50 ms
-decode step dominated by launch overhead plus the M=2 verify projections.
+Status: capture flipped behind `ATLAS_LING_DECODE_GRAPH=1` (strict `== "1"`,
+default OFF), rebased onto packed-prefill main (9569e8c2). The KDA
+slot-pool prerequisite (PR #129) is merged; what this slice landed on top:
+
+- the gated-MLA metadata prestage (`TransformerLayer::decode_meta_prestage`,
+  Phase 1 of `decode_dispatch` and the K=2 verify) and the captured arms'
+  staged reads;
+- the flip of both `decode_graph_unsupported` vetoes under the family
+  switch; `decode_a2` batched graphs scoped off for the family (the
+  pool-indexed lane serves those widths eagerly);
+- the stream-ordered MoE `moe_done` reset (`memset_async`): `GpuBackend::
+  memset` SYNCHRONIZES its stream, which a capture refuses with status
+  900 (found live: the first captured decode step refused and re-ran
+  eagerly — the fallback machinery works as designed);
+- the in-process A/B lever `ATLAS_LING_DECODE_GRAPH_ARM_AFTER=<steps>`.
+
+Target: >= 36 tok/s single-stream greedy on one GB10 Spark (vLLM
+single-node 35.8) — an nsys 50 ms decode step dominated by launch overhead
+plus the M=2 verify projections.
 
 Scope of the flip, in order: (1) the single-sequence decode step
 (`decode_dispatch`), (2) the K=2 MTP verify of one sequence
