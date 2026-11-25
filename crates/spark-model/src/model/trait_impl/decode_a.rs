@@ -159,10 +159,13 @@ impl TransformerModel {
             )?;
         }
 
-        // Ling family: refresh the gated-MLA step-metadata staging
-        // pre-graph (docs/ling-decode-graphs.md) — positions/slots/
-        // base_len/block table at their fixed addresses. No-op for every
-        // layer of every other model, and while the family switch is off.
+        // Ling family: count the step toward the ARM_AFTER arming threshold
+        // (in-process graph-vs-eager A/B lever, `graph_flags.rs`), then
+        // refresh the gated-MLA step-metadata staging pre-graph
+        // (docs/ling-decode-graphs.md) — positions/slots/base_len/block
+        // table at their fixed addresses. No-op on every other model and
+        // while the family switch stays unarmed.
+        crate::model::graph_flags::ling_graph_step_tick();
         if self.ling_meta_prestage_armed() {
             self.ling_prestage_meta(seq, &kv_cache, 1, stream)?;
         }

@@ -262,10 +262,12 @@ impl TransformerModel {
             )?;
         }
 
-        // Ling family: the K=2 window's gated-MLA step metadata staged
+        // Ling family: count the verify step toward the ARM_AFTER arming
+        // threshold, then stage the K=2 window's gated-MLA step metadata
         // pre-graph (docs/ling-decode-graphs.md) — the verify rows' rope
         // positions, paged slots, `base_len`, block table at their fixed
-        // addresses. No-op off the family or while the switch is off.
+        // addresses. No-op off the family or while the switch is unarmed.
+        crate::model::graph_flags::ling_graph_step_tick();
         if self.ling_meta_prestage_armed() {
             self.ling_prestage_meta(seq, &kv_cache, k, stream)?;
         }

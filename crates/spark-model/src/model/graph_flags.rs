@@ -63,9 +63,57 @@ pub(crate) fn debug_no_graph() -> bool {
 /// their `decode_graph_unsupported` veto. Prerequisite: the KDA slot-pool
 /// PR (per-seq state must be pool-slot-stable). Strict `== "1"`, read once;
 /// `startup_parity` carries it to every rank. See `docs/ling-decode-graphs.md`.
-pub(crate) fn ling_decode_graph() -> bool {
+///
+/// In-process A/B: set `ATLAS_LING_DECODE_GRAPH_ARM_AFTER=<steps>` (strict
+/// decimal) to keep the family EAGER for the first `steps` decode/verify
+/// steps of the process and arm capture only after — one process then
+/// serves both arms, so serve-level greed nondeterminism across fresh
+/// processes drops out of the A/B (the gates' requirement).
+fn ling_graph_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_LING_DECODE_GRAPH").as_deref() == Ok("1"))
+}
+
+/// Steps to keep the switch eager before arming (0: armed from the first
+/// step). Read once. Only read under [`ling_graph_requested`].
+fn ling_graph_arm_after() -> u64 {
+    static ON: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_LING_DECODE_GRAPH_ARM_AFTER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+fn ling_graph_steps() -> &'static std::sync::atomic::AtomicU64 {
+    static STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    &STEPS
+}
+
+/// The family's decode-graph switch, ARMED: requested and past the
+/// `ARM_AFTER` step count. This is what the layer vetoes, the admissibility
+/// gates and the staging readiness all consult, per step.
+pub(crate) fn ling_decode_graph() -> bool {
+    ling_graph_armed_core(
+        ling_graph_requested(),
+        ling_graph_arm_after(),
+        ling_graph_steps().load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Pure core of [`ling_decode_graph`].
+fn ling_graph_armed_core(requested: bool, arm_after: u64, steps: u64) -> bool {
+    requested && steps >= arm_after
+}
+
+/// Count one Ling decode/verify step toward the `ARM_AFTER` arming
+/// threshold. The dispatches call this once per step, family-gated; on
+/// every other model (or with the lever unset) it is one relaxed load.
+pub(crate) fn ling_graph_step_tick() {
+    if ling_graph_arm_after() > 0 {
+        ling_graph_steps().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// `ATLAS_LING_DECODE_GRAPH_DEBUG_STAGE=1`: the bailing family prestages its
@@ -104,7 +152,7 @@ fn ling_meta_staged_core(switch_on: bool, debug_on: bool, graph_capture: bool) -
 
 #[cfg(test)]
 mod ling_graph_tests {
-    use super::ling_meta_staged_core as core;
+    use super::{ling_graph_armed_core as arm, ling_meta_staged_core as core};
 
     #[test]
     fn staged_only_under_the_switch_and_capture_or_the_debug_arm() {
@@ -119,6 +167,20 @@ mod ling_graph_tests {
         assert!(core(false, true, false));
         assert!(core(false, true, true));
         assert!(core(true, true, true));
+    }
+
+    #[test]
+    fn armed_only_when_requested_and_past_the_step_threshold() {
+        // Not requested: never, whatever the counters say.
+        assert!(!arm(false, 0, 0));
+        assert!(!arm(false, 150, 1000));
+        // ARM_AFTER=0 (or unset): armed from the first step.
+        assert!(arm(true, 0, 0));
+        // The lever: eager for `arm_after - 1` steps, armed from there on.
+        assert!(!arm(true, 150, 0));
+        assert!(!arm(true, 150, 149));
+        assert!(arm(true, 150, 150));
+        assert!(arm(true, 150, 151));
     }
 }
 
