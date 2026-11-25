@@ -126,7 +126,7 @@ fn conservative_state_pool_math() {
     );
     assert_eq!(mla_kv_bytes_per_token(&config), 15_232);
     // A 262,144-token full-context budget stays under 4 GiB.
-    assert!(262_144 * 15_232 < 4 * (1 << 30));
+    assert!(262_144u64 * 15_232u64 < 4u64 * (1 << 30));
 }
 
 #[test]
