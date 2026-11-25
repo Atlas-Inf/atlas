@@ -49,6 +49,10 @@ pub(crate) struct Inkling2Kernels {
     pub moe_grouped_down_nvfp4: KernelHandle,
     pub moe_grouped_down_mxfp8: KernelHandle,
     pub moe_combine: KernelHandle,
+    /// AMD (strix-hip) only, from kernels/strix-hip inkling2_block_res.cu:
+    /// one-launch sums+out block residual with optional resid/push/rmsnorm folds
+    /// (NULL elsewhere; the two-launch decode path stays the fallback).
+    pub block_res_fused: KernelHandle,
     /// prefill: Atlas's sort, grouped GEMMs (NVFP4 pointer table, BF16) and
     /// weighted unpermute, around this target's softcapped SwiGLU
     pub moe_sort: KernelHandle,
@@ -92,6 +96,11 @@ impl Inkling2Kernels {
             block_res_sums: gpu.kernel("inkling2_block_res", "inkling2_block_res_sums")?,
             block_res_out: gpu.kernel("inkling2_block_res", "inkling2_block_res_out")?,
             block_res_row: gpu.kernel("inkling2_block_res", "inkling2_block_res_row")?,
+            block_res_fused: if cfg!(atlas_scale) {
+                crate::layers::try_kernel(gpu, "inkling2_block_res", "inkling2_block_res_fused")
+            } else {
+                KernelHandle(0)
+            },
             head_norm: gpu.kernel("inkling2_head_ops", "inkling2_head_norm")?,
             msg_gate_z: gpu.kernel("inkling2_head_ops", "inkling2_msg_gate_z")?,
             msg_gate_out: gpu.kernel("inkling2_head_ops", "inkling2_msg_gate_out")?,
@@ -386,5 +395,71 @@ pub(crate) fn head_norm(
         .arg_f32(value)
         .arg_f32(a.log_n_floor)
         .arg_f32(a.log_alpha)
+        .launch(stream)
+}
+
+/// `inkling2_block_res_fused`: the decode two-launch path folded to one CTA a
+/// row, with the same accumulation order and BF16 roundings.
+pub(crate) fn block_res_fused(
+    gpu: &dyn GpuBackend,
+    kernels: &Inkling2Kernels,
+    a: &BlockRes,
+    resid: Option<(DevicePtr, DevicePtr, DevicePtr, bool)>,
+    push_dst: DevicePtr,
+    norm_ws: [DevicePtr; 3],
+    n_norm: usize,
+    normed: DevicePtr,
+    norm_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        kernels.block_res_fused.0 != 0
+            && a.num_blocks < MAX_BLOCK_STATES
+            && (1..=MAX_RES_QUERIES).contains(&a.num_queries)
+            && a.hidden.div_ceil(RES_CHUNK) <= 16
+            && n_norm <= a.num_queries
+            && a.rows <= 16,
+        "inkling2 fused block residual out of its kernel limits"
+    );
+    ensure!(
+        a.partial_f32.is_null() != a.partial_bf16.is_null(),
+        "inkling2 block residual needs exactly one partial"
+    );
+    let (rx, rc, rst) = match resid {
+        Some((x, c, out, restart)) => {
+            ensure!(
+                out == a.partial_f32,
+                "inkling2 fused resid must write the partial"
+            );
+            (x, c, u32::from(restart))
+        }
+        None => (DevicePtr::NULL, DevicePtr::NULL, 0),
+    };
+    KernelLaunch::new(gpu, kernels.block_res_fused)
+        .grid([u32_of(a.rows, "rows")?, 1, 1])
+        .block([RES_CHUNK as u32, 1, 1])
+        .arg_ptr(a.blocks)
+        .arg_ptr(a.partial_f32)
+        .arg_ptr(a.partial_bf16)
+        .arg_ptr(rx)
+        .arg_ptr(rc)
+        .arg_ptr(a.partial_f32)
+        .arg_u32(rst)
+        .arg_ptr(push_dst)
+        .arg_ptr(a.queries)
+        .arg_ptr(a.out)
+        .arg_ptr(norm_ws[0])
+        .arg_ptr(norm_ws[1])
+        .arg_ptr(norm_ws[2])
+        .arg_ptr(normed)
+        .arg_u32(u32_of(n_norm, "n norm")?)
+        .arg_u32(u32_of(a.rows, "rows")?)
+        .arg_u32(u32_of(a.hidden, "hidden")?)
+        .arg_u32(u32_of(a.num_blocks, "blocks")?)
+        .arg_u32(u32_of(a.row_stride, "row stride")?)
+        .arg_u64(a.block_stride as u64)
+        .arg_u32(u32_of(a.num_queries, "queries")?)
+        .arg_f32(a.eps)
+        .arg_f32(norm_eps)
         .launch(stream)
 }

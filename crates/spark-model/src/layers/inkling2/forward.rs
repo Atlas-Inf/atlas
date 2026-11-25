@@ -12,6 +12,7 @@ use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::batch::Batch;
+use super::calls::BlockResFold;
 use super::layer::Inkling2Layer;
 use super::ops::{self, DecodeAttn, HeadNorm};
 use super::weights::{InputNorms, KvConv};
@@ -70,38 +71,90 @@ impl Inkling2Layer {
         // attention inputs (fp32 in res3 unless layer 0)
         let n_in = if v.full { 3 } else { 1 };
         let has_res = !w.attn_query.is_null();
-        if has_res {
-            self.block_res(
-                gpu,
-                n,
-                s.blocks,
-                v.blocks_before,
-                DevicePtr::NULL,
-                x,
-                w.attn_query,
-                n_in,
-                s.res3,
-                stream,
-            )?;
-        }
         let gated_inputs = v.pass > 0;
+        let inputs_split = self.inputs_split();
+        let ws = match w.input_norms {
+            InputNorms::Shared(nw) if !inputs_split => vec![nw],
+            InputNorms::Shared(nw) => vec![nw; 3],
+            InputNorms::Separate { q, k, v: vn } => vec![q, k, vn],
+        };
+        // AMD: the one-launch block residual; the rmsnorms that follow fold in
+        // whenever no message gate sits between them.
+        let fused_res = self.k.block_res_fused.0 != 0 && n <= 16;
+        let fold_norm = fused_res && has_res && !gated_inputs;
+        if has_res {
+            if fused_res {
+                self.block_res_fused(
+                    gpu,
+                    n,
+                    s.blocks,
+                    v.blocks_before,
+                    DevicePtr::NULL,
+                    x,
+                    w.attn_query,
+                    n_in,
+                    s.res3,
+                    &BlockResFold::norms(
+                        // planes past `n_in` hold no block-res output; the
+                        // unfused launch writes them but nothing reads them
+                        if fold_norm {
+                            &ws[..ws.len().min(n_in)]
+                        } else {
+                            &[]
+                        },
+                        s.normed3,
+                        p.eps,
+                    ),
+                    stream,
+                )?;
+            } else {
+                self.block_res(
+                    gpu,
+                    n,
+                    s.blocks,
+                    v.blocks_before,
+                    DevicePtr::NULL,
+                    x,
+                    w.attn_query,
+                    n_in,
+                    s.res3,
+                    stream,
+                )?;
+            }
+        }
         if gated_inputs {
             let ll = v
                 .loop_layer
                 .context("inkling2: later pass outside the loop")?;
             let q = self.msg_queries.offset(ll * 4 * h * 4);
-            self.block_res(
-                gpu,
-                n,
-                s.msg_blocks,
-                v.message_blocks,
-                DevicePtr::NULL,
-                s.msg_h,
-                q,
-                4,
-                s.msg4,
-                stream,
-            )?;
+            if fused_res {
+                self.block_res_fused(
+                    gpu,
+                    n,
+                    s.msg_blocks,
+                    v.message_blocks,
+                    DevicePtr::NULL,
+                    s.msg_h,
+                    q,
+                    4,
+                    s.msg4,
+                    &BlockResFold::none(),
+                    stream,
+                )?;
+            } else {
+                self.block_res(
+                    gpu,
+                    n,
+                    s.msg_blocks,
+                    v.message_blocks,
+                    DevicePtr::NULL,
+                    s.msg_h,
+                    q,
+                    4,
+                    s.msg4,
+                    stream,
+                )?;
+            }
             // q, k, v inputs gated by their messages in one pass; SWA layers fan
             // their one input out to the three
             let row_elems = n * h;
@@ -115,29 +168,26 @@ impl Inkling2Layer {
                 stream,
             )?;
         }
-        // input norms -> normed3
-        let inputs_split = self.inputs_split();
-        let src_f32 = |i: usize| if has_res { res(i) } else { DevicePtr::NULL };
-        let src_bf16 = if has_res { DevicePtr::NULL } else { x };
-        // one launch for the visit's input norms; layer 0 reads x for all three
-        let in_plane = if has_res { n * h } else { 0 };
-        let ws = match w.input_norms {
-            InputNorms::Shared(nw) if !inputs_split => vec![nw],
-            InputNorms::Shared(nw) => vec![nw; 3],
-            InputNorms::Separate { q, k, v: vn } => vec![q, k, vn],
-        };
-        gm.rmsnorms(
-            gpu,
-            n,
-            src_f32(0),
-            src_bf16,
-            in_plane,
-            &ws,
-            normed(0),
-            h,
-            p.eps,
-            stream,
-        )?;
+        // input norms -> normed3 (skipped when the fused block_res folded them:
+        // a message gate in between keeps them separate)
+        if !fold_norm {
+            let src_f32 = |i: usize| if has_res { res(i) } else { DevicePtr::NULL };
+            let src_bf16 = if has_res { DevicePtr::NULL } else { x };
+            // one launch for the visit's input norms; layer 0 reads x for all three
+            let in_plane = if has_res { n * h } else { 0 };
+            gm.rmsnorms(
+                gpu,
+                n,
+                src_f32(0),
+                src_bf16,
+                in_plane,
+                &ws,
+                normed(0),
+                h,
+                p.eps,
+                stream,
+            )?;
+        }
         self.project(gpu, n, exact, stream)?;
 
         // k/v convs, then the per-head epilogues
@@ -302,24 +352,38 @@ impl Inkling2Layer {
             stream,
         )?;
 
-        // block push + residual, MLP input
-        if v.boundary {
-            gpu.copy_d2d_async(x, s.blocks.offset(v.blocks_before * bstride), rb, stream)?;
-        }
-        gm.residual(gpu, x, s.conv_out, s.resid, n * h, v.boundary, stream)?;
+        // block push + residual, MLP input (all inside the fused kernel on AMD)
         let nb_mlp = v.blocks_before + usize::from(v.boundary);
-        self.block_res(
-            gpu,
-            n,
-            s.blocks,
-            nb_mlp,
-            s.resid,
-            DevicePtr::NULL,
-            w.mlp_query,
-            1,
-            s.mlp_in,
-            stream,
-        )?;
+        let fold_mlp_norm = fused_res && !gated_inputs;
+        if fused_res {
+            self.block_res_mlp_fused(
+                gpu,
+                n,
+                nb_mlp,
+                x,
+                s.conv_out,
+                v.boundary,
+                fold_mlp_norm,
+                stream,
+            )?;
+        } else {
+            if v.boundary {
+                gpu.copy_d2d_async(x, s.blocks.offset(v.blocks_before * bstride), rb, stream)?;
+            }
+            gm.residual(gpu, x, s.conv_out, s.resid, n * h, v.boundary, stream)?;
+            self.block_res(
+                gpu,
+                n,
+                s.blocks,
+                nb_mlp,
+                s.resid,
+                DevicePtr::NULL,
+                w.mlp_query,
+                1,
+                s.mlp_in,
+                stream,
+            )?;
+        }
         if gated_inputs {
             let mlp_msg = s.msg4.offset(3 * rf);
             self.msg_gates(
@@ -332,17 +396,19 @@ impl Inkling2Layer {
                 stream,
             )?;
         }
-        gm.rmsnorm(
-            gpu,
-            n,
-            s.mlp_in,
-            DevicePtr::NULL,
-            w.mlp_norm,
-            s.mlp_normed,
-            h,
-            p.eps,
-            stream,
-        )?;
+        if !fold_mlp_norm {
+            gm.rmsnorm(
+                gpu,
+                n,
+                s.mlp_in,
+                DevicePtr::NULL,
+                w.mlp_norm,
+                s.mlp_normed,
+                h,
+                p.eps,
+                stream,
+            )?;
+        }
 
         // router, experts, post-MLP conv, layer output
         gm.proj_f32(
@@ -389,18 +455,34 @@ impl Inkling2Layer {
             gpu.copy_d2d_async(hidden, s.prelude_h, rb, stream)?;
         }
         if v.last {
-            self.block_res(
-                gpu,
-                n,
-                s.blocks,
-                nb_mlp,
-                DevicePtr::NULL,
-                hidden,
-                self.g.output_query,
-                1,
-                s.final_out,
-                stream,
-            )?;
+            if fused_res {
+                self.block_res_fused(
+                    gpu,
+                    n,
+                    s.blocks,
+                    nb_mlp,
+                    DevicePtr::NULL,
+                    hidden,
+                    self.g.output_query,
+                    1,
+                    s.final_out,
+                    &BlockResFold::none(),
+                    stream,
+                )?;
+            } else {
+                self.block_res(
+                    gpu,
+                    n,
+                    s.blocks,
+                    nb_mlp,
+                    DevicePtr::NULL,
+                    hidden,
+                    self.g.output_query,
+                    1,
+                    s.final_out,
+                    stream,
+                )?;
+            }
             gm.cast_bf16(gpu, s.final_out, hidden, n * h, stream)?;
         }
         Ok(())

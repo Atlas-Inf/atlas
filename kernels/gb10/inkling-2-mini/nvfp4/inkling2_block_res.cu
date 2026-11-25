@@ -205,3 +205,183 @@ extern "C" __global__ void inkling2_block_res_row(
     ink_res_out(blocks, partial_f32, partial_bf16, sums, out, row, 0, 1, rows, H, nb, row_stride, block_stride, nq,
                 eps);
 }
+
+// AMD (strix-hip / SCALE): one-launch block residual, one 256-thread CTA per row.
+// Replays the two-launch decode path's arithmetic exactly: the hidden dimension's
+// chunks are folded over sequentially inside the CTA, so every per-chunk reduce and
+// every chunk's output elements keep the same accumulation order and the same BF16
+// roundings as `inkling2_block_res_sums` + `inkling2_block_res_out`. Grid (rows),
+// rows 1..16 (decode / verify).
+//
+// Optional folds, each bit-identical to the launch it replaces:
+//   resid: partial := (restart ? 0 : x) + c, written to resid_out (which is the
+//          partial_f32 pointer) for inkling2_layer_out, and resid_x is pushed to
+//          push_dst (the boundary visit's block slot, inside the nb states).
+//   norm:  the rmsnorms that read this row's out planes (inkling2_rmsnorm's
+//          register path, H <= 256 * 16, same i-order per-thread sums and the
+//          same block reduce). Planes q < n_norm write normed; out always written.
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+
+#define INK_FUSED_MAX_CHUNKS 16
+
+extern "C" __global__ void inkling2_block_res_fused(
+    const __nv_bfloat16* __restrict__ blocks,
+    const float* __restrict__ partial_f32,
+    const __nv_bfloat16* __restrict__ partial_bf16,
+    const __nv_bfloat16* __restrict__ resid_x,      // NULL unless the residual is folded in
+    const __nv_bfloat16* __restrict__ resid_c,
+    float* __restrict__ resid_out,                  // = partial_f32 in resid mode
+    const unsigned int resid_restart,
+    __nv_bfloat16* __restrict__ push_dst,           // NULL, or the slot the boundary visit pushes resid_x to
+    const float* __restrict__ queries,
+    float* __restrict__ out,                        // [nq, rows, H]
+    const __nv_bfloat16* __restrict__ nw0,
+    const __nv_bfloat16* __restrict__ nw1,
+    const __nv_bfloat16* __restrict__ nw2,          // NULL => no norm fold
+    __nv_bfloat16* __restrict__ normed,             // [nq, rows, H]
+    const unsigned int n_norm,
+    const unsigned int rows,
+    const unsigned int H,
+    const unsigned int nb,
+    const unsigned int row_stride,
+    const unsigned long long block_stride,
+    const unsigned int nq,
+    const float eps,
+    const float norm_eps
+) {
+    atlas_pdl_enter();
+    const unsigned long long row = blockIdx.x;
+    const unsigned int chunks = (H + INK_THREADS - 1) / INK_THREADS;
+
+    // Folded residual + boundary push: one elementwise pass, then the partial is
+    // simply resid_out in global memory, and the pushed slot reads resid_x's copy.
+    if (resid_c != nullptr) {
+        const unsigned long long ro = row * H;
+        for (unsigned int e = threadIdx.x; e < H; e += INK_THREADS) {
+            const float r = (resid_restart ? 0.0f : __bfloat162float(resid_x[ro + e])) +
+                            __bfloat162float(resid_c[ro + e]);
+            resid_out[ro + e] = r;
+        }
+        if (push_dst != nullptr) {
+            for (unsigned int e = threadIdx.x; e < H; e += INK_THREADS)
+                push_dst[row * (unsigned long long)row_stride + e] = resid_x[ro + e];
+        }
+        __syncthreads();
+    }
+
+    __shared__ float sums[INK_FUSED_MAX_CHUNKS * INK_RES_PER];
+    for (unsigned int c = 0; c < chunks; c++) {
+        ink_res_sums(blocks, partial_f32, partial_bf16, queries, sums + c * INK_RES_PER, row, c, chunks, H, nb,
+                     row_stride, block_stride, nq);
+        __syncthreads();
+    }
+
+    // Softmax weights x rstd, once — the same arithmetic the out kernel runs per chunk.
+    const unsigned int ns = nb + 1;
+    __shared__ float p[INK_MAX_Q][INK_MAX_STATES];
+    if (threadIdx.x < nq) {
+        const unsigned int q = threadIdx.x;
+        float logit[INK_MAX_STATES], rstd[INK_MAX_STATES], mx = -1e30f;
+#pragma unroll
+        for (unsigned int j = 0; j < INK_MAX_STATES; j++) {
+            if (j >= ns) break;
+            float ss = 0.0f, d = 0.0f;
+            for (unsigned int c = 0; c < chunks; c++) {
+                const float* t = sums + c * INK_RES_PER + j * (1 + INK_MAX_Q);
+                ss += t[0];
+                d += t[1 + q];
+            }
+            rstd[j] = rsqrtf(ss / (float)H + eps);
+            logit[j] = d * rstd[j] * rsqrtf((float)H);
+            mx = fmaxf(mx, logit[j]);
+        }
+        float sum = 0.0f;
+#pragma unroll
+        for (unsigned int j = 0; j < INK_MAX_STATES; j++) {
+            if (j >= ns) break;
+            logit[j] = __expf(logit[j] - mx);
+            sum += logit[j];
+        }
+#pragma unroll
+        for (unsigned int j = 0; j < INK_MAX_STATES; j++) {
+            if (j >= ns) break;
+            p[q][j] = logit[j] / sum * rstd[j];
+        }
+    }
+    __syncthreads();
+
+    // The out kernel's per-chunk passes, kept in registers: thread t's chunk-c
+    // outputs are exactly the elements t + c * 256 the folded rmsnorm wants.
+    float v[INK_FUSED_MAX_CHUNKS][INK_MAX_Q];
+    for (unsigned int c = 0; c < chunks; c++) {
+        const unsigned int e = c * INK_THREADS + threadIdx.x;
+        if (e < H) {
+            float o[INK_MAX_Q] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (unsigned int j = 0; j < ns; j++) {
+                const float s = ink_state(blocks, partial_f32, partial_bf16, row, row_stride, block_stride, H, nb, j, e);
+#pragma unroll
+                for (int q = 0; q < INK_MAX_Q; q++) o[q] += (q < (int)nq ? p[q][j] : 0.0f) * s;
+            }
+#pragma unroll
+            for (int q = 0; q < INK_MAX_Q; q++) v[c][q] = o[q];
+        } else {
+#pragma unroll
+            for (int q = 0; q < INK_MAX_Q; q++) v[c][q] = 0.0f;
+        }
+    }
+#pragma unroll
+    for (unsigned int c = 0; c < INK_FUSED_MAX_CHUNKS; c++) {
+        if (c >= chunks) break;
+        const unsigned int e = c * INK_THREADS + threadIdx.x;
+        if (e < H) {
+#pragma unroll
+            for (unsigned int q = 0; q < INK_MAX_Q; q++) {
+                if (q >= nq) break;
+                out[((unsigned long long)q * rows + row) * H + e] = v[c][q];
+            }
+        }
+    }
+    if (nw0 == nullptr || n_norm == 0) return;
+    __syncthreads();
+
+    // Folded inkling2_rmsnorm (register path): gamma-free part uses this kernel's
+    // out values in the same per-thread i order; the block reduce matches.
+    __shared__ float red[8];
+    __shared__ float s_rstd;
+    for (unsigned int q = 0; q < n_norm; q++) {
+        const __nv_bfloat16* __restrict__ w = q == 0 ? nw0 : (q == 1 ? nw1 : nw2);
+        float wv[INK_FUSED_MAX_CHUNKS];
+        float ss = 0.0f;
+#pragma unroll
+        for (unsigned int i = 0; i < INK_FUSED_MAX_CHUNKS; i++) {
+            if (i >= chunks) break;
+            const unsigned int e = threadIdx.x + i * INK_THREADS;
+            wv[i] = e < H ? __bfloat162float(w[e]) : 0.0f;
+            if (e < H) ss += v[i][q] * v[i][q];
+        }
+        // rms_block_rstd over the CTA, identical order
+        {
+            float t = ss;
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) t += __shfl_xor_sync(0xffffffff, t, off);
+            if (threadIdx.x % 32 == 0) red[threadIdx.x / 32] = t;
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                float s = 0.0f;
+                for (unsigned int i = 0; i < blockDim.x / 32; i++) s += red[i];
+                s_rstd = rsqrtf(s / (float)H + norm_eps);
+            }
+            __syncthreads();
+        }
+        const float rstd = s_rstd;
+#pragma unroll
+        for (unsigned int i = 0; i < INK_FUSED_MAX_CHUNKS; i++) {
+            if (i >= chunks) break;
+            const unsigned int e = threadIdx.x + i * INK_THREADS;
+            if (e < H) normed[((unsigned long long)q * rows + row) * H + e] = __float2bfloat16(wv[i] * (v[i][q] * rstd));
+        }
+        __syncthreads();
+    }
+}
+
+#endif // __SCALE__ || __HIP_PLATFORM_AMD__
