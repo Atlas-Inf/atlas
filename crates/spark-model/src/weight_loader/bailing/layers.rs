@@ -105,6 +105,47 @@ fn f32_raw(store: &WeightStore, name: &str, elems: usize) -> Result<DevicePtr> {
     Ok(t.ptr)
 }
 
+
+/// FP32 weight, promoted from BF16 storage when the checkpoint stores it
+/// that way (the primitive-ai NVFP4 build ships the router gate and expert
+/// bias in BF16; the config's `router_dtype: fp32` describes the routing
+/// math, not the on-disk tensor). Load-time promote via the common
+/// `bf16_to_f32` kernel keeps every kernel contract (FP32 router GEMV)
+/// untouched.
+fn f32_or_upcast(
+    store: &WeightStore,
+    name: &str,
+    elems: usize,
+    gpu: &dyn GpuBackend,
+    kernels: &std::sync::Arc<LingKernels>,
+) -> Result<DevicePtr> {
+    let t = store.get(name).with_context(|| format!("missing {name}"))?;
+    ensure!(
+        t.num_elements() == elems,
+        "ling: {name} must have {elems} elements, got {}",
+        t.num_elements()
+    );
+    match t.dtype {
+        WeightDtype::FP32 => Ok(t.ptr),
+        WeightDtype::BF16 => {
+            let dst = gpu
+                .alloc(elems * 4)
+                .with_context(|| format!("ling: alloc f32 promote for {name}"))?;
+            spark_runtime::kernel_args::KernelLaunch::new(gpu, kernels.bf16_to_f32_k)
+                .grid([div_ceil(elems as u32, 256), 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(t.ptr)
+                .arg_ptr(dst)
+                .arg_u32(elems as u32)
+                .launch(gpu.default_stream())
+                .with_context(|| format!("ling: promote {name} bf16->f32"))?;
+            gpu.synchronize(gpu.default_stream())?;
+            Ok(dst)
+        }
+        other => anyhow::bail!("ling: {name} must be FP32 or BF16, got {other:?}"),
+    }
+}
+
 fn load_kda_weights(store: &WeightStore, lp: &str, gpu: &dyn GpuBackend) -> Result<LingKdaWeights> {
     let attn = |stem: &str| format!("{lp}.attention.{stem}.weight");
     // Fused conv filter blob [3T, conv_k]: the q|k|v conv1d weights back
@@ -407,12 +448,20 @@ fn load_moe_weights(
     kernels: &Arc<LingKernels>,
 ) -> Result<LingMoeWeights> {
     let moe = format!("{lp}.mlp");
-    let router = f32_raw(
+    let router = f32_or_upcast(
         store,
         &format!("{moe}.gate.weight"),
         spec.experts * spec.hidden,
+        gpu,
+        kernels,
     )?;
-    let bias = f32_raw(store, &format!("{moe}.gate.expert_bias"), spec.experts)?;
+    let bias = f32_or_upcast(
+        store,
+        &format!("{moe}.gate.expert_bias"),
+        spec.experts,
+        gpu,
+        kernels,
+    )?;
     let (gate, mut freed) = load_expert_projection(
         store,
         &moe,

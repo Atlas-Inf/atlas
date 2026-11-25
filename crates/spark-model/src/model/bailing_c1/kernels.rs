@@ -18,6 +18,10 @@ pub(crate) struct LingKernels {
     pub conv_update_k: KernelHandle,
     pub conv_prefill_k: KernelHandle,
     pub moe_transpose_batched_k: KernelHandle,
+    /// Common `bf16_to_f32` (module `residual_add`): the primitive-ai build
+    /// stores the FP32-routing gate/expert-bias tensors in BF16, promoted at
+    /// load time (512 x hidden each — a few MB per model).
+    pub bf16_to_f32_k: KernelHandle,
     // kda.cu
     pub kda_recurrent_k: KernelHandle,
     pub kda_gated_norm_k: KernelHandle,
@@ -70,6 +74,7 @@ impl LingKernels {
                 "moe_transpose_batched",
                 "moe_transpose_u8_batched",
             )?,
+            bf16_to_f32_k: required(gpu, "residual_add", "bf16_to_f32")?,
             kda_recurrent_k: required(gpu, "kda", "kda_recurrent_bf16")?,
             kda_gated_norm_k: required(gpu, "kda", "kda_sigmoid_gated_rms_norm")?,
             mla_kv_a_cache_k: required(gpu, "gated_mla", "ling_mla_kv_a_norm_rope_cache")?,
