@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Ling-3.2-air (bailing_moe_v3_vl text tower) — NVFP4 W4A4 target for GB10.
+#
+# Kernel set (see the sibling .cu files and the PRs that added them, #110-#113):
+#   kda.cu          — 35 KDA linear-attention layers: token-serial decode,
+#                     slot-pool indexed decode, MTP verify snapshots/commit,
+#                     register-resident prefill pair, sigmoid-gated RMS o_norm.
+#   gated_mla.cu    — 7 gated-MLA layers (5, 11, 17, 23, 29, 35, 41) plus the
+#                     layer-42 NEXTN draft body: kv_a norm + partial rope cache,
+#                     absorbed q path, gated V extraction, paged decode/verify
+#                     attention, chunk-local causal prefill.
+#   moe_decode.cu   — 512-expert top-8 sigmoid+bias group-routed NVFP4 MoE with
+#                     per-layer SwiGLU clamps and a BF16 shared expert.
+#   ling_mtp_eh.cu  — NEXTN draft path: fused enorm|hnorm pair and the single-
+#                     draft on-device pick (argmax + log-softmax confidence).
+#
+# Straight file stems are already unique module names (kda, gated_mla,
+# moe_decode, ling_mtp_eh); common kernels register under their own stems via
+# HARDWARE.toml.
+
+[build]
+# Parity-first: keep non-fused multiply-add off globally, matching the GLM and
+# DeepSeek-V4 flashes. Per-kernel fast-math overrides can be added here only
+# behind measured parity + perf evidence.
+extra_nvcc_flags = ["--fmad=false"]
