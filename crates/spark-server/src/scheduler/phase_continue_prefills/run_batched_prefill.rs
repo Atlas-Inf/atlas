@@ -79,10 +79,12 @@ pub(super) fn run_batched_prefill_step(
             (cl, il)
         } else {
             let remaining = p.prompt_tokens.len() - p.chunk_offset;
-            // Same MLA correctness gate as `run_standard_chunk_loop` — MLA
-            // models lack a paged-MLA prefill kernel so multi-chunk prefill
-            // silently corrupts attention. Force single-chunk for MLA.
-            let effective_max = if model.is_mla() {
+            // Same MLA correctness gate as `run_standard_chunk_loop` —
+            // MLA models WITHOUT a chunk-correct MLA prefill must take
+            // their whole prompt in one chunk (multi-chunk silently
+            // corrupts attention). `supports_chunked_mla` families (GLM-5's
+            // pipe; Ling's packed context) chunk at the budget.
+            let effective_max = if model.is_mla() && !model.supports_chunked_mla() {
                 remaining
             } else {
                 max_prefill_tokens

@@ -81,6 +81,11 @@ pub(super) struct PrefillInProgress {
     /// ranks got no prefill command yet, so only the continue phase may run
     /// that chunk, as the head of the queue (`phase_continue_prefills::queued_first`).
     pub queued_first_chunk: Option<usize>,
+    /// Set by the continue phase when this prefill can never be served as
+    /// sent (an unchunkable-MLA prompt past the buffer arena cap): promotion
+    /// then reports `invalid_request_error`/400 — agent clients do not retry
+    /// 400s, where `server_error`/500 sends them round again (#180).
+    pub invalid_request: Option<String>,
     /// Arc-wrapped so the original request, the per-prefill scheduler
     /// state, and any retry path (Tier 5c) can share the read-only
     /// token slice without copying ~40 KB on every long prompt.

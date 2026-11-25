@@ -13,6 +13,25 @@ use super::super::decode_logits_step::process_decode_logits;
 use super::super::sample_first_token;
 use super::super::types::{ActiveSeq, PrefillInProgress};
 
+/// The continuation chunk's row count: never more than the remaining
+/// prompt, never more than the caller's `cap` (the chunk budget, already
+/// sliced by any mixed-step policy). A chunkable model keeps the
+/// continuation AT the budget — the production bug this pins had the
+/// continuation sized to the whole remaining prompt (25176-token prompt,
+/// 8193-token budget: chunk 1 asked for 16983 and blew past the arena).
+#[cfg(test)]
+fn continuation_chunk_len(remaining: usize, cap: usize) -> usize {
+    remaining.min(cap)
+}
+
+/// Same, inlined at the call site (the loop body is performance-nothing;
+/// the fn exists for the regression tests below).
+#[inline]
+#[cfg(not(test))]
+fn continuation_chunk_len(remaining: usize, cap: usize) -> usize {
+    remaining.min(cap)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_standard_chunk_loop(
     model: &dyn Model,
@@ -49,13 +68,35 @@ pub(super) fn run_standard_chunk_loop(
     // requests (Q12: avoids back-to-back chunked prefill monopolising
     // the scheduler).
     let remaining = p.prompt_tokens.len() - p.chunk_offset;
-    // MLA correctness gate: Atlas has no `prefill_attention_paged_mla_*`
-    // kernel; the existing MLA prefill at qwen3_attention/prefill.rs:1723
-    // only attends over the current chunk's K/V, so multi-chunk prefill
-    // silently corrupts attention output. Force single-chunk until a
-    // paged-MLA prefill kernel lands. Hurts cold TTFT on long MLA
-    // prompts but preserves correctness.
+    // MLA correctness gate: a model whose MLA attention cannot carry a
+    // cached prefix across chunks (no chunk-correct MLA prefill) must take
+    // its whole prompt in ONE chunk — the legacy qwen3-MLA prefill only
+    // attends over the current chunk's K/V, silently corrupting output.
+    // Models that declare `supports_chunked_mla` (GLM-5's packed pipe;
+    // the Ling driver's packed-context prefill, PR #130) chunk normally.
+    //
+    // The forced single chunk is sized to `remaining` — but that is only
+    // satisfiable while the prompt FITS one arena. A prompt past the
+    // arena cap on an unchunkable family would otherwise surface as the
+    // mid-flight dispatch guard ("chunk exceeds buffer arena capacity")
+    // — an erroring loop, chunk after chunk sized to the whole tail.
+    // Reject once, honestly, at the sizing site (same convention as the
+    // chunk-error arm below: log + complete the sequence).
     let force_single_chunk = model.is_mla() && !model.supports_chunked_mla();
+    if force_single_chunk && remaining > max_batch_tokens {
+        let msg = format!(
+            "prefill chunk sizing: this model's MLA prefill cannot chunk, but \
+             {} remaining prompt tokens exceed the single-chunk arena cap \
+             ({max_batch_tokens}). The prompt cannot be prefilled whole.",
+            remaining
+        );
+        tracing::error!("{msg}");
+        // Promotion reports invalid_request_error/400 — the request can
+        // never be served as sent, and agent clients do not retry 400s.
+        p.invalid_request = Some(msg);
+        completed_indices.push((idx, None));
+        return;
+    }
     let effective_max = if force_single_chunk {
         remaining
     } else {
@@ -72,7 +113,7 @@ pub(super) fn run_standard_chunk_loop(
     } else {
         effective_max.min(slice_budget)
     };
-    let mut chunk_len = remaining.min(cap);
+    let mut chunk_len = continuation_chunk_len(remaining, cap);
     // Land a chunk boundary on `ssm_tail_boundary` so the SSM snapshot saved
     // there is exactly what the NEXT turn's block-floored `matched_tokens`
     // looks up — otherwise the warm restore falls back to the coarse
@@ -344,5 +385,43 @@ pub(super) fn run_standard_chunk_loop(
             tracing::error!("Prefill chunk error: {e:#}");
             completed_indices.push((idx, None));
         }
+    }
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::continuation_chunk_len;
+
+    /// BUG 1 regression (production, 2026-11-25): a 25176-token prompt on
+    /// the default 8193-token budget failed its continuation chunk —
+    /// "Prefill chunk (16983 tokens) exceeds buffer arena capacity
+    /// (8193)" — because the continuation was sized to the whole
+    /// remaining tail instead of min(remaining, budget).
+    #[test]
+    fn continuation_chunk_stays_at_the_budget() {
+        let total = 25176;
+        let budget = 8193;
+        let first = continuation_chunk_len(total, budget);
+        assert_eq!(first, budget, "chunk 0 takes one budget-sized slice");
+        let remaining = total - first;
+        // The bug: the continuation was sized to `remaining` (16983) —
+        // over the arena. It must be exactly the budget.
+        assert_eq!(continuation_chunk_len(remaining, budget), budget);
+        assert!(continuation_chunk_len(remaining, budget) <= budget);
+    }
+
+    /// The short tail chunk covers the leftovers exactly.
+    #[test]
+    fn continuation_tail_chunk_is_exact() {
+        // 19855 tokens: 8193 + 8193 = 16386 through, 3469 left.
+        let remaining = 19855 - 2 * 8193;
+        assert_eq!(continuation_chunk_len(remaining, 8193), remaining);
+    }
+
+    /// A chunkable model smaller than the budget takes the whole prompt
+    /// in one chunk (single-chunk short prompt unchanged).
+    #[test]
+    fn short_prompt_single_chunk() {
+        assert_eq!(continuation_chunk_len(260, 8193), 260);
     }
 }
