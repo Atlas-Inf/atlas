@@ -18,7 +18,9 @@ use crate::weight_map::DenseWeight;
 
 /// One module's routed-expert device tables: repacked packed/scale pointers
 /// and the folded scale2 values — exactly the `ling_moe_tile.cuh` contract
-/// (`scale2_vals[e] = input_global_scale / weight_global_scale[e]`).
+/// (`scale2_vals[e] = (1/input_global_scale) * (1/weight_global_scale[e])`:
+/// the compressed-tensors checkpoint stores both globals as reciprocals of
+/// the dequant multipliers).
 pub(crate) struct LingExpertTable {
     pub packed_ptrs: DevicePtr,
     pub scale_ptrs: DevicePtr,
@@ -33,10 +35,13 @@ pub(crate) struct LingMoeWeights {
     pub gate: LingExpertTable,
     pub up: LingExpertTable,
     pub down: LingExpertTable,
-    /// `a2_gscale[e] = 1 / input_global_scale(down)`.
+    /// `a2_gscale[e] = input_global_scale(down)` — the gate/up epilogue's
+    /// re-quantizer encodes the checkpoint recipe with `g = ig`, so the
+    /// intermediate's dequant global is its reciprocal.
     pub a2_gscale: DevicePtr,
-    /// Gate/up `input_global_scale` (asserted equal at load) — the dequant
-    /// global of the quantized activation the route kernel writes.
+    /// The RECIPROCAL of the gate/up `input_global_scale` (asserted equal
+    /// across experts at load) — the dequant global of the quantized
+    /// activation the route kernel writes.
     pub a_scale2: f32,
     pub shared_gate: DenseWeight,
     pub shared_up: DenseWeight,

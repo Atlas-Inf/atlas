@@ -37,9 +37,12 @@
 //
 // Scale contract (the GLM fp4l/input_scales precedent, see
 // ling_moe_quant.cuh): a_scale2 is the dequant global of the packed MoE
-// input (the checkpoint's gate/up input_global_scale); each projection's
-// scale2_vals[e] folds weight_global_scale[e] with the projection's
-// input-side global, and a2_gscale[e] = 1 / input_global_scale(down).
+// input (the RECIPROCAL of the checkpoint's gate/up input_global_scale —
+// the compressed-tensors convention stores the reciprocal); each
+// projection's scale2_vals[e] = (1/input-side global) * (1/
+// weight_global_scale[e]) folds both reciprocals, and
+// a2_gscale[e] = input_global_scale(down) (the re-quantizer's g in
+// sf = e4m3(amax * g / 6), whose dequant global is 1/g = 1/ig).
 //
 // Layout: routed expert weights must be loader-repacked to the GLM native
 // NVFP4 layout — packed bytes [K/2, N] and group scales [K/16, N]

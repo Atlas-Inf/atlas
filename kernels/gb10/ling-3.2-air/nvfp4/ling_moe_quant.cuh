@@ -12,14 +12,16 @@
 //   * A quantization: per 16-value group, e4m3 group scale
 //     sf = e4m3(amax * inv_scale2 / 6), nibble = e2m1(x / (sf * scale2)),
 //     i.e. the dequant global of the packed activation is `scale2` — the
-//     checkpoint's per-projection `input_global_scale` (loader-supplied).
+//     RECIPROCAL of the checkpoint's `input_global_scale` (the compressed-
+//     -tensors convention: the scalar quantizes, its reciprocal dequantizes).
 //   * GEMM epilogue: the mxf4nvf4 accumulator already carries both e4m3
-//     group scales, so scale2_vals[e] = weight_global_scale[e] * gx folds the
-//     weight and activation per-tensor scales (GLM fp4l/input_scales
-//     precedent).
+//     group scales, so scale2_vals[e] = (1/gx) * (1/weight_global_scale[e])
+//     folds the reciprocals of both per-tensor scales
+//     (cf. GLM fp4l/input_scales — that build's globals are the dequant
+//     multipliers themselves, Ling's are their reciprocals).
 //   * Down-input re-quantization: silu.mul is quantized with
-//     g = 1 / input_global_scale (down), so q = x * g / sf and the dequant
-//     global of the packed intermediate is input_global_scale (down).
+//     g = input_global_scale (down), so q = x * g / sf and the dequant
+//     global of the packed intermediate is 1 / input_global_scale (down).
 //
 // The Ling swiglu limit is the Bailing clamp (modeling_bailing_moe_v3_vl.py
 // BailingMoeV3MLP.forward): routed experts clamp gate to max=limit and up to
@@ -94,7 +96,7 @@ __device__ __forceinline__ unsigned char ling_float_to_e4m3(float v) {
 }
 
 // The e4m3 scale byte of a 16-value group with absolute maximum `group_max`
-// under activation global scale `g` (= 1 / input_global_scale for the down
+// under activation global scale `g` (= input_global_scale for the down
 // input; see the file comment), and the multiplier taking a value to its
 // e2m1 code. sf = e4m3(amax * g / 6), q = e2m1(x * g / sf) — silu_nvfp4_
 // group_scale's arithmetic, so the packed intermediate matches GLM's fused
