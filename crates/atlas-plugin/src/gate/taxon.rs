@@ -159,7 +159,7 @@ fn layers(root: &Path, target: &Target) -> Option<Vec<PathBuf>> {
 /// Kernel sources for `target`, after shadowing.
 ///
 /// Mirrors `collect_cu_files`: `common/` is the base layer and each of the
-/// target's [`layers`] overrides the ones before it, keyed by file STEM — so a
+/// target's `layers` overrides the ones before it, keyed by file STEM — so a
 /// model dir holds overrides, not the model's kernels. Sorted, so callers get a
 /// stable order.
 ///
