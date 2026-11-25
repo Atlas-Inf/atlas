@@ -59,7 +59,7 @@ fn ling_mla_moe_prefill_repro_gpu() -> Result<()> {
     let mut ckpt = Ckpt::open()?;
     let layer = build_layer(gpu, &mut ckpt, &spec, &kernels, &scratch, 5)?;
 
-    let kv = PagedKvCache::new(
+    let mut kv = PagedKvCache::new(
         KvCacheConfig {
             block_size: 8,
             num_kv_heads: 1,
