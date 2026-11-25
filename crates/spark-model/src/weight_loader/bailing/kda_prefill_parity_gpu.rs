@@ -275,9 +275,12 @@ fn run_one(
     let mut tail_bad: Option<&'static str> = None;
     for (name, get) in STAGES {
         let (a, b) = (get(&tail.0), get(&tail.1));
-        let (_, bad) = cmp_stage(name, a, b);
+        let (bit_eq, bad) = cmp_stage(name, a, b);
+        eprintln!(
+            "layer {layer_idx} rows={m} tail {name}: {bad} values off-tolerance ({bit_eq}/{} bit-equal)",
+            a.len()
+        );
         if bad > 0 && tail_bad.is_none() {
-            eprintln!("layer {layer_idx} rows={m}: decode-after-prefill diverges at {name}");
             tail_bad = Some(name);
         }
     }
