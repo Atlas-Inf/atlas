@@ -35,12 +35,13 @@ use image::RgbImage;
 mod types;
 
 use crate::vision_preprocess::{
-    MEAN, STD, decode_data_uri_bytes, glm_resize_or_pad, glm_target_size, normalize_channel,
+    decode_data_uri_bytes, glm_resize_or_pad, glm_target_size, normalize_channel,
     patch_coordinates, target_size_for,
 };
 
 mod gif_access;
 mod glm;
+pub mod ling;
 mod patchify;
 
 /// Frames per second to sample at, when the caller has no better idea.
@@ -268,6 +269,13 @@ pub fn preprocess_video(
         return glm::preprocess_glm_video(data_uri, vcfg, max_pixels, target_fps, ffmpeg);
     }
     let (frames, frame_times) = decode_frames(data_uri, target_fps, ffmpeg)?;
+    // Ling's processor samples at most `fps` frames per second however short
+    // the clip, and times them from its own sample rate.
+    let (frames, frame_times) = if vcfg.is_bailing_vl {
+        ling::select(frames, &frame_times, target_fps, ffmpeg.max_frames)
+    } else {
+        (frames, frame_times)
+    };
     let tp = vcfg.temporal_patch_size;
 
     // The decoder has already sampled the clip: its frames ARE the plan, at
@@ -304,6 +312,13 @@ pub fn preprocess_video(
             max_pixels,
             true,
         )?
+    } else if vcfg.is_bailing_vl {
+        ling::frame_size(
+            first.height(),
+            first.width(),
+            keep.len(),
+            ling::TOTAL_PIXELS,
+        )
     } else {
         target_size_for(first.height(), first.width(), grid_unit, max_pixels)
     };
@@ -362,20 +377,10 @@ pub fn preprocess_video(
                 for (t, frame) in resized.iter().enumerate() {
                     for py in 0..ps {
                         for px in 0..ps {
-                            let raw = frame.get_pixel((pw * ps + px) as u32, (ph * ps + py) as u32)
-                                [c] as f32
-                                / 255.0;
                             let off = c * (tp * ps * ps) + t * (ps * ps) + py * ps + px;
-                            pixels[patch_idx * patch_dim + off] = if vcfg.is_glm5_next {
-                                normalize_channel(
-                                    vcfg,
-                                    c,
-                                    frame.get_pixel((pw * ps + px) as u32, (ph * ps + py) as u32)
-                                        [c],
-                                )
-                            } else {
-                                (raw - MEAN[c]) / STD[c]
-                            };
+                            let value =
+                                frame.get_pixel((pw * ps + px) as u32, (ph * ps + py) as u32)[c];
+                            pixels[patch_idx * patch_dim + off] = normalize_channel(vcfg, c, value);
                         }
                     }
                 }

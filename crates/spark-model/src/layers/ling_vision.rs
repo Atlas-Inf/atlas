@@ -20,6 +20,11 @@ use super::vision_encoder::{ViTBlock, VisionEncoder, VitWeight};
 const TEXT_HIDDEN: usize = 2560;
 const RAW_VISION_HIDDEN: usize = 4608;
 const PROJECTOR_HIDDEN: usize = TEXT_HIDDEN;
+/// Raw-tower passes one splice may hold. The raw tower encodes at most its
+/// `p_max` patches at once; four passes of rows cover an 8,192-token prefill
+/// chunk plus the two largest stills it can cut through, so a long video in
+/// the NVFP4 prefill profile is encoded in passes instead of refused.
+const WINDOW_PASSES: usize = 4;
 
 fn bf16_ptr(store: &WeightStore, name: &str, shape: &[usize]) -> Result<DevicePtr> {
     let tensor = store.get(name)?;
@@ -100,11 +105,15 @@ pub struct LingVisionProjector {
     k_gelu: KernelHandle,
     buf_fc1: DevicePtr,
     buf_out: DevicePtr,
+    /// Rows one raw-tower pass yields (`buf_fc1`).
+    pass_rows: usize,
+    /// Rows `buf_out` holds across passes.
     max_rows: usize,
 }
 
 impl LingVisionProjector {
-    fn load(store: &WeightStore, gpu: &dyn GpuBackend, max_rows: usize) -> Result<Self> {
+    fn load(store: &WeightStore, gpu: &dyn GpuBackend, pass_rows: usize) -> Result<Self> {
+        let max_rows = pass_rows * WINDOW_PASSES;
         Ok(Self {
             fc1_w: bf16_ptr(
                 store,
@@ -118,16 +127,19 @@ impl LingVisionProjector {
             // The visual tower's blocks use gelu_pytorch_tanh, but HF's
             // top-level linear_proj is plain nn.GELU(approximate="none").
             k_gelu: gpu.kernel("ling_vision", "ling_projector_gelu_exact")?,
-            buf_fc1: gpu.alloc(max_rows * PROJECTOR_HIDDEN * 2)?,
+            buf_fc1: gpu.alloc(pass_rows * PROJECTOR_HIDDEN * 2)?,
             buf_out: gpu.alloc(max_rows * PROJECTOR_HIDDEN * 2)?,
+            pass_rows,
             max_rows,
         })
     }
 
+    /// Project one raw-tower pass of `rows` into `buf_out` from `out_row`.
     fn forward(
         &self,
         input: DevicePtr,
         rows: usize,
+        out_row: usize,
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
@@ -135,10 +147,12 @@ impl LingVisionProjector {
             return Ok(());
         }
         ensure!(
-            rows <= self.max_rows,
-            "Ling vision projector rows {rows} exceed capacity {}",
-            self.max_rows
+            rows <= self.pass_rows && out_row + rows <= self.max_rows,
+            "Ling vision projector rows {out_row}+{rows} exceed capacity {} ({} a pass)",
+            self.max_rows,
+            self.pass_rows
         );
+        let out = self.buf_out.offset(out_row * PROJECTOR_HIDDEN * 2);
         let n = PROJECTOR_HIDDEN as u32;
         let k = RAW_VISION_HIDDEN as u32;
         let m = rows as u32;
@@ -165,7 +179,7 @@ impl LingVisionProjector {
             .arg_ptr(self.buf_fc1)
             .arg_ptr(self.fc2_w)
             .arg_ptr(self.fc2_b)
-            .arg_ptr(self.buf_out)
+            .arg_ptr(out)
             .arg_u32(m)
             .arg_u32(n)
             .arg_u32(n)
@@ -246,8 +260,9 @@ impl LingVisionTower {
             )
             .context("construct Ling raw Qwen vision encoder")?,
         );
-        let max_rows = raw.p_max / (vcfg.spatial_merge_size * vcfg.spatial_merge_size);
-        let projector = LingVisionProjector::load(store, gpu, max_rows)?;
+        let pass_rows = raw.p_max / (vcfg.spatial_merge_size * vcfg.spatial_merge_size);
+        let projector = LingVisionProjector::load(store, gpu, pass_rows)?;
+        let max_rows = projector.max_rows;
         tracing::info!(
             "Ling vision tower loaded: Qwen ViT depth={}, raw_width={}, out_width={}, max_rows={}",
             vcfg.depth,
@@ -276,24 +291,44 @@ impl LingVisionTower {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<Vec<(usize, usize, usize)>> {
-        let result = self.raw.forward_items(items, gpu, stream)?;
-        let rows = result.iter().map(|(_, _, merged)| *merged).sum();
-        self.projector
-            .forward(self.raw.buf_out, rows, gpu, stream)?;
-        Ok(result)
+        let mut images = Vec::new();
+        for item in items {
+            for group in item.groups.iter() {
+                images.push((group.as_slice(), item.grid_h, item.grid_w));
+            }
+        }
+        self.forward_batched(&images, gpu, stream)
     }
 
+    /// Encode `images` in passes of at most the raw tower's `p_max` patches.
+    /// Each image is its own attention sequence, so the passes give the
+    /// bytes one pass would.
     pub fn forward_batched(
         &self,
         images: &[(&[f32], usize, usize)],
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<Vec<(usize, usize, usize)>> {
-        let result = self.raw.forward_batched(images, gpu, stream)?;
-        let rows = result.iter().map(|(_, _, merged)| *merged).sum();
-        self.projector
-            .forward(self.raw.buf_out, rows, gpu, stream)?;
-        Ok(result)
+        let mut out = Vec::with_capacity(images.len());
+        let (mut start, mut out_row) = (0usize, 0usize);
+        while start < images.len() {
+            let mut end = start;
+            let mut patches = 0usize;
+            while end < images.len()
+                && (end == start || patches + images[end].1 * images[end].2 <= self.raw.p_max)
+            {
+                patches += images[end].1 * images[end].2;
+                end += 1;
+            }
+            let result = self.raw.forward_batched(&images[start..end], gpu, stream)?;
+            let rows: usize = result.iter().map(|(_, _, merged)| *merged).sum();
+            self.projector
+                .forward(self.raw.buf_out, rows, out_row, gpu, stream)?;
+            out_row += rows;
+            out.extend(result);
+            start = end;
+        }
+        Ok(out)
     }
 }
 

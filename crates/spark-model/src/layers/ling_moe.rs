@@ -345,7 +345,7 @@ impl LingMoeFfn {
         ctx: &ForwardContext<'_>,
         stream: u64,
     ) -> Result<()> {
-        if num_tokens > 1 && self.supports_batched_prefill() {
+        if self.supports_batched_prefill() {
             return self.forward_a16_prefill(input, num_tokens, ctx, stream);
         }
         ensure!(

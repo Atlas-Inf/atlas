@@ -9,10 +9,11 @@ use spark_runtime::weights::{WeightDtype, WeightStore};
 use crate::layers::ops;
 use crate::weight_map::DenseWeight;
 
-/// The one-row decode and small concurrent batches use the original kernels.
+/// BF16 rows: up to the batched GEMV's limit one kernel whose rows do not
+/// depend on the row count (serial decode and a small verify or batch agree
+/// byte for byte), a tensor-core GEMM past it.
 pub(crate) fn bf16_prompt_rows(
     gpu: &dyn GpuBackend,
-    kernel: KernelHandle,
     batch_gemv: KernelHandle,
     input: DevicePtr,
     weight: &DenseWeight,
@@ -22,12 +23,10 @@ pub(crate) fn bf16_prompt_rows(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    if (2..=ops::DENSE_GEMV_BATCHM_MAX_M).contains(&m) {
+    if m <= ops::DENSE_GEMV_BATCHM_MAX_M {
         ops::dense_gemv_batchm(gpu, batch_gemv, input, weight, output, m, n, k, n, stream)
-    } else if m > ops::DENSE_GEMV_BATCHM_MAX_M {
-        ops::bf16_gemm(input, weight.weight.0, output, m, n, k, stream)
     } else {
-        ops::dense_gemm_tc(gpu, kernel, input, weight, output, m, n, k, stream)
+        ops::bf16_gemm(input, weight.weight.0, output, m, n, k, stream)
     }
 }
 
@@ -53,8 +52,6 @@ impl LingProjectionScratch {
 #[derive(Clone, Copy)]
 enum Format {
     Bf16 {
-        gemv: KernelHandle,
-        gemm: KernelHandle,
         batch_gemv: KernelHandle,
         decode_nvfp4: Option<(
             crate::weight_map::QuantizedWeight,
@@ -122,9 +119,7 @@ impl LingProjection {
                 };
                 Format::Bf16 {
                     decode_nvfp4,
-                    gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
                     batch_gemv: gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?,
-                    gemm: gpu.kernel("gemm_tc", "dense_gemm_tc")?,
                 }
             }
             WeightDtype::FP8E4M3 => {
@@ -180,8 +175,6 @@ impl LingProjection {
         );
         match self.format {
             Format::Bf16 {
-                gemv,
-                gemm,
                 batch_gemv,
                 decode_nvfp4,
             } => {
@@ -200,13 +193,12 @@ impl LingProjection {
                 let weight = DenseWeight {
                     weight: self.weight,
                 };
-                if rows == 1 {
-                    ops::dense_gemv(gpu, gemv, input, &weight, output, self.n, self.k, stream)
-                } else {
-                    bf16_prompt_rows(
-                        gpu, gemm, batch_gemv, input, &weight, output, rows, self.n, self.k, stream,
-                    )
-                }
+                // One row too: `dense_gemv_batchm`'s rows do not depend on the
+                // row count, so serial decode computes the bytes a two-row MTP
+                // verify computes for the same row.
+                bf16_prompt_rows(
+                    gpu, batch_gemv, input, &weight, output, rows, self.n, self.k, stream,
+                )
             }
             Format::Fp8 {
                 scales,
