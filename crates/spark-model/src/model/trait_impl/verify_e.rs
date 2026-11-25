@@ -56,6 +56,11 @@ impl TransformerModel {
     /// is armed. Everything outside falls back to the per-seq loop.
     pub(super) fn can_batch_verify_dispatch(&self, ks: &[usize]) -> bool {
         let n = ks.len();
+        // Ling's layers have no multi-sequence verify: several drafting
+        // sequences take the per-sequence verify.
+        if self.config.model_type == "bailing_moe_v3_vl" {
+            return false;
+        }
         // One sequence only on the exact lane past its own 4-row verify
         // (`verify_batch_ks_ok`).
         (1..=crate::layer::VERIFY_WY_TABLE_SEQS).contains(&n)
