@@ -162,7 +162,10 @@ impl LingKdaLayer {
                     state.conv_state.offset(plane * T * 4 * 4),
                     s.kda_preconv.offset(rows as usize * (plane * T) * 2),
                     &DenseWeight {
-                        weight: w.conv.weight.offset((plane * T) * 2),
+                        // Filter blob is [plane][T][4] BF16 (see the loader's
+                        // fused conv pack): plane slice = T*4 elems = T*4*2
+                        // bytes, same stride the [T, d_conv] kernel slice uses.
+                        weight: w.conv.weight.offset((plane * T) * 4 * 2),
                     },
                     DevicePtr::NULL,
                     s.kda_qkv.offset((plane * T) * 2),
