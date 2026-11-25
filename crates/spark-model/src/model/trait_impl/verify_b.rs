@@ -269,7 +269,19 @@ impl TransformerModel {
         // addresses. No-op off the family or while the switch is unarmed.
         crate::model::graph_flags::ling_graph_step_tick();
         if self.ling_meta_prestage_armed() {
+            if crate::model::graph_flags::ling_cap_trace()
+                && self.config.model_type == "bailing_moe_v3_vl"
+                && let Some(l5) = self.layers.get(5)
+            {
+                l5.ling_cap_dump_meta(self.gpu.as_ref(), &seq.block_table, stream, "pre-stage");
+            }
             self.ling_prestage_meta(seq, &kv_cache, k, stream)?;
+            if crate::model::graph_flags::ling_cap_trace()
+                && self.config.model_type == "bailing_moe_v3_vl"
+                && let Some(l5) = self.layers.get(5)
+            {
+                l5.ling_cap_dump_meta(self.gpu.as_ref(), &seq.block_table, stream, "post-stage");
+            }
         }
 
         let ctx = ForwardContext {
@@ -415,6 +427,7 @@ impl TransformerModel {
                         stream,
                     )?;
                 }
+                self.ling_cap_trace_capture(layer_idx, hidden, k, stream)?;
                 // DFlash hidden capture for ctx conditioning. Capture from
                 // the LAST verified position (K-1) — the bonus token in
                 // K=2. This populates `dflash_hidden_save` so the next
@@ -462,6 +475,7 @@ impl TransformerModel {
             }
         }
 
+        self.ling_cap_trace_flush("ver", seq, k, stream)?;
         if let Some(rows) = serial_rows {
             self.exact_verify_compare(rows, seq_len_in)?;
         }

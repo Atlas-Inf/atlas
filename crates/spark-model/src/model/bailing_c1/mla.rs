@@ -1210,6 +1210,65 @@ impl TransformerLayer for LingMlaLayer {
         !crate::model::graph_flags::ling_decode_graph()
     }
 
+    /// `ATLAS_LING_CAP_TRACE` readset dump: the staged metadata values
+    /// (positions/slots/base_len plus a slice of the staged block table,
+    /// tail garbage included) and one FNV per physical block of the
+    /// layer-owned V-latent pool (block size 64, the served config).
+    fn ling_cap_dump_meta(&self, gpu: &dyn GpuBackend, blocks: &[u32], stream: u64, tag: &str) {
+        let s = &self.scratch;
+        let mut pos = [0u8; 32];
+        let mut slots = [0u8; 32];
+        let mut base = [0u8; 4];
+        let mut tbl = [0u8; 132 * 4];
+        let _ = gpu.synchronize(stream);
+        let has = gpu.copy_d2h(s.mla_pos, &mut pos).is_ok()
+            && gpu.copy_d2h(s.mla_slots, &mut slots).is_ok()
+            && gpu.copy_d2h(s.mla_base_len, &mut base).is_ok()
+            && gpu.copy_d2h(s.mla_block_table, &mut tbl).is_ok();
+        if !has {
+            return;
+        }
+        let posv: Vec<u32> = pos
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let slotv: Vec<i64> = slots
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let tblv: Vec<i32> = tbl
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let basev = u32::from_le_bytes(base);
+        let mut vhs = String::new();
+        let v_pool = *self.v_pool.lock();
+        if let Some(v_pool) = v_pool {
+            let bbytes = 64 * MLA_V_ROW_BF16 * 2;
+            let mut buf = vec![0u8; bbytes];
+            for &b in blocks {
+                if gpu.copy_d2h(v_pool.offset((b as usize) * bbytes), &mut buf).is_err() {
+                    vhs.push('?');
+                    continue;
+                }
+                if !vhs.is_empty() {
+                    vhs.push(',');
+                }
+                vhs.push_str(&format!("{}:{:016x}", b, crate::model::trait_impl::ling_cap_trace::ling_cap_fnv1a(&buf)));
+            }
+        } else {
+            vhs.push_str("NOPOOL");
+        }
+        tracing::warn!(
+            "LING_CAP_META[{tag}] pos={:?} slots={:?} base={} tbl[0..10]={:?} vpool=[{}]",
+            &posv[..2],
+            &slotv[..2],
+            basev,
+            &tblv[..10],
+            vhs
+        );
+    }
+
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
     }

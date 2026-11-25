@@ -116,6 +116,16 @@ pub(crate) fn ling_graph_step_tick() {
     }
 }
 
+/// `ATLAS_LING_CAP_TRACE=1`: captured-mode per-layer fingerprints for the
+/// family's decode / K=2 verify graphs (`trait_impl/ling_cap_trace.rs`).
+/// Unlike every other diagnostic this one does NOT force its steps eager —
+/// the per-layer shadows bake INTO the capture; the flush runs after the
+/// replay. Strict `== "1"`, read once.
+pub(crate) fn ling_cap_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_LING_CAP_TRACE").as_deref() == Ok("1"))
+}
+
 /// `ATLAS_LING_DECODE_GRAPH_DEBUG_STAGE=1`: the bailing family prestages its
 /// step metadata (`TransformerLayer::decode_meta_prestage`) and the Ling
 /// layers read the staging EAGERLY, without capturing — the in-process A/B
