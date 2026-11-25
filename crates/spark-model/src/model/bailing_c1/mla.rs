@@ -11,10 +11,14 @@
 //! `[num_blocks, block_size, 512]` latent pool, sized to the paged pool on
 //! first use and indexed by the SAME slots — admission is the house pool's.
 //!
-//! Decode reads the paged path. Prefill: a first-position sub-chunk runs
-//! the single-pass chunk-local `ling_mla_prefill_attn` over the contiguous
-//! rows (the fast path the kernel documents for ISL<=4096 single-pass
-//! serving); continuing chunks loop 8-row groups over the paged kernel.
+//! Decode reads the paged path. Prefill (`ATLAS_LING_MLA_PACKED_PREFILL`,
+//! default on): every chunk runs `ling_mla_prefill_attn` over the layer's
+//! contiguous context — the prefix rows `ling_mla_ctx_gather` refills from
+//! the paged pools plus the chunk's own rows — so a continuation chunk
+//! carries the same fast path a whole prompt does (`kv_base > 0`);
+//! `=0` restores 8-row paged groups for continuations plus the
+//! `ATLAS_LING_MLA_FAST_PREFILL=1` position-0 special case. Verify rows
+//! always read the paged path.
 
 use std::sync::Arc;
 
@@ -26,7 +30,7 @@ use spark_runtime::kv_cache::PagedKvCache;
 use anyhow::{Result, ensure};
 use atlas_core::config::ModelConfig;
 
-use super::spec::{MLA_K_ROW_BF16, MLA_V_ROW_BF16};
+use super::spec::{MAX_PREFILL_ROWS, MLA_K_ROW_BF16, MLA_V_ROW_BF16};
 use super::{LingFfn, LingKernels, LingScratch, MLA_MAX_ROWS_PAGED};
 use crate::layer::{ForwardContext, LayerState, TransformerLayer};
 use crate::layers::ops;
@@ -51,6 +55,65 @@ pub(crate) struct LingMlaWeights {
     pub kv_b: DenseWeight,
 }
 
+/// `ATLAS_LING_MLA_PACKED_PREFILL`: unset or any value other than "0"
+/// prefills each chunk over the packed context — the layer's contiguous
+/// K/V mirror, refilled from the paged pools when a chunk continues a
+/// cached prefix — so every chunk runs `ling_mla_prefill_attn` (chunk-local
+/// causal against the prefix) instead of <=8-row paged steps, and the
+/// position-0 whole-prompt special case is just `kv_base == 0`. "0"
+/// restores the legacy behavior: paged 8-row groups per continuation chunk
+/// plus the `ATLAS_LING_MLA_FAST_PREFILL=1` whole-prompt fast path. Read
+/// once.
+fn packed_prefill() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_LING_MLA_PACKED_PREFILL").as_deref() != Ok("0"))
+}
+
+/// `ATLAS_LING_PROJ_GEMM_MIN_ROWS` (shared with the KDA half): the smallest
+/// chunk the prefill projections take the house BF16 tensor-core GEMM for.
+fn proj_gemm_min_rows() -> u32 {
+    static MIN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("ATLAS_LING_PROJ_GEMM_MIN_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(16)
+            .max(1)
+    })
+}
+
+/// One prefill-shaped projection: the house BF16 tensor-core GEMM
+/// (`ops::bf16_gemm`) from the M threshold up, the scalar one below it.
+#[allow(clippy::too_many_arguments)]
+fn proj_gemm(
+    gpu: &dyn GpuBackend,
+    k: &LingKernels,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    rows: u32,
+    n: u32,
+    k_dim: u32,
+    stream: u64,
+) -> Result<()> {
+    if rows >= proj_gemm_min_rows() {
+        ops::bf16_gemm(input, weight.weight.0, output, rows, n, k_dim, stream)
+    } else {
+        ops::dense_gemm(gpu, k.gemm_k, input, weight, output, rows, n, k_dim, stream)
+    }
+}
+
+/// The layer's contiguous prefill context: the sequence's K/V rows AS THE
+/// PREFILL KERNEL READS THEM (normed latent + roped tail), used as the
+/// `kv_base` prefix of `ling_mla_prefill_attn`. Refilled per prefill call
+/// from the paged pools (`ling_mla_ctx_gather`), so correctness never
+/// depends on what an earlier pass left in it.
+struct CtxPools {
+    k: DevicePtr,
+    v: DevicePtr,
+    rows: usize,
+}
+
 pub(crate) struct LingMlaLayer {
     input_norm: DenseWeight,
     post_attn_norm: DenseWeight,
@@ -69,6 +132,8 @@ pub(crate) struct LingMlaLayer {
     rope_theta: f64,
     /// Layer-owned V latent pools, lazily sized to the paged pool.
     v_pool: Mutex<Option<DevicePtr>>,
+    /// Layer-owned packed prefill context, lazily sized to the paged pool.
+    ctx: Mutex<Option<CtxPools>>,
 }
 
 impl LingMlaLayer {
@@ -107,6 +172,7 @@ impl LingMlaLayer {
             eps: config.rms_norm_eps as f32,
             rope_theta: config.rope_theta,
             v_pool: Mutex::new(None),
+            ctx: Mutex::new(None),
         })
     }
 
@@ -129,6 +195,47 @@ impl LingMlaLayer {
             MLA_V_ROW_BF16 * 2
         );
         Ok(p)
+    }
+
+    /// The layer's packed prefill context for a chunk that needs
+    /// `need_rows` = prefix + chunk rows: grown by powers of two from the
+    /// prefill cap and capped at [`MAX_PREFILL_ROWS`] (a 799k-row mirror of
+    /// the whole paged pool would defeat the conservative-memory envelope;
+    /// over-cap chunks keep the legacy paged path). The contents are
+    /// per-pass scratch — the gather refills the prefix from the paged
+    /// pools every prefill call — so growth never changes correctness,
+    /// only capacity.
+    fn ctx_pools(
+        &self,
+        gpu: &dyn GpuBackend,
+        need_rows: usize,
+    ) -> Result<Option<CtxPools>> {
+        if need_rows > MAX_PREFILL_ROWS {
+            return Ok(None);
+        }
+        let mut cell = self.ctx.lock();
+        if cell.as_ref().map_or(true, |p| p.rows < need_rows) {
+            let grow = cell
+                .as_ref()
+                .map_or(1024, |p| p.rows)
+                .max(need_rows.next_power_of_two())
+                .min(MAX_PREFILL_ROWS);
+            let k = gpu.alloc(grow * MLA_K_ROW_BF16 * 2)?;
+            gpu.memset(k, 0, grow * MLA_K_ROW_BF16 * 2)?;
+            let v = gpu.alloc(grow * MLA_V_ROW_BF16 * 2)?;
+            gpu.memset(v, 0, grow * MLA_V_ROW_BF16 * 2)?;
+            tracing::info!(
+                "ling MLA layer {}: allocated the packed prefill context ({} K/V rows)",
+                self.attn_idx,
+                grow
+            );
+            *cell = Some(CtxPools { k, v, rows: grow });
+        }
+        Ok(cell.as_ref().map(|p| CtxPools {
+            k: p.k,
+            v: p.v,
+            rows: p.rows,
+        }))
     }
 
     fn kernel_checks(&self, kv_cache: &PagedKvCache) -> Result<(u32, u32)> {
@@ -169,14 +276,38 @@ impl LingMlaLayer {
                 gpu, k.gemv_k, normed, &w.g_proj, s.mla_g, self.heads, hidden, stream,
             )?;
         } else {
-            ops::dense_gemm(
-                gpu, k.gemm_k, normed, &w.q_proj, s.mla_q, rows, q_row, hidden, stream,
+            proj_gemm(
+                gpu,
+                k,
+                normed,
+                &w.q_proj,
+                s.mla_q,
+                rows,
+                q_row,
+                hidden,
+                stream,
+            )?;
+            proj_gemm(
+                gpu,
+                k,
+                normed,
+                &w.kv_a,
+                s.mla_kv_a,
+                rows,
+                kv_dim,
+                hidden,
+                stream,
             )?;
             ops::dense_gemm(
-                gpu, k.gemm_k, normed, &w.kv_a, s.mla_kv_a, rows, kv_dim, hidden, stream,
-            )?;
-            ops::dense_gemm(
-                gpu, k.gemm_k, normed, &w.g_proj, s.mla_g, rows, self.heads, hidden, stream,
+                gpu,
+                k.gemm_k,
+                normed,
+                &w.g_proj,
+                s.mla_g,
+                rows,
+                self.heads,
+                hidden,
+                stream,
             )?;
         }
         Ok(())
@@ -218,7 +349,10 @@ impl LingMlaLayer {
         Ok(v_pool)
     }
 
-    /// q absorb + rope for `rows` rows (q_proj rows -> q_final).
+    /// q absorb + rope for `rows` rows (q_proj rows -> q_final). The row
+    /// loop tiles across the grid's third dimension (`row_tile` rows a
+    /// CTA) so wide chunks occupy the SMs; a 64-row tile at 512 rows
+    /// exposes heads x 2 x 8 CTAs.
     fn q_absorb(
         &self,
         gpu: &dyn GpuBackend,
@@ -228,8 +362,9 @@ impl LingMlaLayer {
     ) -> Result<()> {
         let s = &self.scratch;
         let k = &self.kernels;
+        let row_tile = rows.min(64);
         KernelLaunch::new(gpu, k.mla_q_absorb_k)
-            .grid([self.heads, div_ceil(self.kv_lora, 256), 1])
+            .grid([self.heads, div_ceil(self.kv_lora, 256), div_ceil(rows, row_tile)])
             .block([256, 1, 1])
             .arg_ptr(s.mla_q)
             .arg_ptr(self.weights.w_uk.weight)
@@ -241,6 +376,7 @@ impl LingMlaLayer {
             .arg_u32(self.rope)
             .arg_u32(self.kv_lora)
             .arg_words(&[self.rope_theta.to_bits()])
+            .arg_u32(row_tile)
             .launch(stream)
     }
 
@@ -342,21 +478,64 @@ impl LingMlaLayer {
         Ok((s.mla_pos, s.mla_slots, block_table.len() as u32))
     }
 
-    /// Fast-path single-pass prefill attention over the contiguous rows
-    /// (`ling_mla_prefill_attn`, chunk-local causal from position 0).
-    fn prefill_attn_fast(&self, gpu: &dyn GpuBackend, seq_len: u32, stream: u64) -> Result<()> {
+    /// Fast-path causal prefill attention over the packed context
+    /// (`ling_mla_prefill_attn`): the chunk's `seq_len` query rows against
+    /// the context rows [0, kv_base + seq_len), causal inside the chunk —
+    /// a position-0 whole prompt is just `kv_base == 0`.
+    fn prefill_attn_contig(
+        &self,
+        gpu: &dyn GpuBackend,
+        k_ctx: DevicePtr,
+        v_ctx: DevicePtr,
+        seq_len: u32,
+        kv_base: u32,
+        stream: u64,
+    ) -> Result<()> {
         let s = &self.scratch;
         let k = &self.kernels;
         KernelLaunch::new(gpu, k.mla_prefill_attn_k)
             .grid([self.heads, div_ceil(seq_len, 16), 1])
             .block([256, 1, 1])
             .arg_ptr(s.mla_q_final)
-            .arg_ptr(s.mla_k_contig)
-            .arg_ptr(s.mla_v_contig)
+            .arg_ptr(k_ctx)
+            .arg_ptr(v_ctx)
             .arg_ptr(s.mla_latent)
             .arg_u32(seq_len)
             .arg_u32(1)
             .arg_f32(1.0 / ((self.nope + self.rope) as f32).sqrt())
+            .arg_u32(kv_base)
+            .launch(stream)
+    }
+
+    /// Refill the packed context's prefix rows [0, kv_base) from the paged
+    /// pools (`ling_mla_ctx_gather`): that prefix is exactly what the paged
+    /// path walks, so the packed path's correctness envelope is unchanged
+    /// for every continuation source — earlier prompt chunks, earlier
+    /// turns' decode, or a restored prefix cache.
+    #[allow(clippy::too_many_arguments)]
+    fn ctx_gather(
+        &self,
+        gpu: &dyn GpuBackend,
+        kv_cache: &PagedKvCache,
+        ctx: &CtxPools,
+        block_table: DevicePtr,
+        max_blocks: u32,
+        kv_base: u32,
+        v_pool: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        let (block_size, _) = self.kernel_checks(kv_cache)?;
+        KernelLaunch::new(gpu, self.kernels.mla_ctx_gather_k)
+            .grid([div_ceil(kv_base as u32 * (MLA_K_ROW_BF16 + MLA_V_ROW_BF16) as u32, 256), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(kv_cache.k_pool_ptr(self.attn_idx))
+            .arg_ptr(v_pool)
+            .arg_ptr(ctx.k)
+            .arg_ptr(ctx.v)
+            .arg_ptr(block_table)
+            .arg_u32(max_blocks)
+            .arg_u32(kv_base)
+            .arg_u32(block_size)
             .launch(stream)
     }
 
@@ -529,7 +708,12 @@ impl LingMlaLayer {
     }
 
     /// Prefill attention over `rows` rows starting at `seq_len_start`.
-    /// Single-pass fast path only when this sub-chunk IS the whole prompt.
+    /// `packed` runs the packed-context path (default,
+    /// [`packed_prefill`]): prefix rows are gathered from the paged pools
+    /// into the layer's ctx and the chunk runs `ling_mla_prefill_attn`
+    /// with `kv_base = seq_len_start`. `whole_prompt` is the legacy
+    /// single-pass fast path, valid only for a position-0 whole prompt
+    /// (assembled here when the packed path is off).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn attention_half_prefill(
         &self,
@@ -539,6 +723,7 @@ impl LingMlaLayer {
         rows: usize,
         seq_len_start: usize,
         whole_prompt: bool,
+        packed: bool,
         block_table: &[u32],
         stream: u64,
     ) -> Result<()> {
@@ -546,6 +731,22 @@ impl LingMlaLayer {
         let k = &self.kernels;
         let hidden_w = s.hidden as u32;
         let rows_u32 = rows as u32;
+        if packed {
+            if let Some(ctx) = self.ctx_pools(gpu, seq_len_start + rows)? {
+                let v_pool = self.v_cache_pool(gpu, kv_cache)?;
+                return self.attention_half_packed(
+                    gpu,
+                    hidden,
+                    kv_cache,
+                    rows,
+                    seq_len_start,
+                    &ctx,
+                    v_pool,
+                    block_table,
+                    stream,
+                );
+            }
+        }
         ops::rms_norm(
             gpu,
             k.rms_norm_k,
@@ -582,7 +783,14 @@ impl LingMlaLayer {
         )?;
         self.q_absorb(gpu, rows_u32, positions, stream)?;
         if whole_prompt && seq_len_start == 0 {
-            self.prefill_attn_fast(gpu, rows_u32, stream)?;
+            self.prefill_attn_contig(
+                gpu,
+                s.mla_k_contig,
+                s.mla_v_contig,
+                rows_u32,
+                0,
+                stream,
+            )?;
         } else {
             // Continuing chunk: 8-row groups over the paged cache.
             let base = (seq_len_start as u32).to_le_bytes();
@@ -623,9 +831,116 @@ impl LingMlaLayer {
             }
         }
         self.v_extract(gpu, rows_u32, stream)?;
-        ops::dense_gemm(
+        proj_gemm(
             gpu,
-            k.gemm_k,
+            k,
+            s.attn_out,
+            &self.weights.o_proj,
+            s.ffn_in,
+            rows_u32,
+            hidden_w,
+            self.heads * self.v_dim,
+            stream,
+        )?;
+        ops::residual_add(
+            gpu,
+            k.residual_add_k,
+            hidden,
+            s.ffn_in,
+            rows_u32 * hidden_w,
+            stream,
+        )
+    }
+
+    /// The packed-context prefill attention half: chunk rows continue the
+    /// sequence's context mirror, `ling_mla_ctx_gather` refills the prefix
+    /// the paged pools hold, and one `ling_mla_prefill_attn` launch covers
+    /// prefix + chunk-local causal.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_half_packed(
+        &self,
+        gpu: &dyn GpuBackend,
+        hidden: DevicePtr,
+        kv_cache: &mut PagedKvCache,
+        rows: usize,
+        seq_len_start: usize,
+        ctx: &CtxPools,
+        v_pool: DevicePtr,
+        block_table: &[u32],
+        stream: u64,
+    ) -> Result<()> {
+        let s = &self.scratch;
+        let k = &self.kernels;
+        let hidden_w = s.hidden as u32;
+        let rows_u32 = rows as u32;
+        let kv_row = (self.kv_lora + self.rope) as usize;
+        ops::rms_norm(
+            gpu,
+            k.rms_norm_k,
+            hidden,
+            &self.input_norm,
+            s.normed,
+            rows_u32,
+            hidden_w,
+            self.eps,
+            stream,
+        )?;
+        self.project(gpu, rows_u32, s.normed, stream)?;
+        let (positions, slots, max_blocks) = self.upload_meta(
+            gpu,
+            0,
+            rows,
+            seq_len_start,
+            block_table,
+            kv_cache.block_size(),
+            stream,
+        )?;
+        let table_i32: Vec<i32> = block_table.iter().map(|&b| b as i32).collect();
+        ensure!(
+            table_i32.len() <= s.max_blocks,
+            "ling MLA: block table ({} entries) exceeds the staging cap {}",
+            table_i32.len(),
+            s.max_blocks
+        );
+        gpu.copy_h2d_async(
+            unsafe {
+                std::slice::from_raw_parts(table_i32.as_ptr() as *const u8, table_i32.len() * 4)
+            },
+            s.mla_block_table,
+            stream,
+        )?;
+        if seq_len_start > 0 {
+            self.ctx_gather(
+                gpu,
+                kv_cache,
+                ctx,
+                s.mla_block_table,
+                max_blocks,
+                seq_len_start as u32,
+                v_pool,
+                stream,
+            )?;
+        }
+        // The chunk's own rows land right after the gathered prefix, so the
+        // context is one contiguous run of positions [0, seq_len_start + rows).
+        self.write_cache(
+            gpu,
+            rows_u32,
+            kv_cache,
+            Some((
+                ctx.k.offset(seq_len_start * kv_row * 2),
+                ctx.v.offset(seq_len_start * self.kv_lora as usize * 2),
+            )),
+            slots,
+            positions,
+            stream,
+        )?;
+        self.q_absorb(gpu, rows_u32, positions, stream)?;
+        self.prefill_attn_contig(gpu, ctx.k, ctx.v, rows_u32, seq_len_start as u32, stream)?;
+        self.v_extract(gpu, rows_u32, stream)?;
+        proj_gemm(
+            gpu,
+            k,
             s.attn_out,
             &self.weights.o_proj,
             s.ffn_in,
@@ -698,6 +1013,9 @@ impl TransformerLayer for LingMlaLayer {
             num_tokens,
             seq_len,
             false,
+            // The packed path is a prefill shape: a per-verify gather of
+            // the prompt prefix would run on every decode step.
+            false,
             block_table,
             stream,
         )?;
@@ -725,10 +1043,12 @@ impl TransformerLayer for LingMlaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        // Sub-chunk the prompt: every sub-chunk runs the paged attention
-        // path (correct under any chunking); the single-pass contiguous
-        // fast path stays opt-in (ATLAS_LING_MLA_FAST_PREFILL=1, valid
-        // only for a from-position-0 whole prompt that fits one chunk).
+        // Sub-chunk the prompt; every chunk runs the packed context path
+        // (the default; over-capacity chunks fall back inside). The legacy
+        // behavior — paged 8-row groups plus the ATLAS_LING_MLA_FAST_
+        // PREFILL=1 position-0 whole-prompt fast path — is restored with
+        // ATLAS_LING_MLA_PACKED_PREFILL=0.
+        let packed = packed_prefill();
         let fast = std::env::var("ATLAS_LING_MLA_FAST_PREFILL").as_deref() == Ok("1")
             && seq_len_start == 0;
         let cap = self.scratch.rows;
@@ -741,6 +1061,7 @@ impl TransformerLayer for LingMlaLayer {
                 chunk_rows,
                 seq_len_start + chunk,
                 fast && n == 0 && num_tokens <= cap,
+                packed,
                 block_table,
                 stream,
             )?;

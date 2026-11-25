@@ -192,16 +192,17 @@ extern "C" __global__ void ling_mla_kv_a_norm_rope_cache(
 // q path: absorption + rope + final q assembly
 // ============================================================================
 
-// One CTA per (head, absorbed-dim tile): each of the 256 threads owns one
-// latent output dim n and loops the query rows, so w_uk's rows stream once
-// per row batch instead of once per row. Tile-0 CTAs also rope the head's
+// One CTA per (head, absorbed-dim tile -- and row tile, the third grid
+// dim): each of the 256 threads owns one latent output dim n and loops
+// `row_tile` of the query rows, so w_uk's rows stream once per row batch
+// instead of once per row. Tile-0 CTAs also rope the head's
 // q_rope slice and stitch the final row:
 //   q_final[row, head] = [q_nope @ W_UK (512) | roped q_rope (64)]
 //
 // w_uk: [heads, 512, 128] contiguous BF16, the load-time transpose of
 // kv_b_proj's per-head k_nope slice (w_uk[h][n][j] == kv_b_proj[h*256 + j][n]).
 //
-// Grid: (heads, kv_lora / 256)   Block: (256, 1, 1)
+// Grid: (heads, kv_lora / 256, ceil(rows / row_tile))   Block: (256, 1, 1)
 extern "C" __global__ void ling_mla_q_absorb_rope(
     const __nv_bfloat16* __restrict__ q_full,    // [rows, heads * 192]
     const __nv_bfloat16* __restrict__ w_uk,     // [heads, 512, 128] (transposed view)
@@ -212,7 +213,8 @@ extern "C" __global__ void ling_mla_q_absorb_rope(
     const unsigned int nope,     // 128
     const unsigned int rope_dim, // 64
     const unsigned int kv_lora,  // 512
-    const double rope_theta      // 6e6
+    const double rope_theta,     // 6e6
+    const unsigned int row_tile   // rows per blockIdx.z
 ) {
     atlas_pdl_enter();
     if (heads != LING_MLA_HEADS || nope != LING_MLA_NOPE || rope_dim != LING_MLA_ROPE
@@ -228,8 +230,15 @@ extern "C" __global__ void ling_mla_q_absorb_rope(
     const __nv_bfloat16* w = w_uk + (unsigned long long)head * kv_lora * nope
                            + (unsigned long long)out * nope;
 
+    // Wide chunks split the row loop across blockIdx.z (row_tile rows a
+    // CTA): hundreds of CTAs instead of heads x 2, w_uk streaming once per
+    // CTA either way. row counts below the tile keep gridDim.z == 1.
+    const unsigned int r_begin = blockIdx.z * row_tile;
+    if (r_begin >= rows) return;
+    const unsigned int r_end = (r_begin + row_tile < rows) ? r_begin + row_tile : rows;
+
     if (out < kv_lora) {
-        for (unsigned int r = 0; r < rows; ++r) {
+        for (unsigned int r = r_begin; r < r_end; ++r) {
             const __nv_bfloat16* qn =
                 q_full + (unsigned long long)r * q_row + (unsigned long long)head * qk;
             float acc = 0.0f;
@@ -241,11 +250,12 @@ extern "C" __global__ void ling_mla_q_absorb_rope(
         }
     }
 
-    // Tile 0: the head's roped q_rope slice for every row (32 pairs).
+    // Tile 0: the head's roped q_rope slice for the SAME row slice (32
+    // pairs a row).
     if (blockIdx.y == 0u && threadIdx.x < rope_dim / 2u) {
         const unsigned int p = threadIdx.x;
         const float freq = ling_mla_rope_pair_freq(p, rope_dim, rope_theta);
-        for (unsigned int r = 0; r < rows; ++r) {
+        for (unsigned int r = r_begin; r < r_end; ++r) {
             const float ang = (float)positions[r] * freq;
             const float cos_v = cosf(ang);
             const float sin_v = sinf(ang);
@@ -486,34 +496,36 @@ extern "C" __global__ void ling_mla_v_extract_gated(
 }
 
 // ============================================================================
-// attention: single-pass causal prefill over the contiguous chunk
+// attention: single-pass causal prefill over the packed context
 // ============================================================================
 
-// Chunk-local causal prefill over the contiguous K/V rows
-// ling_mla_kv_a_norm_rope_cache writes for the chunk. Conservative contract:
-// the chunk's causal range starts at position 0 (single-pass ISL <= 4096
-// serving); a chunk continuing a cached prefix is NOT supported here - route
-// it through ling_mla_paged_attn in 8-row steps until this grows a block
-// table. Scalar fp32 dots like the in-tree mla_prefill_attn: at these row
-// counts the pass is KV-bandwidth-bound.
+// Causal prefill over one contiguous K/V run: the driver's packed context,
+// which holds positions [0, kv_base + seq_len) — the prefix the ctx gather
+// refilled from the paged pools plus the chunk's own rows the cache write
+// just appended. The chunk's query rows [0, seq_len) attend the full run:
+// rows < kv_base unmasked (causal by construction), the rest causal
+// (q_pos + kv_base >= kv_pos). kv_base == 0 is the whole-prompt single pass
+// (chunk-local causal from position 0). Scalar fp32 dots like the in-tree
+// mla_prefill_attn: at these row counts the pass is KV-bandwidth-bound.
 //
 // 16 query rows a CTA, 16 lanes a row: 36 score dims a lane (the 576 cache
-// row), 32 value dims a lane (the 512 latent). Causal masking is q_pos >=
-// kv_pos (causal != 0); causal == 0 runs the full chunk (parity tests).
+// row), 32 value dims a lane (the 512 latent). causal == 0 runs the full
+// run unmasked (parity tests).
 //
-// Q: [batch, seq_len, heads, 576]  K: [batch, seq_len, 576]
-// V: [batch, seq_len, 512]          O: [batch, seq_len, heads, 512]
+// Q: [batch, seq_len, heads, 576]  K: [batch, kv_base + seq_len, 576]
+// V: [batch, kv_base + seq_len, 512]  O: [batch, seq_len, heads, 512]
 // heads = gridDim.x.
 //
 // Grid: (heads, ceil(seq_len / 16), batch)   Block: (256, 1, 1)
 extern "C" __global__ void ling_mla_prefill_attn(
     const __nv_bfloat16* __restrict__ Q,
-    const __nv_bfloat16* __restrict__ K,   // [batch, seq_len, 576]
-    const __nv_bfloat16* __restrict__ V,   // [batch, seq_len, 512]
+    const __nv_bfloat16* __restrict__ K,   // [batch, kv_base + seq_len, 576]
+    const __nv_bfloat16* __restrict__ V,   // [batch, kv_base + seq_len, 512]
     __nv_bfloat16* __restrict__ O,
-    const unsigned int seq_len,
+    const unsigned int seq_len,            // the chunk's query rows
     const unsigned int causal,
-    const float inv_sqrt_d                // 192 ** -0.5
+    const float inv_sqrt_d,                // 192 ** -0.5
+    const unsigned int kv_base            // prefix rows carried in K/V
 ) {
     atlas_pdl_enter();
     const unsigned int head = blockIdx.x;
@@ -539,10 +551,11 @@ extern "C" __global__ void ling_mla_prefill_attn(
     #pragma unroll
     for (unsigned int i = 0; i < LING_MLA_PFVVEC; ++i) o_acc[i] = 0.0f;
 
-    const unsigned int kv_end = causal ? q_row + 1u : seq_len;
+    const unsigned int kv_run = kv_base + seq_len;
+    const unsigned int kv_end = causal ? (kv_base + q_row + 1u) : kv_run;
     for (unsigned int kv_pos = 0; kv_pos < kv_end; ++kv_pos) {
         const __nv_bfloat16* k_row =
-            K + (unsigned long long)(batch * seq_len + kv_pos) * LING_MLA_KV_DIM;
+            K + (unsigned long long)(batch * kv_run + kv_pos) * LING_MLA_KV_DIM;
         float dot = 0.0f;
         #pragma unroll
         for (unsigned int i = 0; i < LING_MLA_PFKVEC; ++i)
@@ -561,7 +574,7 @@ extern "C" __global__ void ling_mla_prefill_attn(
         l_prev = alpha * l_prev + p;
 
         const __nv_bfloat16* v_row =
-            V + (unsigned long long)(batch * seq_len + kv_pos) * LING_MLA_LORA;
+            V + (unsigned long long)(batch * kv_run + kv_pos) * LING_MLA_LORA;
         #pragma unroll
         for (unsigned int i = 0; i < LING_MLA_PFVVEC; ++i)
             o_acc[i] = alpha * o_acc[i] + p * __bfloat162float(v_row[lane * LING_MLA_PFVVEC + i]);
@@ -574,4 +587,40 @@ extern "C" __global__ void ling_mla_prefill_attn(
     #pragma unroll
     for (unsigned int i = 0; i < LING_MLA_PFVVEC; ++i)
         o_row[lane * LING_MLA_PFVVEC + i] = __float2bfloat16(o_acc[i] * inv_l);
+}
+
+// Refill the packed prefill context's prefix rows [0, rows) from the paged
+// pools, through the block table the paged attention path itself walks: row
+// `pos`'s physical pool row is table[pos / block_size] * block_size +
+// pos % block_size. One 2-byte element a thread; the pass is a K/V copy of
+// a few MB at ISL 4096.
+//
+// Grid: (ceil(rows * (576 + 512) / 256), 1, 1) Block: (256, 1, 1)
+extern "C" __global__ void ling_mla_ctx_gather(
+    const __nv_bfloat16* __restrict__ k_cache,   // [pool, block_size, 576]
+    const __nv_bfloat16* __restrict__ v_cache,   // [pool, block_size, 512]
+    __nv_bfloat16* __restrict__ k_ctx,           // [rows, 576]
+    __nv_bfloat16* __restrict__ v_ctx,           // [rows, 512]
+    const int* __restrict__ block_tables,
+    const unsigned int max_blocks_per_seq,
+    const unsigned int rows,
+    const unsigned int block_size
+) {
+    atlas_pdl_enter();
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int k_elems = rows * LING_MLA_KV_DIM;
+    const unsigned int v_elems = rows * LING_MLA_LORA;
+    if (i >= k_elems + v_elems) return;
+    const unsigned int pos = (i < k_elems) ? i / LING_MLA_KV_DIM
+                                          : (i - k_elems) / LING_MLA_LORA;
+    const unsigned int off = (i < k_elems) ? i % LING_MLA_KV_DIM
+                                           : (i - k_elems) % LING_MLA_LORA;
+    const int table_entry = block_tables[pos / block_size];
+    const unsigned long long pool_row =
+        (unsigned long long)table_entry * block_size + pos % block_size;
+    if (i < k_elems) {
+        k_ctx[i] = k_cache[pool_row * LING_MLA_KV_DIM + off];
+    } else {
+        v_ctx[i - k_elems] = v_cache[pool_row * LING_MLA_LORA + off];
+    }
 }

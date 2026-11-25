@@ -604,6 +604,7 @@ fn mla_layer5_parity() -> Result<()> {
         12,
         0,
         false,
+        false, // legacy paged groups (the packed path runs in phase 4)
         &rig.block_table,
         stream,
     )?;
@@ -681,6 +682,7 @@ fn mla_layer5_parity() -> Result<()> {
         4,
         12,
         false,
+        false, // legacy paged groups (the packed path runs in phase 4)
         &rig.block_table,
         stream,
     )?;
@@ -768,6 +770,111 @@ fn mla_layer5_parity() -> Result<()> {
         stages.push(check_stage("decode hidden out", &got, &want)?);
     }
 
+    // ---- phase 4: the same two chunks through the packed context path
+    // (the prefill default: ctx write + kv_base carry, gather on the
+    // continuation), on a pristine copy of the rows.
+    let hidden4 = upload_bf16(gpu, &inputs)?;
+    rig.layer.attention_half_prefill(
+        gpu,
+        hidden4,
+        &mut rig.kv,
+        12,
+        0,
+        false,
+        true, // packed
+        &rig.block_table,
+        stream,
+    )?;
+    gpu.synchronize(stream)?;
+    for r in 0..12 {
+        let got = bf16s(
+            gpu,
+            DevicePtr(s.mla_q_final.0 + (r * HEADS * KVD * 2) as u64),
+            HEADS * KVD,
+        )?;
+        stages.push(check_stage(
+            "packed q_final",
+            &got,
+            &ref_q_final(&host, &rows[r], r),
+        )?);
+        let got = bf16s(
+            gpu,
+            DevicePtr(s.mla_latent.0 + (r * HEADS * LORA * 2) as u64),
+            HEADS * LORA,
+        )?;
+        stages.push(check_stage(
+            "packed attn latent",
+            &got,
+            &ref_latent(&host, &rows, r + 1),
+        )?);
+    }
+    for pos in 0..12 {
+        stages.push(check_stage(
+            "packed pool K row",
+            &pool_k_row(gpu, rig.attn_idx, &rig, pos)?,
+            &ref_k_row(&host, &rows[pos], pos),
+        )?);
+    }
+    {
+        let got = bf16s(gpu, hidden4, 12 * HID)?;
+        let want: Vec<u16> = (0..12)
+            .flat_map(|r| ref_attn_half(&host, &rows, r + 1, &inputs[r * HID..(r + 1) * HID]))
+            .collect();
+        stages.push(check_stage("packed hidden out", &got, &want)?);
+    }
+    let chunk4 = DevicePtr(hidden4.0 + (12 * HID * 2) as u64);
+    rig.layer.attention_half_prefill(
+        gpu,
+        chunk4,
+        &mut rig.kv,
+        4,
+        12,
+        false,
+        true, // packed: the gather refills prefix rows [0, 12) from the pool
+        &rig.block_table,
+        stream,
+    )?;
+    gpu.synchronize(stream)?;
+    for r in 12..16 {
+        let got = bf16s(
+            gpu,
+            DevicePtr(s.mla_q_final.0 + ((r - 12) * HEADS * KVD * 2) as u64),
+            HEADS * KVD,
+        )?;
+        stages.push(check_stage(
+            "packed cont q_final",
+            &got,
+            &ref_q_final(&host, &rows[r], r),
+        )?);
+        let got = bf16s(
+            gpu,
+            DevicePtr(s.mla_latent.0 + ((r - 12) * HEADS * LORA * 2) as u64),
+            HEADS * LORA,
+        )?;
+        stages.push(check_stage(
+            "packed cont attn latent",
+            &got,
+            &ref_latent(&host, &rows, r + 1),
+        )?);
+        let got = bf16s(
+            gpu,
+            DevicePtr(s.attn_out.0 + ((r - 12) * HEADS * VD * 2) as u64),
+            HEADS * VD,
+        )?;
+        stages.push(check_stage(
+            "packed cont gated V",
+            &got,
+            &ref_attended(&host, &rows, r + 1),
+        )?);
+    }
+    {
+        let got = bf16s(gpu, chunk4, 4 * HID)?;
+        let want: Vec<u16> = (12..16)
+            .flat_map(|r| ref_attn_half(&host, &rows, r + 1, &inputs[r * HID..(r + 1) * HID]))
+            .collect();
+        stages.push(check_stage("packed cont hidden out", &got, &want)?);
+    }
+
     for st in &stages {
         eprintln!(
             "{}: max_abs {:.5} on scale {:.3}",
@@ -802,6 +909,8 @@ fn mla_layer5_prefill_fast_parity() -> Result<()> {
         N,
         0,
         true, // whole prompt: contiguous K/V + ling_mla_prefill_attn
+        false, // the legacy fast path (the packed default runs in phase 4
+               // of mla_layer5_parity and end to end in the e2e gate)
         &rig.block_table,
         stream,
     )?;
