@@ -179,7 +179,7 @@ fn load_kda_weights(store: &WeightStore, lp: &str, gpu: &dyn GpuBackend) -> Resu
     })
 }
 
-fn load_mla_weights(store: &WeightStore, lp: &str, gpu: &dyn GpuBackend) -> Result<LingMlaWeights> {
+pub(super) fn load_mla_weights(store: &WeightStore, lp: &str, gpu: &dyn GpuBackend) -> Result<LingMlaWeights> {
     let attn = |stem: &str| format!("{lp}.attention.{stem}.weight");
     let kv_b = dense(store, &attn("kv_b_proj"))?;
     Ok(LingMlaWeights {
@@ -221,7 +221,7 @@ fn build_w_uk(gpu: &dyn GpuBackend, kv_b: DevicePtr) -> Result<DenseWeight> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn load_ffn(
+pub(super) fn load_ffn(
     store: &WeightStore,
     lp: &str,
     layer_spec: crate::model::bailing_c1::LayerSpec,

@@ -12,9 +12,17 @@
 //! greedy/sampled tokens for single- and multi-turn decode with ISL
 //! 4096-class prompts. Out of scope, seams left documented:
 //!
-//! * MTP drafting (the `ling_mtp_eh.cu` kernels + `model.layers.42` weights
-//!   exist, but scheduler integration is a later PR; `load_mtp_weights`
-//!   returns `None` and the config's NEXTN layer count is informational).
+//! * MTP drafting is wired for the single-NEXTN shape (the MTP-wiring
+//!   campaign slice): `weight_loader::bailing::load_ling_mtp_module` builds
+//!   layer 42's body via this driver, `layers::ling_mtp::LingMtpHead`
+//!   implements the house [`crate::speculative::DraftProposer`] contract on
+//!   it, and the family's layers serve the K = 2 verify
+//!   (`kda_recurrent_bf16_verify_snap` rollback snapshots on KDA,
+//!   multi-row paged attention on gated MLA). `load_mtp_weights` stays
+//!   `None`: the Qwen-shaped `MtpWeights` does not fit the NEXTN module,
+//!   same as GLM-5's and V4's dedicated loaders. Deeper draft counts
+//!   (`verify_max_drafts`), the KDA slot pool and captured graphs remain
+//!   out of scope.
 //! * Slot-pool KDA decode (`ling_kda_recurrent_indexed` + the GLM
 //!   `SsmStatePool` multi-seq machinery). This driver uses the GLM bring-up
 //!   pattern instead: per-sequence `SsmLayerState` from `alloc_state` on the
@@ -65,8 +73,16 @@
 //! | `residual_add` | `bf16_residual_add` |
 //! | `moe_transpose_batched` | `moe_transpose_u8_batched` (load-time expert repack) |
 //!
-//! `ling_mtp_eh` is deliberately unresolved above: the draft kernels are
-//! landed (PR #111) but the scheduler integration is a later campaign PR.
+//! The drafter side's kernel table (the NEXTN-chain glue;
+//! `layers/ling_mtp.rs` resolves and owns these handles):
+//!
+//! | module (file stem) | kernels used |
+//! |---|---|
+//! | `ling_mtp_eh` | `ling_mtp_eh_norm`, `ling_mtp_draft_pick` |
+//!
+//! On the VERIFY side the KDA layers add
+//! `kda_recurrent_bf16_verify_snap` (module `kda`) for the in-place K-row
+//! walk with per-row H rollback snapshots.
 
 mod ffn;
 mod kda;

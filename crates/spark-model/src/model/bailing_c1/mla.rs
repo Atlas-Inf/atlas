@@ -368,8 +368,7 @@ impl LingMlaLayer {
         seq_len: usize,
         block_table: &[u32],
         stream: u64,
-    ) -> Result<()> {
-        let s = &self.scratch;
+    ) -> Result<()> {        let s = &self.scratch;
         let k = &self.kernels;
         let hidden_w = s.hidden as u32;
         ops::rms_norm(
@@ -465,6 +464,67 @@ impl LingMlaLayer {
             rows * s.hidden as u32,
             stream,
         )
+    }
+
+    /// The drafter-context prefill of this layer's compressed KV ONLY:
+    /// `rows` input rows at consecutive positions `seq_len_start..` write
+    /// their paged K row and V latent and nothing else — no Q projection,
+    /// no attention, no FFN (a single autoregressive layer's cached K/V
+    /// depends only on its own normed input row). This is the Ling body of
+    /// the `prefill_mla_kv_only` shape the house MTP drafters use to build
+    /// the NEXTN drafter's context over the prompt pairs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn kv_only_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        hidden: DevicePtr,
+        kv_cache: &mut PagedKvCache,
+        rows: usize,
+        seq_len_start: usize,
+        block_table: &[u32],
+        stream: u64,
+    ) -> Result<()> {
+        let s = &self.scratch;
+        let k = &self.kernels;
+        let hidden_w = s.hidden as u32;
+        let rows_u32 = rows as u32;
+        ensure!(
+            rows <= s.rows && seq_len_start + rows <= s.rows,
+            "ling MLA kv-only: {rows} rows at {seq_len_start} exceed the scratch cap"
+        );
+        ops::rms_norm(
+            gpu,
+            k.rms_norm_k,
+            hidden,
+            &self.input_norm,
+            s.normed,
+            rows_u32,
+            hidden_w,
+            self.eps,
+            stream,
+        )?;
+        ops::dense_gemm(
+            gpu,
+            k.gemm_k,
+            s.normed,
+            &self.weights.kv_a,
+            s.mla_kv_a,
+            rows_u32,
+            self.kv_lora + self.rope,
+            hidden_w,
+            stream,
+        )?;
+        let (positions, slots, _) = self.upload_meta(
+            gpu,
+            0,
+            rows,
+            seq_len_start,
+            block_table,
+            kv_cache.block_size(),
+            stream,
+        )?;
+        self.write_cache(gpu, rows_u32, kv_cache, None, slots, positions, stream)?;
+        Ok(())
     }
 
     /// Prefill attention over `rows` rows starting at `seq_len_start`.
@@ -602,6 +662,53 @@ impl TransformerLayer for LingMlaLayer {
         self.ffn_half(ctx.gpu, hidden, 1, stream)
     }
 
+    /// The MTP/K-token verify of one sequence: `num_tokens` consecutive
+    /// rows ride the paged kernel's multi-row body (`ling_mla_paged_attn`
+    /// serves rows 1..=8 with per-row causal over the just-written block —
+    /// PR #112's verify-row support), base_len naming the entries before
+    /// the window. A single row runs the plain decode path unchanged.
+    fn decode_batched(
+        &self,
+        hidden: DevicePtr,
+        _residual: DevicePtr,
+        num_tokens: usize,
+        _state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        _disk_block_ids: &mut Vec<u32>,
+        _disk_last_offloaded_per_layer: &mut Vec<u32>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if num_tokens <= 1 {
+            self.attention_half_decode(ctx.gpu, hidden, kv_cache, seq_len, block_table, stream)?;
+            return self.ffn_half(ctx.gpu, hidden, 1, stream);
+        }
+        anyhow::ensure!(
+            num_tokens <= MLA_MAX_ROWS_PAGED,
+            "ling MLA: verify {num_tokens} rows exceeds the paged kernel's {}",
+            MLA_MAX_ROWS_PAGED
+        );
+        self.attention_half_prefill(
+            ctx.gpu,
+            hidden,
+            kv_cache,
+            num_tokens,
+            seq_len,
+            false,
+            block_table,
+            stream,
+        )?;
+        self.ffn_half(ctx.gpu, hidden, num_tokens as u32, stream)
+    }
+
+    /// One NEXTN draft: this layer serves the K = 2 verify (the paged
+    /// kernel's row cap aside, the family's agreed verify width is 2).
+    fn verify_max_drafts(&self) -> Option<usize> {
+        Some(1)
+    }
+
     fn prefill(
         &self,
         hidden: DevicePtr,
@@ -664,3 +771,7 @@ impl TransformerLayer for LingMlaLayer {
 #[cfg(test)]
 #[path = "mla_gpu_parity_tests.rs"]
 mod mla_gpu_parity_tests;
+
+#[cfg(test)]
+#[path = "e2e_gpu_parity_tests.rs"]
+mod e2e_gpu_parity_tests;
