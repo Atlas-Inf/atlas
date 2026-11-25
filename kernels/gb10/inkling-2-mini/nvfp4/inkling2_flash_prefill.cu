@@ -205,7 +205,6 @@ extern "C" __global__ void __launch_bounds__(FP_THREADS, 1) inkling2_flash_prefi
         // store — Ps[warp][2e+lane_hi][n*16+lane_lo] transposes the fragment
         // layout's [key=lane_lo] into the A operand's [row][key] rows. Keeping
         // tm/pv out of arrays saves ~24 live VGPRs; hipcc 7.16 spilled otherwise.
-#pragma unroll
         for (int e = 0; e < 8; e++) {
             float x = fmaxf(acc_s[0][e], acc_s[FP_BC / 16 - 1][e]);
             for (int o = 1; o < 16; o <<= 1) x = fmaxf(x, __shfl_xor_sync(0xffffffffull, x, o));
