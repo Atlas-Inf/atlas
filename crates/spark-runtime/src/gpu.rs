@@ -564,6 +564,25 @@ pub trait GpuBackend: Send + Sync {
         anyhow::bail!("host_ptr_to_device: not supported by this backend")
     }
 
+    /// Whether this device can service ordinary pageable host pointers from
+    /// device kernels through the host page tables.  This is distinct from
+    /// [`Self::host_ptr_to_device`], which only aliases memory explicitly
+    /// allocated with [`Self::alloc_host_pinned`].
+    fn pageable_memory_access_uses_host_page_tables(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Device-side address for a read-only pageable host range.  The default
+    /// rejects the operation so mmap-backed weights stay on the ordered
+    /// staging path on backends without this CUDA capability.
+    fn pageable_host_ptr_to_device(&self, host: *mut u8) -> Result<DevicePtr> {
+        if self.pageable_memory_access_uses_host_page_tables()? {
+            Ok(DevicePtr(host as usize as u64))
+        } else {
+            anyhow::bail!("pageable host-page-table access is not supported by this backend")
+        }
+    }
+
     /// Allocate page-locked (pinned) host memory for efficient async H2D.
     ///
     /// On DGX Spark (UMA/LPDDR5X), pinned memory enables true async DMA

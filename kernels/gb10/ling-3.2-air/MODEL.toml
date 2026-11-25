@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[model]
+name = "ling-3.2-air"
+hf_id = "inclusionAI/Ling-3.2-air"
+architecture = "Bailing MoE v3 VL"
+kernel_source = "glm-5.3-flash"
+layers_total = 42
+layers_linear_attention = 35
+layers_full_attention = 7
+hidden_dim = 2560
+head_dim = 128
+q_heads = 32
+kv_heads = 32
+moe_experts = 512
+moe_topk = 8
+moe_intermediate = 768
+vocab_size = 157184
+max_position_embeddings = 262144
+vision = true
+mtp_layers = 1
+
+[[model_types]]
+model_type = "bailing_moe_v3_vl"
+hidden_size = 2560
+
+[behavior]
+# The published envelope uses an unquoted tool name and arg_key/arg_value tags.
+tool_call_parser = "poolside_v1"
+thinking_default = true
+thinking_in_tools = true
+disable_cwd_hint_injection = true
+default_kv_dtype = "bf16"
+min_reasoning_floor_tokens = 0
+max_thinking_budget = 0
+enable_stream_loop_guards = false
+enable_loop_watchdog = false
+confidence_early_stop = false
+
+[sampling.thinking_text]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.thinking_coding]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.non_thinking]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.tools]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[expected_absent.w4a16_gemv]
+w4a16_gemv_qg_batch4 = "Only the optional skinny kernel handle registry probes the interleaved Qwen query-plus-gate path. Ling loads separate query and gate projections."
+
+[expected_absent.w4a16]
+w4a16_gemm_t_p3 = "The optional NVFP4 vocabulary head uses the resolved two-stage w4a16_gemm_t on Ling."

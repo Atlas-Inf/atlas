@@ -276,6 +276,7 @@ fn stream_for_request(
         max_tool_calls_per_response: 12,
         min_tokens: 0,
         req_return_token_ids: true,
+        req_stream_tool_arguments: request.stream_tool_arguments,
         req_ctx: None,
         dump_seq: None,
     };

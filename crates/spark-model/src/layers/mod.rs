@@ -18,6 +18,13 @@ pub mod glm_sp_moe_seam;
 pub mod glm_sp_overlap;
 pub mod glm_sp_uneven;
 pub(crate) mod inkling2;
+pub mod ling_decoder;
+pub mod ling_kda;
+pub mod ling_mla;
+pub mod ling_moe;
+pub(crate) mod ling_mtp;
+pub mod ling_projection;
+pub mod ling_vision;
 pub mod moe;
 mod moe_grouped_decode;
 pub mod mtp_head;
@@ -54,6 +61,9 @@ pub(crate) use glm5_kda::{
     kda_batched_ffn_enabled, kda_conv_planes_enabled, kda_flash_prefill_word,
     kda_multi_seq_enabled, kda_side_proj_lt_enabled, verify_fused_tp_hc_enabled,
 };
+pub use ling_decoder::{LingDecoderLayer, load_ling_layers};
+pub use ling_moe::LingMoeFfn;
+pub use ling_vision::LingVisionTower;
 pub use moe::MoeLayer;
 pub use moe_grouped_decode::{
     moe_grouped_decode_decide, moe_grouped_decode_enabled, moe_grouped_decode_for,
@@ -78,6 +88,7 @@ use spark_runtime::gpu::DevicePtr;
 #[allow(clippy::large_enum_variant)]
 pub enum FfnComponent {
     Moe(MoeLayer),
+    LingMoe(LingMoeFfn),
     Dense(DenseFfnLayer),
     /// No FFN — used by Nemotron-H standalone attention layers.
     None,
@@ -131,6 +142,7 @@ impl FfnComponent {
     ) -> Result<DevicePtr> {
         match self {
             Self::Moe(m) => m.forward(input, ctx, stream),
+            Self::LingMoe(m) => m.forward(input, ctx, stream),
             Self::Dense(d) => d.forward(input, ctx, stream),
             Self::None => Ok(input),
         }
@@ -149,6 +161,7 @@ impl FfnComponent {
     ) -> Result<(DevicePtr, bool)> {
         match self {
             Self::Moe(m) => m.forward_hc_post(input, ctx, hc_post, stream),
+            Self::LingMoe(m) => Ok((m.forward(input, ctx, stream)?, false)),
             _ => Ok((self.forward(input, ctx, stream)?, false)),
         }
     }
@@ -206,6 +219,7 @@ impl FfnComponent {
     pub fn forward_k2(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
         match self {
             Self::Moe(m) => m.forward_k2(input, ctx, stream),
+            Self::LingMoe(m) => m.forward_k2(input, ctx, stream),
             Self::Dense(d) => d.forward_k2(input, ctx, stream),
             Self::None => Ok(()),
         }
@@ -214,6 +228,7 @@ impl FfnComponent {
     pub fn forward_k3(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
         match self {
             Self::Moe(m) => m.forward_k3(input, ctx, stream),
+            Self::LingMoe(m) => m.forward_k3(input, ctx, stream),
             Self::Dense(d) => d.forward_k3(input, ctx, stream),
             Self::None => Ok(()),
         }
@@ -228,6 +243,7 @@ impl FfnComponent {
             Self::Dense(d) => d.can_forward_km(m),
             // Packed EXL3 MoE: rows run one at a time on the packed kernels.
             Self::Moe(mo) => (2..=16).contains(&m) && mo.is_exl3_packed(),
+            Self::LingMoe(_) => false,
             Self::None => false,
         }
     }
@@ -271,6 +287,7 @@ impl FfnComponent {
     ) -> Result<()> {
         match self {
             Self::Moe(m) => m.forward_prefill(input, num_tokens, ctx, stream),
+            Self::LingMoe(m) => m.forward_prefill(input, num_tokens, ctx, stream),
             Self::Dense(d) => d.forward_prefill(input, num_tokens, ctx, stream),
             Self::None => {
                 let _ = (input, num_tokens);
@@ -288,6 +305,7 @@ impl FfnComponent {
     ) -> Result<()> {
         match self {
             Self::Moe(m) => m.forward_batched(input, num_tokens, ctx, stream),
+            Self::LingMoe(m) => m.forward_batched(input, num_tokens, ctx, stream),
             Self::Dense(d) => d.forward_batched(input, num_tokens, ctx, stream),
             Self::None => {
                 let _ = (input, num_tokens);
@@ -305,6 +323,7 @@ impl FfnComponent {
     ) -> Result<()> {
         match self {
             Self::Moe(m) => m.forward_token_major_decode(input, num_tokens, ctx, stream),
+            Self::LingMoe(m) => m.forward_token_major_decode(input, num_tokens, ctx, stream),
             Self::Dense(d) => d.forward_batched(input, num_tokens, ctx, stream),
             Self::None => {
                 let _ = (input, num_tokens);
@@ -322,6 +341,7 @@ impl FfnComponent {
     ) -> Result<()> {
         match self {
             Self::Moe(m) => m.forward_atomic_c4_decode(input, num_tokens, ctx, stream),
+            Self::LingMoe(m) => m.forward_atomic_c4_decode(input, num_tokens, ctx, stream),
             Self::Dense(d) => d.forward_batched(input, num_tokens, ctx, stream),
             Self::None => {
                 let _ = (input, num_tokens);

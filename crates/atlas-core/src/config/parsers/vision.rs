@@ -40,6 +40,7 @@ pub(crate) fn parse_vision_config(raw: &serde_json::Value) -> Option<VisionConfi
         .or_else(|| vc.get("video_token_id").and_then(serde_json::Value::as_u64))
         .unwrap_or(0) as u32;
     Some(VisionConfig {
+        is_bailing_vl: false,
         is_glm5_next: false,
         is_qwen3vl_video: false,
         in_channels: 3,
@@ -218,6 +219,7 @@ pub(crate) fn parse_glm5_vision_config(
         })
         .unwrap_or_default();
     Ok(Some(VisionConfig {
+        is_bailing_vl: false,
         is_glm5_next: true,
         is_qwen3vl_video: false,
         in_channels,

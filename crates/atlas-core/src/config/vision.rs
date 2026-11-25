@@ -6,6 +6,8 @@
 /// Vision encoder configuration for Qwen3-VL models.
 #[derive(Debug, Clone)]
 pub struct VisionConfig {
+    /// BailingMM2 uses CLIP channel statistics with the Qwen-style tower.
+    pub is_bailing_vl: bool,
     /// True only for the native GLM-5.3 vision tower.  Its RMSNorm/SwiGLU/
     /// convolutional merger is not interchangeable with the Qwen ViT path.
     pub is_glm5_next: bool,

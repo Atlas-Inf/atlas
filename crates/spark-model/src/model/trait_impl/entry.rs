@@ -127,8 +127,11 @@ impl TransformerModel {
     }
 
     pub(super) fn supports_chunked_mla_impl(&self) -> bool {
-        self.config.model_type == "glm5_next"
-            && self.config.index_kpool > 0
-            && self.config.index_topk > 0
+        // Ling's MLA prompt kernel reads the paged keys and values written
+        // by earlier chunks. Its KDA state also persists across those chunks.
+        self.config.model_type == "bailing_moe_v3_vl"
+            || (self.config.model_type == "glm5_next"
+                && self.config.index_kpool > 0
+                && self.config.index_topk > 0)
     }
 }

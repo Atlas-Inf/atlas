@@ -19,6 +19,7 @@ fn no_ffmpeg() -> FfmpegPolicy {
 #[allow(dead_code)]
 fn cfg() -> VisionConfig {
     VisionConfig {
+        is_bailing_vl: false,
         is_glm5_next: false,
         is_qwen3vl_video: false,
         in_channels: 3,
@@ -421,6 +422,7 @@ fn gif_respects_explicit_aggregate_decode_budget() {
 
 fn glm_cfg() -> VisionConfig {
     VisionConfig {
+        is_bailing_vl: false,
         is_glm5_next: true,
         patch_size: 14,
         ..cfg()

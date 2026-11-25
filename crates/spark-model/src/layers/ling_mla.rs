@@ -1,0 +1,643 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Native causal MLA for Ling 3.2 air.
+//!
+//! Ling's full-attention layers are the direct (q_lora-free) Bailing MLA:
+//! q_proj, kv_a_proj_with_mqa + RMSNorm, kv_b_proj, interleaved RoPE,
+//! paged K/V, a head-wise sigmoid gate, and the checkpoint's dense output
+//! projection. Each BF16 cache row stores 128 NoPE channels per head and
+//! one shared 64-channel RoPE tail. Values share an all-zero padding tail.
+
+use anyhow::{Result, ensure};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use spark_runtime::kernel_args::KernelLaunch;
+use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
+use spark_runtime::weights::{WeightDtype, WeightStore};
+
+use crate::layer::AttnMetadataDev;
+use crate::layers::ling_projection::{LingProjection, LingProjectionScratch};
+use crate::layers::ops;
+use crate::weight_map::DenseWeight;
+
+/// Current Ling 3.2 air MLA geometry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LingMlaConfig {
+    pub hidden_size: usize,
+    pub num_heads: usize,
+    pub kv_lora_rank: usize,
+    pub qk_nope_head_dim: usize,
+    pub qk_rope_head_dim: usize,
+    pub v_head_dim: usize,
+    pub rope_theta: f32,
+    pub rms_eps: f32,
+}
+
+impl Default for LingMlaConfig {
+    fn default() -> Self {
+        Self {
+            hidden_size: 2560,
+            num_heads: 32,
+            kv_lora_rank: 512,
+            qk_nope_head_dim: 128,
+            qk_rope_head_dim: 64,
+            v_head_dim: 128,
+            rope_theta: 6_000_000.0,
+            rms_eps: 1e-6,
+        }
+    }
+}
+
+impl LingMlaConfig {
+    pub fn qk_head_dim(self) -> usize {
+        self.qk_nope_head_dim + self.qk_rope_head_dim
+    }
+
+    pub fn q_proj_rows(self) -> usize {
+        self.num_heads * self.qk_head_dim()
+    }
+
+    pub fn kv_b_rows(self) -> usize {
+        self.num_heads * (self.qk_nope_head_dim + self.v_head_dim)
+    }
+
+    pub fn validate(self) -> Result<()> {
+        ensure!(self.hidden_size > 0, "Ling MLA hidden size is zero");
+        ensure!(self.num_heads > 0, "Ling MLA head count is zero");
+        ensure!(self.kv_lora_rank > 0, "Ling MLA KV rank is zero");
+        ensure!(self.qk_nope_head_dim > 0, "Ling MLA NoPE width is zero");
+        ensure!(self.qk_rope_head_dim > 0, "Ling MLA RoPE width is zero");
+        ensure!(
+            self.qk_rope_head_dim.is_multiple_of(2),
+            "Ling MLA RoPE width must be even"
+        );
+        ensure!(self.v_head_dim > 0, "Ling MLA value width is zero");
+        ensure!(
+            self.rope_theta.is_finite() && self.rope_theta > 0.0,
+            "invalid Ling MLA RoPE theta"
+        );
+        ensure!(
+            self.rms_eps.is_finite() && self.rms_eps > 0.0,
+            "invalid Ling MLA RMS epsilon"
+        );
+        Ok(())
+    }
+}
+
+/// Tensors required by one Ling MLA layer. Prefix is normally
+/// model.layers.{layer}.attention.
+pub struct LingMlaWeights {
+    pub q_proj: LingProjection,
+    pub kv_a_proj_with_mqa: LingProjection,
+    pub kv_a_layernorm: DenseWeight,
+    pub kv_b_proj: LingProjection,
+    pub g_proj: LingProjection,
+    /// The checkpoint calls this projection dense, not o_proj.
+    pub dense: LingProjection,
+    /// Device table [qk_rope_head_dim / 2] for the interleaved RoPE kernel.
+    pub rope_inv_freq: DevicePtr,
+}
+
+impl LingMlaWeights {
+    pub fn load(
+        gpu: &dyn GpuBackend,
+        store: &WeightStore,
+        prefix: &str,
+        config: LingMlaConfig,
+        rope_inv_freq: DevicePtr,
+    ) -> Result<Self> {
+        config.validate()?;
+        let h = config.hidden_size;
+        let q = config.q_proj_rows();
+        let kv_a = config.kv_lora_rank + config.qk_rope_head_dim;
+        let kv_b = config.kv_b_rows();
+        let norm = store.get(&format!("{prefix}.kv_a_layernorm.weight"))?;
+        ensure!(
+            norm.shape == [config.kv_lora_rank],
+            "{prefix}.kv_a_layernorm.weight has shape {:?}; expected [{}]",
+            norm.shape,
+            config.kv_lora_rank
+        );
+        ensure!(
+            norm.dtype == WeightDtype::BF16,
+            "{prefix}.kv_a_layernorm.weight must be BF16"
+        );
+        Ok(Self {
+            q_proj: LingProjection::load(gpu, store, &format!("{prefix}.q_proj"), q, h)?,
+            kv_a_proj_with_mqa: LingProjection::load(
+                gpu,
+                store,
+                &format!("{prefix}.kv_a_proj_with_mqa"),
+                kv_a,
+                h,
+            )?,
+            kv_a_layernorm: DenseWeight { weight: norm.ptr },
+            kv_b_proj: LingProjection::load(
+                gpu,
+                store,
+                &format!("{prefix}.kv_b_proj"),
+                kv_b,
+                config.kv_lora_rank,
+            )?,
+            g_proj: LingProjection::load(
+                gpu,
+                store,
+                &format!("{prefix}.g_proj"),
+                config.num_heads,
+                h,
+            )?,
+            dense: LingProjection::load(
+                gpu,
+                store,
+                &format!("{prefix}.dense"),
+                h,
+                config.num_heads * config.v_head_dim,
+            )?,
+            rope_inv_freq,
+        })
+    }
+}
+
+/// Maximum rows per MLA projection tile. Decode uses the first row.
+pub(super) const MLA_TILE_ROWS: usize = 128;
+const MLA_PROMPT_TILE_ROWS: usize = 2048;
+
+/// Scratch layout for a projection tile. All pointers are BF16 except
+/// projection activation/scales, whose sizes are described by the nested
+/// LingProjectionScratch. The caller owns and reuses this storage.
+#[derive(Clone, Copy)]
+pub struct LingMlaScratch {
+    pub projection: LingProjectionScratch,
+    pub q_full: DevicePtr,
+    pub kv_a: DevicePtr,
+    pub kv_norm: DevicePtr,
+    pub q_rope: DevicePtr,
+    pub k_rope: DevicePtr,
+    pub kv_b: DevicePtr,
+    pub k_token: DevicePtr,
+    pub v_compact: DevicePtr,
+    pub attn_padded: DevicePtr,
+    pub attn_compact: DevicePtr,
+    pub attn_gated: DevicePtr,
+    pub gate: DevicePtr,
+}
+
+impl LingMlaScratch {
+    /// Borrow the routed-expert output arena while attention is running.
+    /// FFN starts after all MLA tiles on the same stream have finished.
+    pub(super) fn prompt_tile(
+        self,
+        config: LingMlaConfig,
+        arena: DevicePtr,
+        bytes: usize,
+        tokens: usize,
+    ) -> (Self, usize) {
+        let padded = config.num_heads * config.qk_head_dim();
+        let compact = config.num_heads * config.v_head_dim;
+        let widths = [
+            config.q_proj_rows(),
+            config.kv_lora_rank + config.qk_rope_head_dim,
+            config.kv_lora_rank,
+            config.num_heads * config.qk_rope_head_dim,
+            config.qk_rope_head_dim,
+            config.kv_b_rows(),
+            padded,
+            compact,
+            padded,
+            compact,
+            compact,
+            config.num_heads,
+        ];
+        let row_bytes = 2 * widths.iter().sum::<usize>();
+        let rows = (bytes / row_bytes).min(MLA_PROMPT_TILE_ROWS).min(tokens) / MLA_TILE_ROWS
+            * MLA_TILE_ROWS;
+        if rows <= MLA_TILE_ROWS || arena.is_null() {
+            return (self, MLA_TILE_ROWS);
+        }
+        let mut offset = 0;
+        let [
+            q_full,
+            kv_a,
+            kv_norm,
+            q_rope,
+            k_rope,
+            kv_b,
+            k_token,
+            v_compact,
+            attn_padded,
+            attn_compact,
+            attn_gated,
+            gate,
+        ] = widths.map(|width| {
+            let ptr = arena.offset(offset);
+            offset += 2 * rows * width;
+            ptr
+        });
+        (
+            Self {
+                projection: self.projection,
+                q_full,
+                kv_a,
+                kv_norm,
+                q_rope,
+                k_rope,
+                kv_b,
+                k_token,
+                v_compact,
+                attn_padded,
+                attn_compact,
+                attn_gated,
+                gate,
+            },
+            rows,
+        )
+    }
+}
+
+/// Kernel family used by the native path. The MLA assembly kernels are shared
+/// with DeepSeek's absorbed implementation; only their generic K/V assembly
+/// ABI is used here.
+#[derive(Clone, Copy)]
+pub struct LingMlaKernels {
+    pub rms_norm: KernelHandle,
+    /// Ling's body-diagonal MRoPE; unlike Qwen3.6 it maps H/W/T by
+    /// contiguous frequency sections after the adjacent-pair reshape.
+    pub ling_mrope: KernelHandle,
+    pub q_rope_extract: KernelHandle,
+    pub q_rope_writeback: KernelHandle,
+    pub kv_assemble: KernelHandle,
+    pub reshape_cache: KernelHandle,
+    pub paged_attention: KernelHandle,
+    pub prefill_attention: KernelHandle,
+    pub sigmoid_gate: KernelHandle,
+}
+
+impl LingMlaKernels {
+    /// Resolve the BF16 one-token family used by the pinned Ling checkpoint.
+    pub fn load(gpu: &dyn GpuBackend) -> Result<Self> {
+        Ok(Self {
+            rms_norm: gpu.kernel("ling_norm", "ling_rms_norm")?,
+            ling_mrope: gpu.kernel("ling_mrope", "ling_mrope_rope_bf16")?,
+            q_rope_extract: gpu.kernel("mla_absorbed", "mla_q_rope_extract_batched")?,
+            q_rope_writeback: gpu.kernel("mla_absorbed", "mla_q_rope_writeback_batched")?,
+            kv_assemble: gpu.kernel("mla_absorbed", "mla_kv_assemble_batched")?,
+            reshape_cache: gpu.kernel("ling_mla_prefill", "ling_cache_write")?,
+            // Ling's absorbed K/V rows are 192-wide (qk_nope 128 + RoPE 64),
+            // so resolve the target-local HDIM=192 module rather than the
+            // borrowed generic HDIM=256 paged decoder.
+            paged_attention: gpu.kernel("paged_decode_ling", "paged_decode_attn_ling")?,
+            prefill_attention: gpu.kernel("ling_mla_prefill", "ling_mla_prefill_64")?,
+            sigmoid_gate: gpu.kernel("residual_add", "sigmoid_gate_mul_head_broadcast")?,
+        })
+    }
+}
+
+/// Upload the pinned text RoPE frequency table. The returned allocation must
+/// stay live for the lifetime of the layer weights.
+pub fn alloc_rope_inv_freq(gpu: &dyn GpuBackend, config: LingMlaConfig) -> Result<DevicePtr> {
+    config.validate()?;
+    let pairs = config.qk_rope_head_dim / 2;
+    let mut bytes = Vec::with_capacity(pairs * std::mem::size_of::<f32>());
+    for i in 0..pairs {
+        let exponent = (2 * i) as f64 / config.qk_rope_head_dim as f64;
+        let freq = (config.rope_theta as f64).powf(-exponent) as f32;
+        bytes.extend_from_slice(&freq.to_ne_bytes());
+    }
+    let table = gpu.alloc(bytes.len())?;
+    gpu.copy_h2d(&bytes, table)?;
+    Ok(table)
+}
+
+/// Apply the pinned Ling body-diagonal MRoPE to one compact MLA token.
+/// `positions`, `positions_h` and `positions_w` each point at one u32 metadata
+/// word; the kernel reinterprets H/W as signed i32 to preserve centered
+/// coordinates from the reference implementation.
+fn rope_ling_mrope(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k: DevicePtr,
+    positions: DevicePtr,
+    positions_h: DevicePtr,
+    positions_w: DevicePtr,
+    rows: u32,
+    q_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    inv_freq: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([q_heads + 1, rows, 1])
+        .block([128, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k)
+        .arg_ptr(positions)
+        .arg_ptr(positions_h)
+        .arg_ptr(positions_w)
+        .arg_u32(q_heads)
+        .arg_u32(head_dim)
+        .arg_u32(rotary_dim)
+        .arg_ptr(inv_freq)
+        .arg_u32(8)
+        .arg_u32(12)
+        .arg_u32(12)
+        .launch(stream)
+}
+
+impl LingMlaWeights {
+    /// Process a tile of causal queries from one sequence. Each query supplies
+    /// its own length against a shared block table. Prefix hits precede the
+    /// write floor and already occupy their physical cache slots.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_rows(
+        &self,
+        config: LingMlaConfig,
+        kernels: LingMlaKernels,
+        gpu: &dyn GpuBackend,
+        kv_cache: &PagedKvCache,
+        layer_idx: usize,
+        metadata: AttnMetadataDev,
+        input: DevicePtr,
+        output: Option<DevicePtr>,
+        scratch: LingMlaScratch,
+        rows: u32,
+        write_floor: u32,
+        prompt_offset: Option<u32>,
+        stream: u64,
+    ) -> Result<()> {
+        config.validate()?;
+        ensure!(
+            (metadata.num_seqs == 1 || metadata.num_seqs == rows)
+                && (1..=MLA_PROMPT_TILE_ROWS as u32).contains(&rows)
+                && write_floor <= rows,
+            "Ling MLA expects one sequence and a valid causal tile"
+        );
+        ensure!(
+            (output.is_none()
+                || (!metadata.block_table.is_null()
+                    && metadata.max_blocks_per_seq > 0
+                    && (prompt_offset.is_some() || !metadata.seq_len.is_null())))
+                && (write_floor == rows || !metadata.slot.is_null()),
+            "Ling MLA requires live paged KV metadata from the first prompt token"
+        );
+        ensure!(
+            kv_cache.dtype_for_layer(layer_idx) == KvCacheDtype::Bf16,
+            "Ling MLA native decode currently requires BF16 KV cache"
+        );
+        ensure!(
+            kv_cache.config().dims_for_layer(layer_idx)
+                == (
+                    config.num_heads,
+                    config.qk_nope_head_dim + config.qk_rope_head_dim / config.num_heads
+                ),
+            "Ling MLA cache geometry must be ({} heads, {}-wide K/V), got {:?}",
+            config.num_heads,
+            config.qk_nope_head_dim + config.qk_rope_head_dim / config.num_heads,
+            kv_cache.config().dims_for_layer(layer_idx)
+        );
+        ensure!(
+            !self.rope_inv_freq.is_null(),
+            "Ling MLA RoPE frequency table is missing"
+        );
+
+        let heads = config.num_heads as u32;
+        let nope = config.qk_nope_head_dim as u32;
+        let rope = config.qk_rope_head_dim as u32;
+        let qk = config.qk_head_dim() as u32;
+        let vdim = config.v_head_dim as u32;
+        let qdim = config.q_proj_rows() as u32;
+
+        if output.is_some() {
+            self.q_proj
+                .forward(gpu, input, scratch.q_full, rows, scratch.projection, stream)?;
+        }
+        self.kv_a_proj_with_mqa.forward(
+            gpu,
+            input,
+            scratch.kv_a,
+            rows,
+            scratch.projection,
+            stream,
+        )?;
+        let rank_bytes = config.kv_lora_rank * 2;
+        let rope_bytes = config.qk_rope_head_dim * 2;
+        let latent = if rows == 1 {
+            scratch.kv_a
+        } else {
+            // kv_a interleaves the latent and RoPE channels in each row.
+            gpu.copy_d2d_2d_async(
+                scratch.kv_a,
+                rank_bytes + rope_bytes,
+                scratch.q_rope,
+                rank_bytes,
+                rank_bytes,
+                rows as usize,
+                stream,
+            )?;
+            scratch.q_rope
+        };
+        ops::rms_norm(
+            gpu,
+            kernels.rms_norm,
+            latent,
+            &self.kv_a_layernorm,
+            scratch.kv_norm,
+            rows,
+            config.kv_lora_rank as u32,
+            config.rms_eps,
+            stream,
+        )?;
+
+        // Extract q RoPE channels, rotate q and the shared k RoPE row together,
+        // then write q's rotated channels back into q_full.
+        if output.is_some() {
+            ops::mla_q_rope_extract_batched(
+                gpu,
+                kernels.q_rope_extract,
+                scratch.q_full,
+                scratch.q_rope,
+                rows,
+                heads,
+                qk,
+                nope,
+                rope,
+                qdim,
+                stream,
+            )?;
+        }
+        gpu.copy_d2d_2d_async(
+            scratch.kv_a.offset(rank_bytes),
+            rank_bytes + rope_bytes,
+            scratch.k_rope,
+            rope_bytes,
+            rope_bytes,
+            rows as usize,
+            stream,
+        )?;
+        rope_ling_mrope(
+            gpu,
+            kernels.ling_mrope,
+            scratch.q_rope,
+            scratch.k_rope,
+            metadata.positions,
+            metadata.positions_h,
+            metadata.positions_w,
+            rows,
+            if output.is_some() { heads } else { 0 },
+            rope,
+            rope,
+            self.rope_inv_freq,
+            stream,
+        )?;
+        if output.is_some() {
+            ops::mla_q_rope_writeback_batched(
+                gpu,
+                kernels.q_rope_writeback,
+                scratch.q_rope,
+                scratch.q_full,
+                rows,
+                heads,
+                qk,
+                nope,
+                rope,
+                qdim,
+                stream,
+            )?;
+        }
+        self.kv_b_proj.forward(
+            gpu,
+            scratch.kv_norm,
+            scratch.kv_b,
+            rows,
+            scratch.projection,
+            stream,
+        )?;
+        ops::mla_kv_assemble_batched(
+            gpu,
+            kernels.kv_assemble,
+            scratch.kv_b,
+            scratch.k_rope,
+            scratch.k_token,
+            scratch.v_compact,
+            rows,
+            heads,
+            nope,
+            vdim,
+            rope,
+            qk,
+            (config.num_heads * (config.qk_nope_head_dim + config.v_head_dim)) as u32,
+            stream,
+        )?;
+
+        let k_row_bytes = config.qk_head_dim() * 2;
+        let v_row_bytes = config.v_head_dim * 2;
+        if write_floor < rows {
+            let skip = write_floor as usize * config.num_heads;
+            KernelLaunch::new(gpu, kernels.reshape_cache)
+                .grid([rows - write_floor, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(scratch.k_token.offset(skip * k_row_bytes))
+                .arg_ptr(scratch.v_compact.offset(skip * v_row_bytes))
+                .arg_ptr(kv_cache.k_pool_ptr(layer_idx))
+                .arg_ptr(kv_cache.v_pool_ptr(layer_idx))
+                .arg_ptr(metadata.slot.offset(write_floor as usize * 8))
+                .launch(stream)?;
+        }
+        let Some(output) = output else {
+            return Ok(());
+        };
+        if let Some(offset) = prompt_offset {
+            ops::prefill_attention_paged_64(
+                gpu,
+                kernels.prefill_attention,
+                scratch.q_full,
+                kv_cache.k_pool_ptr(layer_idx),
+                kv_cache.v_pool_ptr(layer_idx),
+                scratch.attn_padded,
+                metadata.block_table,
+                rows,
+                offset + rows,
+                offset,
+                heads,
+                heads,
+                qk,
+                kv_cache.block_size() as u32,
+                0,
+                1.0 / (qk as f32).sqrt(),
+                stream,
+            )?;
+        } else {
+            ops::paged_decode_attn_bf16(
+                gpu,
+                kernels.paged_attention,
+                scratch.q_full,
+                kv_cache.k_pool_ptr(layer_idx),
+                kv_cache.v_pool_ptr(layer_idx),
+                scratch.attn_padded,
+                metadata.block_table,
+                metadata.seq_len,
+                if metadata.num_seqs == 1 {
+                    0
+                } else {
+                    metadata.max_blocks_per_seq
+                },
+                rows,
+                heads,
+                heads,
+                qk,
+                kv_cache.block_size() as u32,
+                1.0 / (config.qk_head_dim() as f32).sqrt(),
+                qdim,
+                0,
+                stream,
+            )?;
+        }
+
+        // Narrow [heads, 192] attention output to the true [heads, 128] V
+        // width before applying the head-wise gate and dense projection.
+        gpu.copy_d2d_2d_async(
+            scratch.attn_padded,
+            k_row_bytes,
+            scratch.attn_compact,
+            v_row_bytes,
+            v_row_bytes,
+            rows as usize * config.num_heads,
+            stream,
+        )?;
+        self.g_proj
+            .forward(gpu, input, scratch.gate, rows, scratch.projection, stream)?;
+        ops::sigmoid_gate_mul_head_broadcast(
+            gpu,
+            kernels.sigmoid_gate,
+            scratch.attn_compact,
+            scratch.gate,
+            scratch.attn_gated,
+            heads,
+            vdim,
+            rows,
+            stream,
+        )?;
+        self.dense.forward(
+            gpu,
+            scratch.attn_gated,
+            output,
+            rows,
+            scratch.projection,
+            stream,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LingMlaConfig;
+
+    #[test]
+    fn pinned_geometry_is_direct_headwise_mla() {
+        let c = LingMlaConfig::default();
+        assert_eq!(c.qk_head_dim(), 192);
+        assert_eq!(c.q_proj_rows(), 32 * 192);
+        assert_eq!(c.kv_b_rows(), 32 * (128 + 128));
+        assert!(c.validate().is_ok());
+    }
+}

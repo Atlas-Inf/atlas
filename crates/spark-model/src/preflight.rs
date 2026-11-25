@@ -106,10 +106,11 @@ fn check_quant_method(config: &ModelConfig) -> Result<()> {
 }
 
 fn check_embedding_and_head(store: &WeightStore) -> Result<()> {
-    // Three canonical embedding-tensor naming schemes across the
+    // Canonical embedding-tensor naming schemes across the
     // families Atlas supports:
     //   `*.embed_tokens.weight`  — HF standard (Qwen, Gemma, MiniMax)
     //   `*.embeddings.weight`    — Nemotron-H backbone prefix
+    //   `*.word_embeddings.weight` — Ling BailingMoE
     //   `tok_embeddings.weight`  — Mistral consolidated checkpoints
     //   `*.embed.weight`         — Thinking Machines Inkling (`model.llm.embed`)
     // Scan discovery-based so future families that adopt yet-another
@@ -118,6 +119,7 @@ fn check_embedding_and_head(store: &WeightStore) -> Result<()> {
     const EMBED_SUFFIXES: &[&str] = &[
         ".embed_tokens.weight",
         ".embeddings.weight",
+        ".word_embeddings.weight",
         ".embed.weight",
     ];
     const EMBED_EXACTS: &[&str] = &[
@@ -233,7 +235,7 @@ fn check_expert_count(store: &WeightStore, config: &ModelConfig) -> Result<()> {
         return Ok(());
     }
     let mut max_expert: Option<usize> = None;
-    for name in store.names() {
+    for name in store.names().chain(store.deferred_names()) {
         // Patterns seen across supported MoE models:
         //   <prefix>.layers.{L}.block_sparse_moe.experts.{E}.w?.weight
         //   <prefix>.layers.{L}.mlp.experts.{E}.{up|down|gate}_proj.weight
@@ -310,6 +312,7 @@ fn check_mtp_consumability(config: &ModelConfig) -> Result<()> {
         "qwen3_vl_moe",
         "qwen3_coder_next",
         "glm5_next",
+        "bailing_moe_v3_vl",
     ];
     if MTP_SUPPORTED_MODEL_TYPES.contains(&config.model_type.as_str()) {
         return Ok(());

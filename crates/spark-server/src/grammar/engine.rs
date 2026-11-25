@@ -24,6 +24,8 @@ use super::extract_ordered_vocab;
 pub struct GrammarEngine {
     pub(super) compiler: GrammarCompiler,
     vocab_size: usize,
+    /// Separator between tool XML tags emitted by the checkpoint chat template.
+    pub(crate) poolside_tag_separator: &'static str,
     /// Set only while [`Self::compile_tool_or_json_grammar`] runs: the JSON
     /// branch every structural-tag tool grammar is unioned with.
     pub(super) json_alternative: Option<xgrammar::Grammar>,
@@ -161,6 +163,7 @@ impl GrammarEngine {
             compiler,
             vocab_size,
             json_alternative: None,
+            poolside_tag_separator: "",
         })
     }
 

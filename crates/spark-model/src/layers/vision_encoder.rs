@@ -121,6 +121,10 @@ pub struct VisionEncoder {
     pub deepstack: Vec<MergerLayer>,   // 3 deepstack mergers
     pub deepstack_indexes: Vec<usize>, // [8, 16, 24] (1-indexed, after Nth block)
     pub merger: MergerLayer,           // final merger (after block 27)
+    /// Ling's `disable_merger_proj` path returns the spatially merged ViT
+    /// stream directly.  The ordinary Qwen tower keeps this false and runs
+    /// the LayerNorm + MLP merger below.
+    pub(crate) raw_spatial_merge: bool,
     // kernel handles
     k_gemm: KernelHandle, // vision_gemm_bias: C[M,N] = A[M,K]@B[N,K]^T + bias
     k_gemm_pipelined: KernelHandle, // dense_gemm_bf16_pipelined (tensor-core, ~40×; no bias)
@@ -192,6 +196,7 @@ mod receive_only_tests {
 
     fn glm_vision() -> VisionConfig {
         VisionConfig {
+            is_bailing_vl: false,
             is_glm5_next: true,
             in_channels: 3,
             depth: 1,

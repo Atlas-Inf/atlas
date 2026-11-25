@@ -84,6 +84,7 @@ pub fn jpeg_with_orientation(w: u32, h: u32, orientation: u16) -> String {
 /// The Qwen3.8 tower's geometry (patch 16, merge 2), no pixel bound.
 pub fn qwen_config() -> VisionConfig {
     VisionConfig {
+        is_bailing_vl: false,
         is_glm5_next: false,
         in_channels: 3,
         depth: 27,
@@ -116,6 +117,7 @@ pub fn qwen_config() -> VisionConfig {
 /// The native GLM-5.3 tower's preprocessing geometry (patch 14, merge 2).
 pub fn glm_config() -> VisionConfig {
     VisionConfig {
+        is_bailing_vl: false,
         is_glm5_next: true,
         patch_size: 14,
         ..qwen_config()

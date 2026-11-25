@@ -36,7 +36,20 @@ impl FastSafetensorsLoader {
     /// `with_deferred_slice`.
     pub(super) fn should_defer_tensor(&self, name: &str) -> bool {
         let name = csf_part(name).map_or(name, |(scale, _)| scale);
-        (self.skip_activation_scales && name.ends_with(".input_scale"))
+        let paged_packed = self.ling_packed_page_start.is_some_and(|first| {
+            name.ends_with(".weight_packed")
+                && parse_expert_index(name).is_some()
+                && name
+                    .strip_prefix("model.layers.")
+                    .and_then(|v| v.split_once('.'))
+                    .and_then(|(v, _)| v.parse::<usize>().ok())
+                    .is_some_and(|layer| layer >= first)
+        });
+        paged_packed
+            || (self.defer_ling_experts
+                && name.starts_with("model.layers.")
+                && parse_expert_index(name).is_some())
+            || (self.skip_activation_scales && name.ends_with(".input_scale"))
             || self.is_host_decoded(name)
             || self.is_expert_tp_slice(name)
     }

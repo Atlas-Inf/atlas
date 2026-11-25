@@ -242,7 +242,7 @@ pub(crate) fn patch_coordinates(
 }
 
 pub(crate) fn normalize_channel(vcfg: &VisionConfig, channel: usize, raw: u8) -> f32 {
-    let (mean, std) = if vcfg.is_glm5_next {
+    let (mean, std) = if vcfg.is_glm5_next || vcfg.is_bailing_vl {
         (GLM_MEAN[channel], GLM_STD[channel])
     } else {
         (MEAN[channel], STD[channel])

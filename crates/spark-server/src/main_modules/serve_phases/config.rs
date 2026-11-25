@@ -94,15 +94,23 @@ pub(crate) fn cap_vocab_size_to_tokenizer(model_dir: &Path, config: &mut ModelCo
     if tok_path.exists()
         && let Ok(tok) = tokenizers::Tokenizer::from_file(&tok_path)
     {
-        let tok_vocab = tok.get_vocab_size(true);
-        if tok_vocab > 0 && tok_vocab < config.vocab_size {
-            tracing::info!(
-                "Capping vocab_size from {} to {} (tokenizer)",
-                config.vocab_size,
-                tok_vocab,
-            );
-            config.vocab_size = tok_vocab;
-        }
+        cap_vocab_size(config, tok.get_vocab_size(true));
+    }
+}
+
+pub(super) fn cap_vocab_size(config: &mut ModelConfig, tokenizer_vocab: usize) {
+    // Ling's reference scores all 157184 checkpoint rows, including five
+    // padding IDs beyond the last entry in tokenizer.json.
+    if config.model_type != "bailing_moe_v3_vl"
+        && tokenizer_vocab > 0
+        && tokenizer_vocab < config.vocab_size
+    {
+        tracing::info!(
+            "Capping vocab_size from {} to {} (tokenizer)",
+            config.vocab_size,
+            tokenizer_vocab
+        );
+        config.vocab_size = tokenizer_vocab;
     }
 }
 

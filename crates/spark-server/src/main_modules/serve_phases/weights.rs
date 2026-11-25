@@ -115,6 +115,15 @@ pub(crate) fn load_weight_store(
         && config.tp_world_size <= 1
         && config.ep_world_size <= 1;
 
+    let ling = config.model_type == "bailing_moe_v3_vl"
+        && config
+            .quantization_config
+            .as_ref()
+            .is_none_or(|quant| quant.quant_method == "fp8");
+    anyhow::ensure!(
+        !ling || use_fast_load(args),
+        "Ling routed experts require the fast loader for demand paging"
+    );
     let store = if use_fast_load(args) {
         #[cfg(unix)]
         {
@@ -141,6 +150,16 @@ pub(crate) fn load_weight_store(
                         "GLM-5 MTP: appended-layer experts are rank-0-only and fully replicated"
                     );
                 }
+            }
+            loader.defer_ling_experts = ling;
+            if config.model_type == "bailing_moe_v3_vl"
+                && config
+                    .quantization_config
+                    .as_ref()
+                    .is_some_and(|q| q.quant_method == "compressed-tensors")
+                && std::env::var("ATLAS_LING_LONG_KV").as_deref() == Ok("1")
+            {
+                loader.ling_packed_page_start = Some(24);
             }
             loader.peak_memory_multiplier = mult;
             loader.expert_tp = config.expert_tp;

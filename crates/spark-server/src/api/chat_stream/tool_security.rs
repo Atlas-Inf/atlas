@@ -9,6 +9,11 @@ pub(super) fn reject(state: &mut StreamState, reason: BlockReason) {
         return;
     }
     tracing::warn!(reason = reason.code(), "tool-call guard blocked a response");
+    // An open call the stream did not hold has already reached the client.
+    state.guard_cut_streamed_call |= state
+        .streaming_tool_args
+        .keys()
+        .any(|idx| !state.buffered_tool_chunks.contains_key(idx));
     state.buffered_tool_chunks.clear();
     state.streaming_tool_args.clear();
     state.pending_token_ids.clear();

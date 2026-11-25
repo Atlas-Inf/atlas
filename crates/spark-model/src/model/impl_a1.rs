@@ -86,7 +86,9 @@ impl TransformerModel {
         // `rms_norm_kernel` normalizes exactly one weight: `final_norm` (a
         // checkpoint tensor). Models that ship HF-vanilla norm weights load it
         // exactly and must use the vanilla kernel.
-        let rms_norm_kernel = if crate::ships_vanilla_norm_weights(&config) {
+        let rms_norm_kernel = if config.model_type == "bailing_moe_v3_vl" {
+            gpu.kernel("ling_norm", "ling_rms_norm")?
+        } else if crate::ships_vanilla_norm_weights(&config) {
             gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?
         } else {
             gpu.kernel("norm", "rms_norm")?
@@ -102,7 +104,11 @@ impl TransformerModel {
         // the SSM/attention sites — it picks the 3-deep pipeline variant when
         // present. lm_head launches 1938 CTAs and already sits at ~83% of
         // achievable, so the expected gain here is small; measured, not assumed.
-        let w4a16_gemm_t_kernel = crate::layers::tgemm_kernel(gpu.as_ref());
+        let w4a16_gemm_t_kernel = if lm_head_nvfp4.is_some() || mtp_lm_head_nvfp4.is_some() {
+            crate::layers::tgemm_kernel(gpu.as_ref())
+        } else {
+            KernelHandle(0)
+        };
         // Lossless BF16-MMA sibling for lm_head, OPT-IN via ATLAS_LMHEAD_LOSSLESS=1.
         // Measured cost 1.81% at C=16 (129.68 -> 127.33). Default is the faster
         // FP8-activation path because the accuracy question it addresses CANNOT

@@ -14,6 +14,7 @@
 //!   - `nemotron`: Nemotron-H (Mamba-2 + MoE + Attention)
 //!   - `gemma4`: Gemma-4 (pure attention, GeGLU, sliding + full attention)
 
+mod bailing_moe_v3;
 pub(crate) mod deepseek_v4;
 pub mod dflash_loader;
 pub mod dflash_preshrink;
@@ -34,6 +35,7 @@ pub(crate) mod qwen4_exp;
 mod ricursive;
 mod step3p7;
 
+pub use bailing_moe_v3::BailingMoeV3WeightLoader;
 pub use deepseek_v4::DeepSeekV4WeightLoader;
 pub use dflash_loader::{
     DflashConfig, DflashLayerWeights, DflashSubConfig, DflashWeights, load_dflash_weights,

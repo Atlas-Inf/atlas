@@ -334,7 +334,7 @@ impl TransformerModel {
             pack.put_prefix_at("positions", 0, &stg.positions, proc_count)?;
             pack.put_prefix_at("slots", slot_offset, &stg.slots, proc_count)?;
 
-            let devs = if marconi_skip {
+            let devs = if marconi_skip || self.config.model_type == "bailing_moe_v3_vl" {
                 let bt_start = (pack.high_water() + 3) & !3;
                 pack.put_at("block_table", bt_start, &seq.block_table)?;
                 let sl_start = (pack.high_water() + 3) & !3;

@@ -5,8 +5,10 @@
 #[derive(clap::Args, Debug, Clone, PartialEq)]
 pub struct ToolGuardArgs {
     /// Screen complete tool calls before release (off by default here;
-    /// SparkQwen ships it on — enable with `--tool-guard on`).
-    #[arg(long, default_value = "off", value_parser = ["on", "off"])]
+    /// SparkQwen ships it on — enable with `--tool-guard on`). `stream` screens
+    /// the same calls but sends their arguments as they are written: a call
+    /// blocked at its end then finishes `content_filter`, not `tool_calls`.
+    #[arg(long, default_value = "off", value_parser = ["on", "off", "stream"])]
     pub tool_guard: String,
     /// Exact host exception for callback/credential-transfer checks; repeatable.
     /// Does not override metadata protection or an explicit denied host.
@@ -21,12 +23,14 @@ pub struct ToolGuardArgs {
 }
 impl ToolGuardArgs {
     pub fn policy(&self) -> Result<atlas_tool_guard::Policy, String> {
-        atlas_tool_guard::Policy::new(
-            self.tool_guard == "on",
+        let mut policy = atlas_tool_guard::Policy::new(
+            self.tool_guard != "off",
             &self.tool_guard_allow_host,
             &self.tool_guard_deny_host,
             self.tool_guard_max_bytes,
-        )
+        )?;
+        policy.stream = self.tool_guard == "stream";
+        Ok(policy)
     }
 }
 
@@ -36,17 +40,19 @@ mod tests {
     use clap::Parser;
     #[test]
     fn tool_guard_default_and_operator_configuration() {
-        for (extra, enabled) in [
-            (vec![], false),
-            (vec!["--tool-guard", "off"], false),
-            (vec!["--tool-guard", "on"], true),
+        for (extra, enabled, stream) in [
+            (vec![], false, false),
+            (vec!["--tool-guard", "off"], false, false),
+            (vec!["--tool-guard", "on"], true, false),
+            (vec!["--tool-guard", "stream"], true, true),
         ] {
             let mut args = vec!["spark", "serve", "fixture"];
             args.extend(extra);
             let Command::Serve(s) = Cli::try_parse_from(args).unwrap().command else {
                 panic!()
             };
-            assert_eq!(s.tool_guard.policy().unwrap().enabled, enabled);
+            let policy = s.tool_guard.policy().unwrap();
+            assert_eq!((policy.enabled, policy.stream), (enabled, stream));
         }
         assert!(
             Cli::try_parse_from(["spark", "serve", "fixture", "--tool-guard", "typo"]).is_err()

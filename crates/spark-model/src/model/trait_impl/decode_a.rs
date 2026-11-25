@@ -28,6 +28,32 @@ use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
 impl TransformerModel {
+    /// Generated text uses the same rotary position on all three axes.
+    pub(in crate::model) fn decode_position(&self, seq: &SequenceState) -> u32 {
+        if self.config.model_type != "bailing_moe_v3_vl" || seq.vision.grids.is_empty() {
+            return seq.seq_len as u32;
+        }
+        let prompt_len = seq.prompt_len.min(seq.tokens.len());
+        let prompt = &seq.tokens[..prompt_len];
+        let grids = &seq.vision.grids;
+        let owned = seq.vision.owned_images;
+        let base = if owned > 0 && seq.vision.grid_base < grids.len() {
+            seq.vision.grid_base
+        } else {
+            0
+        };
+        let hi = if owned > 0 {
+            base.saturating_add(owned).min(grids.len())
+        } else {
+            grids.len()
+        };
+        let (image_pad, video_pad) = self.vision_pad_ids();
+        let delta = crate::model::trait_impl::prefill_b::upload_meta::mrope_pos::ling_rope_delta(
+            prompt, grids, base, hi, image_pad, video_pad,
+        );
+        (seq.seq_len as i32 + delta).max(0) as u32
+    }
+
     /// Whether the online FP8-KV calibration has frozen its scale, model-wide.
     ///
     /// Every calibrating attention layer freezes on ITS first observe within
@@ -101,7 +127,11 @@ impl TransformerModel {
         // full-arena zero (~1.7GB memset/step, sized for max prefill tokens) is
         // unnecessary — skip it for V4 to reclaim that decode-step memset
         // bandwidth. (Other MLA models keep the zero.)
-        if self.config.kv_lora_rank > 0 && self.config.o_lora_rank == 0 {
+        // Ling expands K/V directly and overwrites each of its layer-owned scratch buffers.
+        if self.config.kv_lora_rank > 0
+            && self.config.o_lora_rank == 0
+            && self.config.model_type != "bailing_moe_v3_vl"
+        {
             self.buffers.zero_all(self.gpu.as_ref(), stream)?;
         }
 
@@ -118,7 +148,7 @@ impl TransformerModel {
         let meta_base = self.buffers.scratch().offset(32768);
         let max_blocks = seq.block_table.len() as u32;
 
-        let pos_val = seq.seq_len as u32;
+        let pos_val = self.decode_position(seq);
         self.gpu
             .copy_h2d_async(&pos_val.to_le_bytes(), meta_base, stream)?;
 
@@ -126,12 +156,14 @@ impl TransformerModel {
             .physical_block_for(seq.seq_len / bs)
             .unwrap_or(self.dummy_kv_block);
         let global_slot = (block_idx as i64) * (bs as i64) + ((seq.seq_len % bs) as i64);
+        let slot_ptr = meta_base.offset(8);
         self.gpu
-            .copy_h2d_async(&global_slot.to_le_bytes(), meta_base.offset(8), stream)?;
+            .copy_h2d_async(&global_slot.to_le_bytes(), slot_ptr, stream)?;
 
         let actual_seq_len = (seq.seq_len + 1) as i32;
+        let seq_len_ptr = meta_base.offset(16);
         self.gpu
-            .copy_h2d_async(&actual_seq_len.to_le_bytes(), meta_base.offset(16), stream)?;
+            .copy_h2d_async(&actual_seq_len.to_le_bytes(), seq_len_ptr, stream)?;
 
         let bt_i32: Vec<i32> = seq.block_table.iter().map(|&b| b as i32).collect();
         // SAFETY: length derived from `bt_i32` itself — `len() * size_of::<i32>()` over the `collect`ed Vec above.
@@ -174,8 +206,8 @@ impl TransformerModel {
             positions: meta_base,
             positions_h: meta_base,
             positions_w: meta_base,
-            slot: meta_base.offset(8),
-            seq_len: meta_base.offset(16),
+            slot: slot_ptr,
+            seq_len: seq_len_ptr,
             block_table: meta_base.offset(256),
             max_blocks_per_seq: max_blocks,
             num_seqs: 1,

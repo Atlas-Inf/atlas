@@ -60,6 +60,18 @@ pub(super) struct StreamCtx {
     pub(super) max_tool_calls_per_response: usize,
     pub(super) min_tokens: usize,
     pub(super) req_return_token_ids: bool,
+    /// The request asked for streamed tool calls (`stream_tool_arguments`).
+    pub(super) req_stream_tool_arguments: bool,
     pub(super) req_ctx: Option<crate::rate_limiter::RequestContext>,
     pub(super) dump_seq: Option<u64>,
+}
+
+impl StreamCtx {
+    /// `--tool-guard stream` and the request asked for it: tool calls go out
+    /// as they are written. A request that did not ask is held as under `on`,
+    /// so a client that does not read `content_filter` never gets a call the
+    /// guard blocks.
+    pub(super) fn streams_tool_calls(&self) -> bool {
+        self.state.tool_guard.stream && self.req_stream_tool_arguments
+    }
 }

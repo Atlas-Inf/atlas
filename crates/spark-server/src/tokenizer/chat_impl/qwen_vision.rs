@@ -22,6 +22,14 @@ impl ChatTokenizer {
         let vision_end = self.qwen_single_token("<|vision_end|>")?;
         let image_pad = self.qwen_single_token("<|image_pad|>")?;
         let video_pad = self.qwen_single_token("<|video_pad|>")?;
+        // Ling 3.2 wraps a clip in its own video markers; Qwen has none.
+        let video_wrap = match (
+            self.qwen_single_token("<|video_start|>"),
+            self.qwen_single_token("<|video_end|>"),
+        ) {
+            (Ok(start), Ok(end)) => Some((start, end)),
+            _ => None,
+        };
         expand_qwen_tokens(
             &tokens,
             placeholders,
@@ -30,6 +38,7 @@ impl ChatTokenizer {
                 vision_end,
                 image_pad,
                 video_pad,
+                video_wrap,
             },
             |text| self.encode(text),
         )
@@ -50,6 +59,8 @@ struct QwenTokenIds {
     vision_end: u32,
     image_pad: u32,
     video_pad: u32,
+    /// `<|video_start|>`/`<|video_end|>` when the vocabulary has them.
+    video_wrap: Option<(u32, u32)>,
 }
 
 fn find_subslice(haystack: &[u32], needle: &[u32], from: usize) -> Option<usize> {
@@ -77,7 +88,22 @@ where
             QwenVisionKind::Image => ids.image_pad,
             QwenVisionKind::Video => ids.video_pad,
         };
-        let target = [ids.vision_start, target_pad, ids.vision_end];
+        // Ling's template renders a clip as `video_start video_pad
+        // video_end`, and its processor keeps that pair around the
+        // timestamped groups. Qwen's renders `vision_start video_pad
+        // vision_end` and drops it.
+        let wrap = match (placeholder.kind, ids.video_wrap) {
+            (QwenVisionKind::Video, Some((start, end)))
+                if find_subslice(tokens, &[start, ids.video_pad, end], search_from).is_some() =>
+            {
+                Some((start, end))
+            }
+            _ => None,
+        };
+        let target = match wrap {
+            Some((start, end)) => [start, target_pad, end],
+            None => [ids.vision_start, target_pad, ids.vision_end],
+        };
         let replacement = match placeholder.kind {
             QwenVisionKind::Image => {
                 let mut replacement = Vec::with_capacity(placeholder.pad_count + 2);
@@ -106,6 +132,7 @@ where
                     );
                 }
                 let mut replacement = Vec::with_capacity(2 + frame_count * (per_frame + 4));
+                replacement.extend(wrap.map(|(start, _)| start));
                 for timestamp in &placeholder.timestamps {
                     // This is the exact Qwen3-VL/Qwen3.8 processor spelling.
                     replacement.extend(encode_timestamp(&format!("<{timestamp:.1} seconds>"))?);
@@ -113,6 +140,7 @@ where
                     replacement.extend(std::iter::repeat_n(ids.video_pad, per_frame));
                     replacement.push(ids.vision_end);
                 }
+                replacement.extend(wrap.map(|(_, end)| end));
                 replacement
             }
         };
@@ -139,6 +167,7 @@ mod qwen_vision_tests {
         vision_end: 11,
         image_pad: 14,
         video_pad: 15,
+        video_wrap: Some((16, 17)),
     };
 
     fn expand(tokens: &[u32], placeholders: &[QwenVisionPlaceholder]) -> Vec<u32> {
@@ -187,6 +216,23 @@ mod qwen_vision_tests {
         assert_eq!(
             expand(&input, &[p]),
             vec![5, 90, 91, 10, 15, 15, 11, 92, 93, 10, 15, 15, 11, 6]
+        );
+    }
+
+    #[test]
+    fn ling_video_keeps_its_wrapper_around_the_timestamped_groups() {
+        // BailingMM2Processor: video_start, then per group the timestamp,
+        // vision_start, pads and vision_end, then video_end.
+        let input = [5, 16, 15, 17, 6];
+        let p = QwenVisionPlaceholder {
+            kind: QwenVisionKind::Video,
+            pad_count: 4,
+            per_frame_pad_count: 2,
+            timestamps: vec![0.0, 1.5],
+        };
+        assert_eq!(
+            expand(&input, &[p]),
+            vec![5, 16, 90, 91, 10, 15, 15, 11, 92, 93, 10, 15, 15, 11, 17, 6]
         );
     }
 

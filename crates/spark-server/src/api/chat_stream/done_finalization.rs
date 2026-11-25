@@ -53,7 +53,12 @@ pub(super) fn finalize_done<'a>(
 
     if state.guard_stop == Some(atlas_tool_guard::GUARD_STOP) {
         deltas.push(StreamDelta::Content {
-            text: atlas_tool_guard::REFUSAL.into(),
+            text: if state.guard_cut_streamed_call {
+                atlas_tool_guard::STREAMED_REFUSAL
+            } else {
+                atlas_tool_guard::REFUSAL
+            }
+            .into(),
             token_ids: Vec::new(),
         });
     }

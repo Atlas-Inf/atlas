@@ -41,7 +41,7 @@ extern "C" __global__ void __launch_bounds__(1024) inkling2_moe_tiles(const int*
 // The grouped W4A4 / W8A8 tile of one (column tile, row tile, expert): rows quantized
 // by this file's quantizers, experts as stored; C = BF16(acc * outer[row] * s2[e]),
 // or BF16(acc) for MXFP8 (no outer or global scales).
-template <bool MX8>
+template <bool MX8, bool PointerTable = false>
 __device__ __forceinline__ void ink_moe_lowp(
     const unsigned char* __restrict__ A, const unsigned char* __restrict__ As, const float* __restrict__ outer,
     const unsigned char* __restrict__ codes, const unsigned char* __restrict__ scales,
@@ -58,8 +58,8 @@ __device__ __forceinline__ void ink_moe_lowp(
     const unsigned int rows_left = (unsigned int)m_count - m0, n0 = blockIdx.x * 128;
     w4_rows(sm, rows, (unsigned int)m_start + m0, rows_left);
     const unsigned long long ne = (unsigned long long)e * N;
-    const unsigned char* B = codes + ne * (MX8 ? K : K / 2);
-    const unsigned char* S = scales + ne * (MX8 ? K / 32 : K / 16);
+    const unsigned char* B = PointerTable ? reinterpret_cast<const unsigned char* const*>(codes)[e] : codes + ne * (MX8 ? K : K / 2);
+    const unsigned char* S = PointerTable ? reinterpret_cast<const unsigned char* const*>(scales)[e] : scales + ne * (MX8 ? K / 32 : K / 16);
     float acc[16][4];
     w4_tile<MX8>(sm, acc, A, As, K, rows_left, B, S, n0, B, S, n0 + 64);
     const float g = MX8 ? 1.0f : s2[e];

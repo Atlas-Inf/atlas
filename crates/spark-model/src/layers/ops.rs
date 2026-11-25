@@ -163,6 +163,8 @@ mod kda;
 mod kda_commit_tests;
 #[path = "ops/kda_indexed.rs"]
 mod kda_indexed;
+#[path = "ops/ling.rs"]
+mod ling;
 // Raw-GEMM plumbing for the lowrank path, split for the 500-LoC cap.
 #[path = "ops/hyper_connection_lowrank_gemm.rs"]
 mod hyper_connection_lowrank_gemm;
@@ -394,6 +396,10 @@ pub use kv_cache::*;
 pub use kv_cache_fp8k::*;
 pub use kv_cache_glm::*;
 pub use kv_cache_turbok::*;
+pub(crate) use ling::{
+    dense_gemv_bf16_fp32out, ling_fp8_gate_up_shared, ling_grouped_top8, ling_grouped_top8_rows,
+    ling_silu_down_shared_fp8, ling_silu_mul_bf16, ling_silu_mul_quant_fp8, ling_weighted_sum,
+};
 pub use marlin_nvfp4::*;
 pub use marlin_nvfp4_pack::marlin_pack_nvfp4;
 pub use model_levers::{

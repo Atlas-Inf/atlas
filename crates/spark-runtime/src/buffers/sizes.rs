@@ -425,6 +425,12 @@ impl BufferSizes {
         // Mamba-2 out_proj contracts over d_inner (may exceed hidden), and its
         // prefill input is FP8-precast into this buffer.
         let max_proj_k = h.max(q_heads * hd).max(mamba2_d_inner);
+        // Ling's two dense FFNs also quantize their full intermediate rows.
+        let max_proj_k = if config.model_type == "bailing_moe_v3_vl" {
+            max_proj_k.max(config.intermediate_size)
+        } else {
+            max_proj_k
+        };
         let fp8_act = m * max_proj_k;
         // The same buffer also holds an MXFP8 activation's cuBLASLt scale
         // image (one byte per 32 values, in 128-row x 4-column tiles), which

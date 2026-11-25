@@ -88,10 +88,13 @@ extern "C" __global__ void moe_expert_gemv(
         return;
     }
 
-    // Input pointer: shared (stride=0) or per-expert (stride=K)
-    const __nv_bfloat16* input = A
-        + (unsigned long long)tok * K
-        + (input_stride > 0 ? (unsigned long long)expert_slot * input_stride : 0);
+    // Input pointer: shared token row for gate/up, or the route-major
+    // [token, slot, K] row for down.  The latter needs the token's full
+    // top-k stride; omitting it silently aliases adjacent tokens when this
+    // kernel is launched with grid.z > 1.
+    const __nv_bfloat16* input = input_stride > 0
+        ? A + ((unsigned long long)tok * top_k + expert_slot) * input_stride
+        : A + (unsigned long long)tok * K;
 
     // Standard GEMV logic (vectorized, same structure as w4a16_gemv)
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64

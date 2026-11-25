@@ -60,6 +60,7 @@ fn inspect(layer: &mut dyn TransformerLayer) -> Result<(TargetInfo, &mut FfnComp
     };
     let moe = match ffn {
         FfnComponent::Moe(_) => true,
+        FfnComponent::LingMoe(_) => anyhow::bail!("deferred shared FP8 is not used by native Ling"),
         FfnComponent::Dense(_) => false,
         FfnComponent::None => anyhow::bail!("deferred shared FP8 missing FFN at {ordinal}"),
     };

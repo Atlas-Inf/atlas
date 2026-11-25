@@ -19,6 +19,7 @@ impl FfnComponent {
     ) -> Result<DevicePtr> {
         match self {
             Self::Moe(m) => m.forward_k4(input, ctx, stream),
+            Self::LingMoe(_) => anyhow::bail!("Ling native FFN does not support K=4 verify yet"),
             Self::Dense(d) if d.can_forward_km(4) => {
                 d.forward_km(input, 4, ctx, stream)?;
                 Ok(ctx.buffers.moe_output())
@@ -41,6 +42,7 @@ impl FfnComponent {
     ) -> Result<DevicePtr> {
         match self {
             Self::Moe(m) => m.forward_k5(input, ctx, stream),
+            Self::LingMoe(_) => anyhow::bail!("Ling native FFN does not support K=5 verify yet"),
             Self::Dense(d) if d.can_forward_km(5) => {
                 d.forward_km(input, 5, ctx, stream)?;
                 Ok(ctx.buffers.moe_output())
@@ -151,6 +153,9 @@ impl FfnComponent {
             Self::Dense(d) => {
                 d.forward_prefill(sp.local(normed, h), sp.rows, ctx, stream)?;
                 Ok(ctx.buffers.moe_output())
+            }
+            Self::LingMoe(_) => {
+                anyhow::bail!("Ling native FFN does not support sequence-parallel prefill yet")
             }
             Self::None => anyhow::bail!("SP prefill FFN on a layer without an FFN"),
         }

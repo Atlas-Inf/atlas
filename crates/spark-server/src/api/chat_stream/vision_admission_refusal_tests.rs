@@ -14,6 +14,7 @@ fn an_over_cap_image_is_refused_through_prepare_chat_prompt_with_vision_too_larg
     {
         let s = Arc::get_mut(&mut state).unwrap();
         s.vision_config = Some(atlas_core::config::VisionConfig {
+            is_bailing_vl: false,
             is_glm5_next: false,
             is_qwen3vl_video: false,
             in_channels: 3,
@@ -92,6 +93,7 @@ fn a_video_request_with_a_spent_in_flight_budget_is_refused_busy_before_decode()
     {
         let s = Arc::get_mut(&mut state).unwrap();
         s.vision_config = Some(atlas_core::config::VisionConfig {
+            is_bailing_vl: false,
             is_glm5_next: false,
             is_qwen3vl_video: false,
             in_channels: 3,

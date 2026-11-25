@@ -367,6 +367,26 @@ pub fn build_model(
     // verification then dropped.
     // Only rank 0 runs the MTP draft (no-EP, all experts local). Skip loading it
     // on the worker ranks — they never call propose(), so it would be dead weight.
+    let mut ling_mtp = if config.model_type == "bailing_moe_v3_vl"
+        && use_speculative
+        && !self_speculative
+        && dflash_args.is_none()
+    {
+        anyhow::ensure!(
+            num_drafts == 1,
+            "Ling native MTP currently verifies one draft per step"
+        );
+        Some(crate::layers::ling_mtp::LingMtp::load(
+            &store,
+            &config,
+            gpu.as_ref(),
+            embed,
+            lm_head,
+            max_seq_len,
+        )?)
+    } else {
+        None
+    };
     let v4_mtp_module =
         if config.model_type == "deepseek_v4" && use_speculative && config.ep_rank == 0 {
             match crate::weight_loader::deepseek_v4::load_v4_mtp_module(
@@ -443,6 +463,7 @@ pub fn build_model(
         && config.ep_rank == 0
         && dflash_args.is_none()
         && mtp_weights.is_empty()
+        && ling_mtp.is_none()
         && v4_mtp_module.is_none()
         && !q4e_mtp_loaded
         && !native_glm_mtp
@@ -505,14 +526,24 @@ pub fn build_model(
     // ── Step 3: LM-head quantization (NVFP4 / FP8 / BF16-skip) + the
     // draft-only NVFP4 head for MTP — extracted to lm_head_setup.rs
     // (file-size cap; pure code move).
+    let ling_draft_fp4 =
+        ling_mtp.is_some() && std::env::var("ATLAS_LING_MTP_QUANT_HEAD").as_deref() == Ok("1");
     let (lm_head_nvfp4, lm_head_fp8, mtp_lm_head_nvfp4) = super::lm_head_setup::setup_lm_heads(
         &store,
         &lm_head,
         &config,
         gpu.as_ref(),
         use_speculative,
-        !mtp_weights.is_empty(),
+        !mtp_weights.is_empty() || ling_draft_fp4,
     )?;
+    if ling_draft_fp4 && let Some(head) = &mut ling_mtp {
+        head.set_draft_head(
+            mtp_lm_head_nvfp4
+                .or(lm_head_nvfp4)
+                .context("missing Ling draft-only NVFP4 vocabulary head")?,
+            gpu.as_ref(),
+        )?;
+    }
 
     // Reserve native MTP weights/workspace before measuring free memory. Its
     // private KV is allocated later from the joint target/native pool budget.
@@ -644,6 +675,13 @@ pub fn build_model(
     let glm_cache_shape = glm::cache_shape(&config, kv_dtype, &layer_dtypes)?;
     let (kv_num_heads, kv_head_dim) = if let Some(shape) = glm_cache_shape {
         (shape.num_kv_heads(), shape.head_dim())
+    } else if config.model_type == "bailing_moe_v3_vl" {
+        // Ling's initial paged-attention implementation stores expanded keys and
+        // zero-pads the narrower values to the same cache stride.
+        (
+            config.num_attention_heads,
+            config.qk_nope_head_dim + config.qk_rope_head_dim,
+        )
     } else if config.kv_lora_rank > 0 {
         let mla_cache_dim = config.kv_lora_rank + config.qk_rope_head_dim;
         tracing::info!(
@@ -1313,7 +1351,7 @@ pub fn build_model(
     // illegal address in run_mtp_propose_multi; the fp8 and bf16 heads never
     // reach this free, and NUM_DRAFTS=0 never reads the head).
     let drafter_holds_bf16_head =
-        q4e_mtp_loaded || v4_mtp_module.is_some() || glm5_mtp_head.is_some();
+        q4e_mtp_loaded || v4_mtp_module.is_some() || glm5_mtp_head.is_some() || ling_mtp.is_some();
     let lm_head = if !drafter_holds_bf16_head
         && super::lm_head_setup::bf16_lm_head_is_dead(
             lm_head.weight,
@@ -1365,6 +1403,10 @@ pub fn build_model(
         model.set_prefill_pipe(arena)?;
     }
 
+    if let Some(head) = ling_mtp {
+        model.set_dflash_proposer(std::sync::Arc::new(head));
+        tracing::info!("Ling native MTP enabled (one checkpoint MLA + MoE predictor)");
+    }
     if let Some(head) = glm5_mtp_head {
         model.set_dflash_proposer(std::sync::Arc::new(head));
         tracing::info!("GLM-5 native MTP speculative decoding: ENABLED (single full-rank module)");

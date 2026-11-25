@@ -149,6 +149,7 @@ impl From<ChatCompletionRequest> for ir::ChatRequest {
             seed: req.seed,
             timeout_secs: req.timeout,
             return_token_ids: req.return_token_ids,
+            stream_tool_arguments: req.stream_tool_arguments,
             client_session: crate::session_key::from_openai_body(
                 req.prompt_cache_key.as_deref(),
                 req.metadata.as_ref(),

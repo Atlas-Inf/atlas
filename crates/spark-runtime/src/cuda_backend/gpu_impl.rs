@@ -514,6 +514,26 @@ impl GpuBackend for AtlasCudaBackend {
         Ok(DevicePtr(dptr))
     }
 
+    fn pageable_memory_access_uses_host_page_tables(&self) -> Result<bool> {
+        // CUDA's CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES
+        // is stable at 100.  Keep the query here, next to the pointer alias,
+        // so every caller gets the backend's actual device capability rather
+        // than assuming that a UMA board implies pageable kernel reads.
+        let mut device = 0;
+        let status = unsafe { super::cuCtxGetDevice(&mut device) };
+        if status != 0 {
+            bail!("cuCtxGetDevice failed while checking pageable access: status {status}");
+        }
+        let mut supported = 0;
+        let status = unsafe { super::cuDeviceGetAttribute(&mut supported, 100, device) };
+        if status != 0 {
+            bail!(
+                "cuDeviceGetAttribute(PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES) failed: status {status}"
+            );
+        }
+        Ok(supported != 0)
+    }
+
     fn alloc_host_pinned(&self, bytes: usize) -> Result<*mut u8> {
         self.alloc_host_pinned_cu(bytes)
     }

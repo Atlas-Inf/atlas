@@ -59,6 +59,44 @@ pub fn moe_weighted_sum_blend(
         .launch(stream)
 }
 
+/// Batched weighted sum + optional shared-expert blend.  Ling uses the same
+/// device-side row layout as the common MoE kernel, but has no shared gate:
+/// pass null `input` and `gate_weight` to include `shared_out` at weight 1.
+/// `shared_stride` is in BF16 elements (normally `hidden`).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_weighted_sum_blend_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    output: DevicePtr,
+    expert_out: DevicePtr,
+    expert_weights: DevicePtr,
+    shared_out: DevicePtr,
+    input: DevicePtr,
+    gate_weight: DevicePtr,
+    hidden: u32,
+    top_k: u32,
+    k: u32,
+    rows: u32,
+    shared_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(rows > 0, "batched weighted sum requires at least one row");
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(hidden, 256), rows, 1])
+        .block([256, 1, 1])
+        .arg_ptr(output)
+        .arg_ptr(expert_out)
+        .arg_ptr(expert_weights)
+        .arg_ptr(shared_out)
+        .arg_ptr(input)
+        .arg_ptr(gate_weight)
+        .arg_u32(hidden)
+        .arg_u32(top_k)
+        .arg_u32(k)
+        .arg_u32(shared_stride)
+        .launch(stream)
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // K=2 batch MoE variants — process 2 tokens in single kernel launches
 // ═══════════════════════════════════════════════════════════════════

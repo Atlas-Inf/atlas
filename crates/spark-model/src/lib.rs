@@ -75,7 +75,12 @@ pub fn ships_vanilla_norm_weights(config: &atlas_core::config::ModelConfig) -> b
 pub fn model_type_ships_vanilla_norm_weights(model_type: &str) -> bool {
     matches!(
         model_type,
-        "deepseek_v4" | "glm5_next" | "inkling2_loop" | "laguna" | "ricursive"
+        "deepseek_v4"
+            | "glm5_next"
+            | "inkling2_loop"
+            | "laguna"
+            | "ricursive"
+            | "bailing_moe_v3_vl"
     )
 }
 
@@ -94,6 +99,7 @@ mod norm_convention_tests {
         // Inkling 2's final norm.weight is HF-vanilla (`x * w`); the offset
         // kernel doubled its output scale and flattened every distribution.
         assert!(vanilla("inkling2_loop"));
+        assert!(vanilla("bailing_moe_v3_vl"));
         for other in [
             "qwen3_next",
             "qwen3_5_moe",
