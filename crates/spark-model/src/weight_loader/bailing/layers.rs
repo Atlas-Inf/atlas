@@ -569,3 +569,7 @@ fn load_moe_weights(
 #[cfg(test)]
 #[path = "layers_moe_parity_gpu.rs"]
 mod layers_moe_parity_gpu;
+
+#[cfg(test)]
+#[path = "kda_recurrent_fla_parity_gpu.rs"]
+mod kda_recurrent_fla_parity_gpu;
