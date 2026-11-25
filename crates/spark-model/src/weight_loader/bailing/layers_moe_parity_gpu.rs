@@ -55,7 +55,7 @@ const INTER: usize = 768;
 const PROJS: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
 
 /// BF16 bits widened to f32 (exact).
-fn widen(bits: u16) -> f32 {
+pub(super) fn widen(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
@@ -71,7 +71,7 @@ fn f32_le(bytes: &[u8], at: usize) -> f32 {
 
 // ── GB10 backend with the ling-3.2-air target modules ──────────────────────
 
-fn gpu_backend() -> Result<&'static AtlasCudaBackend> {
+pub(super) fn gpu_backend() -> Result<&'static AtlasCudaBackend> {
     static GPU: OnceLock<Result<AtlasCudaBackend, String>> = OnceLock::new();
     let gpu = GPU.get_or_init(|| {
         configure_pdl("ling-3.2-air");
@@ -92,7 +92,7 @@ fn ckpt_dir() -> Result<PathBuf> {
 
 // ── Checkpoint reader: index parsed once, shard handles kept open ──────────
 
-struct Ckpt {
+pub(super) struct Ckpt {
     dir: PathBuf,
     map: HashMap<String, String>,
     /// Open shard handles with their parsed headers (one header read+parse
@@ -101,7 +101,7 @@ struct Ckpt {
 }
 
 impl Ckpt {
-    fn open() -> Result<Self> {
+    pub(super) fn open() -> Result<Self> {
         let dir = ckpt_dir()?;
         let index: serde_json::Value = serde_json::from_slice(
             &std::fs::read(dir.join("model.safetensors.index.json"))
@@ -122,7 +122,7 @@ impl Ckpt {
     }
 
     /// `(dtype, shape, bytes)` of one tensor.
-    fn tensor(&mut self, name: &str) -> Result<(WeightDtype, Vec<usize>, Vec<u8>)> {
+    pub(super) fn tensor(&mut self, name: &str) -> Result<(WeightDtype, Vec<usize>, Vec<u8>)> {
         let shard = self
             .map
             .get(name)
@@ -620,7 +620,7 @@ impl Xorshift64 {
     }
 }
 
-fn x_rows(m: usize, layer: usize) -> Vec<f32> {
+pub(super) fn x_rows(m: usize, layer: usize) -> Vec<f32> {
     let mut rng = Xorshift64(0x9E37_79B9_7F4A_7C15 ^ ((layer as u64) << 32) ^ 0x1234);
     (0..m)
         .flat_map(|r| {
