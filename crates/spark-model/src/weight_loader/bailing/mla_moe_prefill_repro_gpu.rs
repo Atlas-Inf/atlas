@@ -70,7 +70,7 @@ fn ling_mla_moe_prefill_repro_gpu() -> Result<()> {
             layer_dims: vec![],
             cache_blocks_per_seq: None,
         },
-        BLOCKS as u32,
+        BLOCKS,
         gpu,
     )?;
     let block_table: Vec<u32> = (0..BLOCKS as u32).collect();
