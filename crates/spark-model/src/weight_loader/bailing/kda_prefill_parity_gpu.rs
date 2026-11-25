@@ -359,16 +359,18 @@ fn concat_runs(runs: &[Run]) -> Run {
 /// order); the FP32 states get a small relative band (microscopic cells
 /// are noisy — the sibling harness measured ~4e-2 rel on ~4e-9 cells).
 ///
-/// The BF16 stages also carry a 1e-6 ABSOLUTE floor: the o_proj dot sums
-/// K=4096 bf16 products, so when the reference output itself lands at
-/// ~1e-5 by cancellation, gemm-vs-gemv accumulation order shifts the
-/// result by ~5e-7 — a few bf16 ulps of the *summand* scale, invisible in
-/// the residual (measured 8.5e-3 max rel there). Layout/stride bugs move
-/// whole taps and diverge by O(signal) (the conv-plane bug measured abs
-/// diffs of O(1)), which the floor cannot mask.
+/// Near-zero cells need an ABSOLUTE band too: when the reference itself
+/// lands at ~1e-5 by cancellation (o_proj sums K=4096 bf16 products, and
+/// the prefill/decode recurrences accumulate in different orders), the
+/// per-element relative band can flag a 32% "error" on a 1e-5 cell whose
+/// absolute drift is 5e-6. The floor is 0.2% of the reference stage's RMS
+/// — two orders below bug-scale shifts: the conv plane-stride bug moved
+/// whole k/v planes by O(stage RMS) and every real layout bug shifts
+/// whole rows, so the floor cannot mask one.
 fn cmp_stage(name: &str, got: &[f32], want: &[f32]) -> (usize, usize) {
     assert_eq!(got.len(), want.len(), "{name}: length mismatch");
     let state = name == "h_state" || name == "conv_state";
+    let rms = (want.iter().map(|w| w * w).sum::<f32>() / want.len() as f32).sqrt();
     let mut bit_eq = 0;
     let mut bad = 0;
     let mut worst: Vec<(f32, usize, f32)> = Vec::new();
@@ -379,8 +381,7 @@ fn cmp_stage(name: &str, got: &[f32], want: &[f32]) -> (usize, usize) {
         }
         let scale = w.abs().max(if state { 1e-6 } else { 1e-5 });
         let tol = if state { 0.03 } else { 0.025 };
-        let abs_floor = if state { 0.0 } else { 1e-6 };
-        if (g - w).abs() > (tol * scale).max(abs_floor) {
+        if (g - w).abs() > (tol * scale).max(2e-3 * rms) {
             bad += 1;
         }
         if !state {
@@ -391,7 +392,7 @@ fn cmp_stage(name: &str, got: &[f32], want: &[f32]) -> (usize, usize) {
     for (rel, i, w) in worst.iter().take(8) {
         let g = got[*i];
         eprintln!(
-            "    worst[{name}] #{i}: ref={w:.3e} got={g:.3e} rel={rel:.2e} abs={:.3e}",
+            "    worst[{name}] #{i}: ref={w:.3e} got={g:.3e} rel={rel:.2e} abs={:.3e} rms={rms:.2e}",
             (g - w).abs()
         );
     }
