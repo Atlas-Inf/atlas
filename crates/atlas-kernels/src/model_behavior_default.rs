@@ -52,6 +52,7 @@ impl Default for ModelBehavior {
             tool_call_steering: true,
             verbatim_reasoning_effort: false,
             ban_tool_call_without_tools: true,
+            spec_think: false,
         }
     }
 }

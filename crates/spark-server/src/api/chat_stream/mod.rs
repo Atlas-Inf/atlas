@@ -264,6 +264,7 @@ pub(crate) async fn run_chat_stream(
         cancel_flag.clone(),
         ctx.tool_defs_for_backfill.clone(),
     );
+    stream_state.inkling = state.inkling_markers.map(|m| m.turn(enable_thinking));
     if let Some(detector) = stream_state.detector.as_mut() {
         // Poolside v1 is the only format whose zero-argument call is a bare
         // name inside `<tool_call>`; everywhere else that shape is malformed
@@ -314,7 +315,8 @@ pub(crate) async fn run_chat_stream(
                 // flags survived, which is the built-in negative control:
                 // only this field was reset.
                 stream_state.guard_stop = stream_state.guard_stop.or(guard_stop);
-                handle_done::handle_done(
+                let mut deltas = handle_token::flush_inkling(&mut stream_state, &ctx);
+                deltas.extend(handle_done::handle_done(
                     &mut stream_state,
                     &ctx,
                     finish_reason,
@@ -324,7 +326,8 @@ pub(crate) async fn run_chat_stream(
                     reasoning_tokens,
                     cached_prompt_tokens,
                     accepted_prediction_tokens,
-                )
+                ));
+                deltas
             }
             StreamEvent::Error(msg) => handle_error::handle_error(&ctx, msg),
             StreamEvent::InvalidRequest(msg) => handle_error::handle_invalid_request(&ctx, msg),

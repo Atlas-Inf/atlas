@@ -1,0 +1,4 @@
+# Inkling 2 Mini overlay, merged over laguna-s-2.1 / common. Module names are
+# the file stems.
+[build]
+extra_nvcc_flags = ["--fmad=false", "-DHDIM=128"]

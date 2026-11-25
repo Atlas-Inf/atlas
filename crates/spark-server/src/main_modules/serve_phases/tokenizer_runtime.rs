@@ -332,6 +332,8 @@ pub(crate) fn resolve_tokenizer_runtime(
                 true,
                 tokenizer.inner().token_to_id("<tool_call>"),
             ),
+            // The caller's too: it resolves the Inkling 2 markers.
+            message_open: None,
         },
         vocab_masks,
         reasoning_parser_box,

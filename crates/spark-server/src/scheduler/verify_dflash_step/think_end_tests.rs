@@ -102,3 +102,39 @@ fn a_code_fence_defers_the_boundary_but_not_the_ceiling() {
     assert_eq!(accept(&mut a, Some(END), Some(&MASK), &[7, 2], &mut v), 0);
     assert_eq!(v[0], END);
 }
+
+#[test]
+fn an_inkling_budget_close_is_end_message_and_the_step_ends_there() {
+    // Inkling 2's think end is `<|end_message|>`: the forced accept writes it
+    // where the budget's close lands, and the model opens its next block from
+    // there. An `<|end_message|>` the model wrote itself is left alone.
+    use crate::scheduler::test_support::inkling::{END, MESSAGE, THINKING};
+    let mut a = thinking_seq(true);
+    a.output_tokens = vec![MESSAGE, THINKING, 4];
+    let mut v = [1, 7, 3, 4, 5];
+    assert_eq!(
+        accept(&mut a, Some(END), Some(&BOUNDARY), &[1, 7, 3, 4], &mut v),
+        2
+    );
+    assert_eq!(v[2], END);
+    let mut v = [1, END, MESSAGE, 4];
+    assert_eq!(
+        accept(
+            &mut a,
+            Some(END),
+            Some(&BOUNDARY),
+            &[1, END, MESSAGE],
+            &mut v
+        ),
+        3
+    );
+    assert_eq!(v, [1, END, MESSAGE, 4]);
+}
+
+/// `MASK` widened to the test vocabulary the Inkling marker ids sit in:
+/// token 7 ends a sentence.
+const BOUNDARY: [bool; 2048] = {
+    let mut m = [false; 2048];
+    m[7] = true;
+    m
+};

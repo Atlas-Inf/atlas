@@ -20,6 +20,7 @@ pub mod dflash_loader;
 pub mod dflash_preshrink;
 mod gemma4;
 pub(crate) mod glm5;
+mod inkling2;
 mod laguna;
 mod longcat;
 mod minimax;
@@ -43,6 +44,7 @@ pub use dflash_loader::{
 pub use gemma4::Gemma4WeightLoader;
 pub use glm5::Glm5WeightLoader;
 pub use glm5::mode as glm5_mode;
+pub use inkling2::Inkling2WeightLoader;
 pub use laguna::LagunaWeightLoader;
 pub use longcat::LongcatWeightLoader;
 pub use minimax::MinimaxM2WeightLoader;
@@ -274,13 +276,16 @@ pub trait ModelWeightLoader {
         Ok(None)
     }
     /// Size per-forward activation state the layers share once the arena's
-    /// `max_tokens` is known (Ricursive value residuals). Default: none.
+    /// `max_tokens` and the decode batch's `max_seqs` are known (Ricursive
+    /// value residuals, Inkling 2's per-row stack and per-sequence tables).
+    /// Default: none.
     fn attach_layer_buffers(
         &self,
         _layers: &mut [Box<dyn TransformerLayer>],
         _config: &ModelConfig,
         _gpu: &dyn GpuBackend,
         _max_tokens: usize,
+        _max_seqs: usize,
     ) -> Result<()> {
         Ok(())
     }

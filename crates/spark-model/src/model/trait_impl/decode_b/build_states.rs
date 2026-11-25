@@ -87,7 +87,7 @@ impl TransformerModel {
                     }));
                     ssm_idx += 1;
                 } else {
-                    dummy.push(layer.alloc_state(self.gpu.as_ref())?);
+                    dummy.push(layer.padding_state(self.gpu.as_ref())?);
                 }
             }
             all_layer_states.push(dummy);

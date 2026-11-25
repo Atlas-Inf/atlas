@@ -156,7 +156,8 @@ impl ChatTokenizer {
             eos_token_id,
             supports_thinking,
             glm_tool_markup_as_text: matches!(model_type, "glm5_next" | "qwen4_exp"),
-            tool_call_ids_in_template: model_type == "glm5_next"
+            // Inkling 2 names a tool result by matching its tool_call_id.
+            tool_call_ids_in_template: matches!(model_type, "glm5_next" | "inkling2_loop")
                 || chat_encoding != ChatEncoding::Jinja,
             chat_encoding,
             omni_image_tokens,

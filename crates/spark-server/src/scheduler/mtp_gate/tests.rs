@@ -387,6 +387,37 @@ fn dflash_spec_think_opts_in() {
     ));
 }
 
+/// Inkling 2 speculated through its reasoning before its blocks gave the
+/// scheduler a thinking span (`SchedLimits::message_open`); its MODEL.toml
+/// `spec_think` keeps that, on the DFlash raw-argmax lane it serves on and at
+/// any batch size. Every other model still stays serial in thinking.
+#[test]
+fn inkling_keeps_speculating_inside_its_reasoning() {
+    use crate::scheduler::levers::SchedLevers;
+    use crate::scheduler::test_support::inkling::{self, THINKING};
+    let s = inkling::sched();
+    let (mut a, _rx) = inkling::seq(true, Some(8192));
+    crate::scheduler::emit_step::emit_token(&mut a, THINKING, None, &s);
+    assert!(a.inside_thinking);
+    let card = |spec_think| atlas_kernels::ModelBehavior {
+        spec_think,
+        ..Default::default()
+    };
+    for active in [1, 4] {
+        let on = SchedLevers::defaults().with_behavior(&card(true));
+        let spec_think = spec_think_for(on.dflash_spec_think, false, false, active);
+        for raw in [true, false] {
+            assert!(
+                seq_spec_eligible(&a, spec_think, 0, raw, false),
+                "raw={raw}"
+            );
+        }
+        let off = SchedLevers::defaults().with_behavior(&card(false));
+        let spec_think = spec_think_for(off.dflash_spec_think, false, false, active);
+        assert!(!seq_spec_eligible(&a, spec_think, 0, true, false));
+    }
+}
+
 /// 3.8 `max_thinking_budget = 2048` can cross the floor twice.
 /// Each crossing may open the shipped one-window probe. Serial must
 /// stay a measurement phase, not the mode.

@@ -282,6 +282,11 @@ pub(super) fn decode_response_text(
 ) -> (Option<String>, String) {
     let output_tokens =
         output_tokens_without_stop(&response.output_tokens, response.finish_reason.as_str());
+    let rewritten = state.inkling_markers.map(|m| {
+        m.turn(enable_thinking)
+            .map_all(output_tokens, &state.tokenizer)
+    });
+    let output_tokens = rewritten.as_deref().unwrap_or(output_tokens);
     // GLM's native tool opener also closes reasoning, but belongs to the tool
     // parser. Prefer the FIRST boundary; a later </think> must not swallow the
     // tool call. This never scans arbitrary reasoning text for call syntax.

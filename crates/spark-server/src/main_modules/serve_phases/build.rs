@@ -88,10 +88,14 @@ pub(crate) fn build_prefix_cache(
     args: &cli::ServeArgs,
     config: &ModelConfig,
 ) -> Box<dyn spark_runtime::prefix_cache::PrefixCache> {
-    if args.enable_prefix_caching && !config.kv_only_prefix_cache_is_safe() {
+    if args.enable_prefix_caching
+        && !config.kv_only_prefix_cache_is_safe()
+        && !config.aux_prefix_state()
+    {
         tracing::warn!(
-            "Prefix caching: DISABLED for compressed DeepSeek V4 because the cache does not yet \
-             preserve the compressor pool/ring state required for exact reuse"
+            "Prefix caching: DISABLED for {} because the cache does not yet preserve its \
+             per-sequence state (compressed DeepSeek V4's pool/ring) required for exact reuse",
+            config.model_type
         );
         return Box::new(spark_runtime::prefix_cache::NoPrefixCaching);
     }

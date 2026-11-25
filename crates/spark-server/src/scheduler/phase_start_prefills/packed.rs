@@ -155,8 +155,7 @@ pub(super) fn run(
             think_start_token,
             tool_call_start_token,
             tool_call_end_token,
-            sched.limits.max_seq_len,
-            sched.limits.glm_tool_boundary,
+            sched.limits,
         );
     }
 }

@@ -64,3 +64,34 @@ fn mtp_eos_cannot_bypass_output_or_context_ceiling() {
         }
     }
 }
+
+/// Inkling 2 with thinking off: the reasoning block's body (its think start
+/// included) is not streamed, as for a spontaneous `<think>`; its close and
+/// the answer are. The stream's Inkling rewrite drops a thinking block when
+/// thinking is off, so it reads the same answer either way
+/// (`inkling_turn_tests::a_suppressed_thinking_body_streams_the_same_answer`).
+#[test]
+fn inkling_thinking_off_streams_the_close_and_the_answer_only() {
+    use crate::scheduler::test_support::inkling::{self, END, MESSAGE, TEXT, THINKING};
+    for requested in [true, false] {
+        let (mut a, _response_rx) = inkling::seq(requested, None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        a.sink = ResponseSink::Streaming(tx);
+        let sched = inkling::sched();
+        let toks = [THINKING, 5, END, MESSAGE, TEXT, 6];
+        for &t in &toks {
+            emit_token(&mut a, t, None, &sched);
+        }
+        let mut streamed = Vec::new();
+        while let Ok(StreamEvent::Token(t)) = rx.try_recv() {
+            streamed.push(t);
+        }
+        let want: &[u32] = if requested {
+            &toks
+        } else {
+            &[END, MESSAGE, TEXT, 6]
+        };
+        assert_eq!(streamed, want, "thinking requested={requested}");
+        assert_eq!(a.output_tokens.len(), 1 + toks.len(), "all recorded");
+    }
+}

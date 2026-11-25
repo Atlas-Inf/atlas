@@ -7,7 +7,8 @@
 //! by configuring one [`TagReasoningParser`] per family rather than
 //! duplicating logic. Mistral reuses the same struct with `[THINK]` tags
 //! and `prompt_opens_think = false`. Gemma 4's channel format is distinct
-//! and has its own [`Gemma4ReasoningParser`].
+//! and has its own [`Gemma4ReasoningParser`]. Inkling 2 reuses the struct
+//! with its message markers and a non-exclusive end tag.
 
 use super::{ReasoningFormat, ReasoningParser};
 
@@ -31,8 +32,18 @@ pub(super) fn build(fmt: ReasoningFormat) -> Box<dyn ReasoningParser> {
             start: "[THINK]",
             end: "[/THINK]",
             prompt_opens_think: false,
+            end_closes_only_reasoning: true,
         }),
         ReasoningFormat::Gemma4 => Box::new(Gemma4ReasoningParser),
+        // Output starts inside the thinking block (the model always opens one),
+        // and `<|end_message|>` closes every block of the turn.
+        ReasoningFormat::Inkling2 => Box::new(TagReasoningParser {
+            name: "inkling2",
+            start: "<|content_thinking|>",
+            end: "<|end_message|>",
+            prompt_opens_think: true,
+            end_closes_only_reasoning: false,
+        }),
     }
 }
 
@@ -50,6 +61,8 @@ pub(super) struct TagReasoningParser {
     /// (Qwen / DeepSeek-R1 / MiniMax). `false` when the model emits its
     /// own opening tag (Mistral).
     pub(super) prompt_opens_think: bool,
+    /// See [`ReasoningParser::end_tag_closes_only_reasoning`].
+    pub(super) end_closes_only_reasoning: bool,
 }
 
 impl TagReasoningParser {
@@ -59,6 +72,7 @@ impl TagReasoningParser {
         start: "<think>",
         end: "</think>",
         prompt_opens_think: true,
+        end_closes_only_reasoning: true,
     };
 
     /// This config with a different family name.
@@ -76,6 +90,9 @@ impl ReasoningParser for TagReasoningParser {
     }
     fn end_tag(&self) -> &str {
         self.end
+    }
+    fn end_tag_closes_only_reasoning(&self) -> bool {
+        self.end_closes_only_reasoning
     }
     fn extract_thinking(&self, text: &str, enable_thinking: bool) -> (Option<String>, String) {
         extract_tag_thinking(

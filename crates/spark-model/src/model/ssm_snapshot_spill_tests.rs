@@ -13,7 +13,7 @@ use spark_runtime::gpu::mock::MockGpuBackend;
 fn pool(gpu: &dyn GpuBackend, slots: usize, layers: usize) -> SsmSnapshotPool {
     SsmSnapshotPool::new(
         slots, /*h_bytes*/ 32, /*conv_bytes*/ 16, layers, /*decode_ring*/ 0,
-        /*decode_max_seqs*/ 0, /*hidden_bytes*/ 8, gpu,
+        /*decode_max_seqs*/ 0, /*hidden_bytes*/ 8, /*aux_only*/ false, gpu,
     )
     .unwrap()
 }

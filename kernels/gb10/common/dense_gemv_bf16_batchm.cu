@@ -42,10 +42,17 @@
 #define VEC_SIZE 8   // BF16 values per vectorized load (uint4 = 16 bytes)
 #define MAX_M 8      // compile-time cap on batched rows; callers must pass M <= MAX_M
 
-extern "C" __global__ void dense_gemv_bf16_batchm(
+__device__ __forceinline__ void batchm_store(__nv_bfloat16* c, float v) { *c = __float2bfloat16(v); }
+__device__ __forceinline__ void batchm_store(float* c, float v) { *c = v; }
+
+// The body of the entry below: OutT is the output element (BF16, or FP32
+// unrounded, each row then dense_gemv_bf16_fp32out's: Inkling 2's router,
+// inkling-2-mini/nvfp4/inkling2_router_gemv.cu).
+template <typename OutT>
+__device__ __forceinline__ void dense_gemv_bf16_batchm_body(
     const __nv_bfloat16* __restrict__ A,  // [M, K]
     const __nv_bfloat16* __restrict__ B,  // [N, K]
-    __nv_bfloat16* __restrict__ C,        // rows at C + t*out_stride
+    OutT* __restrict__ C,                 // rows at C + t*out_stride
     unsigned int M,
     unsigned int N,
     unsigned int K,
@@ -158,7 +165,11 @@ extern "C" __global__ void dense_gemv_bf16_batchm(
             bf[2 * i + 1] = __bfloat162float(b_hi);
         }
 
-        for (unsigned int t = 0; t < m; t++) {
+        // compile-time bound: the rows' activation loads issue together instead
+        // of one latency per row (each row's sum keeps its order)
+        #pragma unroll
+        for (unsigned int t = 0; t < MAX_M; t++) {
+            if (t >= m) break;
             const uint4* At_vec = (const uint4*)(A + (unsigned long long)t * K);
             uint4 a_data = At_vec[kv];
             const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
@@ -195,7 +206,13 @@ extern "C" __global__ void dense_gemv_bf16_batchm(
         float a = acc[t];
         #pragma unroll
         for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+#if defined(__HIP_PLATFORM_AMD__)
+            // 64-bit mask: a file that #includes this one (inkling2_router_gemv.cu) is not
+            // run through build.rs's warp-mask widening, and ROCm 10.1 asserts on 32 bits.
+            a += __shfl_down_sync(0xFFFFFFFFULL, a, offset);
+#else
             a += __shfl_down_sync(0xFFFFFFFF, a, offset);
+#endif
         }
         acc[t] = a;
     }
@@ -212,7 +229,14 @@ extern "C" __global__ void dense_gemv_bf16_batchm(
     if (lane == 0) {
         for (unsigned int t = 0; t < m; t++) {
             const float r = smem[t][local_out * 2] + smem[t][local_out * 2 + 1];
-            C[(unsigned long long)t * out_stride + n] = __float2bfloat16(r);
+            batchm_store(C + (unsigned long long)t * out_stride + n, r);
         }
     }
+}
+
+extern "C" __global__ void dense_gemv_bf16_batchm(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride
+) {
+    dense_gemv_bf16_batchm_body(A, B, C, M, N, K, out_stride);
 }

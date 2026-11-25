@@ -22,9 +22,10 @@ use spark_runtime::gpu::DevicePtr;
 /// outside `<think>` (where F2, the mid-word defer, the `</think>` deferral
 /// and the A4 floor act), penalties exactly neutral, no logit bias, and no
 /// one-shot pin to the tool-call opener. The pick must also not be one of the
-/// ids the remaining stages mask ([`raw_pick_masked`]).
-pub(in crate::scheduler) fn raw_argmax_is_pick(a: &ActiveSeq) -> bool {
-    !a.inside_thinking
+/// ids the remaining stages mask ([`raw_pick_masked`]). `thinking_raw`
+/// ([`thinking_raw_pick`]): inside `<think>` too, where none of those acts.
+pub(in crate::scheduler) fn raw_argmax_is_pick(a: &ActiveSeq, thinking_raw: bool) -> bool {
+    (!a.inside_thinking || (thinking_raw && !a.force_end_thinking && a.grammar_state.is_none()))
         && a.repetition_penalty == 1.0
         && a.presence_penalty == 0.0
         && a.frequency_penalty == 0.0
@@ -34,19 +35,33 @@ pub(in crate::scheduler) fn raw_argmax_is_pick(a: &ActiveSeq) -> bool {
         && !tool_pin_armed(a)
 }
 
+/// Whether a thinking row's raw argmax is its pick as well. A model whose
+/// think end closes every block (Inkling 2, `SchedLimits::message_open`)
+/// runs no stage inside its reasoning that can move the argmax: no mid-word
+/// defer, no F2 while `confidence_early_stop` is off; the budget's close only
+/// once armed. The A4 floor biases the think end and the in-think mask hits
+/// the tool-call opener, both redone on the host ([`raw_pick_masked`]).
+pub(in crate::scheduler) fn thinking_raw_pick(
+    limits: &crate::scheduler::limits::SchedLimits,
+    watchdog: &crate::scheduler::helpers::WatchdogParams,
+) -> bool {
+    limits.message_open.is_some() && !watchdog.confidence_early_stop
+}
+
 /// `PinToToolCallStart` is armed: the pick right after `</think>` on a turn
 /// that must call a tool is forced to the opener.
 pub(in crate::scheduler) fn tool_pin_armed(a: &ActiveSeq) -> bool {
     a.think_just_ended && a.require_tool_call && !a.tool_call_opened && !a.inside_thinking
 }
 
-/// Ids the pipeline masks or biases outside `<think>`: `</think>` and
-/// `<think>` (post-close mask), and the tool-call opener under the tool-loop
-/// bias. A raw argmax on one of them must be redone on the host.
+/// Ids the pipeline masks or biases: `</think>` and `<think>` (post-close
+/// mask, A4 floor), and the tool-call opener under the tool-loop bias or,
+/// inside `<think>` ([`thinking_raw_pick`]), its mask. A raw argmax on one of
+/// them must be redone on the host.
 pub(in crate::scheduler) fn raw_pick_masked(a: &ActiveSeq, tok: u32) -> bool {
     Some(tok) == a.think_end_token
         || Some(tok) == a.think_start_token
-        || (a.suppress_tool_call && Some(tok) == a.tool_call_start_token)
+        || ((a.suppress_tool_call || a.inside_thinking) && Some(tok) == a.tool_call_start_token)
         || a.logit_bias
             .iter()
             .any(|&(id, delta)| id == tok && delta == f32::NEG_INFINITY)
@@ -66,7 +81,7 @@ pub(in crate::scheduler) fn pick_row(
     crate::scheduler::emit_step::PickEffects::clear(a);
     let greedy = a.temperature == 0.0 || ctx.sampling.force_temp_zero;
     let fp32 = model.decode_logits_fp32();
-    if greedy && raw_argmax_is_pick(a) {
+    if greedy && raw_argmax_is_pick(a, thinking_raw_pick(&ctx.limits, &ctx.watchdog)) {
         let mut top1 = [match gpu_argmax {
             Some(t) => t,
             None => model.argmax_on_device(logits, 0)?,

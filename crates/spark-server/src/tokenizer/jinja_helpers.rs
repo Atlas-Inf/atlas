@@ -220,6 +220,7 @@ pub(crate) fn build_jinja_env_with(
     //
     // Key order is preserved via the `preserve_order` feature in BOTH modes.
     env.add_filter("tojson_hf", python_tojson);
+    env.add_filter("tojson_py", super::py_tojson::tojson_py);
     if tool_json_style == ToolJsonStyle::HfSpaced {
         env.add_filter("tojson", python_tojson);
     }
@@ -495,6 +496,5 @@ pub(super) fn convert_python_jinja_to_minijinja(template: &str) -> String {
     t = t.replace("tojson(ensure_ascii=True)", "tojson");
 
     // messages[1:] — minijinja 2.x supports slice syntax natively
-
-    t
+    super::hf_tags::neutralize_generation_tags(&super::py_tojson::route_kwarg_calls(&t))
 }

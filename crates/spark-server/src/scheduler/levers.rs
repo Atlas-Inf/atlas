@@ -222,6 +222,14 @@ impl SchedLevers {
         }
     }
 
+    /// The levers this model's MODEL.toml `[behavior]` turns on: `spec_think`
+    /// is the `ATLAS_MTP_SPEC_THINK` opt-in for a model whose reasoning always
+    /// speculated. Never turns a lever off.
+    pub fn with_behavior(mut self, b: &atlas_kernels::ModelBehavior) -> Self {
+        self.dflash_spec_think |= b.spec_think;
+        self
+    }
+
     /// Every opt-in off and every opt-out on — what a build with no `ATLAS_*`
     /// set resolves to. Tests use this instead of mutating the environment.
     pub fn defaults() -> Self {
@@ -330,6 +338,27 @@ mod tests {
         assert!(!d.mtp_dynamic_depth);
         assert!(!d.prefill_srpt && !d.prefill_queue_first_chunk);
         assert!(!d.qwen_copy_drafts);
+    }
+
+    #[test]
+    fn a_model_that_speculates_its_reasoning_opts_in_to_spec_think() {
+        let b = atlas_kernels::ModelBehavior {
+            spec_think: true,
+            ..Default::default()
+        };
+        assert!(SchedLevers::defaults().with_behavior(&b).dflash_spec_think);
+        // Every other model: the environment decides, as before.
+        let plain = atlas_kernels::ModelBehavior::default();
+        assert!(
+            !SchedLevers::defaults()
+                .with_behavior(&plain)
+                .dflash_spec_think
+        );
+        let env_on = SchedLevers {
+            dflash_spec_think: true,
+            ..SchedLevers::defaults()
+        };
+        assert!(env_on.with_behavior(&plain).dflash_spec_think);
     }
 
     #[test]

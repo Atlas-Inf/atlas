@@ -18,6 +18,7 @@ pub mod glm_sp;
 pub mod glm_sp_moe_seam;
 pub mod glm_sp_overlap;
 pub mod glm_sp_uneven;
+pub(crate) mod inkling2;
 pub mod moe;
 mod moe_grouped_decode;
 pub mod mtp_head;

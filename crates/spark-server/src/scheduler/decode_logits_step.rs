@@ -149,8 +149,10 @@ pub fn process_decode_logits(
     // the 7.95 MB D2H + n full-vocab host passes. Kill switch:
     // ATLAS_NO_THINKENDED_GPU_ARGMAX=1 sends them to the host.
     let admit_think_ended = think_ended_gpu_argmax_enabled();
+    let thinking_raw =
+        crate::scheduler::fast_greedy::thinking_raw_pick(&sched.limits, &sched.watchdog);
     let needs_host_logits = active.iter().any(|a| {
-        !crate::scheduler::fast_greedy::raw_argmax_is_pick(a)
+        !crate::scheduler::fast_greedy::raw_argmax_is_pick(a, thinking_raw)
             || (a.think_ended && !admit_think_ended)
     }) || any_logprobs
         || model_logits_fp32;

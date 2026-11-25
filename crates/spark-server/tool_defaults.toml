@@ -24,6 +24,7 @@ minimax_m2  = "minimax_xml"    # MiniMax M2 — <minimax:tool_call><invoke name=
 laguna      = "poolside_v1"     # Poolside — <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>
 deepseek_v4 = "deepseek_v4"    # DeepSeek-V4-Flash — checkpoint-native typed DSML
 deepseek_v41 = "deepseek_v41"  # DeepSeek-V4.1-Flash — the same DSML with a space before each tag name
+inkling2_loop = "hermes"       # Inkling 2 — inkling_turn.rs rewrites its JSON calls as Hermes envelopes
 
 # Default reasoning parser per model_type.
 # Override at runtime with --reasoning-parser <format>.
@@ -34,6 +35,7 @@ deepseek_v41 = "deepseek_v41"  # DeepSeek-V4.1-Flash — the same DSML with a sp
 #   minimax     — <think>...</think>, MiniMax M2 / M2.7
 #   mistral     — [THINK]...[/THINK]
 #   gemma4      — <|channel>thought ... <channel|> ... (Gemma 4 channel format)
+#   inkling2    — <|content_thinking|> ... <|end_message|> (Inkling 2 message blocks)
 #
 # qwen / deepseek_r1 / minimax share one <think>-tag implementation but
 # keep distinct identities so a model is parsed under its own contract.
@@ -55,3 +57,4 @@ qwen3_vl_moe = "qwen"
 mistral     = "mistral"
 minimax_m2  = "minimax"        # MiniMax M2/M2.7 — <think>...</think>, own identity
 laguna      = "qwen"           # Laguna uses ordinary <think>...</think> tags
+inkling2_loop = "inkling2"     # Inkling 2 — message blocks, routed through inkling_turn.rs

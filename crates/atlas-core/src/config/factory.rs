@@ -85,6 +85,7 @@ impl ModelConfig {
             num_experts_per_toks: Vec::new(),
             vision: None,
             quantization_config: None,
+            inkling2: None,
             attn_gated: true,
             gdn_norm_sigmoid: false,
             nested_config: false,

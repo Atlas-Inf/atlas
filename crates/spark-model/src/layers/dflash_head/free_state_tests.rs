@@ -71,6 +71,7 @@ pub(super) fn zero_scratch() -> DflashScratch {
         dflash2_projected_hidden: DevicePtr(0),
         dflash2_selector_scratch: DevicePtr(0),
         dspine: None,
+        inkling: None,
     }
 }
 
@@ -111,6 +112,7 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         layers: Vec::new(),
         candidate_selector: None,
         dspine: None,
+        inkling: None,
         alt: None,
         live: Default::default(),
         fused_kv_weight: None,

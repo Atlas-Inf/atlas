@@ -210,6 +210,8 @@ impl SsmPools {
             // BF16 (`hidden_size` elements). Used to emit exact-hit logits
             // without re-running the last token through the SSM layers.
             hidden_bytes,
+            // a model whose per-sequence state is aux blobs alone (Inkling 2)
+            config.aux_prefix_state(),
             gpu,
         )?;
         // Optional SSM snapshot spill tier. `None` (default) keeps the reclaim

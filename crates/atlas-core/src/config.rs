@@ -490,6 +490,12 @@ pub struct ModelConfig {
     #[serde(skip)]
     pub quantization_config: Option<QuantizationConfig>,
 
+    /// Inkling 2 loop/attention numbers with no shared field (`inkling2_loop`
+    /// only). `num_hidden_layers` counts unrolled visits; this holds the
+    /// physical layout behind them.
+    #[serde(skip)]
+    pub inkling2: Option<Inkling2Config>,
+
     // ── Architecture flags (set by parse_config, not from JSON) ──
     /// Whether Q projection includes an output gate (Q+Gate interleaved, 2x q_dim).
     /// False for Qwen3-VL, Nemotron-H, Mistral (ungated Q).
@@ -893,13 +899,14 @@ pub use gguf::{GgufConfigInputs, GgufMeta, config_from_gguf};
 pub use ngram::{NgramDims, ngram_ids, shift_right_ignore_eos, shift_right_ignore_eos_fill};
 pub use ngram_qwen4exp::Qwen4ExpNgram;
 pub use parsers::{
-    Exl3QuantConfig, PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, RICURSIVE_FFN_CLAMP,
-    parse_mistral_params, parse_peft_adapter_config, parse_quantization_config,
+    Exl3QuantConfig, Inkling2Config, PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig,
+    RICURSIVE_FFN_CLAMP, parse_mistral_params, parse_peft_adapter_config,
+    parse_quantization_config,
 };
 pub(crate) use parsers::{
     parse_deepseek_v4, parse_deepseek_v41, parse_gemma4_params, parse_glm5_next,
-    parse_glm5_vision_config, parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp,
-    parse_ricursive, parse_step3p7, parse_vision_config,
+    parse_glm5_vision_config, parse_inkling2_loop, parse_laguna, parse_longcat_ngram,
+    parse_minimax_m2, parse_qwen4_exp, parse_ricursive, parse_step3p7, parse_vision_config,
 };
 pub use vision::{OmniVisionConfig, PixelBounds, VisionConfig, VisionTokenBudgets};
 

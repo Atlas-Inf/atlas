@@ -112,10 +112,15 @@ fn check_embedding_and_head(store: &WeightStore) -> Result<()> {
     //   `*.embed_tokens.weight`  — HF standard (Qwen, Gemma, MiniMax)
     //   `*.embeddings.weight`    — Nemotron-H backbone prefix
     //   `tok_embeddings.weight`  — Mistral consolidated checkpoints
+    //   `*.embed.weight`         — Thinking Machines Inkling (`model.llm.embed`)
     // Scan discovery-based so future families that adopt yet-another
     // spelling only need to appear as a new suffix here — no enumerated
     // prefix list to maintain.
-    const EMBED_SUFFIXES: &[&str] = &[".embed_tokens.weight", ".embeddings.weight"];
+    const EMBED_SUFFIXES: &[&str] = &[
+        ".embed_tokens.weight",
+        ".embeddings.weight",
+        ".embed.weight",
+    ];
     const EMBED_EXACTS: &[&str] = &[
         "tok_embeddings.weight",
         "embed_tokens.weight",
@@ -194,8 +199,12 @@ fn check_layer_count(store: &WeightStore, config: &ModelConfig) -> Result<usize>
     // 2x expansion), so the checkpoint legitimately carries half as many
     // `layers.N` indices as `num_hidden_layers`. Comparing against the engine
     // count would reject every valid LongCat checkpoint.
+    // Inkling 2's loop runs its core layers several times with shared weights:
+    // the engine's layers are visits, the checkpoint keeps the physical layers.
     let expected = if config.model_type.starts_with("longcat_flash") {
         config.num_hidden_layers / 2
+    } else if let Some(ink) = &config.inkling2 {
+        ink.physical_layers
     } else {
         config.num_hidden_layers
     };

@@ -48,6 +48,7 @@ impl ModelWeightLoader for RicursiveWeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
         max_tokens: usize,
+        _max_seqs: usize,
     ) -> Result<()> {
         let bytes = max_tokens * config.hidden_size * 2;
         let x0 = gpu.alloc(bytes).context("allocate value-residual x0")?;

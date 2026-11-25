@@ -116,6 +116,28 @@ impl TransformerModel {
                     );
                 }
             }
+            // An aux-state model's exact replay of a block-aligned prompt would
+            // anchor on the leaf at its end, which is declined as an exact hit:
+            // look up one block short so the tail checkpoint anchors it.
+            if self.config.aux_prefix_state()
+                && !reserved
+                && let Some(cap) = super::pc_policy::exact_replay_cap(
+                    prefix_match.matched_tokens,
+                    total,
+                    bs,
+                    crate::model::mtp_carry::marconi_exact(),
+                )
+            {
+                prefix_match = cap_prefix_match(
+                    self.prefix_cache.as_ref(),
+                    key_tokens,
+                    bs,
+                    seq.session_hash,
+                    seq.adapter_id,
+                    prefix_match,
+                    cap,
+                );
+            }
             let mut matched = prefix_match.matched_tokens;
             // Stash the matched prefix so `free_sequence` can release the radix
             // refs the lookup just bumped even if this prefill fails to allocate
@@ -346,7 +368,8 @@ impl TransformerModel {
                      for {matched}-token full hit — recomputing all KV+SSM"
                 );
             }
-            let has_ssm = self.config.num_ssm_layers() > 0;
+            // SSM layers, or per-sequence state that rides aux snapshots alone
+            let has_ssm = self.config.snapshot_prefix_state();
             if matched > 0 && !skip && has_ssm {
                 tracing::info!(
                     "Prefix cache hit: {} tokens ({} blocks) but no SSM snapshot — recomputing all KV",

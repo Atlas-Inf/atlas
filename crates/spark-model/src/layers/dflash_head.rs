@@ -32,6 +32,7 @@ mod draft_conf;
 pub mod dspine;
 pub mod dual;
 mod fp8_m32;
+pub mod inkling;
 mod paged_attn_modules;
 pub mod product_policy;
 pub mod selector;
@@ -266,6 +267,8 @@ pub struct DflashScratch {
     pub dflash2_selector_scratch: DevicePtr,
     /// DSpine bridge/tail buffers for this lane's γ rows (`None` off DSpine).
     pub dspine: Option<dspine::DspineScratch>,
+    /// Inkling 2 DSpark buffers (`inkling`), when the drafter is one.
+    pub inkling: Option<inkling::InklingScratch>,
 }
 
 /// Drafter-side weight precision. Defaults to BF16. **Phase G (2026-05-28)**
@@ -647,6 +650,9 @@ pub struct BlockDiffusionDraftHead {
     /// DSpine code bridge and serial-table tail (`dspine`), when the drafter
     /// is a DSpine checkpoint.
     pub dspine: Option<dspine::Dspine>,
+    /// Inkling 2's DSpark variant (`inkling`): tap mix context, anchor and
+    /// mask input, recurrent Markov tail.
+    pub inkling: Option<inkling::InklingDspark>,
     /// `--draft-model-alt`: the second drafter, routed per request (`dual`).
     pub alt: Option<Box<BlockDiffusionDraftHead>>,
     /// Sequence states alive (`alloc_state` .. `free_state`): past two every
@@ -1348,6 +1354,10 @@ impl DraftProposer for BlockDiffusionDraftHead {
         _buffers: &spark_runtime::buffers::BufferArena,
         _config: &atlas_core::config::ModelConfig,
     ) -> usize {
+        // Inkling 2 DSpark proposes one sequence at a time for now.
+        if self.inkling.is_some() {
+            return 1;
+        }
         batch_plan::propose_batch_width(
             self.startup.native_batch_authoritative,
             self.startup.diagnostics.batch_parity,
