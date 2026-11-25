@@ -118,7 +118,7 @@ serve_args=(serve "$MODEL_DIR" --model-name "$NAME" --bind 127.0.0.1 --port "$PO
   --enable-prefix-caching true --request-timeout 0 "${DRAFT_ARGS[@]}")
 CURL="curl -s http://127.0.0.1:$PORT/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"$NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 17 * 23?\"}],\"max_tokens\":256,\"temperature\":0}'"
 cd "$REPO"
-run_serve() { exec env RUST_LOG=${RUST_LOG:-info} ATLAS_KV_EXTERNAL_RESERVE_GB=0 ATLAS_OOM_WATCHDOG_MB=400 "$BIN" "${serve_args[@]}"; }
+run_serve() { exec env RUST_LOG=${RUST_LOG:-info} ATLAS_KV_EXTERNAL_RESERVE_GB=0 ATLAS_OOM_WATCHDOG_MB=400 ${SERVE_PREFIX:-} "$BIN" "${serve_args[@]}"; }
 if [ "$CHECK" -eq 0 ]; then
   echo "ready when /v1/models answers; then try: $CURL" >&2
   run_serve
