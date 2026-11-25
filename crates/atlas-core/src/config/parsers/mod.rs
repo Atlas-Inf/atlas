@@ -20,7 +20,8 @@ mod ricursive;
 mod step3p7;
 mod vision;
 
-pub(crate) use bailing::parse_bailing_moe_v3_vl;
+pub use bailing::BailingParams;
+pub(crate) use bailing::parse_bailing;
 pub(crate) use deepseek_v4::parse_deepseek_v4;
 pub use exl3::Exl3QuantConfig;
 pub(crate) use gemma4::parse_gemma4_params;

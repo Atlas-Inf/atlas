@@ -34,6 +34,26 @@ use serde_json::Value;
 
 use super::super::{LayerType, ModelConfig, finalize_config};
 
+/// Bailing-specific routing constants with no generic [`ModelConfig`]
+/// counterpart — carried on `ModelConfig::bailing` for the spark-model Ling
+/// family driver (`model/bailing_c1.rs`) and the MoE kernels:
+/// `n_group`/`topk_group` group-limited top-k plus the per-layer SwiGLU
+/// clamps (routed 4 on layers 35..=41; shared 5 on 34..=39, 7 on 40..=41).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BailingParams {
+    /// `n_group` — router groups over the expert axis (Ling: 8).
+    pub n_group: usize,
+    /// `topk_group` — groups surviving group-limited top-k (Ling: 4).
+    pub topk_group: usize,
+    /// `moe_router_enable_expert_bias` — the FP32 `mlp.gate.expert_bias`
+    /// participates in selection.
+    pub expert_bias: bool,
+    /// Per-layer routed-expert SwiGLU clamp (0 = none).
+    pub routed_swiglu: Vec<i64>,
+    /// Per-layer shared-expert SwiGLU clamp (0 = none).
+    pub shared_swiglu: Vec<i64>,
+}
+
 fn usize_field(text: &Value, name: &str) -> Result<usize> {
     let value = text
         .get(name)
@@ -49,9 +69,9 @@ fn usize_field(text: &Value, name: &str) -> Result<usize> {
 /// clamped at 4 on layers 35..=41; shared expert at 5 on 34..=39 and 7 on
 /// 40..=41 in the Ling checkpoint) have no `ModelConfig` field — the MoE
 /// kernels consume them, mirrored in `weight_loader/bailing/gate.rs`.
-fn validate_index_list(text: &Value, name: &str, num_layers: usize) -> Result<()> {
+fn read_index_list(text: &Value, name: &str, num_layers: usize) -> Result<Vec<i64>> {
     let Some(list) = text.get(name) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let Value::Array(entries) = list else {
         anyhow::bail!("bailing text_config `{name}` must be an array");
@@ -61,16 +81,17 @@ fn validate_index_list(text: &Value, name: &str, num_layers: usize) -> Result<()
         "bailing text_config `{name}` has {} entries but num_hidden_layers is {num_layers}",
         entries.len()
     );
-    for entry in entries {
-        ensure!(
-            entry.as_u64().is_some() || entry.as_i64().is_some(),
-            "bailing text_config `{name}` entries must be integers"
-        );
-    }
-    Ok(())
+    entries
+        .iter()
+        .map(|entry| {
+            entry
+                .as_i64()
+                .with_context(|| format!("bailing text_config `{name}` entries must be integers"))
+        })
+        .collect()
 }
 
-pub fn parse_bailing_moe_v3_vl(raw: &Value) -> Result<ModelConfig> {
+pub fn parse_bailing(raw: &Value) -> Result<ModelConfig> {
     let text = raw
         .get("text_config")
         .context("bailing_moe_v3_vl config missing text_config")?;
@@ -191,8 +212,8 @@ pub fn parse_bailing_moe_v3_vl(raw: &Value) -> Result<ModelConfig> {
         "bailing: first_k_dense_replace ({first_dense}) exceeds the decoder stack ({num_layers})"
     );
     config.mlp_only_layers = (0..first_dense).collect();
-    validate_index_list(text, "expert_swiglu_limit_list", num_layers)?;
-    validate_index_list(text, "share_expert_swiglu_limit_list", num_layers)?;
+    let routed_swiglu = read_index_list(text, "expert_swiglu_limit_list", num_layers)?;
+    let shared_swiglu = read_index_list(text, "share_expert_swiglu_limit_list", num_layers)?;
 
     // ── gated MLA (BailingMoeV3MultiLatentAttention, modeling ~line 1101)──
     config.num_attention_heads = usize_field(text, "num_attention_heads")?;
@@ -332,6 +353,16 @@ pub fn parse_bailing_moe_v3_vl(raw: &Value) -> Result<ModelConfig> {
     // `linear_proj.*` projector are skipped by the family loader
     // (weight_loader/bailing/vision.rs carries the extension seam).
     config.vision = None;
+
+    // ── family constants for the Ling driver: group-limited routing and
+    // per-layer SwiGLU clamps (mirrored in weight_loader/bailing/gate.rs).
+    config.bailing = Some(BailingParams {
+        n_group,
+        topk_group,
+        expert_bias: config.use_routing_bias,
+        routed_swiglu,
+        shared_swiglu,
+    });
 
     finalize_config(&mut config, raw)?;
     Ok(config)
