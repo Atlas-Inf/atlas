@@ -344,7 +344,8 @@ fn run_layer(
         gpu.synchronize(stream)?;
         let mut bits = vec![0u8; T * 2];
         gpu.copy_d2h(out_p.offset(t * T * 2), &mut bits)?;
-        serial_out[t * T..(t + 1) * T].copy_from_slice(bytemuck_bits(&bits));
+        let row_bits = bytemuck_bits(&bits);
+        serial_out[t * T..(t + 1) * T].copy_from_slice(&row_bits);
 
         let want_fla = ref_step(
             &mut ref_fla,
