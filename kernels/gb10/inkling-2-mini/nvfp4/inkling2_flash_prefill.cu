@@ -71,7 +71,10 @@ extern "C" __global__ void __launch_bounds__(FP_THREADS, 1) inkling2_flash_prefi
 ) {
     atlas_pdl_enter();
     __shared__ __align__(16) __nv_bfloat16 Ks[FP_BC][FP_STRIDE];
-    __shared__ __align__(16) __nv_bfloat16 Vs[FP_BC][FP_STRIDE];
+    // V staged fp16 once at tile load — the same bf16->fp16 conversion the
+    // per-head kernel does in registers per MMA; keeps conversion temps out
+    // of the PV loop's live set (hipcc 7.16 spilled otherwise).
+    __shared__ __align__(16) __fp16 Vs[FP_BC][FP_STRIDE];
     __shared__ __align__(16) float Rs[FP_GROUP * FP_BQ][FP_D_REL];
     __shared__ __align__(16) __fp16 Ps[FP_WARPS][16][FP_BC + 8];
     const unsigned int kvh = blockIdx.x, q0 = blockIdx.y * FP_BQ;
@@ -107,7 +110,11 @@ extern "C" __global__ void __launch_bounds__(FP_THREADS, 1) inkling2_flash_prefi
                      (unsigned long long)(pos % block_size) * rowp + kvh * FP_HD + col
                    : 0ull;
             *(uint4*)&Ks[row][col] = ok ? *(const uint4*)(K_cache + off) : make_uint4(0, 0, 0, 0);
-            *(uint4*)&Vs[row][col] = ok ? *(const uint4*)(V_cache + off) : make_uint4(0, 0, 0, 0);
+            const uint4 v = ok ? *(const uint4*)(V_cache + off) : make_uint4(0, 0, 0, 0);
+            const __nv_bfloat16* vb = (const __nv_bfloat16*)&v;
+            __fp16* vh = (__fp16*)&Vs[row][col];
+#pragma unroll
+            for (int j = 0; j < 8; j++) vh[j] = (__fp16)__bfloat162float(vb[j]);
         }
     };
 
@@ -230,7 +237,7 @@ extern "C" __global__ void __launch_bounds__(FP_THREADS, 1) inkling2_flash_prefi
                 fp_v16h bb;
 #pragma unroll
                 for (int k = 0; k < 16; k++)
-                    bb[k] = (__fp16)__bfloat162float(Vs[nt * 16 + k][d * 16 + lane_lo]);
+                    bb[k] = Vs[nt * 16 + k][d * 16 + lane_lo];
                 acc_o[d] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, bb, acc_o[d]);
             }
         }

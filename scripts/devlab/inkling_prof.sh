@@ -6,7 +6,7 @@
 #
 #   scripts/devlab/inkling_prof.sh
 set -u
-OUT=${OUT:-$PWD}; RES=$OUT/RESULTS.txt; mkdir -p "$OUT"
+OUT=${DEVLAB_OUT:-${OUT:-$PWD}}; RES=$OUT/RESULTS.txt; mkdir -p "$OUT"
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/../.." && pwd)"
 HFC=${HFC:-/mnt/scratch/cache/hf}
 log() { echo "[$(date -u +%H:%M:%SZ)] $*" | tee -a "$RES"; }
@@ -25,6 +25,7 @@ if [ -f "$FP" ]; then
     -include hip/hip_runtime.h -include atlas_hip_cache_hints.h -DHDIM=128 \
     --save-temps=obj "$FP" -o "$T/fp.co" >"$T/cc.log" 2>&1 && {
       S=$(ls "$T"/inkling2_flash_prefill-hip*.s | head -1)
+      cp "$S" "$OUT/fp.s" 2>/dev/null || true
       grep -E "vgpr_count|spill_count|group_segment|wavefront_size|max_flat" "$S" \
         | sed 's/^/  isa /' | tee -a "$RES"
     } || log "flash .cu compile FAILED: $(tail -2 "$T/cc.log")"
