@@ -101,8 +101,11 @@ struct Ckpt {
 impl Ckpt {
     fn open() -> Result<Self> {
         let dir = ckpt_dir()?;
-        let index: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.join("model.safetensors.index.json"))?)?;
+        let index: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("model.safetensors.index.json"))
+                .with_context(|| format!("read index in {}", dir.display()))?,
+        )
+        .with_context(|| format!("parse index in {}", dir.display()))?;
         let map = index["weight_map"]
             .as_object()
             .context("index without weight_map")?
@@ -134,7 +137,8 @@ impl Ckpt {
         let mut header = vec![0u8; *header_len as usize];
         file.rewind()?;
         file.read_exact(&mut header)?;
-        let header: serde_json::Value = serde_json::from_slice(&header)?;
+        let header: serde_json::Value = serde_json::from_slice(&header)
+            .with_context(|| format!("parse shard {shard} header"))?;
         let t = &header[name];
         let shape: Vec<usize> = serde_json::from_value(t["shape"].clone())?;
         let [lo, hi]: [u64; 2] = serde_json::from_value(t["data_offsets"].clone())?;
