@@ -362,3 +362,118 @@ fn tool_guard_document_examples_remain_callable_in_both_formats() {
         assert!(!s.cancel_flag.load(Ordering::Acquire));
     }
 }
+
+/// `--tool-guard stream`: the guard checks each call at its end, but the
+/// call's header and arguments go to the client as the model writes them.
+fn streaming_guard(glm: bool) -> (StreamCtx, StreamState) {
+    let (mut c, s) = setup(glm);
+    Arc::get_mut(&mut c.state).unwrap().tool_guard.stream = true;
+    c.req_stream_tool_arguments = true;
+    (c, s)
+}
+fn started_call(s: &mut StreamState, c: &StreamCtx, args: &str) -> Vec<ir::StreamDelta> {
+    let mut out = vec![];
+    handle_tool_call_start(s, c, "id".into(), "get_url".into(), 0, &mut out);
+    handle_tool_call_args_fragment(s, c, args.into(), 0, &mut out);
+    out
+}
+fn sent_call_bytes(out: &[ir::StreamDelta]) -> bool {
+    out.iter()
+        .any(|d| matches!(d, ir::StreamDelta::ToolCallStart { .. }))
+        && out
+            .iter()
+            .any(|d| matches!(d, ir::StreamDelta::ToolCallArgs { .. }))
+}
+fn assert_blocked_after_streaming(out: &[ir::StreamDelta]) {
+    let refusals: Vec<_> = out
+        .iter()
+        .filter_map(|d| match d {
+            ir::StreamDelta::Content { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refusals, [atlas_tool_guard::STREAMED_REFUSAL], "{out:?}");
+    assert!(
+        out.iter().any(|d| matches!(
+            d,
+            ir::StreamDelta::Finish {
+                reason: ir::FinishReason::ContentFilter,
+                guard_stop: Some(atlas_tool_guard::GUARD_STOP),
+                ..
+            }
+        )),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_streaming_guard_sends_an_allowed_call_as_it_is_written() {
+    let (c, mut s) = streaming_guard(false);
+    assert!(sent_call_bytes(&started_call(&mut s, &c, r#"{"url": "#)));
+    let mut out = vec![];
+    handle_tool_call_args_fragment(&mut s, &c, r#""https://example.com/"}"#.into(), 0, &mut out);
+    handle_tool_call_end(&mut s, &c, 0, &mut out);
+    assert!(
+        out.iter()
+            .any(|d| matches!(d, ir::StreamDelta::ToolCallArgs { .. })),
+        "{out:?}"
+    );
+    assert!(!s.cancel_flag.load(Ordering::Acquire));
+    let done = finish(&mut s, &c);
+    assert!(
+        done.iter().any(|d| matches!(
+            d,
+            ir::StreamDelta::Finish {
+                reason: ir::FinishReason::ToolCalls,
+                guard_stop: None,
+                ..
+            }
+        )),
+        "{done:?}"
+    );
+}
+
+#[test]
+fn a_streaming_guard_still_blocks_a_call_at_its_end() {
+    let (c, mut s) = streaming_guard(false);
+    let mut out = started_call(&mut s, &c, r#"{"url": "http://169.254.169.254/latest/"}"#);
+    assert!(sent_call_bytes(&out));
+    handle_tool_call_end(&mut s, &c, 0, &mut out);
+    assert!(s.cancel_flag.load(Ordering::Acquire));
+    assert_blocked_after_streaming(&finish(&mut s, &c));
+}
+
+#[test]
+fn a_streaming_guard_blocks_a_call_the_response_cuts_off() {
+    let (c, mut s) = streaming_guard(false);
+    assert!(sent_call_bytes(&started_call(
+        &mut s,
+        &c,
+        r#"{"url": "https://exa"#
+    )));
+    assert_blocked_after_streaming(&finish(&mut s, &c));
+}
+
+#[test]
+fn a_streaming_guard_blocks_an_oversized_call_mid_stream() {
+    let (mut c, mut s) = streaming_guard(false);
+    Arc::get_mut(&mut c.state).unwrap().tool_guard.max_bytes = 80;
+    assert!(sent_call_bytes(&started_call(&mut s, &c, r#"{"url": ""#)));
+    let mut out = vec![];
+    handle_tool_call_args_fragment(&mut s, &c, "x".repeat(100), 0, &mut out);
+    assert!(out.is_empty(), "{out:?}");
+    assert!(s.cancel_flag.load(Ordering::Acquire));
+    assert_blocked_after_streaming(&finish(&mut s, &c));
+}
+
+#[test]
+fn a_streaming_guard_still_holds_poolside_calls() {
+    // Poolside's detector holds a call until `</tool_call>` whatever the
+    // guard says, so nothing of a blocked call reached the client.
+    let (c, mut s) = streaming_guard(true);
+    let mut out = started_call(&mut s, &c, r#"{"url": "http://169.254.169.254/"}"#);
+    assert!(out.is_empty(), "{out:?}");
+    handle_tool_call_end(&mut s, &c, 0, &mut out);
+    assert!(out.is_empty(), "{out:?}");
+    assert_blocked(&finish(&mut s, &c));
+}

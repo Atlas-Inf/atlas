@@ -1436,6 +1436,7 @@ pub(crate) fn load_model(
     let tool_guard = args.tool_guard.policy().map_err(anyhow::Error::msg)?;
     tracing::info!(
         enabled = tool_guard.enabled,
+        stream = tool_guard.stream,
         max_bytes = tool_guard.max_bytes,
         "tool-call guard configured"
     );

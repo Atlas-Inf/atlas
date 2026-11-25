@@ -51,7 +51,7 @@ pub(super) fn handle_done(
 
     // A truncated native call must never be salvaged into an executable call.
     if ctx.state.tool_guard.enabled
-        && !state.buffered_tool_chunks.is_empty()
+        && state.has_open_tool_call()
         && state.guard_stop.is_none()
         && !state.stop_string_triggered
     {
@@ -66,7 +66,7 @@ pub(super) fn handle_done(
             let deltas = flush_pending_output(state, ctx);
             if ctx.state.tool_guard.enabled
                 && !state.stop_string_triggered
-                && !state.buffered_tool_chunks.is_empty()
+                && state.has_open_tool_call()
             {
                 super::tool_security::reject(state, atlas_tool_guard::BlockReason::IncompleteCall);
             }
