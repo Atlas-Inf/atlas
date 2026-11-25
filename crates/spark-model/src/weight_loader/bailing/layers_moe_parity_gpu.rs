@@ -95,7 +95,9 @@ fn ckpt_dir() -> Result<PathBuf> {
 struct Ckpt {
     dir: PathBuf,
     map: HashMap<String, String>,
-    files: HashMap<String, (std::fs::File, u64)>,
+    /// Open shard handles with their parsed headers (one header read+parse
+    /// per shard, then raw offset reads).
+    files: HashMap<String, (std::fs::File, u64, serde_json::Value)>,
 }
 
 impl Ckpt {
@@ -131,14 +133,13 @@ impl Ckpt {
             let mut len = [0u8; 8];
             f.read_exact(&mut len)?;
             let header_len = u64::from_le_bytes(len);
-            self.files.insert(shard.clone(), (f, header_len));
+            let mut header = vec![0u8; header_len as usize];
+            f.read_exact(&mut header)?;
+            let header: serde_json::Value = serde_json::from_slice(&header)
+                .with_context(|| format!("parse shard {shard} header"))?;
+            self.files.insert(shard.clone(), (f, header_len, header));
         }
-        let (file, header_len) = self.files.get_mut(&shard).context("just inserted")?;
-        let mut header = vec![0u8; *header_len as usize];
-        file.rewind()?;
-        file.read_exact(&mut header)?;
-        let header: serde_json::Value = serde_json::from_slice(&header)
-            .with_context(|| format!("parse shard {shard} header"))?;
+        let (file, header_len, header) = self.files.get_mut(&shard).context("just inserted")?;
         let t = &header[name];
         let shape: Vec<usize> = serde_json::from_value(t["shape"].clone())?;
         let [lo, hi]: [u64; 2] = serde_json::from_value(t["data_offsets"].clone())?;
