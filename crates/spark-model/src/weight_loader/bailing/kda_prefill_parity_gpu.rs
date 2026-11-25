@@ -360,7 +360,8 @@ fn cmp_stage(name: &str, got: &[f32], want: &[f32]) -> (usize, usize) {
     let state = name == "h_state" || name == "conv_state";
     let mut bit_eq = 0;
     let mut bad = 0;
-    for (g, w) in got.iter().zip(want) {
+    let mut worst: Vec<(f32, usize, f32)> = Vec::new();
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
         if g == w {
             bit_eq += 1;
             continue;
@@ -370,6 +371,17 @@ fn cmp_stage(name: &str, got: &[f32], want: &[f32]) -> (usize, usize) {
         if (g - w).abs() > tol * scale {
             bad += 1;
         }
+        if !state {
+            worst.push(((g - w).abs() / scale, i, *w));
+        }
+    }
+    worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    for (rel, i, w) in worst.iter().take(8) {
+        let g = got[*i];
+        eprintln!(
+            "    worst[{name}] #{i}: ref={w:.3e} got={g:.3e} rel={rel:.2e} abs={:.3e}",
+            (g - w).abs()
+        );
     }
     (bit_eq, bad)
 }
