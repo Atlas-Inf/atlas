@@ -429,8 +429,10 @@ impl TransformerModel {
         // ATLAS_QWEN4EXP_PC_BRANCH: the same plan, captured in-pass
         // (`qwen4exp_points`), with its own minimum.
         let in_pass = self.qwen4exp_pc_branch();
+        // Any model whose prefix hit resumes from a snapshot: SSM layers, or
+        // aux state (Inkling 2's short convolutions).
         if !(glm_pc_branch_enabled() || in_pass)
-            || self.config.num_ssm_layers() == 0
+            || !self.config.snapshot_prefix_state()
             || !self.ssm_snapshots.is_enabled()
             || !self.prefix_cache.is_active()
             || self.tokens_have_vision_pad(tokens)
