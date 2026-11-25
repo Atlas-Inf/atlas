@@ -41,9 +41,9 @@ pub(crate) struct LingKernels {
 }
 
 /// Resolve kernels over the five row buckets {1, 4, 8, 16, 32}.
-fn five(mut f: impl FnMut(u32) -> Result<KernelHandle>) -> Result<[KernelHandle; 5]> {
+fn five(f: impl FnMut(u32) -> Result<KernelHandle>) -> Result<[KernelHandle; 5]> {
     let handles: Vec<KernelHandle> = [1u32, 4, 8, 16, 32]
-        .map(|mr| f(mr))
+        .map(f)
         .into_iter()
         .collect::<Result<_>>()?;
     handles

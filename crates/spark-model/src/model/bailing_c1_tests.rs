@@ -16,7 +16,7 @@ use super::spec::{
 /// atlas-core `parsers/bailing_tests.rs`); the driver consumes whatever
 /// `parse_config` produced, so the fixture mirrors the parsed ModelConfig.
 fn ling_config() -> ModelConfig {
-    let config = atlas_core::config::parse_config(
+    atlas_core::config::parse_config(
         r#"{
         "model_type": "bailing_moe_v3_vl",
         "text_config": {
@@ -41,6 +41,7 @@ fn ling_config() -> ModelConfig {
             "no_kda_lora": true,
             "short_conv_kernel_size": 4,
             "kda_lower_bound": -5.0,
+            "kda_safe_gate": true,
             "num_experts": 512,
             "num_experts_per_tok": 8,
             "moe_intermediate_size": 768,
@@ -65,8 +66,7 @@ fn ling_config() -> ModelConfig {
         }
     }"#,
     )
-    .expect("parse");
-    config
+    .expect("parse")
 }
 
 #[test]
@@ -126,7 +126,7 @@ fn conservative_state_pool_math() {
     );
     assert_eq!(mla_kv_bytes_per_token(&config), 15_232);
     // A 262,144-token full-context budget stays under 4 GiB.
-    assert!(262_144 * 15_232 < 4 * (1 << 30));
+    assert!(262_144 * mla_kv_bytes_per_token(&config) < 4_usize * (1 << 30));
 }
 
 #[test]
