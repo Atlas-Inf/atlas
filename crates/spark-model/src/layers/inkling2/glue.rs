@@ -44,6 +44,9 @@ pub(crate) struct GlueKernels {
     /// AMD (strix-hip): the single-warp `w4a16_gemv_sw` (bit-identical to `w4a16_gemv`,
     /// 8 outputs a block); NULL elsewhere or when the kernel is absent
     pub w4a16_gemv_sw: KernelHandle,
+    /// `w4a16_gemv_sw_gate`: `inkling2_gate_mul` folded into the sw GEMV's
+    /// input load (same target and NULL conditions as `w4a16_gemv_sw`)
+    pub w4a16_gemv_sw_gate: KernelHandle,
     /// AMD (strix-hip): WMMA batched projection `w4a16_wmma` for rows 2..=16;
     /// NULL elsewhere or when the kernel is absent.
     pub w4a16_wmma: KernelHandle,
@@ -95,6 +98,11 @@ impl GlueKernels {
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw: if cfg!(atlas_scale) {
                 crate::layers::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw")
+            } else {
+                KernelHandle(0)
+            },
+            w4a16_gemv_sw_gate: if cfg!(atlas_scale) {
+                crate::layers::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw_gate")
             } else {
                 KernelHandle(0)
             },
@@ -383,6 +391,48 @@ impl GlueKernels {
             .arg_ptr(out)
             .arg_u32(n as u32)
             .launch(s)
+    }
+
+    /// `gate_mul` (BF16(a * sigmoid(g)) into `gated`) then the projection of
+    /// `gated`. With one row, an NVFP4 weight and the AMD gated sw kernel, the
+    /// elementwise pass is folded into the GEMV's input load — the staged
+    /// values are bit-identical to `inkling2_gate_mul`'s output, which is
+    /// still written out for its other consumers.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gate_proj(
+        &self,
+        gpu: &dyn GpuBackend,
+        (rows, exact): (usize, bool),
+        a: DevicePtr,
+        g: DevicePtr,
+        gated: DevicePtr,
+        w: Linear,
+        y: DevicePtr,
+        n: usize,
+        k: usize,
+        s: u64,
+    ) -> Result<()> {
+        if let Linear::Nvfp4 { q, .. } = w
+            && rows == 1
+            && self.w4a16_gemv_sw_gate.0 != 0
+            && k <= 4096
+        {
+            return KernelLaunch::new(gpu, self.w4a16_gemv_sw_gate)
+                .grid([ops::w4a16_gemv_sw_grid_x(n as u32), 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(a)
+                .arg_ptr(g)
+                .arg_ptr(gated)
+                .arg_ptr(q.weight)
+                .arg_ptr(q.weight_scale)
+                .arg_f32(q.weight_scale_2)
+                .arg_ptr(y)
+                .arg_u32(n as u32)
+                .arg_u32(k as u32)
+                .launch(s);
+        }
+        self.gate_mul(gpu, a, g, gated, rows * k, s)?;
+        self.proj(gpu, (rows, exact), gated, w, y, n, k, s)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -341,6 +341,73 @@ extern "C" __global__ void w4a16_gemv_sw(
     }
 }
 
+#if defined(__HIP_PLATFORM_AMD__)
+// ============================================================
+// AMD (strix-hip): `inkling2_gate_mul` folded into `w4a16_gemv_sw`'s input
+// load. The gated activation gated[i] = BF16(a[i] / (1 + exp(-g[i]))) — the
+// elementwise kernel's exact formula — is staged into shared once per block
+// (all 256 threads, before the n>=N early return), written out for any other
+// consumer, and the GEMV then runs bit-identically on it. Grid as
+// w4a16_gemv_sw: (ceil(N / 8), 1, 1), block 256. K <= 4096.
+// ============================================================
+#define GEMV_SW_GATE_MAX_K 4096
+
+extern "C" __global__ void w4a16_gemv_sw_gate(
+    const __nv_bfloat16* __restrict__ A,        // [1, K] attention out
+    const __nv_bfloat16* __restrict__ G,        // [1, K] gate
+    __nv_bfloat16* __restrict__ gated,          // [1, K] gated activation out
+    const unsigned char* __restrict__ B_packed,  // [N, K/2] uint8
+    const unsigned char* __restrict__ B_scale,   // [N, K/GROUP_SIZE] FP8-E4M3
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,               // [1, N]
+    unsigned int N,
+    unsigned int K
+) {
+    atlas_pdl_enter();
+    const unsigned int local_out = threadIdx.x / WARP_SIZE;
+    const unsigned int lane = threadIdx.x % WARP_SIZE;
+    const unsigned int n = blockIdx.x * N_PER_BLOCK_SW + local_out;
+
+    __shared__ unsigned int s_lut2[256];
+    __shared__ __align__(16) __nv_bfloat16 s_gated[GEMV_SW_GATE_MAX_K];
+    stage_e2m1_lut2_block(s_lut2);
+    for (unsigned int e = threadIdx.x; e < K; e += 256) {
+        const float gv = __bfloat162float(G[e]);
+        const __nv_bfloat16 v = __float2bfloat16(__bfloat162float(A[e]) / (1.0f + __expf(-gv)));
+        s_gated[e] = v;
+        gated[e] = v;
+    }
+    __syncthreads();
+    if (n >= N) return;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+
+    __shared__ float s_lut[N_PER_BLOCK_SW][16];
+    stage_e2m1_lut_warp(s_lut[local_out], lane);
+#if ATLAS_WARP_LUT_STAGED
+    const float* __restrict__ warp_lut = s_lut[local_out];
+#else
+    const float* __restrict__ warp_lut = E2M1_LUT;
+#endif
+
+    float acc_a = w4a16_gemv_partial(s_gated, B_packed, B_scale, scale2, n, half_K, num_groups, K16, lane, warp_lut, s_lut2);
+    float acc_b = w4a16_gemv_partial(s_gated, B_packed, B_scale, scale2, n, half_K, num_groups, K16, lane + 32u, warp_lut, s_lut2);
+
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc_a += __shfl_down_sync(W4A16_WARP_MASK, acc_a, offset);
+        acc_b += __shfl_down_sync(W4A16_WARP_MASK, acc_b, offset);
+    }
+
+    if (lane == 0) {
+        float result = acc_a + acc_b;
+        C[n] = __float2bfloat16(result);
+    }
+}
+#endif
+
 // ============================================================
 // W4A16 GEMV with FP32 output (for LM head logits).
 // Identical to w4a16_gemv but writes float instead of BF16.

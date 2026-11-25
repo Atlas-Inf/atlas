@@ -145,13 +145,10 @@ impl Inkling2Layer {
         let kvs = d.kv_dim * (p.conv_k - 1);
         let hs = h * (p.conv_k - 1);
         self.journal_inputs(gpu, batch, [s.k_lin, s.v_lin], 0, stream)?;
-        self.conv(
-            gpu, n, seqs, s.k_lin, s.kc, states, 0, w.k_conv, s.dyn_k, d.kv_dim, p.head_dim, stream,
-        )?;
-        self.conv(
-            gpu, n, seqs, s.v_lin, s.vc, states, kvs, w.v_conv, s.dyn_v, d.kv_dim, p.head_dim,
-            stream,
-        )?;
+        let (k_pool, v_pool) = (
+            kv_cache.k_pool_ptr(self.visit_idx),
+            kv_cache.v_pool_ptr(self.visit_idx),
+        );
         let clip = HeadNorm::Clip {
             threshold: p.qk_clip,
         };
@@ -161,56 +158,68 @@ impl Inkling2Layer {
         } else {
             DevicePtr::NULL
         };
-        self.head_norm(
-            gpu, n, s.q, s.qn, w.q_scale, log_pos, p.heads, p.head_dim, clip, stream,
-        )?;
-        self.head_norm(
-            gpu,
-            n,
-            s.kc,
-            s.kn,
-            DevicePtr::NULL,
-            DevicePtr::NULL,
-            p.kv_heads,
-            p.head_dim,
-            clip,
-            stream,
-        )?;
-        self.head_norm(
-            gpu,
-            n,
-            s.vc,
-            s.vn,
-            DevicePtr::NULL,
-            DevicePtr::NULL,
-            p.kv_heads,
-            p.head_dim,
-            HeadNorm::Rms { eps: p.eps },
-            stream,
-        )?;
-        self.head_norm(
-            gpu,
-            n,
-            s.r,
-            s.rn,
-            w.rel_scale,
-            log_pos,
-            p.heads,
-            p.d_rel,
-            HeadNorm::Clip {
-                threshold: p.rel_clip,
-            },
-            stream,
-        )?;
-
-        // KV of every row first, then each row attends over its own prefix
-        let (k_pool, v_pool) = (
-            kv_cache.k_pool_ptr(self.visit_idx),
-            kv_cache.v_pool_ptr(self.visit_idx),
-        );
-        gm.kv_write(
-            gpu, n, s.kn, s.vn, k_pool, v_pool, meta.slots, p.kv_heads, p.head_dim, bs, stream,
-        )?;
+        // AMD: the two convs, four head norms and the KV write in one launch
+        // (verify rows keep the separate state rolls inside the call)
+        let fused_prologue =
+            self.k.attn_prologue.0 != 0 && n <= 16 && n.is_multiple_of(seqs) && p.kv_heads <= 8;
+        if fused_prologue {
+            self.attn_prologue(
+                gpu, n, seqs, states, kvs, log_pos, k_pool, v_pool, meta.slots, stream,
+            )?;
+        } else {
+            self.conv(
+                gpu, n, seqs, s.k_lin, s.kc, states, 0, w.k_conv, s.dyn_k, d.kv_dim, p.head_dim,
+                stream,
+            )?;
+            self.conv(
+                gpu, n, seqs, s.v_lin, s.vc, states, kvs, w.v_conv, s.dyn_v, d.kv_dim, p.head_dim,
+                stream,
+            )?;
+            self.head_norm(
+                gpu, n, s.q, s.qn, w.q_scale, log_pos, p.heads, p.head_dim, clip, stream,
+            )?;
+            self.head_norm(
+                gpu,
+                n,
+                s.kc,
+                s.kn,
+                DevicePtr::NULL,
+                DevicePtr::NULL,
+                p.kv_heads,
+                p.head_dim,
+                clip,
+                stream,
+            )?;
+            self.head_norm(
+                gpu,
+                n,
+                s.vc,
+                s.vn,
+                DevicePtr::NULL,
+                DevicePtr::NULL,
+                p.kv_heads,
+                p.head_dim,
+                HeadNorm::Rms { eps: p.eps },
+                stream,
+            )?;
+            self.head_norm(
+                gpu,
+                n,
+                s.r,
+                s.rn,
+                w.rel_scale,
+                log_pos,
+                p.heads,
+                p.d_rel,
+                HeadNorm::Clip {
+                    threshold: p.rel_clip,
+                },
+                stream,
+            )?;
+            gm.kv_write(
+                gpu, n, s.kn, s.vn, k_pool, v_pool, meta.slots, p.kv_heads, p.head_dim, bs, stream,
+            )?;
+        }
         let body = ops::attn_body(
             batch.seqs.len(),
             batch.rows_per_seq,
@@ -282,8 +291,20 @@ impl Inkling2Layer {
                 stream,
             )?;
         }
-        gm.gate_mul(gpu, s.attn, s.gate, s.gated, n * d.q_dim, stream)?;
-        gm.proj(gpu, (n, exact), s.gated, w.wo, s.proj, h, d.q_dim, stream)?;
+        // the attention-output gate; AMD folds it into the o-projection's input
+        // load for a single NVFP4 row
+        gm.gate_proj(
+            gpu,
+            (n, exact),
+            s.attn,
+            s.gate,
+            s.gated,
+            w.wo,
+            s.proj,
+            h,
+            d.q_dim,
+            stream,
+        )?;
         self.journal_inputs(gpu, batch, [s.proj], 2, stream)?;
         self.conv(
             gpu,
@@ -302,24 +323,31 @@ impl Inkling2Layer {
             stream,
         )?;
 
-        // block push + residual, MLP input
-        if v.boundary {
-            gpu.copy_d2d_async(x, s.blocks.offset(v.blocks_before * bstride), rb, stream)?;
-        }
-        gm.residual(gpu, x, s.conv_out, s.resid, n * h, v.boundary, stream)?;
+        // block push + residual, MLP input; AMD folds both into the block-res
+        // sums pass on its own (chunks, rows) grid
         let nb_mlp = v.blocks_before + usize::from(v.boundary);
-        self.block_res(
-            gpu,
-            n,
-            s.blocks,
-            nb_mlp,
-            s.resid,
-            DevicePtr::NULL,
-            w.mlp_query,
-            1,
-            s.mlp_in,
-            stream,
-        )?;
+        if self.k.block_res_resid.0 != 0 && n <= 16 {
+            self.block_res_mlp(
+                gpu, n, nb_mlp, x, s.conv_out, s.resid, s.mlp_in, v.boundary, stream,
+            )?;
+        } else {
+            if v.boundary {
+                gpu.copy_d2d_async(x, s.blocks.offset(v.blocks_before * bstride), rb, stream)?;
+            }
+            gm.residual(gpu, x, s.conv_out, s.resid, n * h, v.boundary, stream)?;
+            self.block_res(
+                gpu,
+                n,
+                s.blocks,
+                nb_mlp,
+                s.resid,
+                DevicePtr::NULL,
+                w.mlp_query,
+                1,
+                s.mlp_in,
+                stream,
+            )?;
+        }
         if gated_inputs {
             let mlp_msg = s.msg4.offset(3 * rf);
             self.msg_gates(
@@ -367,23 +395,32 @@ impl Inkling2Layer {
             p.route_scale,
             stream,
         )?;
-        self.routed_experts(gpu, n, exact, stream)?;
+        // AMD decode rows: the moe_combine (one row only — the batched path
+        // combines in its unpermute), the post-MLP conv and layer_out fuse
+        let fused_tail = self.k.mlp_tail.0 != 0 && n == seqs && n <= 16;
+        if fused_tail {
+            let single = n == 1;
+            self.routed_experts(gpu, n, exact, !single, stream)?;
+            self.mlp_tail(gpu, n, states, 2 * kvs + hs, single, hidden, stream)?;
+        } else {
+            self.routed_experts(gpu, n, exact, true, stream)?;
+            self.conv(
+                gpu,
+                n,
+                seqs,
+                s.moe_out,
+                s.mlp_conv,
+                states,
+                2 * kvs + hs,
+                KvConv::Static { weight: w.mlp_conv },
+                DevicePtr::NULL,
+                h,
+                h,
+                stream,
+            )?;
+            gm.layer_out(gpu, s.resid, s.mlp_conv, hidden, n * h, stream)?;
+        }
         self.journal_inputs(gpu, batch, [s.moe_out], 3, stream)?;
-        self.conv(
-            gpu,
-            n,
-            seqs,
-            s.moe_out,
-            s.mlp_conv,
-            states,
-            2 * kvs + hs,
-            KvConv::Static { weight: w.mlp_conv },
-            DevicePtr::NULL,
-            h,
-            h,
-            stream,
-        )?;
-        gm.layer_out(gpu, s.resid, s.mlp_conv, hidden, n * h, stream)?;
 
         if v.save_prelude {
             gpu.copy_d2d_async(hidden, s.prelude_h, rb, stream)?;

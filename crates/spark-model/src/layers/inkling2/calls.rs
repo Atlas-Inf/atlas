@@ -92,6 +92,155 @@ impl Inkling2Layer {
         )
     }
 
+    /// The fused attention prologue (`inkling2_attn_prologue`, AMD only): the
+    /// k/v convs, the four head norms and the KV write in one launch (verify
+    /// rows keep their `sconv_state` rolls inside it).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attn_prologue(
+        &self,
+        gpu: &dyn GpuBackend,
+        n: usize,
+        seqs: usize,
+        states: DevicePtr,
+        kvs: usize,
+        log_pos: DevicePtr,
+        k_pool: DevicePtr,
+        v_pool: DevicePtr,
+        slots: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        let (s, w, p) = (&self.shared, &self.w, &self.p);
+        let taps = |conv: KvConv, dyn_taps: DevicePtr| match conv {
+            KvConv::Static { weight } => (weight, DevicePtr::NULL),
+            KvConv::Dynamic { static_w, .. } => (static_w, dyn_taps),
+        };
+        let (k_w, k_dyn) = taps(w.k_conv, s.dyn_k);
+        let (v_w, v_dyn) = taps(w.v_conv, s.dyn_v);
+        ops::attn_prologue(
+            gpu,
+            &self.k,
+            &ops::AttnPrologue {
+                k_lin: s.k_lin,
+                v_lin: s.v_lin,
+                q_in: s.q,
+                r_in: s.r,
+                kc: s.kc,
+                vc: s.vc,
+                qn: s.qn,
+                kn: s.kn,
+                vn: s.vn,
+                rn: s.rn,
+                states,
+                state_off_k: 0,
+                state_off_v: kvs,
+                k_w,
+                v_w,
+                k_dyn,
+                v_dyn,
+                q_scale: w.q_scale,
+                rel_scale: w.rel_scale,
+                positions: log_pos,
+                k_cache: k_pool,
+                v_cache: v_pool,
+                slots,
+                rows: n,
+                rows_per_seq: n / seqs,
+                num_seqs: seqs,
+                heads: p.heads,
+                kv_heads: p.kv_heads,
+                head_dim: p.head_dim,
+                d_rel: p.d_rel,
+                conv_k: p.conv_k,
+                dyn_stride: p.kv_heads * p.conv_k,
+                qk_clip: p.qk_clip,
+                rel_clip: p.rel_clip,
+                eps: p.eps,
+                log_n_floor: p.log_n_floor,
+                log_alpha: p.log_alpha,
+            },
+            stream,
+        )
+    }
+
+    /// The residual + boundary push folded into the MLP block-residual sums
+    /// (`inkling2_block_res_sums_resid`, AMD only), then `_out`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn block_res_mlp(
+        &self,
+        gpu: &dyn GpuBackend,
+        n: usize,
+        nb: usize,
+        x: DevicePtr,
+        conv_out: DevicePtr,
+        resid: DevicePtr,
+        out: DevicePtr,
+        push: bool,
+        stream: u64,
+    ) -> Result<()> {
+        let (w, d, s) = (&self.w, &self.dims, &self.shared);
+        ops::block_res_mlp(
+            gpu,
+            &self.k,
+            &ops::BlockRes {
+                blocks: s.blocks,
+                partial_f32: DevicePtr::NULL,
+                partial_bf16: DevicePtr::NULL,
+                queries: w.mlp_query,
+                out,
+                rows: n,
+                hidden: d.hidden,
+                num_blocks: nb,
+                row_stride: d.hidden,
+                block_stride: d.block_stride(),
+                num_queries: 1,
+                sums: s.res_sums,
+                eps: 1e-6,
+            },
+            x,
+            conv_out,
+            resid,
+            push,
+            stream,
+        )
+    }
+
+    /// `inkling2_mlp_tail` (AMD decode rows): combine (single row only) + the
+    /// post-MLP conv + layer_out. `combine` says `y` still holds per-slot
+    /// expert outputs to combine; otherwise `moe_out` is already final.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn mlp_tail(
+        &self,
+        gpu: &dyn GpuBackend,
+        n: usize,
+        states: DevicePtr,
+        state_off: usize,
+        combine: bool,
+        hidden: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        let (s, w, d, p) = (&self.shared, &self.w, &self.dims, &self.p);
+        ops::mlp_tail(
+            gpu,
+            &self.k,
+            &ops::MlpTail {
+                y: if combine { s.y } else { DevicePtr::NULL },
+                weights: if combine { s.weights } else { DevicePtr::NULL },
+                moe_out: s.moe_out,
+                mlp_conv: s.mlp_conv,
+                states,
+                state_off,
+                conv_w: w.mlp_conv,
+                resid: s.resid,
+                hidden,
+                rows: n,
+                hidden_dim: d.hidden,
+                top_k: if combine { d.top_k } else { 0 },
+                conv_k: p.conv_k,
+            },
+            stream,
+        )
+    }
+
     /// Message gates `which` (consecutive, at most three) of this loop layer;
     /// strides in fp32 elements between the gates' `h`, `m` and `out` rows.
     #[allow(clippy::too_many_arguments)]
@@ -171,11 +320,14 @@ impl Inkling2Layer {
     /// `ids` / `weights`, input `mlp_normed`, output `moe_out`): grouped GEMMs
     /// for prefill-sized row counts, the decode GEMVs otherwise and for every
     /// verify run (`exact`: the decode numerics, BF16 expert inputs).
+    /// `combine = false` (AMD fused MLP tail): the decode-GEMV path leaves `y`
+    /// per expert slot for `inkling2_mlp_tail`'s own combine.
     pub(super) fn routed_experts(
         &self,
         gpu: &dyn GpuBackend,
         n: usize,
         exact: bool,
+        combine: bool,
         stream: u64,
     ) -> Result<()> {
         let (s, w, d, p, h) = (&self.shared, &self.w, &self.dims, &self.p, self.dims.hidden);
@@ -227,6 +379,7 @@ impl Inkling2Layer {
                     out_stride: h,
                     gate_softcap: p.gate_softcap,
                     up_softcap: p.up_softcap,
+                    combine,
                 },
                 stream,
             )?;

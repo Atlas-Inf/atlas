@@ -9,6 +9,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
 pub(crate) use super::attn_ops::*;
+pub(crate) use super::fused_ops::*;
 pub(crate) use super::gate_ops::*;
 pub(crate) use super::moe_ops::*;
 
@@ -66,6 +67,11 @@ pub(crate) struct Inkling2Kernels {
     pub moe_gemm_nvfp4: KernelHandle,
     pub moe_gemm_mxfp8: KernelHandle,
     pub softcap_swiglu: KernelHandle,
+    /// AMD (strix-hip) only, from this target's `inkling2_fused` module: the
+    /// elementwise decode fusions (NULL elsewhere or when absent)
+    pub attn_prologue: KernelHandle,
+    pub mlp_tail: KernelHandle,
+    pub block_res_resid: KernelHandle,
 }
 
 /// A strix-hip-only kernel of this target's `inkling2_moe_gemm` module; NULL on other targets.
@@ -121,6 +127,24 @@ impl Inkling2Kernels {
             moe_gemm_nvfp4: amd_kernel(gpu, "inkling2_moe_gemm_nvfp4")?,
             moe_gemm_mxfp8: amd_kernel(gpu, "inkling2_moe_gemm_mxfp8")?,
             softcap_swiglu: amd_kernel(gpu, "inkling2_softcap_swiglu")?,
+            attn_prologue: crate::layers::try_kernel_gated(
+                cfg!(atlas_scale),
+                gpu,
+                "inkling2_fused",
+                "inkling2_attn_prologue",
+            ),
+            mlp_tail: crate::layers::try_kernel_gated(
+                cfg!(atlas_scale),
+                gpu,
+                "inkling2_fused",
+                "inkling2_mlp_tail",
+            ),
+            block_res_resid: crate::layers::try_kernel_gated(
+                cfg!(atlas_scale),
+                gpu,
+                "inkling2_fused",
+                "inkling2_block_res_sums_resid",
+            ),
         })
     }
 }

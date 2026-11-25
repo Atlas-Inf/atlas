@@ -55,6 +55,8 @@ pub(crate) struct MoeDecode {
     pub out_stride: usize,
     pub gate_softcap: f32,
     pub up_softcap: f32,
+    /// false: leave `y` per expert slot for `inkling2_mlp_tail`'s own combine
+    pub combine: bool,
 }
 
 pub(crate) fn moe_decode(
@@ -106,6 +108,9 @@ pub(crate) fn moe_decode(
         .arg_u32(u32_of(a.inter, "inter")?)
         .arg_u32(top_k)
         .launch(stream)?;
+    if !a.combine {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernels.moe_combine)
         .grid([u32_of(a.hidden.div_ceil(256), "hidden")?, rows, 1])
         .block([256, 1, 1])
