@@ -93,6 +93,26 @@ pub(crate) fn mxfp8_scales_f32(scales: &[u8]) -> Result<Vec<f32>> {
         .collect())
 }
 
+/// FP8 scaled in square blocks, as the row-major MXFP8 scales `[n, k/32]` the
+/// `mxfp8_gemv` tiers read. DeepSeek-V4.1 ships one UE8M0 scale per 32 x 32
+/// block (`[ceil(n/32), k/32]`); each grid row is repeated for the weight rows
+/// it covers. The same scales, so the same weights.
+pub fn fp8_block_scales_to_rows(grid: &[u8], n: usize, k: usize) -> Result<Vec<u8>> {
+    let per_row = k / MXFP8_BLOCK;
+    ensure!(
+        k.is_multiple_of(MXFP8_BLOCK) && grid.len() == n.div_ceil(MXFP8_BLOCK) * per_row,
+        "FP8 block scales: {} bytes for [{n}, {k}] in {MXFP8_BLOCK} x {MXFP8_BLOCK} blocks",
+        grid.len()
+    );
+    Ok((0..n)
+        .flat_map(|row| {
+            let at = row / MXFP8_BLOCK * per_row;
+            &grid[at..at + per_row]
+        })
+        .copied()
+        .collect())
+}
+
 /// Host reference: MXFP8 `[n, k]` to BF16 bits. The kernel path below must
 /// match it bit for bit; it is also what the golden test pins against
 /// PyTorch's own `float8_e4m3fn -> float32 -> bfloat16`.

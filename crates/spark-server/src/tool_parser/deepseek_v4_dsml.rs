@@ -2,18 +2,68 @@
 
 use super::*;
 
-pub(super) const DSML_OPEN: &str = "<｜DSML｜tool_calls>";
-pub(super) const DSML_CLOSE: &str = "</｜DSML｜tool_calls>";
-const INVOKE_OPEN: &str = "<｜DSML｜invoke name=\"";
-const INVOKE_CLOSE: &str = "</｜DSML｜invoke>";
-const PARAM_OPEN: &str = "<｜DSML｜parameter name=\"";
-const PARAM_CLOSE: &str = "</｜DSML｜parameter>";
+/// One checkpoint family's spelling of DSML.
+pub struct Dsml {
+    name: &'static str,
+    pub(super) open: &'static str,
+    close: &'static str,
+    invoke_open: &'static str,
+    invoke_close: &'static str,
+    param_open: &'static str,
+    param_close: &'static str,
+    leaks: LeakMarkers,
+}
 
-pub struct DeepseekV4DsmlParser;
+macro_rules! dsml {
+    ($name:literal, $calls:literal, $invoke:literal, $parameter:literal) => {
+        Dsml {
+            name: $name,
+            open: concat!("<｜DSML｜", $calls, ">"),
+            close: concat!("</｜DSML｜", $calls, ">"),
+            invoke_open: concat!("<｜DSML｜", $invoke, " name=\""),
+            invoke_close: concat!("</｜DSML｜", $invoke, ">"),
+            param_open: concat!("<｜DSML｜", $parameter, " name=\""),
+            param_close: concat!("</｜DSML｜", $parameter, ">"),
+            leaks: LeakMarkers {
+                orphan_open: &[
+                    concat!("<｜DSML｜", $invoke, " name=\""),
+                    concat!("<｜DSML｜", $parameter, " name=\""),
+                ],
+                close: &[
+                    concat!("</｜DSML｜", $parameter, ">"),
+                    concat!("</｜DSML｜", $invoke, ">"),
+                    concat!("</｜DSML｜", $calls, ">"),
+                ],
+                envelope_open: &[concat!("<｜DSML｜", $calls, ">")],
+                envelope_close: &[concat!("</｜DSML｜", $calls, ">")],
+            },
+        }
+    };
+}
 
-impl ToolCallParser for DeepseekV4DsmlParser {
+pub(super) static DSML_V4: Dsml = dsml!("deepseek_v4", "tool_calls", "invoke", "parameter");
+/// DeepSeek-V4.1 writes each tag name after a space.
+pub(super) static DSML_V41: Dsml = dsml!("deepseek_v41", " calls", " invoke", " parameter");
+pub(super) static DSML_DIALECTS: [&Dsml; 2] = [&DSML_V4, &DSML_V41];
+
+/// The first opening tag of either dialect in `text`, and where it starts.
+fn find_dsml(text: &str) -> Option<(usize, &'static Dsml)> {
+    DSML_DIALECTS
+        .iter()
+        .filter_map(|&dsml| Some((text.find(dsml.open)?, dsml)))
+        .min_by_key(|&(start, _)| start)
+}
+
+pub struct DeepseekDsmlParser(&'static Dsml);
+
+impl DeepseekDsmlParser {
+    pub const V4: Self = Self(&DSML_V4);
+    pub const V41: Self = Self(&DSML_V41);
+}
+
+impl ToolCallParser for DeepseekDsmlParser {
     fn name(&self) -> &str {
-        "deepseek_v4"
+        self.0.name
     }
 
     fn system_prompt(
@@ -28,6 +78,7 @@ impl ToolCallParser for DeepseekV4DsmlParser {
     }
 
     fn format_tool_calls(&self, calls: &[IncomingToolCall]) -> String {
+        let dsml = self.0;
         let mut invokes = Vec::with_capacity(calls.len());
         for call in calls {
             let args = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
@@ -43,18 +94,20 @@ impl ToolCallParser for DeepseekV4DsmlParser {
                         ),
                     };
                     params.push(format!(
-                        "<{DSML}parameter name=\"{key}\" string=\"{string}\">{value}</{DSML}parameter>",
-                        DSML = "｜DSML｜",
+                        "{}{key}\" string=\"{string}\">{value}{}",
+                        dsml.param_open, dsml.param_close,
                     ));
                 }
             }
             invokes.push(format!(
-                "<｜DSML｜invoke name=\"{}\">\n{}\n</｜DSML｜invoke>",
+                "{}{}\">\n{}\n{}",
+                dsml.invoke_open,
                 call.function.name,
-                params.join("\n")
+                params.join("\n"),
+                dsml.invoke_close,
             ));
         }
-        format!("{DSML_OPEN}\n{}\n{DSML_CLOSE}", invokes.join("\n"))
+        format!("{}\n{}\n{}", dsml.open, invokes.join("\n"), dsml.close)
     }
 
     fn format_tool_response(&self, content: &str) -> String {
@@ -62,12 +115,7 @@ impl ToolCallParser for DeepseekV4DsmlParser {
     }
 
     fn leak_markers(&self) -> LeakMarkers {
-        LeakMarkers {
-            orphan_open: &[INVOKE_OPEN, PARAM_OPEN],
-            close: &[PARAM_CLOSE, INVOKE_CLOSE, DSML_CLOSE],
-            envelope_open: &[DSML_OPEN],
-            envelope_close: &[DSML_CLOSE],
-        }
+        self.0.leaks
     }
 
     fn wants_typed_arguments(&self) -> bool {
@@ -80,7 +128,7 @@ pub(super) fn parse_dsml_tool_calls(text: &str) -> (Option<String>, Vec<ToolCall
     let mut calls = Vec::new();
     let mut rest = text;
     loop {
-        let Some(start) = rest.find(DSML_OPEN) else {
+        let Some((start, dsml)) = find_dsml(rest) else {
             let tail = rest.trim();
             if !tail.is_empty() {
                 content.push(tail.to_string());
@@ -91,33 +139,33 @@ pub(super) fn parse_dsml_tool_calls(text: &str) -> (Option<String>, Vec<ToolCall
         if !before.is_empty() {
             content.push(before.to_string());
         }
-        let body = &rest[start + DSML_OPEN.len()..];
-        let Some(end) = body.find(DSML_CLOSE) else {
+        let body = &rest[start + dsml.open.len()..];
+        let Some(end) = body.find(dsml.close) else {
             content.push(rest[start..].to_string());
             break;
         };
-        calls.extend(parse_dsml_invokes(&body[..end]));
-        rest = &body[end + DSML_CLOSE.len()..];
+        calls.extend(parse_dsml_invokes(&body[..end], dsml));
+        rest = &body[end + dsml.close.len()..];
     }
     let content = (!content.is_empty()).then(|| content.join("\n"));
     (content, calls)
 }
 
-pub(super) fn parse_dsml_invokes(body: &str) -> Vec<ToolCall> {
+fn parse_dsml_invokes(body: &str, dsml: &Dsml) -> Vec<ToolCall> {
     let mut calls = Vec::new();
     let mut rest = body;
-    while let Some(start) = rest.find(INVOKE_OPEN) {
-        rest = &rest[start + INVOKE_OPEN.len()..];
+    while let Some(start) = rest.find(dsml.invoke_open) {
+        rest = &rest[start + dsml.invoke_open.len()..];
         let Some(name_end) = rest.find("\">\n") else {
             break;
         };
         let name = &rest[..name_end];
         let after_header = &rest[name_end + 3..];
-        let Some(invoke_end) = after_header.find(INVOKE_CLOSE) else {
+        let Some(invoke_end) = after_header.find(dsml.invoke_close) else {
             break;
         };
         let params = after_header[..invoke_end].trim_matches('\n');
-        if let Some(arguments) = parse_dsml_parameters(params) {
+        if let Some(arguments) = parse_dsml_parameters(params, dsml) {
             calls.push(ToolCall {
                 id: next_tool_call_id(),
                 call_type: "function".into(),
@@ -127,23 +175,23 @@ pub(super) fn parse_dsml_invokes(body: &str) -> Vec<ToolCall> {
                 },
             });
         }
-        rest = &after_header[invoke_end + INVOKE_CLOSE.len()..];
+        rest = &after_header[invoke_end + dsml.invoke_close.len()..];
     }
     calls
 }
 
-fn parse_dsml_parameters(params: &str) -> Option<serde_json::Value> {
+fn parse_dsml_parameters(params: &str, dsml: &Dsml) -> Option<serde_json::Value> {
     let mut object = serde_json::Map::new();
     let mut rest = params.trim();
     while !rest.is_empty() {
-        rest = rest.strip_prefix(PARAM_OPEN)?;
+        rest = rest.strip_prefix(dsml.param_open)?;
         let name_end = rest.find("\" string=\"")?;
         let name = &rest[..name_end];
         rest = &rest[name_end + "\" string=\"".len()..];
         let string_end = rest.find("\">")?;
         let is_string = &rest[..string_end];
         rest = &rest[string_end + 2..];
-        let value_end = rest.find(PARAM_CLOSE)?;
+        let value_end = rest.find(dsml.param_close)?;
         let raw = &rest[..value_end];
         let value = match is_string {
             "true" => serde_json::Value::String(raw.to_string()),
@@ -153,7 +201,7 @@ fn parse_dsml_parameters(params: &str) -> Option<serde_json::Value> {
         if object.insert(name.to_string(), value).is_some() {
             return None;
         }
-        rest = rest[value_end + PARAM_CLOSE.len()..].trim_start_matches('\n');
+        rest = rest[value_end + dsml.param_close.len()..].trim_start_matches('\n');
     }
     Some(serde_json::Value::Object(object))
 }
@@ -166,17 +214,17 @@ pub(super) enum DsmlStreamAction {
 
 impl StreamingToolDetector {
     pub(super) fn process_dsml(&mut self, outputs: &mut Vec<DetectorOutput>) -> DsmlStreamAction {
-        if self.inside_dsml {
-            let Some(end) = self.buffer.find(DSML_CLOSE) else {
+        if let Some(dsml) = self.inside_dsml {
+            let Some(end) = self.buffer.find(dsml.close) else {
                 return DsmlStreamAction::Wait;
             };
             let body = self.buffer[..end].to_string();
-            self.buffer = self.buffer[end + DSML_CLOSE.len()..].to_string();
-            self.inside_dsml = false;
-            self.emit_dsml_calls(&body, outputs);
+            self.buffer = self.buffer[end + dsml.close.len()..].to_string();
+            self.inside_dsml = None;
+            self.emit_dsml_calls(&body, dsml, outputs);
             return DsmlStreamAction::Continue;
         }
-        let Some(start) = self.buffer.find(DSML_OPEN) else {
+        let Some((start, dsml)) = find_dsml(&self.buffer) else {
             return DsmlStreamAction::NotDsml;
         };
         if start > 0 {
@@ -186,29 +234,26 @@ impl StreamingToolDetector {
             }
         }
         if self.marker_is_literal(start) {
-            let marker = self.buffer[start..start + DSML_OPEN.len()].to_string();
-            self.buffer = self.buffer[start + DSML_OPEN.len()..].to_string();
+            let marker = self.buffer[start..start + dsml.open.len()].to_string();
+            self.buffer = self.buffer[start + dsml.open.len()..].to_string();
             self.push_content(outputs, marker);
             return DsmlStreamAction::Continue;
         }
-        self.buffer = self.buffer[start + DSML_OPEN.len()..].to_string();
-        self.inside_dsml = true;
+        self.buffer = self.buffer[start + dsml.open.len()..].to_string();
+        self.inside_dsml = Some(dsml);
         DsmlStreamAction::Continue
     }
 
     pub(super) fn flush_dsml(&mut self) -> Option<Vec<DetectorOutput>> {
-        if !self.inside_dsml {
-            return None;
-        }
+        let dsml = self.inside_dsml.take()?;
         let body = std::mem::take(&mut self.buffer);
-        self.inside_dsml = false;
         let mut outputs = Vec::new();
-        self.emit_dsml_calls(&body, &mut outputs);
+        self.emit_dsml_calls(&body, dsml, &mut outputs);
         (!outputs.is_empty()).then_some(outputs)
     }
 
-    fn emit_dsml_calls(&mut self, body: &str, outputs: &mut Vec<DetectorOutput>) {
-        for call in parse_dsml_invokes(body) {
+    fn emit_dsml_calls(&mut self, body: &str, dsml: &Dsml, outputs: &mut Vec<DetectorOutput>) {
+        for call in parse_dsml_invokes(body, dsml) {
             let index = self.call_counter as usize;
             self.call_counter += 1;
             self.emitted_tool_calls = true;

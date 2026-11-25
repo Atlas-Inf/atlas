@@ -5,6 +5,7 @@
 use super::*;
 
 mod deepseek_v4;
+mod deepseek_v41;
 mod glm5_next;
 use serde_json::json;
 mod laguna;

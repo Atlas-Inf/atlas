@@ -111,12 +111,14 @@ impl ChatTokenizer {
                 },
             )
         };
-        let chat_encoding = if model_type == "deepseek_v4" {
-            tracing::info!("Using checkpoint-native DeepSeek-V4 message encoding");
-            ChatEncoding::DeepseekV4
-        } else {
-            ChatEncoding::Jinja
+        let chat_encoding = match model_type {
+            "deepseek_v4" => ChatEncoding::Deepseek(crate::tokenizer::deepseek_v4::Dialect::V4),
+            "deepseek_v41" => ChatEncoding::Deepseek(crate::tokenizer::deepseek_v4::Dialect::V41),
+            _ => ChatEncoding::Jinja,
         };
+        if chat_encoding != ChatEncoding::Jinja {
+            tracing::info!("Using checkpoint-native DeepSeek message encoding");
+        }
 
         // nemotron_h_omni: `<image>`(18) placeholders expand to
         // `<img>`(19) + N x id-18 + `</img>`(20) per the checkpoint's
@@ -156,7 +158,7 @@ impl ChatTokenizer {
             glm_tool_markup_as_text: matches!(model_type, "glm5_next" | "qwen4_exp"),
             // Inkling 2 names a tool result by matching its tool_call_id.
             tool_call_ids_in_template: matches!(model_type, "glm5_next" | "inkling2_loop")
-                || chat_encoding == ChatEncoding::DeepseekV4,
+                || chat_encoding != ChatEncoding::Jinja,
             chat_encoding,
             omni_image_tokens,
             chat_template,

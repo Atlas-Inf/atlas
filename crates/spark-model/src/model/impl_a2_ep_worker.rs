@@ -13,6 +13,7 @@
 //! - 0xFFFFFFEB: prefill chunk carrying DFlash verify owners (`glm_fused_chunk`)
 //! - 0xFFFFFFEC: serve this rank's half of a split DFlash propose (`draft_assist`)
 //! - 0xFFFFFFE7: multi-sequence prefill (`prefill_b::multi`)
+//! - 0xFFFFFFE4: whether the ranks pick a step's largest logit (`head_pick`)
 
 use anyhow::Result;
 
@@ -176,6 +177,9 @@ impl TransformerModel {
         }
         if cmd == super::draft_assist::EP_CMD_DRAFT_ASSIST {
             return self.draft_assist_serve(seq_id).map(Some);
+        }
+        if cmd == super::head_pick::EP_CMD_HEAD_PICK {
+            return self.head_pick_receive().map(|()| Some(true));
         }
         Ok(None)
     }

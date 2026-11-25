@@ -9,7 +9,8 @@
 //! under `ATLAS_RICURSIVE_PDL=1` ([`RICURSIVE_PDL_KERNELS`]), Qwen3.8-27B under
 //! `ATLAS_QWEN38_PDL=1` (prefill, [`QWEN38_PDL_KERNELS`]) and, separately,
 //! `ATLAS_QWEN38_PDL_DECODE=1` (the decode chain,
-//! [`QWEN38_PDL_DECODE_KERNELS`]), and Inkling 2 Mini always
+//! [`QWEN38_PDL_DECODE_KERNELS`]), DeepSeek-V4.1-Flash under
+//! `ATLAS_DSV41_PDL=1` (`pdl_dsv41.rs`), and Inkling 2 Mini always
 //! ([`ALWAYS_ON`]: its decode chain, [`INKLING2_PDL_KERNELS`]). A kernel launches with PDL when a switch
 //! that is on lists it. A list is its target's own: a `common/` kernel that
 //! waits for one target's sake is launched with PDL only where a target lists
@@ -17,6 +18,10 @@
 //! no-ops).
 
 use std::sync::OnceLock;
+
+#[path = "pdl_dsv41.rs"]
+mod dsv41;
+use dsv41::DSV41_PDL_KERNELS;
 
 /// A kernel target with PDL-entered kernels: its name and its switches. Every
 /// copy of a kernel any of its lists names, in the kernels the target serves,
@@ -71,6 +76,13 @@ pub(super) const PDL_TARGETS: &[PdlTarget] = &[
         switches: &[PdlSwitch {
             name: "ATLAS_RICURSIVE_PDL",
             kernels: RICURSIVE_PDL_KERNELS,
+        }],
+    },
+    PdlTarget {
+        model: "deepseek-v4.1-flash",
+        switches: &[PdlSwitch {
+            name: "ATLAS_DSV41_PDL",
+            kernels: DSV41_PDL_KERNELS,
         }],
     },
     PdlTarget {

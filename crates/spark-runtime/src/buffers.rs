@@ -15,6 +15,7 @@ mod glm_latent;
 mod lend;
 mod release;
 mod sizes;
+mod sizes_own_scratch;
 mod sizes_q12;
 mod sizes_q2;
 mod verify_masks;

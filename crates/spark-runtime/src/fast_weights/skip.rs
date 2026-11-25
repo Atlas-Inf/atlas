@@ -56,7 +56,10 @@ impl FastSafetensorsLoader {
     fn is_expert_tp_slice(&self, name: &str) -> bool {
         self.expert_tp
             && !name.starts_with("mtp.")
-            && (name.ends_with(".weight") || name.ends_with(".weight_scale"))
+            // `.scale` is DeepSeek-V4.1's name for an expert's block scales.
+            && (name.ends_with(".weight")
+                || name.ends_with(".weight_scale")
+                || name.ends_with(".scale"))
             && parse_expert_index(name).is_some()
             && ![
                 &self.replicated_expert_prefix,

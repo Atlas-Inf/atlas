@@ -75,7 +75,7 @@ pub fn ships_vanilla_norm_weights(config: &atlas_core::config::ModelConfig) -> b
 pub fn model_type_ships_vanilla_norm_weights(model_type: &str) -> bool {
     matches!(
         model_type,
-        "deepseek_v4" | "glm5_next" | "inkling2_loop" | "laguna" | "ricursive"
+        "deepseek_v4" | "deepseek_v41" | "glm5_next" | "inkling2_loop" | "laguna" | "ricursive"
     )
 }
 

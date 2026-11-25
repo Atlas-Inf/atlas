@@ -1,0 +1,87 @@
+[model]
+name = "deepseek-v4.1-flash"
+hf_id = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+architecture = "MLA + MoE + mHC + shared sparse attention + Engram + DSpark"
+
+# V4.1 keeps V4's MoE, mHC and attention-projection kernels, so this target
+# compiles deepseek-v4-flash's tree (`kernel_source`) and adds only what V4
+# lacks in its own `nvfp4/` overlay. MODEL.toml is this target's own.
+kernel_source = "deepseek-v4-flash"
+
+layers_total = 40
+
+hidden_dim = 5120
+head_dim = 512
+q_heads = 64
+kv_heads = 1
+
+vocab_size = 129280
+max_position_embeddings = 1048576
+rope_theta = 10000
+compress_rope_theta = 160000
+
+# MLA
+q_lora_rank = 1280
+o_lora_rank = 1024
+o_groups = 8
+qk_rope_head_dim = 64
+sliding_window = 128
+
+# Indexer
+index_n_heads = 32
+index_head_dim = 128
+
+# MoE
+num_experts = 384
+num_shared_experts = 1
+moe_intermediate_size = 2304
+top_k = 6
+
+# Hyper-Connections (mHC)
+hc_mult = 4
+hc_sinkhorn_iters = 20
+hc_eps = 1e-6
+
+# No collision: deepseek_v41 is a distinct identity, so no match_names.
+[[model_types]]
+model_type = "deepseek_v41"
+hidden_size = 5120
+
+# Sampling: deepseek-v4-flash's presets. The 1017 repository ships no
+# generation_config.json to take them from.
+[sampling.thinking]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+
+[sampling.coding]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+
+[sampling.general]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+
+[behavior]
+enable_loop_watchdog = true
+thinking_default = false
+# The window KV is FP8 in the reference, as V4's is.
+default_kv_dtype = "fp8"
+fp8_kv_calibration_tokens = 256
+
+# expected_absent: harvested from V4.1's own runs, one entry per lookup its
+# start-up gate reported. V4's entries name V4's dispatch sites and are not
+# copied.
+
+[expected_absent.w4a16]
+w4a16_gemm_t_p3 = """
+3-deep weight-pipeline twin shipped only in qwen3.6-27b's shadow.
+`layers::tgemm_kernel` probes it for the model's lm_head handle
+(model/impl_a1.rs) and falls back to w4a16_gemm_t, which resolves here.
+V4.1's head is BF16 and its layers launch their own dsv41 kernels, so the
+handle is not on a path this model runs."""

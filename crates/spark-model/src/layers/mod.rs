@@ -2,6 +2,7 @@
 
 pub mod aux_d2h;
 pub mod canonical_verify;
+pub mod deepseek_v41;
 pub mod deepseek_v4_mtp;
 pub mod dense_ffn;
 pub mod dflash_head;

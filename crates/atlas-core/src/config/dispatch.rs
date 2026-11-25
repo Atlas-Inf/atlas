@@ -10,10 +10,10 @@ use anyhow::{Context, Result};
 
 use super::{
     LayerType, ModelConfig, default_conv_kernel, default_partial_rotary, default_rms_eps,
-    default_rope_theta, finalize_config, parse_deepseek_v4, parse_gemma4_params, parse_glm5_next,
-    parse_inkling2_loop, parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_mistral_params,
-    parse_quantization_config, parse_qwen4_exp, parse_ricursive, parse_step3p7,
-    parse_vision_config, validate_config,
+    default_rope_theta, finalize_config, parse_deepseek_v4, parse_deepseek_v41,
+    parse_gemma4_params, parse_glm5_next, parse_inkling2_loop, parse_laguna, parse_longcat_ngram,
+    parse_minimax_m2, parse_mistral_params, parse_quantization_config, parse_qwen4_exp,
+    parse_ricursive, parse_step3p7, parse_vision_config, validate_config,
 };
 
 use super::dispatch_nemotron;
@@ -67,6 +67,7 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
                     "LongcatFlashForCausalLM" => Some("longcat_flash"),
                     "Qwen4ExpForConditionalGeneration"
                     | "Qwen3_8FlashNextForConditionalGeneration" => Some("qwen4_exp"),
+                    "DeepseekV41ForCausalLM" => Some("deepseek_v41"),
                     _ => None,
                 })
         })
@@ -255,6 +256,7 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
         "minimax_m2" => parse_minimax_m2(&raw),
         "step3p7" => parse_step3p7(&raw),
         "deepseek_v4" => parse_deepseek_v4(json),
+        "deepseek_v41" => parse_deepseek_v41(&raw),
         "glm5_next" => parse_glm5_next(&raw),
         _ => {
             // Flat config (qwen3_next, etc.)

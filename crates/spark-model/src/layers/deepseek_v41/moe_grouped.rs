@@ -1,0 +1,405 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! The routed experts of a batch of rows, grouped by expert
+//! (`dsv41_experts_*` in `dsv41_expert.cu`).
+//!
+//! A row alone reads its six experts' weights, and a batch a row at a time
+//! reads six a row: 384 experts' worth every 64 rows. Rows that chose the
+//! same expert can share one read of it. The host sorts the batch's (row,
+//! slot) pairs by expert and cuts each expert's run into tiles of up to
+//! 32, and three launches take every tile: both projections in, the
+//! activation, and, once the ranks have gathered the activations, the
+//! projection out. A row's bytes are those of [`super::moe::experts_in`]
+//! and [`super::moe::experts_out`] on it alone.
+//!
+//! A few rows, a verify's, are sorted on the device ([`plan_on_device`]):
+//! the host's turn costs a wait for the GPU a layer, and each rank waits its
+//! own while the others wait for it.
+
+use anyhow::{Result, ensure};
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
+
+use super::moe::MoeKernels;
+use super::weights::{ExpertSlab, Slice};
+
+/// The pairs of one expert a launch takes together (`dsv41_expert.cu`).
+const TILE: usize = 32;
+
+/// The most rows whose pairs the device sorts: no expert of theirs has more
+/// than a tile's.
+pub const DEVICE_ROWS: usize = TILE;
+
+/// The tiles the launches of a batch cover, and its pairs.
+#[derive(Clone, Copy)]
+pub struct Counts {
+    pub tiles: usize,
+    pub pairs: usize,
+}
+
+/// A batch's (row, slot) pairs in expert order, as the kernels read them.
+pub struct Plan {
+    /// `[tiles, 3]` u32: expert, first pair, pairs.
+    pub tiles: Vec<u32>,
+    /// A pair's row of the batch, its row of the output (`row * slots +
+    /// slot`), and its routing weight.
+    pub row_of: Vec<i32>,
+    pub out_row: Vec<i32>,
+    pub weights: Vec<f32>,
+}
+
+impl Plan {
+    /// `chosen` and `weights` are `[rows, top_k]`, a row's experts ascending,
+    /// as the router leaves them by expert. A row has `slots` outputs.
+    pub fn new(
+        chosen: &[u32],
+        weights: &[f32],
+        top_k: usize,
+        slots: usize,
+        experts: usize,
+    ) -> Self {
+        let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); experts];
+        for (pair, &expert) in chosen.iter().enumerate() {
+            by_expert[expert as usize].push((pair / top_k, pair % top_k));
+        }
+        let mut plan = Self {
+            tiles: Vec::new(),
+            row_of: Vec::with_capacity(chosen.len()),
+            out_row: Vec::with_capacity(chosen.len()),
+            weights: Vec::with_capacity(chosen.len()),
+        };
+        for (expert, pairs) in by_expert.iter().enumerate() {
+            for tile in pairs.chunks(TILE) {
+                plan.tiles
+                    .extend([expert as u32, plan.row_of.len() as u32, tile.len() as u32]);
+                for &(row, slot) in tile {
+                    plan.row_of.push(row as i32);
+                    plan.out_row.push((row * slots + slot) as i32);
+                    plan.weights.push(weights[row * top_k + slot]);
+                }
+            }
+        }
+        plan
+    }
+
+    pub fn tile_count(&self) -> usize {
+        self.tiles.len() / 3
+    }
+
+    pub fn pairs(&self) -> usize {
+        self.row_of.len()
+    }
+
+    pub fn counts(&self) -> Counts {
+        Counts {
+            tiles: self.tile_count(),
+            pairs: self.pairs(),
+        }
+    }
+}
+
+/// [`Plan::new`] of `rows` rows, at most [`DEVICE_ROWS`], on the device and
+/// into `scratch`, from `chosen` and `weights` as the router leaves them
+/// (`[rows, top_k]`). The launches then cover a tile a pair, and those past
+/// the experts chosen are none: the host does not learn how many there are.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_on_device(
+    gpu: &dyn GpuBackend,
+    kernels: &MoeKernels,
+    scratch: &GroupedScratch,
+    chosen: DevicePtr,
+    weights: DevicePtr,
+    rows: usize,
+    top_k: usize,
+    slots: usize,
+    stream: u64,
+) -> Result<Counts> {
+    let pairs = rows * top_k;
+    ensure!(
+        (1..=DEVICE_ROWS).contains(&rows) && pairs <= 1024,
+        "dsv41_experts_plan: {rows} rows of {top_k} experts"
+    );
+    KernelLaunch::new(gpu, kernels.experts_plan)
+        .grid([1, 1, 1])
+        .block([pairs as u32, 1, 1])
+        .arg_ptr(chosen)
+        .arg_ptr(weights)
+        .arg_ptr(scratch.tiles)
+        .arg_ptr(scratch.row_of)
+        .arg_ptr(scratch.out_row)
+        .arg_ptr(scratch.weights)
+        .arg_u32(top_k as u32)
+        .arg_u32(slots as u32)
+        .launch(stream)?;
+    Ok(Counts {
+        tiles: pairs,
+        pairs,
+    })
+}
+
+/// Device buffers of a plan and of the launches' working values, for
+/// batches of up to `rows` rows.
+#[derive(Clone, Copy)]
+pub struct GroupedScratch {
+    pub tiles: DevicePtr,
+    pub row_of: DevicePtr,
+    pub out_row: DevicePtr,
+    pub weights: DevicePtr,
+    /// `[pairs, 2, part rows]` BF16.
+    pub gate_up: DevicePtr,
+}
+
+impl GroupedScratch {
+    pub fn alloc(
+        gpu: &dyn GpuBackend,
+        rows: usize,
+        top_k: usize,
+        experts: usize,
+        part_rows: usize,
+    ) -> Result<Self> {
+        // The shared expert's rows follow the pairs where a few rows take it
+        // beside the routed experts.
+        let (pairs, all) = (rows * top_k, rows * (top_k + 1));
+        Ok(Self {
+            // An expert's run ends in at most one tile that is not full; and
+            // a few rows sorted on the device have a tile a pair.
+            tiles: gpu.alloc((experts + pairs / TILE).max(pairs.min(1024)) * 3 * 4)?,
+            row_of: gpu.alloc(pairs * 4)?,
+            out_row: gpu.alloc(all * 4)?,
+            weights: gpu.alloc(all * 4)?,
+            gate_up: gpu.alloc(all * 2 * part_rows * 2)?,
+        })
+    }
+
+    /// Put `plan` on the device. Nothing queued may still read the last.
+    pub fn upload(&self, gpu: &dyn GpuBackend, plan: &Plan) -> Result<()> {
+        let words = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let ints = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let floats: Vec<u8> = plan.weights.iter().flat_map(|w| w.to_le_bytes()).collect();
+        gpu.copy_h2d(&words(&plan.tiles), self.tiles)?;
+        gpu.copy_h2d(&ints(&plan.row_of), self.row_of)?;
+        gpu.copy_h2d(&ints(&plan.out_row), self.out_row)?;
+        gpu.copy_h2d(&floats, self.weights)
+    }
+}
+
+fn layout<'a>(slab: &ExpertSlab, launch: KernelLaunch<'a>) -> KernelLaunch<'a> {
+    let (data, scales) = slab.layout();
+    launch
+        .arg_u64(slab.stride() as u64)
+        .arg_u32(data as u32)
+        .arg_u32(scales as u32)
+}
+
+/// One part of the way into the routed experts of every row of a batch:
+/// `inner` (`[pairs, part_rows]` BF16) = the part's rows of each pair's
+/// hidden activation in FP8. `x` is the rows' input in FP8 (`[rows, hidden]`
+/// BF16), `part_rows` the part's share of an expert's hidden rows.
+///
+/// With `shared`, the part's rows of the shared expert's w1 and w3 and the
+/// batch's rows, of a batch [`plan_on_device`] sorted: the shared expert's
+/// activations follow the pairs' in `inner`, from the same launches.
+#[allow(clippy::too_many_arguments)]
+pub fn experts_in(
+    gpu: &dyn GpuBackend,
+    kernels: &MoeKernels,
+    slab: &ExpertSlab,
+    plan: Counts,
+    scratch: &GroupedScratch,
+    x: DevicePtr,
+    inner: DevicePtr,
+    part_rows: usize,
+    hidden: usize,
+    limit: f32,
+    shared: Option<([Slice; 2], usize)>,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        part_rows.is_multiple_of(32) && hidden.is_multiple_of(32),
+        "dsv41_experts: {part_rows} rows of {hidden}"
+    );
+    let tiles = plan.tiles as u32;
+    if tiles == 0 {
+        return Ok(());
+    }
+    let none = Slice {
+        data: DevicePtr::NULL,
+        scales: DevicePtr::NULL,
+    };
+    let ([w1, w3], shared_rows) = shared.unwrap_or(([none; 2], 0));
+    let own = if shared_rows > 0 { 2 } else { 0 };
+    layout(
+        slab,
+        KernelLaunch::new(gpu, kernels.experts_in)
+            .grid([div_ceil(part_rows as u32, 16), 2 * tiles + own, 1])
+            .block([256, 1, 1])
+            .arg_ptr(x)
+            .arg_ptr(slab.base)
+            .arg_ptr(scratch.tiles)
+            .arg_ptr(scratch.row_of)
+            .arg_ptr(scratch.gate_up)
+            .arg_u32(part_rows as u32)
+            .arg_u32(hidden as u32),
+    )
+    .arg_ptr(w1.data)
+    .arg_ptr(w1.scales)
+    .arg_ptr(w3.data)
+    .arg_ptr(w3.scales)
+    .arg_u32(plan.pairs as u32)
+    .arg_u32(shared_rows as u32)
+    .launch(stream)?;
+    activate(
+        gpu,
+        kernels,
+        GateUp::paired(scratch.gate_up, part_rows),
+        scratch.weights,
+        inner,
+        plan.pairs + shared_rows,
+        part_rows,
+        limit,
+        stream,
+    )
+}
+
+/// One part of the way out of them: `out` (`[rows * slots, n]` BF16) gets,
+/// at each pair's output row, the part's `n` rows of that expert's output.
+/// `inner` is every part of the pairs' hidden activations, as
+/// [`experts_in`] left each and the ranks gathered them: a part
+/// `piece_stride` values after the last. With `shared`, the part's rows of
+/// the shared expert's w2 and the batch's rows, as [`experts_in`] takes
+/// them: its output goes to each row's last slot.
+#[allow(clippy::too_many_arguments)]
+pub fn experts_out(
+    gpu: &dyn GpuBackend,
+    kernels: &MoeKernels,
+    slab: &ExpertSlab,
+    plan: Counts,
+    scratch: &GroupedScratch,
+    inner: DevicePtr,
+    piece_stride: usize,
+    out: DevicePtr,
+    part_rows: usize,
+    n: usize,
+    shared: Option<(Slice, usize)>,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        part_rows.is_multiple_of(64),
+        "dsv41_experts_out: {part_rows} hidden rows a part"
+    );
+    let tiles = plan.tiles as u32;
+    if tiles == 0 {
+        return Ok(());
+    }
+    let none = Slice {
+        data: DevicePtr::NULL,
+        scales: DevicePtr::NULL,
+    };
+    let (w2, shared_rows) = shared.unwrap_or((none, 0));
+    layout(
+        slab,
+        KernelLaunch::new(gpu, kernels.experts_out)
+            .grid([
+                div_ceil(n as u32, 16),
+                tiles + u32::from(shared_rows > 0),
+                1,
+            ])
+            .block([256, 1, 1])
+            .arg_ptr(inner)
+            .arg_ptr(slab.base)
+            .arg_ptr(scratch.tiles)
+            .arg_ptr(scratch.out_row)
+            .arg_ptr(out)
+            .arg_u32(n as u32)
+            .arg_u32(part_rows as u32),
+    )
+    .arg_u64(piece_stride as u64)
+    .arg_ptr(w2.data)
+    .arg_ptr(w2.scales)
+    .arg_u32(plan.pairs as u32)
+    .arg_u32(shared_rows as u32)
+    .launch(stream)
+}
+
+/// Where [`activate`] finds a row's gate values and its up values: rows
+/// `row_stride` values apart, the up values `up_offset` after the gate's.
+#[derive(Clone, Copy)]
+pub struct GateUp {
+    pub base: DevicePtr,
+    pub up_offset: usize,
+    pub row_stride: usize,
+}
+
+impl GateUp {
+    /// `[count, 2, part_rows]`: a row's gate values and then its up values.
+    pub fn paired(base: DevicePtr, part_rows: usize) -> Self {
+        Self {
+            base,
+            up_offset: part_rows,
+            row_stride: 2 * part_rows,
+        }
+    }
+}
+
+/// `inner` (`[count, part_rows]` BF16) = the FP8 activation of `gate_up`
+/// under `weights` (`[count]` FP32, or none for the shared expert's 1).
+#[allow(clippy::too_many_arguments)]
+pub fn activate(
+    gpu: &dyn GpuBackend,
+    kernels: &MoeKernels,
+    gate_up: GateUp,
+    weights: DevicePtr,
+    inner: DevicePtr,
+    count: usize,
+    part_rows: usize,
+    limit: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernels.experts_act)
+        .grid([div_ceil((count * part_rows) as u32, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate_up.base)
+        .arg_ptr(weights)
+        .arg_ptr(inner)
+        .arg_u32(count as u32)
+        .arg_u32(part_rows as u32)
+        .arg_f32(limit)
+        .arg_u64(gate_up.up_offset as u64)
+        .arg_u64(gate_up.row_stride as u64)
+        .launch(stream)
+}
+
+/// [`activate`]'s values as the ranks send them and the tensor cores read
+/// them: `codes` (`[count, part_rows]` E4M3) and `sf` (`[count, part_rows /
+/// 32]` E8M0), half the bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn activate_codes(
+    gpu: &dyn GpuBackend,
+    kernels: &MoeKernels,
+    gate_up: GateUp,
+    weights: DevicePtr,
+    codes: DevicePtr,
+    sf: DevicePtr,
+    count: usize,
+    part_rows: usize,
+    limit: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernels.experts_act_codes)
+        .grid([div_ceil((count * part_rows / 32) as u32, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate_up.base)
+        .arg_ptr(weights)
+        .arg_ptr(codes)
+        .arg_ptr(sf)
+        .arg_u32(count as u32)
+        .arg_u32(part_rows as u32)
+        .arg_f32(limit)
+        .arg_u64(gate_up.up_offset as u64)
+        .arg_u64(gate_up.row_stride as u64)
+        .launch(stream)
+}
+
+#[cfg(test)]
+#[path = "moe_grouped_test_gpu.rs"]
+mod test_gpu;

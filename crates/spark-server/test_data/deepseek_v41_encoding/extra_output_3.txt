@@ -1,0 +1,53 @@
+<｜begin▁of▁sentence｜><｜System｜>Tools ahead.
+
+## Tools
+
+You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<｜DSML｜ calls>" block like the following:
+
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="$TOOL_NAME">
+<｜DSML｜ parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜ parameter>
+...
+</｜DSML｜ invoke>
+<｜DSML｜ invoke name="$TOOL_NAME2">
+...
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
+
+String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+
+If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.
+
+Otherwise, output directly after </think> with tool calls or final response.
+
+### Available Tool Schemas
+
+{"name": "maps::route", "description": "Mapping tools.\nPlan a route", "parameters": {"type": "object", "properties": {}}}
+{"name": "files::read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}
+{"name": "web::search", "description": "Search", "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}
+{"name": "files::stat", "description": "Stat", "parameters": {"type": "object", "properties": {}}}
+
+You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
+<｜User｜>Go<｜Assistant｜></think>
+
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="files::read">
+<｜DSML｜ parameter name="path" string="true">/tmp/x</｜DSML｜ parameter>
+<｜DSML｜ parameter name="lines" string="false">[1, 2]</｜DSML｜ parameter>
+<｜DSML｜ parameter name="deep" string="false">{"k": null}</｜DSML｜ parameter>
+<｜DSML｜ parameter name="ok" string="false">true</｜DSML｜ parameter>
+<｜DSML｜ parameter name="n" string="false">1.5</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+<｜DSML｜ invoke name="web::search">
+<｜DSML｜ parameter name="q" string="true">say "hi" <b></｜DSML｜ parameter>
+</｜DSML｜ invoke>
+<｜DSML｜ invoke name="maps::route">
+<｜DSML｜ parameter name="to" string="true">Paris</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>file text</tool_result>
+
+<tool_result>results</tool_result>
+
+<tool_result>route ok</tool_result>
+
+And then?<｜Assistant｜></think>

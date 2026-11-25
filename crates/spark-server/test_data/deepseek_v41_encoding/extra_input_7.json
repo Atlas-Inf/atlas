@@ -1,0 +1,23 @@
+{
+ "thinking_mode": "chat",
+ "reasoning_effort": "max",
+ "messages": [
+  {
+   "role": "user",
+   "content": "a"
+  },
+  {
+   "role": "user",
+   "content": "b"
+  },
+  {
+   "role": "assistant",
+   "reasoning_content": "kept out",
+   "content": "c"
+  },
+  {
+   "role": "user",
+   "content": "d"
+  }
+ ]
+}

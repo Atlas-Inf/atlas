@@ -27,6 +27,7 @@
 //! one QP (same-QP WRITEs land in order: a NIC property, opt-in as on the
 //! pair).
 
+mod a2a_split;
 mod collectives;
 pub(in crate::nccl_backend) mod link;
 

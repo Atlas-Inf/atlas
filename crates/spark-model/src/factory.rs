@@ -13,11 +13,11 @@ use spark_runtime::weights::WeightStore;
 use crate::mistral_loader::MistralWeightLoader;
 use crate::weight_loader::LongcatWeightLoader;
 use crate::weight_loader::{
-    DeepSeekV4WeightLoader, DflashConfig, Gemma4WeightLoader, Glm5WeightLoader,
-    Inkling2WeightLoader, LagunaWeightLoader, MinimaxM2WeightLoader, ModelWeightLoader,
-    NemotronHWeightLoader, NllbWeightLoader, Qwen3VLWeightLoader, Qwen3WeightLoader,
-    Qwen4ExpWeightLoader, Qwen35DenseWeightLoader, Qwen35WeightLoader, RicursiveWeightLoader,
-    Step3p7WeightLoader,
+    DeepSeekV4WeightLoader, DeepSeekV41WeightLoader, DflashConfig, Gemma4WeightLoader,
+    Glm5WeightLoader, Inkling2WeightLoader, LagunaWeightLoader, MinimaxM2WeightLoader,
+    ModelWeightLoader, NemotronHWeightLoader, NllbWeightLoader, Qwen3VLWeightLoader,
+    Qwen3WeightLoader, Qwen4ExpWeightLoader, Qwen35DenseWeightLoader, Qwen35WeightLoader,
+    RicursiveWeightLoader, Step3p7WeightLoader,
 };
 
 mod dspark_admission;
@@ -137,12 +137,14 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         "ricursive" => Ok(Box::new(RicursiveWeightLoader)),
         // DeepSeek-V4 family (Flash) — MLA + MoE + CSA/HCA hybrid attention + mHC.
         "deepseek_v4" => Ok(Box::new(DeepSeekV4WeightLoader)),
+        // DeepSeek-V4.1: its own attention cache, Engram and carried mHC mix.
+        "deepseek_v41" => Ok(Box::new(DeepSeekV41WeightLoader)),
         "glm5_next" => Ok(Box::new(Glm5WeightLoader)),
         // Inkling 2 Mini: looped hybrid-SWA MoE (layout check only for now).
         "inkling2_loop" => Ok(Box::new(Inkling2WeightLoader)),
         _ => bail!(
             "Unsupported model type: '{}' (normalized: '{}'). \
-             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, holo3_1_moe, qwen3_vl_moe, qwen4_exp, nemotron_h, nemotron_h_puzzle, nemotron_h_omni, gemma4, mistral, minimax_m2, step3p7, laguna, deepseek_v4, inkling2_loop, m2m_100",
+             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, holo3_1_moe, qwen3_vl_moe, qwen4_exp, nemotron_h, nemotron_h_puzzle, nemotron_h_omni, gemma4, mistral, minimax_m2, step3p7, laguna, deepseek_v4, deepseek_v41, inkling2_loop, m2m_100",
             config.model_type,
             normalized,
         ),

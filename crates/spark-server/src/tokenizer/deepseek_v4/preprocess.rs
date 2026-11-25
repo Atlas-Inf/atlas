@@ -4,14 +4,42 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
-fn role(message: &Value) -> Option<&str> {
+use super::Dialect;
+
+pub(super) fn role(message: &Value) -> Option<&str> {
     message.get("role").and_then(Value::as_str)
 }
 
-fn last_user_index(messages: &[Value]) -> Option<usize> {
-    messages
-        .iter()
-        .rposition(|m| matches!(role(m), Some("user" | "developer")))
+/// Whether the message at `index` is one the assistant answers: a user turn,
+/// V4's `developer`, or a V4.1 system message past the start.
+pub(super) fn opens_assistant_turn(index: usize, message: &Value, dialect: Dialect) -> bool {
+    match (role(message), dialect) {
+        (Some("user"), _) | (Some("developer"), Dialect::V4) => true,
+        (Some("system"), Dialect::V41) => index > 0,
+        _ => false,
+    }
+}
+
+/// The last message that starts a turn. In V4.1 a user message holding only
+/// tool results continues the turn before it.
+pub(super) fn last_user_index(messages: &[Value], dialect: Dialect) -> Option<usize> {
+    (0..messages.len()).rev().find(|&index| {
+        let message = &messages[index];
+        let only_tool_results = dialect == Dialect::V41
+            && message
+                .get("content_blocks")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| {
+                    !blocks.is_empty()
+                        && !blocks.iter().any(|block| {
+                            matches!(
+                                block.get("type").and_then(Value::as_str),
+                                Some("text" | "image" | "image_url")
+                            )
+                        })
+                });
+        opens_assistant_turn(index, message, dialect) && !only_tool_results
+    })
 }
 
 pub(super) fn attach_top_level_tools(
@@ -46,16 +74,28 @@ pub(super) fn attach_top_level_tools(
     Ok(())
 }
 
-pub(super) fn merge_tool_messages(messages: &[Value]) -> Result<Vec<Value>> {
+pub(super) fn merge_tool_messages(messages: &[Value], dialect: Dialect) -> Result<Vec<Value>> {
     let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
     for message in messages {
         let message_role = role(message).unwrap_or_default();
         match message_role {
             "tool" => {
+                let mut content = message.get("content");
+                // V4.1: a tool result may carry blocks (text and images) beside
+                // or instead of a string.
+                if dialect == Dialect::V41 && !content.is_some_and(Value::is_string) {
+                    let blocks = message.get("content_blocks");
+                    if blocks
+                        .and_then(Value::as_array)
+                        .is_some_and(|v| !v.is_empty())
+                    {
+                        content = blocks;
+                    }
+                }
                 let block = json!({
                     "type": "tool_result",
                     "tool_use_id": message.get("tool_call_id").cloned().unwrap_or(Value::String(String::new())),
-                    "content": message.get("content").cloned().unwrap_or(Value::String(String::new())),
+                    "content": content.cloned().unwrap_or(Value::String(String::new())),
                 });
                 if let Some(blocks) = merged.last_mut().and_then(user_content_blocks_mut) {
                     blocks.push(block);
@@ -68,7 +108,15 @@ pub(super) fn merge_tool_messages(messages: &[Value]) -> Result<Vec<Value>> {
                     .get("content")
                     .cloned()
                     .unwrap_or(Value::String(String::new()));
-                let block = json!({"type": "text", "text": content});
+                // V4 keeps the content whole in one text block. V4.1 takes a
+                // list of content parts, or the message's own blocks, as the
+                // blocks themselves.
+                let blocks = match (dialect, message.get("content_blocks"), content) {
+                    (Dialect::V41, Some(Value::Array(blocks)), _) => blocks.clone(),
+                    (Dialect::V41, _, Value::Array(parts)) => parts,
+                    (Dialect::V41, _, Value::Null) => vec![json!({"type": "text", "text": ""})],
+                    (_, _, content) => vec![json!({"type": "text", "text": content})],
+                };
                 let can_merge = merged.last().is_some_and(|m| {
                     role(m) == Some("user")
                         && m.get("content_blocks").and_then(Value::as_array).is_some()
@@ -79,13 +127,13 @@ pub(super) fn merge_tool_messages(messages: &[Value]) -> Result<Vec<Value>> {
                         .last_mut()
                         .and_then(user_content_blocks_mut)
                         .expect("checked content_blocks")
-                        .push(block);
+                        .extend(blocks);
                 } else {
                     let mut new_message = message.clone();
                     new_message
                         .as_object_mut()
                         .context("DeepSeek-V4 user message must be an object")?
-                        .insert("content_blocks".into(), Value::Array(vec![block]));
+                        .insert("content_blocks".into(), Value::Array(blocks));
                     merged.push(new_message);
                 }
             }
@@ -161,8 +209,8 @@ pub(super) fn sort_tool_results_by_call_order(messages: &mut [Value]) {
     }
 }
 
-pub(super) fn drop_thinking_messages(messages: &[Value]) -> Vec<Value> {
-    let Some(last_user) = last_user_index(messages) else {
+pub(super) fn drop_thinking_messages(messages: &[Value], dialect: Dialect) -> Vec<Value> {
+    let Some(last_user) = last_user_index(messages, dialect) else {
         return messages.to_vec();
     };
     let mut out = Vec::with_capacity(messages.len());

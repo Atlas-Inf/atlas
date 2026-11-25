@@ -93,3 +93,18 @@ fn output_allocation_failure_releases_widened_scales() {
     assert!(dequant_mxfp8_to_bf16(&gpu, &src).is_err());
     assert_eq!(gpu.alloc_count(), before, "temporary scales leaked");
 }
+
+#[test]
+fn block_scales_repeat_for_every_row_they_cover() {
+    // [70, 64] in 32 x 32 blocks is a 3 x 2 grid; the last block row is short.
+    let grid = [110u8, 111, 120, 121, 130, 131];
+    let rows = fp8_block_scales_to_rows(&grid, 70, 64).unwrap();
+    assert_eq!(rows.len(), 70 * 2);
+    for (row, pair) in rows.chunks_exact(2).enumerate() {
+        let block = row / 32;
+        assert_eq!(pair, &grid[block * 2..block * 2 + 2], "row {row}");
+    }
+    // A grid of the wrong size, and a width that is not whole blocks.
+    assert!(fp8_block_scales_to_rows(&grid[..4], 70, 64).is_err());
+    assert!(fp8_block_scales_to_rows(&grid, 70, 80).is_err());
+}

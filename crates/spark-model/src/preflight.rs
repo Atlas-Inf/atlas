@@ -23,6 +23,7 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::weights::WeightStore;
 
 mod deepseek_v4;
+pub mod deepseek_v41;
 
 /// Run all model-agnostic + model-type-specific pre-flight checks.
 ///

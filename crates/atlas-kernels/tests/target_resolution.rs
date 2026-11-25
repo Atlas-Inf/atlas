@@ -459,3 +459,30 @@ fn nemotron_super_vl_resolves_to_its_own_target() {
         "omni reuses the puzzle kernel tree (Super backbone + LatentMoE shadows)"
     );
 }
+
+/// DeepSeek-V4.1-Flash has its own identity and MODEL.toml, compiles V4's
+/// kernels, and adds the MXFP8 decode tiers its 32-wide FP8 scales need.
+#[test]
+fn deepseek_v41_resolves_to_its_own_target_on_v4s_kernels() {
+    assert_eq!(
+        resolve_name(
+            "deepseek_v41",
+            5120,
+            &["deepseek-ai/DeepSeek-V4.1-Flash-1017"]
+        ),
+        Some("deepseek-v4.1-flash")
+    );
+    assert_eq!(
+        resolve_name("deepseek_v4", 4096, &["deepseek-ai/DeepSeek-V4-Flash"]),
+        Some("deepseek-v4-flash")
+    );
+    let parsed = parse_targets();
+    let v41 = parsed
+        .iter()
+        .find(|t| t.name == "deepseek-v4.1-flash")
+        .expect("V4.1 target exists");
+    assert_eq!(v41.kernel_source.as_deref(), Some("deepseek-v4-flash"));
+    let overlay = gb10_dir().join("deepseek-v4.1-flash/nvfp4/mxfp8_gemv.cu");
+    let overlay = std::fs::read_to_string(overlay).expect("V4.1 overlay kernel");
+    assert!(overlay.contains("#include \"../../glm-5.3-flash/nvfp4/mxfp8_gemv.cu\""));
+}

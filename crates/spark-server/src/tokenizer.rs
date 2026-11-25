@@ -64,6 +64,7 @@ fn normalize_tool_call_arguments(messages: &[serde_json::Value]) -> Vec<serde_js
 mod chat_impl;
 mod chat_render;
 mod deepseek_v4;
+pub mod engram_dsv41;
 mod hf_tags;
 mod ids_only;
 mod jinja_helpers;
@@ -78,7 +79,8 @@ pub(crate) use message_preprocess::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatEncoding {
     Jinja,
-    DeepseekV4,
+    /// The checkpoint's own encoder, not a chat template.
+    Deepseek(deepseek_v4::Dialect),
 }
 
 pub struct ChatTokenizer {

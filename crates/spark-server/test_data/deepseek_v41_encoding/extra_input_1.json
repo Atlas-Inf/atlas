@@ -1,0 +1,19 @@
+{
+ "thinking_mode": "thinking",
+ "reasoning_effort": 88,
+ "messages": [
+  {
+   "role": "user",
+   "content": "Hi"
+  },
+  {
+   "role": "assistant",
+   "reasoning_content": "greet",
+   "content": "Hello."
+  },
+  {
+   "role": "system",
+   "content": "From now on answer in French."
+  }
+ ]
+}

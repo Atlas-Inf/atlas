@@ -486,6 +486,14 @@ pub trait GpuBackend: Send + Sync {
         Ok(0) // Default: return legacy stream
     }
 
+    /// A stream whose kernels go ahead of the other streams' waiting work
+    /// (the context's greatest stream priority): for short launches that
+    /// must start beside a long one already running, which would otherwise
+    /// queue behind every block it has still to place.
+    fn create_stream_ahead(&self) -> Result<u64> {
+        self.create_stream()
+    }
+
     /// Destroy a stream from [`Self::create_stream`] once its work is done
     /// (stream 0, the legacy stream, is never destroyed).
     fn destroy_stream(&self, _stream: u64) -> Result<()> {

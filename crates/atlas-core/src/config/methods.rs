@@ -466,10 +466,12 @@ impl ModelConfig {
     /// Whether the radix prefix cache captures every state needed to resume
     /// this model exactly from KV blocks alone. DeepSeek V4 compression also
     /// carries a prompt-built pool and ring that are not represented by KV
-    /// blocks today; Inkling 2's short-conv states ride snapshots instead
+    /// blocks today, DeepSeek V4.1 keeps its whole attention cache outside the
+    /// KV blocks, and Inkling 2's short-conv states ride snapshots instead
     /// ([`Self::aux_prefix_state`]).
     pub fn kv_only_prefix_cache_is_safe(&self) -> bool {
         match self.model_type.as_str() {
+            "deepseek_v41" => false,
             "deepseek_v4" => self.compress_ratios.iter().all(|&ratio| ratio == 0),
             "inkling2_loop" => false,
             _ => true,
