@@ -3,6 +3,7 @@
 //! Per-model-family JSON parsers, split out of `config.rs` for file-size
 //! budget.
 
+mod bailing;
 mod deepseek_v4;
 mod exl3;
 mod gemma4;
@@ -19,6 +20,7 @@ mod ricursive;
 mod step3p7;
 mod vision;
 
+pub(crate) use bailing::parse_bailing_moe_v3_vl;
 pub(crate) use deepseek_v4::parse_deepseek_v4;
 pub use exl3::Exl3QuantConfig;
 pub(crate) use gemma4::parse_gemma4_params;
