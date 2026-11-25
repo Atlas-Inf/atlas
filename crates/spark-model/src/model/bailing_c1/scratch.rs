@@ -143,7 +143,7 @@ impl LingScratch {
             hidden,
             max_blocks,
             normed: Self::bf16(gpu, rows * hidden)?,
-            attn_out: Self::bf16(gpu, rows * attn_out_width(hidden))?,
+            attn_out: Self::bf16(gpu, rows * Self::attn_out_width(hidden))?,
             ffn_out: Self::bf16(gpu, rows * hidden)?,
             kda_qkv: Self::bf16(gpu, rows * 3 * kda_t)?,
             kda_preconv: Self::bf16(gpu, rows * 3 * kda_t)?,
