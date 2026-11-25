@@ -11,7 +11,11 @@ pub(super) fn parse_complete_call(
     idx: u32,
     promote_bare_names: bool,
 ) -> Option<ToolCall> {
-    let body = text.trim();
+    // Ling3 separators are trimmed first: a zero-argument Ling call's body
+    // can carry the same trailing noise Ling places between structural
+    // tags (whitespace or a literal backslash-n), which `trim()` alone
+    // cannot remove, and then it is a bare name like Poolside's.
+    let body = trim_ling3_separators(text.trim());
     if is_tool_name_component(body) {
         if promote_bare_names {
             return parse_poolside_v1_call(body);
@@ -33,10 +37,17 @@ pub(super) fn parse_complete_call(
 /// Auto-detect and parse inner content of a `<tool_call>` block.
 /// Tries Gemma-4 native, JSON (hermes), qwen3_coder XML, then tag-style XML fallback.
 pub(super) fn parse_one_call(text: &str, idx: u32) -> Option<ToolCall> {
-    if text.contains("<arg_key>")
-        && let Some(tc) = parse_poolside_v1_call(text)
-    {
-        return Some(tc);
+    if text.contains("<arg_key>") {
+        // Strict Poolside adjacency first so native Poolside/Hy4 emissions
+        // keep exact semantics (duplicate keys reject, keys must be name
+        // components); Ling-3.2 (and GLM-4.5) emissions place newlines
+        // between the tags, so fall through to the tolerant ling3 parser.
+        if let Some(tc) = parse_poolside_v1_call(text) {
+            return Some(tc);
+        }
+        if let Some(tc) = parse_ling3_call(text) {
+            return Some(tc);
+        }
     }
     // Try Gemma-4 native: call:fn_name{...} or _call:fn_name{...}
     if text.starts_with("call:") || text.starts_with("_call:") {
