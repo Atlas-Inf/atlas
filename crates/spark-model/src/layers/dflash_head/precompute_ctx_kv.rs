@@ -194,18 +194,23 @@ impl BlockDiffusionDraftHead {
         let kv_dim = (self.num_kv_heads * self.head_dim) as u32;
         let l_total = self.num_layers;
 
-        // Step 1: fc projection [n, L_t*h_t] → [n, h].
-        self.ctx_projection(
-            gpu,
-            0,
-            &self.fc,
-            src,
-            fc_dst,
-            n,
-            h,
-            target_hidden_dim,
-            stream,
-        )?;
+        // Step 1: fc projection [n, L_t*h_t] → [n, h] (an Inkling 2 target's
+        // last tap normed first, `inkling_taps`).
+        if let Some(t) = self.inkling_taps.as_ref() {
+            self.inkling_tap_fc(t, gpu, src, n, h, target_hidden_dim, fc_dst, stream)?;
+        } else {
+            self.ctx_projection(
+                gpu,
+                0,
+                &self.fc,
+                src,
+                fc_dst,
+                n,
+                h,
+                target_hidden_dim,
+                stream,
+            )?;
+        }
         if let Some(d) = dump {
             d("fc_proj", fc_dst, n as usize * h as usize * bf16)?;
         }

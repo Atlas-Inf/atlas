@@ -216,20 +216,30 @@ pub fn build_model(
         && let Some(ref sub) = args.drafter_config.dflash_config
     {
         config.dflash_capture_layers = sub.target_layer_ids.clone();
-        // Inkling 2 DSpark taps name visit INPUTS (tap t = what enters visit
-        // t; t = visit count = the final-norm output). Atlas captures after a
-        // layer, so tap t is visit t - 1's output; the drafter applies the
-        // final norm to the last tap itself (`dflash_head/inkling.rs`).
-        if args.drafter_config.is_inkling2_dspark() {
+        // Inkling 2 drafter taps name visit INPUTS (tap t = what enters visit
+        // t; t = visit count = the final-norm output), for the bundled DSpark
+        // and for DFlash2 drafters alike. Atlas captures after a layer, so tap
+        // t is visit t - 1's output; the drafter applies the final norm to the
+        // last tap itself (`dflash_head/inkling.rs`, `dflash_head/inkling_taps.rs`).
+        let inkling_dflash2 =
+            config.model_type == "inkling2_loop" && args.drafter_config.is_dflash2();
+        if args.drafter_config.is_inkling2_dspark() || inkling_dflash2 {
             anyhow::ensure!(
                 config.model_type == "inkling2_loop"
                     && sub
                         .target_layer_ids
                         .iter()
-                        .all(|&t| (1..=config.num_hidden_layers).contains(&t)),
-                "Inkling 2 DSpark taps {:?} need an Inkling 2 target of {} visits",
+                        .all(|&t| (1..=config.num_hidden_layers).contains(&t))
+                    && (!inkling_dflash2
+                        || sub.target_layer_ids.last() == Some(&config.num_hidden_layers)),
+                "Inkling 2 drafter taps {:?} need an Inkling 2 target of {} visits{}",
                 sub.target_layer_ids,
-                config.num_hidden_layers
+                config.num_hidden_layers,
+                if inkling_dflash2 {
+                    ", the last the final-norm output"
+                } else {
+                    ""
+                }
             );
             config.dflash_capture_layers = sub.target_layer_ids.iter().map(|&t| t - 1).collect();
         }
@@ -878,6 +888,11 @@ pub fn build_model(
             Some(mut weights) => {
                 if let Some(ink) = weights.inkling.as_mut() {
                     ink.attach_target(&store, config.rms_norm_eps as f32)?;
+                } else if config.model_type == "inkling2_loop" && args.drafter_config.is_dflash2() {
+                    weights.inkling_tap_norm = Some((
+                        store.get("model.llm.norm.weight")?.ptr,
+                        config.rms_norm_eps as f32,
+                    ));
                 }
                 if lightning_dspark_admitted {
                     anyhow::ensure!(

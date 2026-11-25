@@ -653,6 +653,9 @@ pub struct BlockDiffusionDraftHead {
     /// Inkling 2's DSpark variant (`inkling`): tap mix context, anchor and
     /// mask input, recurrent Markov tail.
     pub inkling: Option<inkling::InklingDspark>,
+    /// A DFlash2 drafter on an Inkling 2 target: the target's final norm for
+    /// the last tap (`inkling_taps`).
+    pub inkling_taps: Option<inkling_taps::InklingTapNorm>,
     /// `--draft-model-alt`: the second drafter, routed per request (`dual`).
     pub alt: Option<Box<BlockDiffusionDraftHead>>,
     /// Sequence states alive (`alloc_state` .. `free_state`): past two every
@@ -917,6 +920,7 @@ pub use lifecycle::{
     CaptureDescriptor, CaptureStatus, DflashGraphIdentity, DsparkLifecycleError, SequenceGeneration,
 };
 mod first_append;
+mod inkling_taps;
 pub use first_append::FirstAppend;
 pub(crate) use first_append::{keep_own_capture, note_own_capture, own_capture_row};
 #[cfg(test)]

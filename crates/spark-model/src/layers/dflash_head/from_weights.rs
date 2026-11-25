@@ -39,6 +39,7 @@ impl BlockDiffusionDraftHead {
         super::selector_platform::validate_requested_features(startup.diagnostics.draft_conf)?;
         let dspine_weights = weights.dspine.take();
         let inkling_weights = weights.inkling.take();
+        let inkling_tap_norm = weights.inkling_tap_norm.take();
         let dspine_spec = dspine_weights.as_ref().map(|w| w.spec);
         let embed_tokens_shared = weights
             .embed_tokens
@@ -157,7 +158,10 @@ impl BlockDiffusionDraftHead {
         let inkling_conf = startup.diagnostics.draft_conf && inkling_weights.is_some();
         let (selector_kernel, draft_conf) = super::draft_conf::selector_kernel(
             gpu,
-            glm_series && startup.diagnostics.draft_conf && weights.candidate_selector.is_some(),
+            glm_series,
+            (glm_series || target_model_type == "inkling2_loop")
+                && startup.diagnostics.draft_conf
+                && weights.candidate_selector.is_some(),
             selector_build,
         );
         if weights.candidate_selector.is_some() && selector_kernel.is_none() {
@@ -946,6 +950,7 @@ impl BlockDiffusionDraftHead {
             },
             dspine: None,
             inkling: None,
+            inkling_taps: None,
             alt: None,
             live: Default::default(),
             // Phase 2 stage 2: fused KV weight built above by copy_d2d
@@ -1032,6 +1037,14 @@ impl BlockDiffusionDraftHead {
         };
         if let Some(w) = dspine_weights {
             head.dspine = Some(super::dspine::Dspine::build(&head, w, gpu)?);
+        }
+        if let Some((w, eps)) = inkling_tap_norm {
+            head.inkling_taps = Some(super::inkling_taps::InklingTapNorm::build(
+                gpu,
+                w,
+                eps,
+                head.target_layer_ids.len() * head.target_hidden_size,
+            )?);
         }
         if let Some(w) = inkling_weights {
             head.inkling = Some(super::inkling::InklingDspark::build(

@@ -113,6 +113,7 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         candidate_selector: None,
         dspine: None,
         inkling: None,
+        inkling_taps: None,
         alt: None,
         live: Default::default(),
         fused_kv_weight: None,
