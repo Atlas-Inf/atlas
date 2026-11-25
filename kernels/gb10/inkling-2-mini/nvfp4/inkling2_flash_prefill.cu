@@ -71,7 +71,10 @@ extern "C" __global__ void __launch_bounds__(FP_THREADS, 1) inkling2_flash_prefi
 ) {
     atlas_pdl_enter();
     __shared__ __align__(16) __nv_bfloat16 Ks[FP_BC][FP_STRIDE];
-    __shared__ __align__(16) __nv_bfloat16 Vs[FP_BC][FP_STRIDE];
+    // V staged fp16 once at tile load — the same bf16->fp16 conversion the
+    // per-head kernel does in registers per MMA; keeps conversion temps out
+    // of the PV loop's live set (hipcc 7.16 spilled otherwise).
+    __shared__ __align__(16) __fp16 Vs[FP_BC][FP_STRIDE];
     __shared__ __align__(16) float Rs[FP_GROUP * FP_BQ][FP_D_REL];
     __shared__ __align__(16) __fp16 Ps[FP_WARPS][16][FP_BC + 8];
     const unsigned int kvh = blockIdx.x, q0 = blockIdx.y * FP_BQ;
@@ -107,7 +110,11 @@ extern "C" __global__ void __launch_bounds__(FP_THREADS, 1) inkling2_flash_prefi
                      (unsigned long long)(pos % block_size) * rowp + kvh * FP_HD + col
                    : 0ull;
             *(uint4*)&Ks[row][col] = ok ? *(const uint4*)(K_cache + off) : make_uint4(0, 0, 0, 0);
-            *(uint4*)&Vs[row][col] = ok ? *(const uint4*)(V_cache + off) : make_uint4(0, 0, 0, 0);
+            const uint4 v = ok ? *(const uint4*)(V_cache + off) : make_uint4(0, 0, 0, 0);
+            const __nv_bfloat16* vb = (const __nv_bfloat16*)&v;
+            __fp16* vh = (__fp16*)&Vs[row][col];
+#pragma unroll
+            for (int j = 0; j < 8; j++) vh[j] = (__fp16)__bfloat162float(vb[j]);
         }
     };
 
@@ -193,42 +200,31 @@ extern "C" __global__ void __launch_bounds__(FP_THREADS, 1) inkling2_flash_prefi
             }
         }
 
-        // per-row max over the row's 16 keys: rows sit in lane_hi halves,
-        // so the reduce is shfl_xor 1,2,4,8 inside each half-warp.
-        float tm[8];
+        // Per row (element e): half-warp shfl_xor max over the row's 16 keys
+        // (rows sit in lane_hi halves), the online-softmax update, and the P
+        // store — Ps[warp][2e+lane_hi][n*16+lane_lo] transposes the fragment
+        // layout's [key=lane_lo] into the A operand's [row][key] rows. Keeping
+        // tm/pv out of arrays saves ~24 live VGPRs; hipcc 7.16 spilled otherwise.
 #pragma unroll
         for (int e = 0; e < 8; e++) {
             float x = fmaxf(acc_s[0][e], acc_s[FP_BC / 16 - 1][e]);
             for (int o = 1; o < 16; o <<= 1) x = fmaxf(x, __shfl_xor_sync(0xffffffffull, x, o));
-            tm[e] = x;
-        }
-        float pv[FP_BC / 16][8];
-#pragma unroll
-        for (int e = 0; e < 8; e++) {
-            const float nm = fmaxf(m_st[e], tm[e]);
+            const float nm = fmaxf(m_st[e], x);
             const float sc = __expf(m_st[e] - nm);
             m_st[e] = nm;
             float rs = 0.0f;
 #pragma unroll
             for (int n = 0; n < FP_BC / 16; n++) {
                 const float s = acc_s[n][e];
-                pv[n][e] = s <= -1e29f ? 0.0f : __expf(s - nm);
-                rs += pv[n][e];
+                const float p = s <= -1e29f ? 0.0f : __expf(s - nm);
+                Ps[warp][2 * e + lane_hi][n * 16 + lane_lo] = (__fp16)p;
+                rs += p;
             }
             for (int o = 1; o < 16; o <<= 1) rs += __shfl_xor_sync(0xffffffffull, rs, o);
             l_st[e] = l_st[e] * sc + rs;
 #pragma unroll
             for (int d = 0; d < FP_HD / 16; d++) acc_o[d][e] *= sc;
         }
-
-        // Stage P (fp16) per warp so the A fragments read a row's 16 keys
-        // contiguously — the softmax layout (row 2e+lane_hi, key lane_lo) is
-        // transposed vs the A operand's [row=lane_lo][key] rows.
-#pragma unroll
-        for (int n = 0; n < FP_BC / 16; n++)
-#pragma unroll
-            for (int e = 0; e < 8; e++)
-                Ps[warp][2 * e + lane_hi][n * 16 + lane_lo] = (__fp16)pv[n][e];
         fp_wave_sync();
 #pragma unroll
         for (int nt = 0; nt < FP_BC / 16; nt++) {
@@ -241,7 +237,7 @@ extern "C" __global__ void __launch_bounds__(FP_THREADS, 1) inkling2_flash_prefi
                 fp_v16h bb;
 #pragma unroll
                 for (int k = 0; k < 16; k++)
-                    bb[k] = (__fp16)__bfloat162float(Vs[nt * 16 + k][d * 16 + lane_lo]);
+                    bb[k] = Vs[nt * 16 + k][d * 16 + lane_lo];
                 acc_o[d] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, bb, acc_o[d]);
             }
         }
