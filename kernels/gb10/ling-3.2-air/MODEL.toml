@@ -1,0 +1,185 @@
+# Ling-3.2-air (inclusionAI, MIT, 2026-11-23) — Bailing V3 hybrid, community
+# NVFP4 build `primitive-ai/Ling-3.2-air-NVFP4` (77.9 GB on disk):
+# routed experts NVFP4 W4A4 (per-tensor weight_packed + per-16 e4m3
+# weight_scale + one fp32 weight_global_scale), everything else BF16, router
+# gate + expert_bias fp32.
+#
+# SERVES (target): text-only first. Vision weights (27-layer
+# qwen3-class ViT tower + linear_proj.* at model level) load-skip is
+# acceptable in this phase; kernels and the loader land in sibling PRs, and
+# the KERNEL.toml + integration wiring follow.
+#
+# WHY THIS CARD LOOKS SO THIN: [expected_absent] exemptions are added by the
+# kernel PRs that shadow their own dispatch paths. Nothing here invents
+# exemptions for kernels that do not exist yet.
+
+[model]
+name = "ling-3.2-air"
+hf_id = "primitive-ai/Ling-3.2-air-NVFP4"
+params = "~121B"
+active_params = "~5.5B"
+architecture = "KDA linear attn + gated MLA + sigmoid MoE + NEXTN MTP (Bailing V3 VL, text-only serving)"
+license = "MIT"
+
+# 42 text layers. Attention typing per modeling_bailing_moe_v3_vl.py:1516-19:
+# full (gated MLA) iff (i+1) % 6 == 0, so layers 5,11,17,23,29,35,41; the
+# other 35 are KDA linear-attention layers (Kimi Delta Attention). The first
+# two layers (0-1, first_k_dense_replace) carry a DENSE MLP; layers 2-41
+# are MoE (40 MoE layers).
+layers_total = 42
+layers_linear_attention = 35
+layers_full_attention = 7
+layer_pattern = "5:1 within layer_group_size 6; MLA at 5,11,17,23,29,35,41"
+
+hidden_dim = 2560
+head_dim = 128
+q_heads = 32
+vocab_size = 157184
+max_position_embeddings = 262144
+# Checkpoint config.json ships NO rope_scaling. The campaign brief mentions
+# a deepseek_yarn factor-4 to 1M; that lives in the OFFICIAL release config,
+# not this primitive-ai NVFP4 checkpoint — 262144 is what this build declares
+# and what Atlas should assume conservatively (ISL <= 4096 anyway).
+rope_theta = 6000000
+partial_rotary_factor = 0.5
+rotary_dim = 64
+# M-RoPE section for the vision path; text-only serving uses t only.
+mrope_section = [8, 12, 12]
+
+# KDA layers carry classic deltanet tensors (A_log, dt_bias, q/k/v_conv1d,
+# o_norm, short_conv kernel 4, linear_silu, safe gate, lower bound -5.0) AND
+# deepseek-style compressed-KV projections (kv_lora 512 + o_proj `dense`).
+kv_lora_rank = 512
+qk_nope_head_dim = 128
+qk_rope_head_dim = 64
+v_head_dim = 128
+linear_conv_kernel = 4
+# The 7 gated-MLA layers: head-wise output gating, q/k norm, partial rope,
+# no nope-MLA path (use_mla_nope = false).
+gated_mla_granularity = "head_wise"
+
+moe_experts = 512
+moe_topk = 8
+moe_intermediate = 768
+shared_expert_intermediate = 768
+# Sigmoid routing with per-expert bias tensor (mlp.gate.expert_bias, fp32
+# router): group_limited_topk — per-group top-2 score summed across 8
+# groups, top 4 groups selected, top-8 experts inside, norm_topk_prob with
+# routed_scaling_factor 2.5 (modeling_bailing_moe_v3_vl.py:457-488).
+moe_score_function = "sigmoid"
+moe_topk_group = 4
+moe_n_group = 8
+moe_routed_scaling = 2.5
+moe_norm_topk_prob = true
+moe_expert_bias = true
+moe_router_dtype = "fp32"
+# Bailing SwiGLU clamp (modeling :425-427): gate clamps at max, up clamps
+# at ±limit; a 0 entry means NO clamp. This checkpoint: routed experts
+# clamped to 4 on layers 35-41 only; the ONE shared expert is clamped to 7
+# on layers 40-41 and 5 on layers 34-39. A kernel that ignores this diverges
+# from the checkpoint on the last 8 layers.
+expert_swiglu_limit = "4 on 35..41 (0 elsewhere)"
+share_expert_swiglu_limit = "7 on 40..41, 5 on 34..39"
+
+mtp_layers = 1
+mtp_type = "nextn (model.layers.42, eh_proj; mtp_use_kda = false)"
+vision = true
+# match_names listed for disambiguation only — `bailing_moe_v3_vl` is unique
+# in the registry today; a future bailing sibling sharing
+# (bailing_moe_v3_vl, 2560) has these needles to separate on.
+match_names = [
+    "ling-3.2-air",
+    "Ling-3.2-air-NVFP4",
+]
+
+# Sampling: the checkpoint's generation_config.json declares temperature
+# 1.0, top_p 0.95, top_k 20 — and NOTHING else. min_p and top_n_sigma are
+# pinned OFF so the CLI defaults (min_p 0.08, top_n_sigma 1.0) cannot stack
+# on the card values (sigma=1.0 truncates temp-1.0 sampling to near-greedy).
+# Explicit request values always win.
+[sampling.thinking_text]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.thinking_coding]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.non_thinking]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.tools]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+top_n_sigma = 0.0
+
+# `bailing_moe_v3_vl` is what the checkpoint's config.json declares. The
+# factory normalizes model_type by lowercasing and mapping '-'/'.'
+# -> '_', which leaves it unchanged, so no aliases are needed.
+[[model_types]]
+model_type = "bailing_moe_v3_vl"
+hidden_size = 2560
+
+[behavior]
+# THINKING ON BY DEFAULT. The checkpoint's chat template (checked in
+# verbatim as jinja-templates/ling-3.2-air.jinja, wired by
+# jinja_template below — the loader prefers that key over the generic
+# {model_type}.jinja) defaults `enable_thinking` to true and injects a
+# `detailed thinking on/off` system instruction accordingly; with tools it
+# keeps the think block open on the generation prompt. Atlas passes
+# enable_thinking (and preserve_thinking, which the template also defaults
+# to true) as defined booleans from chat_template_kwargs.
+thinking_default = true
+thinking_in_tools = true
+# The override file IS needed despite model-first rendering being the
+# default: the template's tool-call render iterates `_args.items()`
+# (the MiniMax-style minijinja gap jinja-templates/ exists for).
+jinja_template = "ling-3.2-air"
+# vLLM-parity reasoning policy, as glm-5.3-flash and qwen3.8-flash-next
+# serve theirs: no server thinking budget unless the client sends one, no
+# 90% cap, no confidence early stop, and both repetition guards off.
+# PROVISIONAL: none of this is measured on Ling yet — revisit after the
+# first bring-up benchmarks rather than after a gate run.
+max_thinking_budget = 0
+cap_thinking_at_max_tokens = false
+confidence_early_stop = false
+enable_think_loop_watchdog = false
+enable_loop_watchdog = false
+enable_stream_loop_guards = false
+# Card sampling presets ([sampling.*] above) apply to core chat/completions
+# requests too; the card declares no penalties, so preset penalties stay
+# off. NOTE this key lives in [behavior]; placed after a [sampling.*]
+# header it silently becomes a preset key and does nothing.
+use_sampling_presets_for_core = true
+use_sampling_preset_penalties_for_core = false
+# The checkpoint ships no k_scale/v_scale (NVFP4 routed experts only), so an
+# engine FP8 KV default silently clips BF16 into E4M3's [-448, 448] range
+# at exactly the long contexts the KDA/MLA split makes expensive. BF16 KV
+# is the default for this target; --kv-cache-dtype still overrides.
+default_kv_dtype = "bf16"
+
+# ── expected_absent ────────────────────────────────────────────────────────
+# Harvested 2026-11-25 from a single-Spark `--check-kernels` run: 64 lookups,
+# 1 unresolved, kernel_set_hash d594d0bbb1a1. No entry is silenced
+# speculatively; each names its dispatch site and the fallback it resolves to.
+
+[expected_absent.w4a16]
+w4a16_gemm_t_p3 = """
+3-deep weight-pipeline twin of w4a16_gemm_t, shipped only in qwen3.6-27b's
+shadow. layers::tgemm_kernel probes it on every A1 lm_head/ssm site and falls
+back to w4a16_gemm_t, which RESOLVES here (same module); runtime behaviour is
+unchanged. Ling's dense projections are BF16 (lm_head unquantized in the
+primitive-ai build), so the fast tile-GEMM path services the 157,178-token
+lm_head only; UNMEASURED for these shapes — candidate, not loss."""

@@ -6,6 +6,7 @@ pub mod deepseek_v4_mtp;
 pub mod dense_ffn;
 pub mod dflash_head;
 pub mod ep_dispatch;
+
 pub mod fp8_calibration;
 mod glm5_kda;
 pub mod glm5_mtp;
@@ -18,6 +19,7 @@ pub mod glm_sp_moe_seam;
 pub mod glm_sp_overlap;
 pub mod glm_sp_uneven;
 pub mod hy4;
+pub mod ling_mtp;
 pub mod moe;
 mod moe_grouped_decode;
 pub mod mtp_head;
@@ -45,6 +47,7 @@ pub use kernel_pick::*;
 
 pub(crate) use deepseek_v4_mtp::argmax_grammar_masked;
 pub use deepseek_v4_mtp::{DeepseekV4MtpHead, DeepseekV4MtpProposerState};
+pub use ling_mtp::{LingMtpHead, LingMtpProposerState};
 pub use dense_ffn::{DenseFfnLayer, DenseFfnWeights, FfnActivation};
 pub use dflash_head::{
     BlockDiffusionDraftHead, DflashLayer, DflashProposerState, DflashQuantization,

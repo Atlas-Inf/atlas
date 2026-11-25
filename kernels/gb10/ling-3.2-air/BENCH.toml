@@ -1,0 +1,67 @@
+# Benchmarks for this model, and the thresholds its gate records must meet.
+#
+# Sibling of MODEL.toml so the numbers sit beside the thing they describe;
+# hardware and model are implied by the path and cannot disagree with the
+# contents. Read by `atlas_plugin::gate::bench`.
+#
+# This file may land BEFORE the model's kernels do (they arrive in sibling
+# PRs adding kernels/gb10/ling-3.2-air/nvfp4): `gate::bench::bench_files`
+# discovers BENCH.toml by path alone, so the gate definition does not wait
+# on the compiled target.
+#
+# Thresholds are per CHECKPOINT, not per model: two checkpoints of one model
+# can differ by several BFCL points, so they cannot share a bar.
+#
+# This file is deliberately OUTSIDE the closure hash (`taxon::configs` does
+# not list it), so ratcheting a threshold does not invalidate the record that
+# justified the ratchet.
+#
+# `status = "unmeasured"` entries carry NO [benchmarks.metrics] table. Absence
+# is the TODO -- a guessed threshold a run could clear would report PASS for
+# something nobody measured.
+#
+# NOTHING IS `default = true`. This target claims no gate slot until it has
+# a measured record; select it explicitly with --pull-request-gate
+# --hardware gb10 --checkpoint primitive-ai/Ling-3.2-air-NVFP4.
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "primitive-ai/Ling-3.2-air-NVFP4"
+gate = "bfcl-subset"
+label = "Ling-3.2-air (NVFP4, primitive-ai)"
+default = false
+status = "unmeasured"
+note = """\
+The golden ST-995 draw (non_live 62 / live 10 / hallucination 10, \
+subset_floor 25, n=995, seed 42, temp 0, NO param overrides). Bootstrap \
+per the repo protocol: once the loader + kernels land, drive the leg \
+manually on a Spark --
+
+    spark benchmark run bfcl-subset --url http://127.0.0.1:8081 \
+        --model primitive-ai/Ling-3.2-air-NVFP4
+
+-- collect repeats, then write floors and flip this to "measured". No \
+cross-family bar is inherited: SGLang/VLAM numbers for the official FP8 \
+release are a different build of a different checkpoint, not a baseline \
+for this NVFP4 pack. NOTE for first bring-up: the template defaults \
+thinking ON and there is no ling3 tool-call parser in the registry yet -- \
+until one lands (tracked in the PR that adds this file), tool definitions \
+do not reach the template on this target, and a BFCL score taken before \
+that is a text-parity datapoint, not a gate record."""
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "primitive-ai/Ling-3.2-air-NVFP4"
+gate = "agentic-webserver"
+label = "Ling-3.2-air (NVFP4, primitive-ai)"
+default = false
+status = "unmeasured"
+note = """\
+The 2.5h MLPerf-edge agentic workload -- the leg most sensitive to the \
+NEXTN MTP layer being correct (multi-turn tool use over long trajectories, \
+so draft-acceptance damage shows up long before incoherence). Same \
+protocol as bfcl-subset above: manual drive first, thresholds from real \
+tiers, then "measured". Deliberately NO wall bound until at least a second \
+tier exists; the campaign's 36 tok/s single-stream decode target is an \
+integration-lead milestone to record in the recipe notes, not a gate \
+threshold guessed in advance."""

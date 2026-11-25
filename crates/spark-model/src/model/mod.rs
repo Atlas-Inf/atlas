@@ -32,6 +32,7 @@ mod dflash_warm_ctx;
 mod draft_assist;
 pub(crate) mod qsa_commit_table;
 pub use draft_assist::DraftAssist;
+pub mod bailing_c1;
 pub(crate) mod drafter_context;
 pub(crate) mod drop;
 pub mod glm_c4;

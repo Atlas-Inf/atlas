@@ -24,10 +24,13 @@ pub(super) fn copy_target_hidden_row(
         .checked_mul(bytes)
         .context("MTP hidden row offset overflow")?;
     // GLM's target returns final-normalized rows to its MTP layer, whose
-    // separate learned hnorm still applies. Match its prompt capture and
-    // plain generate path. Other families retain their raw-hidden contract.
+    // separate learned hnorm still applies. Ling's reference
+    // (modeling_bailing_moe_v3_vl.py) applies the model's final RMSNorm to
+    // the hidden before its NEXTN layer identically. Match their prompt
+    // capture and plain generate path. Other families retain their
+    // raw-hidden contract.
     // Decode/verify already produced these rows; do not normalize twice.
-    let source = if model_type == "glm5_next" {
+    let source = if model_type == "glm5_next" || model_type == "bailing_moe_v3_vl" {
         normalized
     } else {
         raw
