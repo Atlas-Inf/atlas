@@ -91,6 +91,7 @@ fn an_over_cap_image_is_refused_through_prepare_chat_prompt_with_vision_too_larg
         s.vision_config = Some(atlas_core::config::VisionConfig {
             is_glm5_next: false,
             is_qwen3vl_video: false,
+            is_inkling2: false,
             in_channels: 3,
             depth: 27,
             hidden_size: 1152,

@@ -258,6 +258,7 @@ pub(crate) fn parse_inkling2_loop(raw: &Value) -> Result<ModelConfig> {
     config.mtp_transformer_layers = 0;
 
     config.inkling2 = Some(ink);
+    config.vision = super::inkling2_vision::parse_inkling2_vision(raw, config.hidden_size)?;
     finalize_config(&mut config, raw)?;
     Ok(config)
 }

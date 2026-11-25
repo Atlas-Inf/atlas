@@ -63,9 +63,10 @@ extern "C" __global__ void __launch_bounds__(MIX_THREADS) inkling2_dspark_mix(
         out[(unsigned long long)blockIdx.x * hidden + i] = __float2bfloat16(mixed[i] * inv * __bfloat162float(w[i]));
 }
 
-// The block input in place over `rows` rows of `hidden` (row 0 holds the anchor's raw
-// target embedding): row 0 = BF16(rms(row 0) * embed_norm), the target's normalized
-// embedding; rows 1.. = mask_embed. grid (rows), block 256.
+// The block input in place over `rows` rows of `hidden`: row 0 holds the anchor's target
+// embedding and stays (the target's table is normed at load; a non-NULL `embed_norm`
+// norms a raw row here instead: BF16(rms(row 0) * embed_norm)); rows 1.. = mask_embed.
+// grid (rows), block 256.
 extern "C" __global__ void __launch_bounds__(MIX_THREADS) inkling2_dspark_block_input(
     __nv_bfloat16* __restrict__ block, const __nv_bfloat16* __restrict__ embed_norm,
     const __nv_bfloat16* __restrict__ mask_embed, const float eps, const unsigned int hidden
@@ -77,6 +78,7 @@ extern "C" __global__ void __launch_bounds__(MIX_THREADS) inkling2_dspark_block_
         for (unsigned int i = threadIdx.x; i < hidden; i += blockDim.x) row[i] = mask_embed[i];
         return;
     }
+    if (embed_norm == nullptr) return;
     float ss = 0.0f;
     for (unsigned int i = threadIdx.x; i < hidden; i += blockDim.x) {
         const float v = __bfloat162float(row[i]);

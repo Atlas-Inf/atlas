@@ -16,6 +16,7 @@ fn an_over_cap_image_is_refused_through_prepare_chat_prompt_with_vision_too_larg
         s.vision_config = Some(atlas_core::config::VisionConfig {
             is_glm5_next: false,
             is_qwen3vl_video: false,
+            is_inkling2: false,
             in_channels: 3,
             depth: 27,
             hidden_size: 1152,
@@ -94,6 +95,7 @@ fn a_video_request_with_a_spent_in_flight_budget_is_refused_busy_before_decode()
         s.vision_config = Some(atlas_core::config::VisionConfig {
             is_glm5_next: false,
             is_qwen3vl_video: false,
+            is_inkling2: false,
             in_channels: 3,
             depth: 27,
             hidden_size: 1152,

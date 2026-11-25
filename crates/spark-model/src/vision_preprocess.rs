@@ -260,6 +260,9 @@ fn still_target(
     orig_w: u32,
     max_pixels: Option<usize>,
 ) -> Result<(u32, u32)> {
+    if vcfg.is_inkling2 {
+        return inkling2::canvas(vcfg, orig_h, orig_w, max_pixels);
+    }
     if vcfg.is_glm5_next {
         return glm_target_size(
             vcfg,
@@ -314,7 +317,11 @@ fn preprocess_probed(probed: ProbedImage, vcfg: &VisionConfig) -> Result<(Vec<f3
     let _slot = probe::decode_slot(probed.decoded_bytes);
     let img = decode_bytes(&probed.bytes, probed.fmt)?;
     drop(probed.bytes);
-    let img = img.into_rgb8();
+    let img = if vcfg.is_inkling2 {
+        inkling2::to_rgb(img)
+    } else {
+        img.into_rgb8()
+    };
     let (orig_w, orig_h) = (img.width(), img.height());
     let (th, tw) = still_target(vcfg, orig_h, orig_w, max_pixels)?;
     // The probe sized the oriented image with the same function: the grid
@@ -326,6 +333,9 @@ fn preprocess_probed(probed: ProbedImage, vcfg: &VisionConfig) -> Result<(Vec<f3
         probed.target.1
     );
 
+    if vcfg.is_inkling2 {
+        return inkling2::patchify(vcfg, &img, max_pixels);
+    }
     let img = if vcfg.is_glm5_next {
         let allow_upscale = vcfg.temporal_patch_size * orig_h as usize * (orig_w as usize)
             < glm_pixel_budget(vcfg, max_pixels, false).0;
@@ -383,6 +393,7 @@ pub fn image_pad_count(grid_h: usize, grid_w: usize, spatial_merge_size: usize) 
     (grid_h / sms) * (grid_w / sms)
 }
 
+mod inkling2;
 mod probe;
 pub use probe::{ProbedImage, decode_gated, probe_image};
 pub mod fixtures;

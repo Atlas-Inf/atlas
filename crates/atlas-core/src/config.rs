@@ -839,6 +839,7 @@ pub use parsers::{
     RICURSIVE_FFN_CLAMP, parse_mistral_params, parse_peft_adapter_config,
     parse_quantization_config,
 };
+pub use parsers::{INKLING2_IMAGE_TOKEN, INKLING2_IMAGE_TOKEN_ID};
 pub(crate) use parsers::{
     parse_deepseek_v4, parse_gemma4_params, parse_glm5_next, parse_glm5_vision_config,
     parse_inkling2_loop, parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp,

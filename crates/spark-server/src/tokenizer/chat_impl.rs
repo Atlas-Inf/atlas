@@ -335,9 +335,11 @@ impl ChatTokenizer {
     /// models). Cheap to call repeatedly — the underlying tokenizer caches
     /// single-token encodes.
     pub fn image_pad_token_id(&self) -> Option<u32> {
-        self.encode("<|image_pad|>")
-            .ok()
-            .and_then(|ids| if ids.len() == 1 { Some(ids[0]) } else { None })
+        // Qwen's spelling, or Inkling 2's image token.
+        ["<|image_pad|>", atlas_core::config::INKLING2_IMAGE_TOKEN]
+            .into_iter()
+            .find_map(|t| self.encode(t).ok().filter(|ids| ids.len() == 1))
+            .map(|ids| ids[0])
     }
 
     /// `<|video_pad|>`, the temporal sibling. `None` on a tokenizer without
