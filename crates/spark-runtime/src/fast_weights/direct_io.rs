@@ -146,7 +146,38 @@ pub(super) fn read_tensor_aligned(
     len: usize,
     using_direct: bool,
 ) -> Result<(AlignedBuffer, usize)> {
-    let (window_start, window_len, slice_off) = if using_direct {
+    let (window_start, window_len, slice_off) = aligned_window(abs_offset, len, using_direct);
+    // `AlignedBuffer::new` rounds up, so its capacity is >= window_len.
+    let mut buf = AlignedBuffer::new(window_len);
+    debug_assert!(buf.spare_len() >= window_len);
+    // SAFETY: `spare_ptr()` is `buf`'s first uninitialised byte with at least
+    // `window_len` bytes of capacity behind it, and `fd` is the caller's open
+    // descriptor.
+    let filled = unsafe {
+        pread_window(
+            fd,
+            buf.spare_ptr(),
+            window_start,
+            window_len,
+            slice_off + len,
+        )
+    }?;
+    // Only now are those bytes initialised — before this the buffer must not
+    // be viewed as a `&[u8]` at all.
+    buf.mark_initialised(filled);
+    Ok((buf, slice_off))
+}
+
+/// The read window for `len` bytes at `abs_offset`: `(window_start,
+/// window_len, slice_off)`. With `using_direct` it is widened to the
+/// [`O_DIRECT_ALIGN`] boundaries O_DIRECT requires; the bytes asked for start
+/// `slice_off` into it.
+pub(super) fn aligned_window(
+    abs_offset: u64,
+    len: usize,
+    using_direct: bool,
+) -> (u64, usize, usize) {
+    if using_direct {
         let ws = abs_offset - (abs_offset % O_DIRECT_ALIGN as u64);
         let unaligned_end = abs_offset + len as u64;
         let aligned_end = unaligned_end.div_ceil(O_DIRECT_ALIGN as u64) * O_DIRECT_ALIGN as u64;
@@ -154,22 +185,31 @@ pub(super) fn read_tensor_aligned(
         (ws, wl, (abs_offset - ws) as usize)
     } else {
         (abs_offset, len, 0usize)
-    };
+    }
+}
 
-    // `AlignedBuffer::new` rounds up, so its capacity is >= window_len; the
-    // loop below never asks for more than the spare region holds.
-    let mut buf = AlignedBuffer::new(window_len);
+/// `pread` up to `window_len` bytes at `window_start` into `dst`, and return
+/// how many arrived. Fewer than `window_len` is accepted at end-of-file (an
+/// aligned window rounded past it) as long as the first `need` bytes did.
+///
+/// # Safety
+/// `dst` must be valid for `window_len` bytes of writes, and `fd` open.
+pub(super) unsafe fn pread_window(
+    fd: std::os::unix::io::RawFd,
+    dst: *mut u8,
+    window_start: u64,
+    window_len: usize,
+    need: usize,
+) -> Result<usize> {
     let mut filled = 0usize;
     while filled < window_len {
-        let want = (window_len - filled).min(buf.spare_len());
-        // SAFETY: `spare_ptr()` points at `buf`'s first uninitialised byte and
-        // `want` is clamped to the spare region, so the kernel writes only
-        // inside the allocation. `fd` is the caller's open descriptor.
+        // SAFETY: the caller made `dst` valid for `window_len` bytes and
+        // `filled < window_len`, so the kernel writes only inside it.
         let ret = unsafe {
             libc::pread(
                 fd,
-                buf.spare_ptr() as *mut libc::c_void,
-                want,
+                dst.add(filled) as *mut libc::c_void,
+                window_len - filled,
                 (window_start + filled as u64) as libc::off_t,
             )
         };
@@ -178,7 +218,7 @@ pub(super) fn read_tensor_aligned(
             // On O_DIRECT, a non-aligned tail at EOF may return EINVAL on
             // some filesystems. Accept the short read as long as we've
             // already covered the tensor's exact range.
-            if filled >= slice_off + len {
+            if filled >= need {
                 break;
             }
             bail!(
@@ -189,21 +229,17 @@ pub(super) fn read_tensor_aligned(
         if ret == 0 {
             break; // EOF
         }
-        // Only now are those bytes initialised — before this the buffer must
-        // not be viewed as a `&[u8]` at all.
-        buf.mark_initialised(ret as usize);
         filled += ret as usize;
     }
-    if filled < slice_off + len {
+    if filled < need {
         bail!(
-            "short read: got {} bytes, need at least {} (tensor spans offset {}..{})",
+            "short read: got {} bytes, need at least {} (window starts at offset {})",
             filled,
-            slice_off + len,
-            abs_offset,
-            abs_offset + len as u64
+            need,
+            window_start,
         );
     }
-    Ok((buf, slice_off))
+    Ok(filled)
 }
 
 #[cfg(all(test, unix))]
