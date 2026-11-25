@@ -268,7 +268,11 @@ impl LingFfn {
             let base = start as usize;
             let xb = x.offset(base * self.hidden * 2);
             // 1. route + input quant + group-limited top-8 + sort + worklist.
-            gpu.memset(s.moe_done, 0, 4)?;
+            // Stream-ordered reset: the capturing decode/verify graphs bake
+            // this memset as a graph node (a graph-captured fill goes
+            // through `memset_async` per the GpuBackend contract), whereas
+            // `memset` synchronizes the stream — illegal inside a capture.
+            gpu.memset_async(s.moe_done, 0, 4, stream)?;
             let router_ctas = div_ceil(self.experts as u32, 8);
             let groups = batch * (self.hidden as u32 / 16);
             let quant_ctas = div_ceil(groups, 256);

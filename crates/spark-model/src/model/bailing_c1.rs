@@ -58,11 +58,15 @@
 //!      forward is capturable later the same way.
 //!    * The ling lever is `ATLAS_LING_KDA_INDEXED` (default on) —
 //!      teacher forcing via env parity is unchanged on the single rank.
-//! * CUDA-graph decode: both layer kinds still report
-//!   `decode_graph_unsupported` so the scheduler stays eager (the KDA
-//!   half of the addressing prerequisite above is done; flipping the
-//!   veto is the graph slice's move, the gated-MLA half of the pool
-//!   addressing is separate).
+//! * CUDA-graph decode (the graph slice, behind
+//!   `ATLAS_LING_DECODE_GRAPH=1`, `model::graph_flags`): both layer kinds
+//!   drop their `decode_graph_unsupported` veto, so the single-sequence
+//!   decode graph (keyed by pool slot) and the single-sequence K=2 verify
+//!   graph capture. What they may rely on is the contract block above, the
+//!   gated-MLA metadata prestage (`decode_meta_prestage`, Phase 1 of the
+//!   dispatches) and the V-pool-invariant; batched decode graphs stay off
+//!   for the family (`decode_a2`'s `ling_batched_graphs_off` gate) — the
+//!   indexed lane serves those widths. Off (default) the family is eager.
 //! * Vision (the loader skips `model.visual.*` / `linear_proj.*`).
 //!
 //! Decode step sequence, per layer in plan order

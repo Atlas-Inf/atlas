@@ -87,7 +87,18 @@ fn ling_mla_moe_prefill_repro_gpu() -> Result<()> {
     report_hidden(gpu, hidden, ROWS, HIDDEN, "input hidden")?;
 
     // ── attention half: the whole-prompt contiguous prefill path.
-    layer.attention_half_prefill(gpu, hidden, &mut kv, ROWS, 0, true, true, &block_table, stream)?;
+    layer.attention_half_prefill(
+        gpu,
+        hidden,
+        &mut kv,
+        ROWS,
+        0,
+        true, // whole prompt
+        true, // packed (upstream repro default)
+        false, // staged
+        &block_table,
+        stream,
+    )?;
     gpu.synchronize(stream)?;
     report_hidden(gpu, hidden, ROWS, HIDDEN, "post-attention hidden")?;
 

@@ -232,6 +232,30 @@ pub trait TransformerLayer: Send + Sync {
     /// recompute (PLE's history already advanced in `decode_prestage`).
     fn decode_prestage_rearm(&self, _state: &mut dyn LayerState) {}
 
+    /// Per-step staging of family-owned decode/verify DEVICE metadata into
+    /// its fixed buffers, called from the dispatch's Phase 1 — before any
+    /// capture/replay — for `rows` rows of ONE sequence whose first row sits
+    /// at position `seq_len_start`. The Ling gated-MLA layer implements this
+    /// (rope positions, paged-cache slots, `base_len`, the i32 block table)
+    /// so a capturing step's in-layer uploads — pageable H2D, capture-illegal
+    /// (status 900) — become pre-graph refreshes of addresses the captured
+    /// kernels then read. The bytes are the ones the layer's eager arm
+    /// uploads itself, so a non-capturing step changes behavior not at all.
+    /// Layers whose decode consumes no host-computed metadata keep the
+    /// no-op default.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_meta_prestage(
+        &self,
+        _rows: usize,
+        _seq_len_start: usize,
+        _block_table: &[u32],
+        _block_size: usize,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Prefill-side warm for layers whose row ids are a pure host function
     /// of the prompt (PLE). Called once per prefill dispatch — before the
     /// layer loop — with the FULL prompt and `from`, the first position this
