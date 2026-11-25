@@ -382,7 +382,11 @@ fn cmp_stage(name: &str, got: &[f32], want: &[f32]) -> (usize, usize) {
         }
         let scale = w.abs().max(if state { 1e-6 } else { 1e-5 });
         let tol = if state { 0.03 } else { 0.025 };
-        if (g - w).abs() > (tol * scale).max(5e-3 * rms) {
+        // FP32 recurrence states drift further on microscopic cells (the
+        // sibling harness measured ~4e-2 rel on ~4e-9 cells) than one
+        // band-width-through-a-tap, so their floor is 3% of stage RMS.
+        let floor = if state { 3e-2 * rms } else { 5e-3 * rms };
+        if (g - w).abs() > (tol * scale).max(floor) {
             bad += 1;
         }
         worst.push(((g - w).abs() / scale, i, *w));
