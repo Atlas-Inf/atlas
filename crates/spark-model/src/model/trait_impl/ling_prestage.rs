@@ -64,4 +64,25 @@ impl TransformerModel {
         self.config.model_type == "bailing_moe_v3_vl"
             && crate::model::graph_flags::ling_decode_graph()
     }
+
+    /// Whether the Ling family KEEPS a slot's captured decode/verify graphs
+    /// when the sequence that claimed the slot goes away
+    /// (`free_sequence`'s `invalidate_slot_graphs` skips it). The
+    /// invalidation drops graphs that reference per-SEQUENCE allocations
+    /// released by `free_state` — the PLE conv carry and QSA indexer keys of
+    /// the qwen/GLM families. The Ling capture contract
+    /// (`docs/ling-decode-graphs.md`, the pool PR's family doc) has no such
+    /// state: the KDA h/conv and verify-rollback snapshots are
+    /// `SsmStatePool` addresses fixed per (layer, slot) and only ZEROED at
+    /// claim, the gated-MLA metadata lives in the fixed Ling scratch the
+    /// dispatch refreshes before every replay, the KV cache is paged-pool,
+    /// and the only per-sequence device memory the layers own (the
+    /// `alloc_state` harness states) never appears on a served path. A
+    /// retained graph therefore replays to the same addresses for any next
+    /// occupant of the slot; keeping it is precisely why the graphs exist
+    /// (without retention every request re-captured — 47/47 captures at
+    /// slot=0 — and never reached the replay economics at all).
+    pub(super) fn ling_slot_graphs_retained(&self) -> bool {
+        self.config.model_type == "bailing_moe_v3_vl"
+    }
 }
