@@ -569,3 +569,7 @@ fn load_moe_weights(
 #[cfg(test)]
 #[path = "layers_moe_parity_gpu.rs"]
 mod layers_moe_parity_gpu;
+
+#[cfg(test)]
+#[path = "layers_dense_parity_gpu.rs"]
+mod layers_dense_parity_gpu;

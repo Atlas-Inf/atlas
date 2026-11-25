@@ -55,23 +55,23 @@ const INTER: usize = 768;
 const PROJS: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
 
 /// BF16 bits widened to f32 (exact).
-fn widen(bits: u16) -> f32 {
+pub(super) fn widen(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
 /// `f32 -> BF16 -> f32` (one round-trip: the reference chain's
 /// per-tensor rounding).
-fn bf16(v: f32) -> f32 {
+pub(super) fn bf16(v: f32) -> f32 {
     f32::from_bits((f32_to_bf16(v) as u32) << 16)
 }
 
-fn f32_le(bytes: &[u8], at: usize) -> f32 {
+pub(super) fn f32_le(bytes: &[u8], at: usize) -> f32 {
     f32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
 }
 
 // ── GB10 backend with the ling-3.2-air target modules ──────────────────────
 
-fn gpu_backend() -> Result<&'static AtlasCudaBackend> {
+pub(super) fn gpu_backend() -> Result<&'static AtlasCudaBackend> {
     static GPU: OnceLock<Result<AtlasCudaBackend, String>> = OnceLock::new();
     let gpu = GPU.get_or_init(|| {
         configure_pdl("ling-3.2-air");
@@ -92,7 +92,7 @@ fn ckpt_dir() -> Result<PathBuf> {
 
 // ── Checkpoint reader: index parsed once, shard handles kept open ──────────
 
-struct Ckpt {
+pub(super) struct Ckpt {
     dir: PathBuf,
     map: HashMap<String, String>,
     /// Open shard handles with their parsed headers (one header read+parse
@@ -101,7 +101,7 @@ struct Ckpt {
 }
 
 impl Ckpt {
-    fn open() -> Result<Self> {
+    pub(super) fn open() -> Result<Self> {
         let dir = ckpt_dir()?;
         let index: serde_json::Value = serde_json::from_slice(
             &std::fs::read(dir.join("model.safetensors.index.json"))
@@ -122,7 +122,7 @@ impl Ckpt {
     }
 
     /// `(dtype, shape, bytes)` of one tensor.
-    fn tensor(&mut self, name: &str) -> Result<(WeightDtype, Vec<usize>, Vec<u8>)> {
+    pub(super) fn tensor(&mut self, name: &str) -> Result<(WeightDtype, Vec<usize>, Vec<u8>)> {
         let shard = self
             .map
             .get(name)
@@ -150,7 +150,7 @@ impl Ckpt {
         Ok((dtype, shape, data))
     }
 
-    fn scalar(&mut self, name: &str) -> Result<f32> {
+    pub(super) fn scalar(&mut self, name: &str) -> Result<f32> {
         let (dt, shape, data) = self.tensor(name)?;
         ensure!(
             dt == WeightDtype::FP32 && shape == [1] && data.len() == 4,
@@ -163,7 +163,7 @@ impl Ckpt {
 // ── Host mirrors of ling_moe_quant.cuh (bit-identical by construction) ───────
 
 /// `ling_e2m1_quantize`.
-fn e2m1_quantize(v: f32) -> u32 {
+pub(super) fn e2m1_quantize(v: f32) -> u32 {
     let absv = v.abs();
     let sign = u32::from(v < 0.0) << 3;
     let idx = if absv <= 0.25 {
@@ -187,7 +187,7 @@ fn e2m1_quantize(v: f32) -> u32 {
 }
 
 /// `ling_float_to_e4m3`.
-fn f32_to_e4m3(v: f32) -> u8 {
+pub(super) fn f32_to_e4m3(v: f32) -> u8 {
     let bits = v.to_bits();
     let sign = (bits >> 31) & 1;
     if bits & 0x7FFF_FFFF == 0 {
@@ -231,7 +231,7 @@ fn f32_to_e4m3(v: f32) -> u8 {
 }
 
 /// The e4m3 decode of `ling_quantize_group` (sign honored).
-fn e4m3_signed(b: u8) -> f32 {
+pub(super) fn e4m3_signed(b: u8) -> f32 {
     let sign = (b >> 7) & 1;
     let exp = (b >> 3) & 0xF;
     let man = b & 7;
@@ -246,14 +246,14 @@ fn e4m3_signed(b: u8) -> f32 {
 }
 
 /// `ling_group_scale`'s decode (group scales are unsigned).
-fn e4m3_unsigned(b: u8) -> f32 {
+pub(super) fn e4m3_unsigned(b: u8) -> f32 {
     fp8_e4m3_to_f32(b & 0x7F)
 }
 
 /// `ling_quantize_group`: 16 f32 values -> (scale byte, 8 packed bytes),
 /// with the launcher's dequant-global `scale2` (`ffn.rs` passes
 /// `inv = 1.0 / scale2`, mirrored exactly).
-fn quantize_group_mirror(x16: &[f32], scale2: f32, inv_scale2: f32) -> (u8, [u8; 8]) {
+pub(super) fn quantize_group_mirror(x16: &[f32], scale2: f32, inv_scale2: f32) -> (u8, [u8; 8]) {
     let mut group_max = 0.0f32;
     for v in x16 {
         group_max = group_max.max(v.abs());
@@ -282,7 +282,7 @@ fn quantize_group_mirror(x16: &[f32], scale2: f32, inv_scale2: f32) -> (u8, [u8;
 
 /// `ling_group_scale`: the re-quantizer's scale byte and the e2m1
 /// multiplier (`inv = g / sf`).
-fn group_scale_mirror(group_max: f32, g: f32) -> (u8, f32) {
+pub(super) fn group_scale_mirror(group_max: f32, g: f32) -> (u8, f32) {
     let byte = f32_to_e4m3(group_max * g / 6.0);
     let decoded = e4m3_unsigned(byte);
     let inv = if decoded > 0.0 { g / decoded } else { 0.0 };
@@ -290,14 +290,14 @@ fn group_scale_mirror(group_max: f32, g: f32) -> (u8, f32) {
 }
 
 /// `ling_silu_bf16`.
-fn silu_clamped(g_bf16: f32, limit: f32) -> f32 {
+pub(super) fn silu_clamped(g_bf16: f32, limit: f32) -> f32 {
     let sig = 1.0 / (1.0 + (-g_bf16).exp());
     let s = bf16(g_bf16 * sig);
     if limit > 0.0 && s > limit { limit } else { s }
 }
 
 /// `ling_gate_up_mul`.
-fn gate_up_mul(gate_silu: f32, up: f32, limit: f32) -> f32 {
+pub(super) fn gate_up_mul(gate_silu: f32, up: f32, limit: f32) -> f32 {
     let mut u = up;
     if limit > 0.0 {
         u = u.clamp(-limit, limit);
@@ -305,11 +305,11 @@ fn gate_up_mul(gate_silu: f32, up: f32, limit: f32) -> f32 {
     bf16(gate_silu * u)
 }
 
-fn e2m1(code: u32) -> f32 {
+pub(super) fn e2m1(code: u32) -> f32 {
     FP4_E2M1[(code & 0xF) as usize]
 }
 
-fn nibbles(b: u8) -> (u32, u32) {
+pub(super) fn nibbles(b: u8) -> (u32, u32) {
     ((b & 0xF) as u32, (b >> 4) as u32)
 }
 
@@ -568,7 +568,7 @@ fn shared_reference(host: &LayerHost, x: &[f32], m: usize) -> Vec<Vec<f32>> {
 }
 
 /// BF16 tensor read to f32 (widened exactly).
-fn read_bf16(ckpt: &mut Ckpt, name: &str, len: usize) -> Result<Vec<f32>> {
+pub(super) fn read_bf16(ckpt: &mut Ckpt, name: &str, len: usize) -> Result<Vec<f32>> {
     let (dt, sh, b) = ckpt.tensor(name)?;
     ensure!(
         dt == WeightDtype::BF16 && sh.len() == 2 && b.len() == len * 2,
@@ -581,7 +581,7 @@ fn read_bf16(ckpt: &mut Ckpt, name: &str, len: usize) -> Result<Vec<f32>> {
 
 /// Router tensor read to f32: BF16 (widened exactly) or FP32 on disk —
 /// the load path's `f32_or_upcast` takes both.
-fn read_f32s(ckpt: &mut Ckpt, name: &str, len: usize) -> Result<Vec<f32>> {
+pub(super) fn read_f32s(ckpt: &mut Ckpt, name: &str, len: usize) -> Result<Vec<f32>> {
     let (dt, sh, b) = ckpt.tensor(name)?;
     let elems = sh.iter().product::<usize>();
     ensure!(elems == len, "{name}: {sh:?} for {len} elements");
@@ -620,7 +620,7 @@ impl Xorshift64 {
     }
 }
 
-fn x_rows(m: usize, layer: usize) -> Vec<f32> {
+pub(super) fn x_rows(m: usize, layer: usize) -> Vec<f32> {
     let mut rng = Xorshift64(0x9E37_79B9_7F4A_7C15 ^ ((layer as u64) << 32) ^ 0x1234);
     (0..m)
         .flat_map(|r| {
