@@ -282,8 +282,11 @@ pub(crate) fn load_model(
     // should learn that from the startup log rather than from a user's failed
     // request an hour later.
     let glm_vision = config.vision.as_ref().is_some_and(|v| v.is_glm5_next);
+    let ling_vision = config.vision.as_ref().is_some_and(|v| v.is_bailing_vl);
     let video_max_frames = args.video_max_frames.unwrap_or(if glm_vision {
         spark_model::video_sample::GLM_DEFAULT_MAX_FRAMES
+    } else if ling_vision {
+        spark_model::video_preprocess::ling::DEFAULT_MAX_FRAMES
     } else {
         spark_model::video_preprocess::DEFAULT_MAX_FRAMES
     });
