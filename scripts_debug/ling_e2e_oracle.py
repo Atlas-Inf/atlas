@@ -438,8 +438,16 @@ def main():
                     trace.setdefault("b_raw", {})[tk] = b_raw.clone()
                 gg = f.view(HEADS, 128)
                 og = g.view(HEADS, 128)
-                decay = torch.exp(LOWER / (1.0 + torch.exp(
-                    -(a_log[:, None] * (gg + dt_bias.view(HEADS, 128))))))
+                # Safe-gate decay per fla's authoritative reference
+                # (fla/ops/kda/fused_recurrent.py): a = exp(A_log) FIRST —
+                # g = lower_bound * sigmoid(exp(A_log) * (g + dt_bias)).
+                # (The atlas kernel takes expf(a_log[head]) too; an oracle
+                # with raw A_log is bit-clean only at token 0, where the
+                # decay cancels against the zero state, and diverges
+                # per-head in proportion to exp(A_log) from token 1.)
+                a = torch.exp(a_log)[:, None]
+                decay = torch.exp(
+                    LOWER * torch.sigmoid(a * (gg + dt_bias.view(HEADS, 128))))
                 qq = qkv[0:KDA_T].view(HEADS, 128)
                 kk = qkv[KDA_T:2 * KDA_T].view(HEADS, 128)
                 vv = qkv[2 * KDA_T:3 * KDA_T].view(HEADS, 128)
