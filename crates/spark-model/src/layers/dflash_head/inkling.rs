@@ -39,6 +39,7 @@ struct Kernels {
     rnn_ctx: KernelHandle,
     rnn_raw: KernelHandle,
     rnn_gate: KernelHandle,
+    pick: KernelHandle,
 }
 
 impl Kernels {
@@ -53,6 +54,7 @@ impl Kernels {
             rnn_ctx: k("inkling2_dspark_rnn_ctx")?,
             rnn_raw: k("inkling2_dspark_rnn_raw")?,
             rnn_gate: k("inkling2_dspark_rnn_gate")?,
+            pick: k("inkling2_dspark_pick")?,
         })
     }
 }
@@ -62,7 +64,20 @@ pub struct InklingDspark {
     w: Inkling2DsparkWeights,
     fold: DenseWeight,
     k: Kernels,
+    /// A step's shared head pass (`inkling_group.rs`).
+    group: group::TailGroup,
+    /// The staged batch's per-sequence tail buffers (`inkling_batch.rs`).
+    batch: batch::BatchScratch,
+    /// Report each draft's confidence after the block's tokens
+    /// (`draft_conf.rs`): the log-probability of the pick under the
+    /// softcapped logits, for the scheduler's verify width.
+    conf: bool,
 }
+
+/// The checkpoint's `final_logit_softcapping`, which the reference applies
+/// to a draft row's logits (`markov_logits`). It does not move the argmax;
+/// the confidence is taken under it.
+const LOGIT_SOFTCAP: f32 = 30.0;
 
 /// One propose lane's buffers.
 pub struct InklingScratch {
@@ -74,6 +89,22 @@ pub struct InklingScratch {
     bias: DevicePtr,
     /// `[ctx rows, 2 * kv_dim]` one layer's context K/V before the scatter.
     kv_tmp: DevicePtr,
+    /// Draft steps the next tail runs; 0 is the whole block. A step that
+    /// verifies fewer drafts than the block holds (two or more live
+    /// sequences) sets it, so the tail stops there: each step is a pass over
+    /// the folded head (about 0.4 ms on one GB10).
+    tail_steps: std::sync::atomic::AtomicUsize,
+    /// The next tail runs here whatever the group holds (a graph capture).
+    inline_tail: std::sync::atomic::AtomicBool,
+    /// The last tail was held for the group's head pass: no drafts yet.
+    held: std::sync::atomic::AtomicBool,
+}
+
+/// The stored step count for a tail of `drafts` drafts in a `gamma`-row
+/// block: 0 for the whole block (`gamma - 1` drafts or more), else the
+/// drafts, at least one.
+fn tail_steps_for(drafts: usize, gamma: usize) -> usize {
+    if drafts + 1 < gamma { drafts.max(1) } else { 0 }
 }
 
 impl InklingScratch {
@@ -99,7 +130,37 @@ impl InklingScratch {
             latent: a(FOLD_K * bf16)?,
             bias: a(vocab * bf16)?,
             kv_tmp: a(ctx_rows.max(1) * 2 * kv_dim * bf16)?,
+            tail_steps: Default::default(),
+            inline_tail: Default::default(),
+            held: Default::default(),
         })
+    }
+
+    /// Keep the next tail out of the group (`true`) or let it join.
+    pub(super) fn set_inline_tail(&self, inline: bool) {
+        self.inline_tail
+            .store(inline, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the last tail was held for the group, clearing the mark.
+    pub(super) fn take_held(&self) -> bool {
+        self.held.swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Run the next tail for `drafts` drafts of a `gamma`-row block.
+    pub(super) fn set_tail_steps(&self, drafts: usize, gamma: usize) {
+        self.tail_steps.store(
+            tail_steps_for(drafts, gamma),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// The next tail's step count, if shorter than the block's.
+    pub(super) fn short_tail(&self) -> Option<usize> {
+        match self.tail_steps.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            steps => Some(steps),
+        }
     }
 }
 
@@ -111,7 +172,10 @@ impl InklingDspark {
         lm_head: DevicePtr,
         vocab: usize,
         hidden: usize,
+        gamma: usize,
+        batch_capacity: usize,
         dense_gemm: KernelHandle,
+        conf: bool,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
         ensure!(
@@ -119,7 +183,7 @@ impl InklingDspark {
             "Inkling 2 DSpark needs the target's BF16 head and Markov rank {RANK}"
         );
         ensure!(
-            !w.target_embed_norm.is_null() && !w.target_final_norm.is_null(),
+            !w.target_final_norm.is_null(),
             "Inkling 2 DSpark: target norms not attached"
         );
         let bf16 = 2;
@@ -164,6 +228,9 @@ impl InklingDspark {
             w,
             fold: DenseWeight { weight: fold },
             k: Kernels::resolve(gpu)?,
+            group: group::TailGroup::alloc(gpu, hidden, gamma, vocab)?,
+            batch: batch::BatchScratch::alloc(gpu, batch_capacity.max(1), hidden, gamma, vocab)?,
+            conf,
         })
     }
 
@@ -320,101 +387,68 @@ impl BlockDiffusionDraftHead {
             _ => gpu.memset_async(sc.f_rnn, 0, h * 2, stream),
         }
     }
+}
 
-    /// The draft tokens of rows 1..γ from the block's logits (rows 1..γ of
-    /// `logits` hold the base logits of the drafter's normed rows `normed`):
-    /// per step, the recurrence from the previous token, its fold over the
-    /// head added to that row's logits, then the argmax. Row 0 (the anchor)
-    /// is argmaxed as is; it is not a draft.
-    pub(super) fn inkling_tail(
-        &self,
-        ink: &InklingDspark,
-        gpu: &dyn GpuBackend,
-        normed: DevicePtr,
-        scratch: &DflashScratch,
-        stream: u64,
-    ) -> Result<()> {
-        let sc = scratch
-            .inkling
-            .as_ref()
-            .context("Inkling 2 DSpark lane scratch")?;
-        let (h, v) = (self.hidden_size as u32, self.vocab_size);
-        let steps = self.gamma - 1;
-        let bf16 = 2usize;
-        let row = |i: usize| scratch.logits.offset(i * v * bf16);
-        ops::argmax_bf16(
-            gpu,
-            self.kernels.argmax,
-            row(0),
-            scratch.draft_tokens_dev,
-            v as u32,
-            stream,
-        )?;
-        KernelLaunch::new(gpu, ink.k.rnn_ctx)
-            .grid([(3 * RANK / 8) as u32, 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(ink.w.rnn_proj.weight)
-            .arg_ptr(ink.w.rnn_bias)
-            .arg_ptr(normed)
-            .arg_ptr(sc.f_rnn)
-            .arg_ptr(sc.ctx)
-            .arg_u32(steps as u32)
-            .arg_u32(h)
-            .launch(stream)?;
-        gpu.memset_async(sc.state, 0, RANK * bf16, stream)?;
-        for i in 0..steps {
-            // step i drafts row i + 1 from the token before it (the anchor first)
-            let prev = if i == 0 {
-                scratch.markov_prev_dev
-            } else {
-                scratch.draft_tokens_dev.offset(i * 4)
-            };
-            KernelLaunch::new(gpu, ink.k.rnn_raw)
-                .grid([(3 * RANK / 8) as u32, 1, 1])
-                .block([256, 1, 1])
-                .arg_ptr(ink.w.rnn_proj.weight)
-                .arg_ptr(sc.ctx.offset(i * 3 * RANK * 4))
-                .arg_ptr(sc.state)
-                .arg_ptr(ink.w.markov_w1.weight)
-                .arg_ptr(prev)
-                .arg_ptr(sc.raw)
-                .arg_u32(h)
-                .launch(stream)?;
-            KernelLaunch::new(gpu, ink.k.rnn_gate)
-                .grid([1, 1, 1])
-                .block([RANK as u32, 1, 1])
-                .arg_ptr(sc.raw)
-                .arg_ptr(sc.state)
-                .arg_ptr(sc.latent)
-                .arg_u32(FOLD_K as u32)
-                .launch(stream)?;
-            ops::dense_gemv(
-                gpu,
-                self.kernels.dense_gemv,
-                sc.latent,
-                &ink.fold,
-                sc.bias,
-                v as u32,
-                FOLD_K as u32,
-                stream,
-            )?;
-            ops::residual_add(
-                gpu,
-                self.kernels.residual_add,
-                row(i + 1),
-                sc.bias,
-                v as u32,
-                stream,
-            )?;
-            ops::argmax_bf16(
-                gpu,
-                self.kernels.argmax,
-                row(i + 1),
-                scratch.draft_tokens_dev.offset((i + 1) * 4),
-                v as u32,
-                stream,
-            )?;
-        }
-        Ok(())
+/// One `inkling2_dspark_pick` launch's rows (`sequences` of them, each at
+/// its index times the strides; a null `bias` or `conf` is none).
+pub(super) struct Pick {
+    logits: DevicePtr,
+    /// BF16 elements between two sequences' rows.
+    logits_stride: u64,
+    bias: DevicePtr,
+    bias_stride: u32,
+    token: DevicePtr,
+    /// `u32` words between two sequences' tokens (and confidences).
+    token_stride: u32,
+    conf: DevicePtr,
+    conf_stride: u32,
+    vocab: usize,
+}
+
+/// The pick and, with `p.conf`, the drafter's confidence in it, for
+/// `sequences` rows (see the kernel).
+pub(super) fn pick(
+    gpu: &dyn GpuBackend,
+    ink: &InklingDspark,
+    p: &Pick,
+    sequences: usize,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, ink.k.pick)
+        .grid([sequences as u32, 1, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(p.logits)
+        .arg_u64(p.logits_stride)
+        .arg_ptr(p.bias)
+        .arg_u32(p.bias_stride)
+        .arg_ptr(p.token)
+        .arg_u32(p.token_stride)
+        .arg_ptr(p.conf)
+        .arg_u32(p.conf_stride)
+        .arg_u32(p.vocab as u32)
+        .arg_f32(LOGIT_SOFTCAP)
+        .launch(stream)
+}
+
+#[path = "inkling_batch.rs"]
+mod batch;
+#[path = "inkling_group.rs"]
+mod group;
+#[path = "inkling_tail.rs"]
+mod tail;
+
+#[cfg(test)]
+mod tail_steps_tests {
+    use super::tail_steps_for;
+
+    #[test]
+    fn a_tail_runs_the_steps_its_verify_will_read() {
+        // γ = 8: seven drafts is the whole block (the captured graph).
+        assert_eq!(tail_steps_for(7, 8), 0);
+        assert_eq!(tail_steps_for(9, 8), 0);
+        // Fewer drafts stop the tail early, never before the first.
+        assert_eq!(tail_steps_for(3, 8), 3);
+        assert_eq!(tail_steps_for(1, 8), 1);
+        assert_eq!(tail_steps_for(0, 8), 1);
     }
 }

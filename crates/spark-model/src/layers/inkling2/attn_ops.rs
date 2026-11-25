@@ -102,6 +102,49 @@ pub(crate) const DECODE_ATTN_SPLITS: usize = 32;
 const MAX_ATTN_SPLITS: usize = DECODE_ATTN_SPLITS;
 const MAX_GQA_GROUP: usize = 4;
 
+/// The attention body a forward's rows take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttnBody {
+    /// The tensor-core paged prefill body: consecutive rows of one sequence.
+    Prefill,
+    /// The decode body, each row's keys in this many splits.
+    Decode { splits: usize },
+}
+
+/// Which body `seqs` sequences of `rows_per_seq` rows take, with scratch for
+/// `slots` (row, split) pairs.
+///
+/// A decode row splits its keys [`DECODE_ATTN_SPLITS`] ways. So does every
+/// row of a verify run (up to `verify_rows` rows a sequence): the verified
+/// token must be the one plain decode picks, and the prefill body sums a
+/// row's keys in another order, enough to turn a tie between two logits one
+/// BF16 step apart (greedy text with drafts parted from text without at such
+/// ties). Longer runs are prefill: one sequence on the tensor cores, several
+/// on the decode body unsplit (they have rows enough to fill the GPU).
+pub(crate) fn attn_body(
+    seqs: usize,
+    rows_per_seq: usize,
+    verify_rows: usize,
+    slots: usize,
+) -> AttnBody {
+    let rows = seqs * rows_per_seq;
+    if rows_per_seq <= verify_rows && rows * DECODE_ATTN_SPLITS <= slots {
+        AttnBody::Decode {
+            splits: DECODE_ATTN_SPLITS,
+        }
+    } else if seqs == 1 {
+        AttnBody::Prefill
+    } else {
+        AttnBody::Decode { splits: 1 }
+    }
+}
+
+/// (row, split) pairs the partials scratch holds for `max_rows` rows a
+/// forward and `max_seqs` sequences ([`attn_partials_len`]).
+pub(crate) fn attn_slots(max_rows: usize, max_seqs: usize) -> usize {
+    max_rows.max(max_seqs * DECODE_ATTN_SPLITS)
+}
+
 /// fp32 elements of attention partials for `slots` (row, split) pairs.
 pub(crate) fn attn_partials_len(slots: usize, heads: usize, head_dim: usize) -> usize {
     slots * heads * (head_dim + 2)
@@ -159,15 +202,11 @@ pub(crate) fn prefill_attn(
     );
     let q_len = u32_of(a.q_len, "q_len")?;
     let kv_heads = u32_of(a.kv_heads, "kv heads")?;
-    // AMD (strix-hip): `inkling2_flash_prefill` is mma.sync / cp.async PTX and builds as a
-    // stub there; every row count takes the per-head body below.
-    if !cfg!(atlas_scale)
-        && a.q_len >= FLASH_MIN_ROWS
-        && a.heads == FLASH_GROUP * a.kv_heads
-        && a.d_rel == FLASH_D_REL
-    {
-        // a prefill chunk: one CTA per (KV head, 64 tokens) shares each K/V tile
-        // with the group's query heads, computing the bias where it adds it
+    // a prefill chunk: one CTA per (KV head, 64 tokens) shares each K/V tile
+    // with the group's query heads — wave32 WMMA on strix-hip, mma.sync on gb10.
+    if a.q_len >= FLASH_MIN_ROWS && a.heads == FLASH_GROUP * a.kv_heads && a.d_rel == FLASH_D_REL {
+        // computing the relative bias where it is added; the per-row kernel's
+        // q_len x heads x rel_extent table is never materialised
         return KernelLaunch::new(gpu, k.flash_prefill)
             .grid([kv_heads, q_len.div_ceil(64), 1])
             .block([384, 1, 1])
@@ -255,4 +294,39 @@ pub(crate) fn prefill_attn(
         .arg_ptr(a.bias)
         .arg_u32(extent)
         .launch(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AttnBody, DECODE_ATTN_SPLITS, attn_body, attn_slots};
+
+    const DECODE: AttnBody = AttnBody::Decode {
+        splits: DECODE_ATTN_SPLITS,
+    };
+
+    #[test]
+    fn a_verify_run_attends_as_decode_rows_do() {
+        let slots = attn_slots(4096, 8);
+        // one token of one sequence, and of eight
+        assert_eq!(attn_body(1, 1, 16, slots), DECODE);
+        assert_eq!(attn_body(8, 1, 16, slots), DECODE);
+        // a verify run: eight rows of one sequence, three rows each of two
+        assert_eq!(attn_body(1, 8, 16, slots), DECODE);
+        assert_eq!(attn_body(2, 3, 16, slots), DECODE);
+        assert_eq!(attn_body(1, 16, 16, slots), DECODE);
+        // a prefill chunk of one sequence, and of several
+        assert_eq!(attn_body(1, 17, 16, slots), AttnBody::Prefill);
+        assert_eq!(attn_body(1, 4096, 16, slots), AttnBody::Prefill);
+        assert_eq!(attn_body(4, 512, 16, slots), AttnBody::Decode { splits: 1 });
+    }
+
+    #[test]
+    fn a_run_the_scratch_cannot_split_keeps_its_old_body() {
+        // scratch for eight split rows: a ninth row does not fit split
+        let slots = attn_slots(64, 8);
+        assert_eq!(slots, 8 * DECODE_ATTN_SPLITS);
+        assert_eq!(attn_body(1, 8, 16, slots), DECODE);
+        assert_eq!(attn_body(1, 9, 16, slots), AttnBody::Prefill);
+        assert_eq!(attn_body(3, 3, 16, slots), AttnBody::Decode { splits: 1 });
+    }
 }

@@ -14,7 +14,7 @@ use spark_runtime::kv_cache::PagedKvCache;
 use super::batch::Batch;
 use super::layer::Inkling2Layer;
 use super::ops::{self, DecodeAttn, HeadNorm};
-use super::weights::{InputNorms, KvConv, Linear};
+use super::weights::{InputNorms, KvConv};
 use crate::layer::ForwardContext;
 
 impl Inkling2Layer {
@@ -37,25 +37,18 @@ impl Inkling2Layer {
             self.visit_idx
         );
         let (n, seqs) = (batch.rows(), batch.seqs.len());
+        // A verify run (journaled rows) takes decode's kernels at any row
+        // count, so each verified token is the one serial decode picks; prefill
+        // rows take the prefill kernels and the checkpoint's declared numerics.
+        let exact = !batch.journals.is_empty();
         let (h, rb, rf) = (d.hidden, n * d.hidden * 2, n * d.hidden * 4);
         let bstride = d.block_stride() * 2; // bytes between stack blocks
         let bs = kv_cache.block_size();
         let gm = &self.gk;
         let meta = self.meta(gpu, batch, ctx, bs, v.first, stream)?;
 
-        if v.first {
-            gm.rmsnorm(
-                gpu,
-                n,
-                DevicePtr::NULL,
-                hidden,
-                self.g.embed_norm,
-                hidden,
-                h,
-                p.eps,
-                stream,
-            )?;
-        }
+        // `hidden` arrives normed: the embedding table is (`load_embedding`),
+        // and image rows never pass through `embed_norm`.
         let states = self.bind_states(gpu, conv_states, ctx.graph_capture, stream)?;
         for (j, state) in batch.journals.iter().zip(conv_states) {
             gpu.copy_d2d_async(*state, *j, self.conv_state_bytes(), stream)?;
@@ -114,7 +107,7 @@ impl Inkling2Layer {
             let row_elems = n * h;
             self.msg_gates(
                 gpu,
-                n,
+                (n, exact),
                 0..3,
                 (res(0), if v.full { row_elems } else { 0 }),
                 (s.msg4, row_elems),
@@ -123,7 +116,7 @@ impl Inkling2Layer {
             )?;
         }
         // input norms -> normed3
-        let inputs_split = v.full || gated_inputs;
+        let inputs_split = self.inputs_split();
         let src_f32 = |i: usize| if has_res { res(i) } else { DevicePtr::NULL };
         let src_bf16 = if has_res { DevicePtr::NULL } else { x };
         // one launch for the visit's input norms; layer 0 reads x for all three
@@ -145,43 +138,7 @@ impl Inkling2Layer {
             p.eps,
             stream,
         )?;
-        let (aq, ak, av) = if inputs_split {
-            (normed(0), normed(1), normed(2))
-        } else {
-            (normed(0), normed(0), normed(0))
-        };
-
-        // projections
-        gm.proj(gpu, n, aq, w.wq, s.q, d.q_dim, h, stream)?;
-        gm.proj(gpu, n, ak, w.wk, s.k_lin, d.kv_dim, h, stream)?;
-        gm.proj(gpu, n, av, w.wv, s.v_lin, d.kv_dim, h, stream)?;
-        gm.proj(gpu, n, aq, w.wr, s.r, d.rel_dim, h, stream)?;
-        gm.proj(gpu, n, aq, w.gate, s.gate, d.q_dim, h, stream)?;
-        gm.proj(gpu, n, aq, Linear::Bf16(w.sink), s.sink, p.heads, h, stream)?;
-        if let KvConv::Dynamic { proj, .. } = w.k_conv {
-            gm.proj(
-                gpu,
-                n,
-                ak,
-                Linear::Bf16(proj),
-                s.dyn_k,
-                d.dyn_dim,
-                h,
-                stream,
-            )?;
-        }
-        if let KvConv::Dynamic { proj, .. } = w.v_conv {
-            gm.proj(
-                gpu,
-                n,
-                av,
-                Linear::Bf16(proj),
-                s.dyn_v,
-                d.dyn_dim,
-                h,
-                stream,
-            )?;
-        }
+        self.project(gpu, n, exact, stream)?;
 
         // k/v convs, then the per-head epilogues
         // each state: k, v, post-attention, post-MLP convs (fp32 elements)
@@ -254,8 +211,14 @@ impl Inkling2Layer {
         gm.kv_write(
             gpu, n, s.kn, s.vn, k_pool, v_pool, meta.slots, p.kv_heads, p.head_dim, bs, stream,
         )?;
-        if batch.seqs.len() == 1 && batch.rows_per_seq > 1 {
-            // a prefill chunk (or verify run) of one sequence: tensor cores
+        let body = ops::attn_body(
+            batch.seqs.len(),
+            batch.rows_per_seq,
+            super::layer::MAX_VERIFY_ROWS,
+            ops::attn_slots(d.max_rows, d.max_seqs),
+        );
+        if body == ops::AttnBody::Prefill {
+            // a prefill chunk of one sequence: tensor cores
             ops::prefill_attn(
                 gpu,
                 &self.k,
@@ -283,11 +246,11 @@ impl Inkling2Layer {
                 stream,
             )?;
         } else {
-            // decode rows split their keys over the GPU; prefill rows have rows enough
-            let splits = if batch.rows_per_seq == 1 {
-                ops::DECODE_ATTN_SPLITS
-            } else {
-                1
+            // decode and verify rows split their keys over the GPU; prefill
+            // rows have rows enough
+            let splits = match body {
+                ops::AttnBody::Decode { splits } => splits,
+                ops::AttnBody::Prefill => 1,
             };
             ops::decode_attn(
                 gpu,
@@ -320,7 +283,7 @@ impl Inkling2Layer {
             )?;
         }
         gm.gate_mul(gpu, s.attn, s.gate, s.gated, n * d.q_dim, stream)?;
-        gm.proj(gpu, n, s.gated, w.wo, s.proj, h, d.q_dim, stream)?;
+        gm.proj(gpu, (n, exact), s.gated, w.wo, s.proj, h, d.q_dim, stream)?;
         self.journal_inputs(gpu, batch, [s.proj], 2, stream)?;
         self.conv(
             gpu,
@@ -361,7 +324,7 @@ impl Inkling2Layer {
             let mlp_msg = s.msg4.offset(3 * rf);
             self.msg_gates(
                 gpu,
-                n,
+                (n, exact),
                 3..4,
                 (s.mlp_in, 0),
                 (mlp_msg, 0),
@@ -384,7 +347,7 @@ impl Inkling2Layer {
         // router, experts, post-MLP conv, layer output
         gm.proj_f32(
             gpu,
-            n,
+            (n, exact),
             s.mlp_normed,
             w.router,
             s.logits,
@@ -404,7 +367,7 @@ impl Inkling2Layer {
             p.route_scale,
             stream,
         )?;
-        self.routed_experts(gpu, n, stream)?;
+        self.routed_experts(gpu, n, exact, stream)?;
         self.journal_inputs(gpu, batch, [s.moe_out], 3, stream)?;
         self.conv(
             gpu,

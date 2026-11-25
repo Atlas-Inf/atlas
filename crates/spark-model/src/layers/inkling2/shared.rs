@@ -109,6 +109,9 @@ pub(crate) struct Shared {
     pub block_table: DevicePtr,
     /// `[visits, max_seqs]` conv-state base pointers, a visit's own row each
     pub state_tables: DevicePtr,
+    /// Each visit's fused-projection tables, one a row count up to
+    /// `BATCHM_MAX_ROWS` (`proj.rs`)
+    pub proj_tables: DevicePtr,
     /// The conv state of every graph-padding row (written, never read)
     pub pad_conv: DevicePtr,
 }
@@ -147,7 +150,7 @@ impl Shared {
             rel_table: a.take(r * d.heads * super::ops::MAX_REL_EXTENT * b),
             attn_partials: a.take(
                 super::ops::attn_partials_len(
-                    r.max(d.max_seqs * super::ops::DECODE_ATTN_SPLITS),
+                    super::ops::attn_slots(r, d.max_seqs),
                     d.heads,
                     d.q_dim / d.heads,
                 ) * f,
@@ -190,6 +193,7 @@ impl Shared {
             block_table: a
                 .take(d.max_seqs * super::layer::MAX_VERIFY_ROWS * d.max_blocks_per_seq * 4),
             state_tables: a.take(d.visits * d.max_seqs * 8),
+            proj_tables: a.take(d.visits * super::glue::BATCHM_MAX_ROWS * super::proj::TABLE_BYTES),
             pad_conv: a.take(d.conv_state_bytes()),
         }
     }

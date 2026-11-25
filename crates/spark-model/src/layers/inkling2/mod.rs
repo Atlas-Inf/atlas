@@ -15,6 +15,7 @@ mod moe_ops;
 mod moe_prefill_hip;
 pub(crate) mod ops;
 mod owner_runs;
+mod proj;
 pub(crate) mod schedule;
 pub(crate) mod shared;
 pub(crate) mod weights;

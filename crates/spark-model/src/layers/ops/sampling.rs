@@ -286,17 +286,6 @@ fn dflash2_selector_topk_splits(columns: u32) -> u32 {
         .clamp(1, DFLASH2_SELECTOR_MAX_SPLITS as u32)
 }
 
-/// Bytes of `dflash2_candidate_selector` (or `dflash2_selector_topk`)
-/// scratch for up to `gamma` rows: a u32 ticket (padded to 16 bytes), f32
-/// values and u32 ids of every slice's top-K, a u32 ticket per row and the
-/// rows' merged lists, sized for the widest selector's K (each kernel lays it
-/// out by its own). It must start zeroed (the kernel leaves every ticket at
-/// zero), and launches sharing it must be stream-ordered.
-pub fn dflash2_selector_scratch_bytes(gamma: usize) -> usize {
-    let k = super::DFLASH2_SELECTOR_WIDE_MAX_TOP_K;
-    16 + 2 * 4 * gamma * DFLASH2_SELECTOR_MAX_SPLITS * k + 4 * gamma + 2 * 4 * gamma * k
-}
-
 /// Bytes of `gamma` rows' top-`DFLASH2_SELECTOR_MAX_TOP_K` lists: f32 values
 /// `[gamma, K]`, then u32 ids `[gamma, K]` (`dflash2_selector_topk`).
 pub fn dflash2_selector_lists_bytes(gamma: usize) -> usize {

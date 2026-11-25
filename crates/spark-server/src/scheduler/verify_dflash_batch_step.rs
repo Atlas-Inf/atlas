@@ -267,9 +267,16 @@ pub(super) fn step_verify_dflash_batched(
         }
         return;
     }
+    // A batch whose narrow steps stopped paying proposes nothing: its next
+    // steps are plain batched decode (`adaptive_spec::plain_hold_step`).
+    crate::scheduler::adaptive_spec::judge_narrow(batch, sched);
     let t_propose = Instant::now();
     let pending: Vec<usize> = (0..n)
-        .filter(|&i| !batch[i].finished && batch[i].pending_drafts.is_empty())
+        .filter(|&i| {
+            !batch[i].finished
+                && batch[i].pending_drafts.is_empty()
+                && !crate::scheduler::adaptive_spec::held(batch[i])
+        })
         .collect();
     let batch_min = model.mtp_propose_batch_min().max(1);
     // The head declares its own batched-propose envelope
@@ -378,7 +385,11 @@ pub(super) fn step_verify_dflash_batched(
     } else {
         // Below the head's batched-propose envelope (lone pending, or the
         // head declares max width 1): every pending sequence still gets its
-        // serial propose this step — not just the first.
+        // serial propose this step — not just the first. A proposer that
+        // shares work between them (`mtp_group_begin`) may hold a propose's
+        // drafts until the group closes.
+        let grouped = pending.len() >= 2 && model.mtp_group_begin(pending.len(), propose_nd);
+        let mut held: Vec<usize> = Vec::new();
         for &i in &pending {
             if let Err(e) = model.save_hidden_for_mtp_from_stash(i, 0) {
                 tracing::error!("save_hidden_for_mtp_from_stash({i}): {e:#}");
@@ -398,6 +409,7 @@ pub(super) fn step_verify_dflash_batched(
                     None,
                 ) {
                     Ok(d) if !d.is_empty() => batch[i].pending_drafts = d,
+                    Ok(_) if grouped => held.push(i),
                     Ok(_) => {
                         let slot = batch[i].seq.slot_idx;
                         let target = &mut batch[i];
@@ -413,6 +425,32 @@ pub(super) fn step_verify_dflash_batched(
                         let slot = batch[i].seq.slot_idx;
                         let target = &mut batch[i];
                         fail_closed_if_lightning(model, target, "single errored", slot);
+                    }
+                }
+            }
+        }
+        if grouped {
+            let drafts = model.mtp_group_finish().and_then(|d| {
+                anyhow::ensure!(
+                    d.len() == held.len(),
+                    "{} draft lists for {} held proposes",
+                    d.len(),
+                    held.len()
+                );
+                Ok(d)
+            });
+            match drafts {
+                Ok(drafts) => {
+                    for (i, d) in held.into_iter().zip(drafts) {
+                        batch[i].pending_drafts = d;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("mtp_group_finish: {e:#}");
+                    for i in held {
+                        let slot = batch[i].seq.slot_idx;
+                        let target = &mut batch[i];
+                        fail_closed_if_lightning(model, target, "group errored", slot);
                     }
                 }
             }

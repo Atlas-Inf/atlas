@@ -10,7 +10,10 @@
 
 use anyhow::{Result, ensure};
 
-use super::{DFLASH2_SELECTOR_MAX_TOP_K, DFLASH2_SELECTOR_SYMBOL, DFLASH2_SELECTOR_THREADS};
+use super::{
+    DFLASH2_SELECTOR_MAX_SPLITS, DFLASH2_SELECTOR_MAX_TOP_K, DFLASH2_SELECTOR_SYMBOL,
+    DFLASH2_SELECTOR_THREADS,
+};
 
 /// Mirrors `DF2_SEL_MAX_TOP_K` / `DF2_SEL_THREADS` of the 32-candidate twin.
 pub const DFLASH2_SELECTOR_WIDE_MAX_TOP_K: usize = 32;
@@ -69,6 +72,25 @@ pub(super) fn ensure_base_selector(top_k: u32, entry: &str) -> Result<()> {
     Ok(())
 }
 
+/// Bytes of `dflash2_candidate_selector` (or `dflash2_selector_topk`)
+/// scratch for up to `gamma` rows: a u32 ticket (padded to 16 bytes), f32
+/// values and u32 ids of every slice's top-K, a u32 ticket per row and the
+/// rows' merged lists, sized for the widest selector's K (each kernel lays it
+/// out by its own). It must start zeroed (the kernel leaves every ticket at
+/// zero), and launches sharing it must be stream-ordered.
+pub fn dflash2_selector_scratch_bytes(gamma: usize) -> usize {
+    let k = super::DFLASH2_SELECTOR_WIDE_MAX_TOP_K;
+    dflash2_selector_lists_offset(gamma, k) + 2 * 4 * gamma * k
+}
+
+/// Byte offset of the rows' merged lists (f32 values `[gamma, max_top_k]`,
+/// then u32 ids) in the scratch of a selector built for `max_top_k`
+/// candidates: past its ticket, its slice lists and the row tickets, as the
+/// kernel's `df2_sel_scratch` lays them out by its own `DF2_SEL_MAX_TOP_K`.
+pub fn dflash2_selector_lists_offset(gamma: usize, max_top_k: usize) -> usize {
+    16 + 2 * 4 * gamma * DFLASH2_SELECTOR_MAX_SPLITS * max_top_k + 4 * gamma
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +106,32 @@ mod tests {
         assert!(dflash2_selector_build(33).is_err());
         assert!(ensure_base_selector(32, "walk").is_err());
         assert!(ensure_base_selector(16, "walk").is_ok());
+    }
+
+    /// The merged lists sit where each kernel's `df2_sel_scratch` puts them
+    /// (u32 words: 4 ticket, 2 * gamma * SPLITS * K slice lists, gamma row
+    /// tickets), by the launched build's own K, and the shared scratch holds
+    /// the widest build's lists exactly.
+    #[test]
+    fn merged_lists_follow_each_builds_own_layout() {
+        for gamma in [8, 16, 32] {
+            for b in [DFLASH2_SELECTOR_BASE, DFLASH2_SELECTOR_WIDE] {
+                let k = b.max_top_k;
+                let words = 4 + 2 * gamma * super::super::DFLASH2_SELECTOR_MAX_SPLITS * k + gamma;
+                assert_eq!(
+                    super::super::dflash2_selector_lists_offset(gamma, k),
+                    4 * words
+                );
+                assert!(
+                    super::super::dflash2_selector_lists_offset(gamma, k) + 8 * gamma * k
+                        <= super::super::dflash2_selector_scratch_bytes(gamma)
+                );
+            }
+            let w = DFLASH2_SELECTOR_WIDE.max_top_k;
+            assert_eq!(
+                super::super::dflash2_selector_lists_offset(gamma, w) + 8 * gamma * w,
+                super::super::dflash2_selector_scratch_bytes(gamma)
+            );
+        }
     }
 }

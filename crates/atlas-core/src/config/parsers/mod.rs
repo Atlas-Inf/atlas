@@ -8,6 +8,8 @@ mod exl3;
 mod gemma4;
 mod glm5_next;
 mod inkling2;
+mod inkling2_vision;
+pub use inkling2_vision::{INKLING2_IMAGE_TOKEN, INKLING2_IMAGE_TOKEN_ID};
 mod laguna;
 mod longcat;
 mod lora;

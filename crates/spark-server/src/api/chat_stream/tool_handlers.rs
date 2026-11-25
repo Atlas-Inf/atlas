@@ -17,13 +17,14 @@ use super::state::{PendingRetry, StreamState};
 type DeltaVec = Vec<StreamDelta>;
 
 /// Whether this stream holds a tool call's deltas until the call validates:
-/// under tool retry, and for Poolside v1, whose detector buffers a call's
+/// under the tool guard (unless it streams), under tool retry, and for
+/// Poolside v1, whose detector buffers a call's
 /// arguments until `</tool_call>` anyway. Holding its header too means the
 /// client never sees a call start that the blocking path would not return:
 /// an unregistered name (rejected at validation) or an envelope the response
 /// cuts off before `</tool_call>` (never validated, so never flushed).
 fn holds_tool_deltas(state: &StreamState, ctx: &StreamCtx) -> bool {
-    ctx.state.tool_guard.enabled
+    (ctx.state.tool_guard.enabled && !ctx.streams_tool_calls())
         || ctx.tool_retry_enabled
         || state
             .detector

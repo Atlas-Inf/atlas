@@ -21,6 +21,7 @@ pub mod det_trace;
 pub mod engine;
 pub mod factory;
 pub mod forward;
+pub mod inkling2_vision;
 pub mod layer;
 pub mod layers;
 pub mod lora;

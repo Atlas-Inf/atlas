@@ -33,24 +33,48 @@ use std::sync::OnceLock;
 /// Past eight sequences the depth narrows with the batch so a step's rows
 /// stay within one exact batched verify (128 rows, `VERIFY_ROW_CAP`):
 /// [`wide_depth`].
+///
+/// An operator's `ATLAS_DFLASH_BATCH_DEPTH` table also bounds two sequences
+/// (Inkling 2: 4 rows each keep a two-sequence verify inside the 8-row
+/// batched kernels, 66 ms against 107 ms for 16 rows on one GB10).
 pub(crate) fn batch_depth(nd: usize, n: usize, held: impl Iterator<Item = usize>) -> usize {
+    batch_depth_with(nd, n, held, table().1.then(|| wide_depth(n)))
+}
+
+/// [`batch_depth`] over its table input: `pinned` is the operator's depth
+/// for `n`, when a table was given.
+fn batch_depth_with(
+    nd: usize,
+    n: usize,
+    held: impl Iterator<Item = usize>,
+    pinned: Option<usize>,
+) -> usize {
     match n {
         0 | 1 => nd,
-        2 => held.min().map_or(nd, |h| nd.min(h.max(MAX_DRAFTS))),
+        2 => {
+            let d = held.min().map_or(nd, |h| nd.min(h.max(MAX_DRAFTS)));
+            pinned.map_or(d, |p| d.min(p).max(1))
+        }
         _ => nd.min(wide_depth(n)).max(1),
     }
+}
+
+/// The depth table and whether the operator gave it.
+fn table() -> &'static (Vec<(usize, usize)>, bool) {
+    static T: OnceLock<(Vec<(usize, usize)>, bool)> = OnceLock::new();
+    T.get_or_init(|| {
+        match parse_depths(std::env::var("ATLAS_DFLASH_BATCH_DEPTH").ok().as_deref()) {
+            Some(t) => (t, true),
+            None => (WIDE_DEPTHS.to_vec(), false),
+        }
+    })
 }
 
 /// Draft depth for `n` live sequences: `ATLAS_DFLASH_BATCH_DEPTH`
 /// (`n:depth,...`, ascending; the first entry whose `n` covers the batch
 /// applies, the last beyond it) or [`WIDE_DEPTHS`].
 pub(crate) fn wide_depth(n: usize) -> usize {
-    static T: OnceLock<Vec<(usize, usize)>> = OnceLock::new();
-    let table = T.get_or_init(|| {
-        parse_depths(std::env::var("ATLAS_DFLASH_BATCH_DEPTH").ok().as_deref())
-            .unwrap_or_else(|| WIDE_DEPTHS.to_vec())
-    });
-    depth_for(table, n)
+    depth_for(&table().0, n)
 }
 
 /// Measured on the 27B (Qwen3.8-27B NVFP4 + DFlash2, one GB10, exact batched

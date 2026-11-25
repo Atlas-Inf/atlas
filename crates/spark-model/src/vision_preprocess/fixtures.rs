@@ -109,6 +109,7 @@ pub fn qwen_config() -> VisionConfig {
         min_pixels: None,
         video_pixels: None,
         is_qwen3vl_video: false,
+        is_inkling2: false,
         omni: None,
     }
 }

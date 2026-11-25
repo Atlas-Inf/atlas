@@ -12,6 +12,8 @@ use spark_runtime::kernel_args::KernelLaunch;
 use super::weights::Linear;
 use crate::layers::ops;
 
+mod route;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GlueKernels {
     pub rmsnorm: KernelHandle,
@@ -28,6 +30,11 @@ pub(crate) struct GlueKernels {
     pub dense_gemv_batchm_f32: KernelHandle,
     /// `dense_gemv_bf16_fp32out`: one row of router logits
     pub dense_gemv_f32: KernelHandle,
+    /// `inkling2_proj_gemv`: a visit's BF16 input projections in one launch
+    pub proj_gemv: KernelHandle,
+    /// `inkling2_proj_gemv_mixed`: the same for one decode row with NVFP4
+    /// projections among them (0 where the target does not ship it)
+    pub proj_gemv_mixed: KernelHandle,
     /// `moe_topk_sigmoid_batched_f32`
     pub topk: KernelHandle,
     /// `reshape_and_cache_flash` (BF16 KV)
@@ -77,6 +84,12 @@ impl GlueKernels {
             dense_gemv_batchm_f32: gpu
                 .kernel("inkling2_router_gemv", "dense_gemv_bf16_batchm_f32out")?,
             dense_gemv_f32: gpu.kernel("gemv", "dense_gemv_bf16_fp32out")?,
+            proj_gemv: gpu.kernel("inkling2_proj_gemv", "inkling2_proj_gemv")?,
+            proj_gemv_mixed: crate::layers::try_kernel(
+                gpu,
+                "inkling2_proj_gemv",
+                "inkling2_proj_gemv_mixed",
+            ),
             topk: gpu.kernel("moe_topk_sig", "moe_topk_sigmoid_batched_f32")?,
             kv_write: gpu.kernel("reshape_and_cache", "reshape_and_cache_flash")?,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
@@ -98,12 +111,19 @@ impl GlueKernels {
     }
 }
 
+/// `(first row, rows)` passes of at most `width` rows over `rows`.
+pub(crate) fn passes(rows: usize, width: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..rows)
+        .step_by(width)
+        .map(move |first| (first, (rows - first).min(width)))
+}
+
 /// Rows `dense_gemv_bf16_batchm` takes at once (its MAX_M): a decode batch or a
 /// verify of up to 8 rows reads each BF16 weight once, every row computed as the
 /// one-row GEMV computes it. cuBLASLt took 2-6x longer on the small projections
 /// (sinks, relative bias, router) at two rows; RigMark short code, Strict, one
 /// Spark: C2 / C4 / C8 49.5 / 79.2 / 120.2 -> 52.6 / 81.7 / 122.1.
-const BATCHM_MAX_ROWS: usize = 8;
+pub(crate) const BATCHM_MAX_ROWS: usize = 8;
 
 fn blocks(n: usize) -> u32 {
     n.div_ceil(256) as u32
@@ -165,12 +185,13 @@ impl GlueKernels {
     /// the dense GEMV / BF16 GEMM; a Spark NVFP4 one through `w4a16_gemv` /
     /// `w4a16_gemv_batch8/16` for decode and verify rows, and its checkpoint BF16
     /// weight for prefill rows (from `MOE_GROUPED_MIN_ROWS`, where the experts
-    /// take the checkpoint's too).
+    /// take the checkpoint's too). `exact` (a verify run): every row through
+    /// the decode GEMVs at any row count, in passes of their widest batch.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn proj(
         &self,
         gpu: &dyn GpuBackend,
-        rows: usize,
+        (rows, exact): (usize, bool),
         x: DevicePtr,
         w: Linear,
         y: DevicePtr,
@@ -178,6 +199,17 @@ impl GlueKernels {
         k: usize,
         s: u64,
     ) -> Result<()> {
+        let pass = match w {
+            Linear::Bf16(_) => BATCHM_MAX_ROWS,
+            Linear::Nvfp4 { .. } => super::moe_ops::MOE_GROUPED_MIN_ROWS - 1,
+        };
+        if exact && rows > pass {
+            for (first, part) in passes(rows, pass) {
+                let (xo, yo) = (x.offset(first * k * 2), y.offset(first * n * 2));
+                self.proj(gpu, (part, true), xo, w, yo, n, k, s)?;
+            }
+            return Ok(());
+        }
         match w {
             Linear::Bf16(w) if rows == 1 => self.gemv_with(gpu, self.dense_gemv, x, w, y, n, k, s),
             Linear::Bf16(w) if rows <= BATCHM_MAX_ROWS => {
@@ -254,7 +286,7 @@ impl GlueKernels {
     pub(crate) fn proj_f32(
         &self,
         gpu: &dyn GpuBackend,
-        rows: usize,
+        (rows, exact): (usize, bool),
         x: DevicePtr,
         w: DevicePtr,
         y: DevicePtr,
@@ -262,6 +294,13 @@ impl GlueKernels {
         k: usize,
         s: u64,
     ) -> Result<()> {
+        if exact && rows > BATCHM_MAX_ROWS {
+            for (first, part) in passes(rows, BATCHM_MAX_ROWS) {
+                let (xo, yo) = (x.offset(first * k * 2), y.offset(first * n * 4));
+                self.proj_f32(gpu, (part, true), xo, w, yo, n, k, s)?;
+            }
+            return Ok(());
+        }
         if rows == 1 {
             self.gemv_with(gpu, self.dense_gemv_f32, x, w, y, n, k, s)
         } else if rows <= BATCHM_MAX_ROWS {
@@ -401,68 +440,6 @@ impl GlueKernels {
             .arg_ptr(x)
             .arg_ptr(out)
             .arg_u32(n as u32)
-            .launch(s)
-    }
-
-    /// Sigmoid top-k over fp32 logits `[rows, experts]`, normalised, x `scale`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn route(
-        &self,
-        gpu: &dyn GpuBackend,
-        rows: usize,
-        logits: DevicePtr,
-        bias: DevicePtr,
-        ids: DevicePtr,
-        w: DevicePtr,
-        experts: usize,
-        top_k: usize,
-        scale: f32,
-        s: u64,
-    ) -> Result<()> {
-        KernelLaunch::new(gpu, self.topk)
-            .grid([rows as u32, 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(logits)
-            .arg_ptr(bias)
-            .arg_ptr(ids)
-            .arg_ptr(w)
-            .arg_u32(experts as u32)
-            .arg_u32(top_k as u32)
-            .arg_u32(1)
-            .arg_f32(scale)
-            .launch(s)
-    }
-
-    /// Write `rows` tokens' K and V into this visit's BF16 pages at `slots`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn kv_write(
-        &self,
-        gpu: &dyn GpuBackend,
-        rows: usize,
-        k: DevicePtr,
-        v: DevicePtr,
-        k_pool: DevicePtr,
-        v_pool: DevicePtr,
-        slots: DevicePtr,
-        kv_heads: usize,
-        head_dim: usize,
-        block_size: usize,
-        s: u64,
-    ) -> Result<()> {
-        let stride = (kv_heads * head_dim) as u32;
-        KernelLaunch::new(gpu, self.kv_write)
-            .grid([rows as u32, 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(k)
-            .arg_ptr(v)
-            .arg_ptr(k_pool)
-            .arg_ptr(v_pool)
-            .arg_ptr(slots)
-            .arg_u32(kv_heads as u32)
-            .arg_u32(head_dim as u32)
-            .arg_u32(block_size as u32)
-            .arg_u32(stride)
-            .arg_u32(stride)
             .launch(s)
     }
 }

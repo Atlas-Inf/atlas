@@ -31,7 +31,7 @@ pub(super) fn record(
 
     // Adaptive speculation (ATLAS_DFLASH_ADAPTIVE=1): feed the rolling
     // accept window; may suspend this seq's speculation (see adaptive_spec).
-    crate::scheduler::adaptive_spec::record_verify(a, num_accepted, sched);
+    crate::scheduler::adaptive_spec::record_verify(a, num_accepted, drafts.len(), sched);
     a.spec_adapt.survival.record(drafts.len(), num_accepted);
     crate::scheduler::dflash_conf_width::record(draft_conf, drafts.len(), num_accepted);
     crate::scheduler::copy_drafts::settle(

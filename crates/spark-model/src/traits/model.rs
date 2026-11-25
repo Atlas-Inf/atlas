@@ -1116,6 +1116,19 @@ pub trait Model: Send + Sync {
         2
     }
 
+    /// Bracket the next `members` [`Self::run_mtp_propose_multi`] calls of
+    /// `drafts` drafts each (`DraftProposer::group_begin`). `true`: a
+    /// bracketed call may return no drafts; [`Self::mtp_group_finish`] has
+    /// them. Default: no group.
+    fn mtp_group_begin(&self, _members: usize, _drafts: usize) -> bool {
+        false
+    }
+
+    /// The drafts of the bracketed calls that returned none, in call order.
+    fn mtp_group_finish(&self) -> Result<Vec<Vec<u32>>> {
+        Ok(Vec::new())
+    }
+
     /// DFlash K=γ graphed verify (γ+1 tokens). Specialization of the K=2/3/4
     /// pattern for arbitrary K. Default impl falls back to eager
     /// `decode_verify`. Models can override for CUDA-graph speedup keyed by

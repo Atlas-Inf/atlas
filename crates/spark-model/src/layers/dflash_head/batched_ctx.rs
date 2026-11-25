@@ -151,12 +151,17 @@ impl BlockDiffusionDraftHead {
         // Quantized/tensor-core context dispatch depends on row count. A
         // concatenated launch can select a different kernel from each serial
         // chunk, so retain serial projection for these configurations.
-        let offsets =
-            if self.twins.ctx_q4.is_some() || self.kernels.small_m_gemv || self.drafter_cublas {
-                None
-            } else {
-                offsets
-            };
+        // Inkling 2 projects its context per draft layer
+        // (`inkling_ctx_kv_project`), per chunk.
+        let offsets = if self.twins.ctx_q4.is_some()
+            || self.kernels.small_m_gemv
+            || self.drafter_cublas
+            || self.inkling.is_some()
+        {
+            None
+        } else {
+            offsets
+        };
 
         let Some(offsets) = offsets else {
             for chunk in pending {

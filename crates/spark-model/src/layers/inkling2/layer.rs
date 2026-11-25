@@ -81,6 +81,11 @@ pub(crate) struct Inkling2Layer {
     pub shared: Shared,
     /// The conv-state bases this visit's state table holds on the device.
     pub bound_states: Mutex<Vec<u64>>,
+    /// Whether the visit's input projections run as one launch (`proj.rs`)
+    pub fused_proj: bool,
+    /// Whether one decode row's input projections, NVFP4 ones among them, run
+    /// as one launch (`proj.rs`)
+    pub fused_mixed: bool,
 }
 
 impl Inkling2Layer {

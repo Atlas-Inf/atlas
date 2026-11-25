@@ -16,12 +16,26 @@ use crate::traits::SequenceState;
 /// rounding 3 live GLM requests up to the generic 4-row graph bucket: the
 /// dummy fourth row otherwise runs every KDA/MLA layer and consumes 25% of
 /// the distributed decode work without producing a token.
-pub(super) fn decode_dispatch_width(n: usize, glm5_distributed: bool) -> usize {
-    if glm5_distributed {
+pub(super) fn decode_dispatch_width(n: usize, exact: bool) -> usize {
+    if exact {
         n
     } else {
         crate::traits::padded_batch_n(n)
     }
+}
+
+/// Sequences up to which Inkling 2 decodes at its exact width (one captured
+/// graph a width).
+const INKLING2_EXACT_WIDTH_MAX: usize = 8;
+
+/// Whether `model_type` dispatches `n` local sequences at exactly `n` rows.
+/// Inkling 2 does, up to [`INKLING2_EXACT_WIDTH_MAX`]: every row reads its
+/// own experts (about 1.7 GB, 6 ms on one GB10) and its layers take any row
+/// count, so a padding row is pure cost. Padded to the graph ladder, three
+/// requests ran as four rows and five to seven as eight: five delivered
+/// fewer tokens a second than four.
+pub(super) fn local_exact_width(model_type: &str, n: usize) -> bool {
+    model_type == "inkling2_loop" && n <= INKLING2_EXACT_WIDTH_MAX
 }
 
 impl TransformerModel {
@@ -36,7 +50,8 @@ impl TransformerModel {
         // EP uses the exact protocol width so C=3 does not execute a dummy
         // fourth row on both ranks.
         let glm5_distributed = self.comm.is_some() && self.config.model_type == "glm5_next";
-        let padded_n = decode_dispatch_width(n, glm5_distributed);
+        let exact = glm5_distributed || local_exact_width(&self.config.model_type, n);
+        let padded_n = decode_dispatch_width(n, exact);
 
         // Both ranks validate their own actual slot guards/state pointers and
         // refresh the fixed ID stream before any graph lookup or replay.
@@ -189,11 +204,29 @@ impl TransformerModel {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_dispatch_width;
+    use super::{decode_dispatch_width, local_exact_width};
 
     #[test]
     fn distributed_decode_keeps_exact_protocol_width() {
         assert_eq!(decode_dispatch_width(3, true), 3);
         assert_eq!(decode_dispatch_width(3, false), 4);
+    }
+
+    #[test]
+    fn inkling2_decodes_at_its_exact_width_up_to_eight() {
+        for n in [1, 3, 5, 7, 8] {
+            assert!(local_exact_width("inkling2_loop", n), "n={n}");
+        }
+        // past eight sequences it keeps the graph ladder, as every other model does
+        assert!(!local_exact_width("inkling2_loop", 9));
+        assert!(!local_exact_width("qwen3_5_moe", 3));
+        assert_eq!(
+            decode_dispatch_width(5, local_exact_width("inkling2_loop", 5)),
+            5
+        );
+        assert_eq!(
+            decode_dispatch_width(5, local_exact_width("qwen3_5_moe", 5)),
+            8
+        );
     }
 }

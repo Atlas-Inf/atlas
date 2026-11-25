@@ -1354,10 +1354,6 @@ impl DraftProposer for BlockDiffusionDraftHead {
         _buffers: &spark_runtime::buffers::BufferArena,
         _config: &atlas_core::config::ModelConfig,
     ) -> usize {
-        // Inkling 2 DSpark proposes one sequence at a time for now.
-        if self.inkling.is_some() {
-            return 1;
-        }
         batch_plan::propose_batch_width(
             self.startup.native_batch_authoritative,
             self.startup.diagnostics.batch_parity,
@@ -1369,6 +1365,14 @@ impl DraftProposer for BlockDiffusionDraftHead {
             self.lane_count() > 1,
             self.batch_capacity,
         )
+    }
+
+    fn group_begin(&self, members: usize, drafts: usize) -> bool {
+        self.alt.is_none() && self.inkling_group_begin(members, drafts)
+    }
+
+    fn group_finish(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<Vec<Vec<u32>>> {
+        self.inkling_group_finish(gpu, stream)
     }
 
     fn propose_batch_min(&self) -> usize {

@@ -190,3 +190,23 @@ fn guard_stop_serializes_on_the_wire_choice_and_is_absent_when_none() {
     );
     plain.finish_reason = "stop".into();
 }
+
+// ── stream_tool_arguments (Atlas extension) ─────────────────────────
+
+#[test]
+fn stream_tool_arguments_is_an_opt_in_request_field() {
+    for (extra, expected) in [(Some(true), true), (Some(false), false), (None, false)] {
+        let mut body = serde_json::json!({"model": "m", "messages": []});
+        if let Some(value) = extra {
+            body["stream_tool_arguments"] = value.into();
+        }
+        let req: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.stream_tool_arguments, expected);
+        assert_eq!(
+            crate::ir::ChatRequest::from(req).stream_tool_arguments,
+            expected
+        );
+    }
+    let body = serde_json::json!({"model": "m", "messages": [], "stream_tool_arguments": "yes"});
+    assert!(serde_json::from_value::<ChatCompletionRequest>(body).is_err());
+}

@@ -19,6 +19,10 @@ pub const DEFAULT_MAX_BYTES: usize = 1024 * 1024;
 /// Stable wire marker. Details never contain the rejected arguments.
 pub const GUARD_STOP: &str = "tool_call_guard";
 pub const REFUSAL: &str = "[atlas] A tool call was blocked by the tool-call guard. No blocked call was released. Review the server policy before retrying.";
+/// The refusal when a streaming guard ([`Policy::stream`]) blocked a call
+/// whose start the client already has: the finish reason is
+/// `content_filter`, not `tool_calls`, and the call must not run.
+pub const STREAMED_REFUSAL: &str = "[atlas] A tool call was blocked by the tool-call guard after part of it streamed. Do not run it. Review the server policy before retrying.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockReason {
@@ -45,6 +49,10 @@ impl BlockReason {
 #[derive(Debug, Clone)]
 pub struct Policy {
     pub enabled: bool,
+    /// Send a call's arguments as they are written and check the call at its
+    /// end, instead of holding the call until it passes. A blocked call then
+    /// ends the response with `content_filter` and [`STREAMED_REFUSAL`].
+    pub stream: bool,
     pub max_bytes: usize,
     allow_hosts: HashSet<String>,
     deny_hosts: HashSet<String>,
@@ -53,6 +61,7 @@ impl Default for Policy {
     fn default() -> Self {
         Self {
             enabled: true,
+            stream: false,
             max_bytes: DEFAULT_MAX_BYTES,
             allow_hosts: HashSet::new(),
             deny_hosts: HashSet::new(),
@@ -76,6 +85,7 @@ impl Policy {
         };
         Ok(Self {
             enabled,
+            stream: false,
             max_bytes,
             allow_hosts: hosts(allow)?,
             deny_hosts: hosts(deny)?,

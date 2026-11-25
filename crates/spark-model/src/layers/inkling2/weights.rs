@@ -115,7 +115,6 @@ pub(crate) struct PhysicalWeights {
 /// Model-level queries.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GlobalWeights {
-    pub embed_norm: DevicePtr,
     pub output_query: DevicePtr,
     /// `[2 * core, H]`: per loop layer the (q, mlp) message queries
     pub cross_pass_queries: DevicePtr,
@@ -125,7 +124,6 @@ pub(crate) struct GlobalWeights {
 
 pub(crate) fn global(store: &WeightStore) -> Result<GlobalWeights> {
     Ok(GlobalWeights {
-        embed_norm: ptr(store, &format!("{PREFIX}.embed_norm.weight"))?,
         output_query: ptr(store, &format!("{PREFIX}.attn_res.output_query"))?,
         cross_pass_queries: ptr(store, &format!("{PREFIX}.middle_cycle_cross_pass_queries"))?,
         cross_pass_kv_queries: ptr(

@@ -23,6 +23,9 @@ pub(crate) struct MsgGate<'a> {
     /// `[gates, rows, rank]` fp32 scratch
     pub z: DevicePtr,
     pub rows: usize,
+    /// Decode or verify rows: the two decode kernels at any row count, so each
+    /// row is the one serial decode computes.
+    pub decode_rows: bool,
     pub hidden: usize,
     pub rank: usize,
     pub eps: f32,
@@ -64,7 +67,11 @@ pub(crate) fn msg_gate(
     let pick = |f: fn(&MessageGate) -> DevicePtr, i: usize| f(&a.gates[i.min(n - 1)]);
     let rows = u32_of(a.rows, "rows")?;
     // (on AMD the fused gate is the WMMA port in inkling2_head_ops.cu's AMD branch)
-    if a.rows >= FUSED_ROWS && a.rank == MAX_GATE_RANK && a.hidden.is_multiple_of(64) {
+    if !a.decode_rows
+        && a.rows >= FUSED_ROWS
+        && a.rank == MAX_GATE_RANK
+        && a.hidden.is_multiple_of(64)
+    {
         let mut f = KernelLaunch::new(gpu, kernels.msg_gate_fused)
             .grid([rows.div_ceil(FUSED_ROWS as u32), 1, 1])
             .block([256, 1, 1])

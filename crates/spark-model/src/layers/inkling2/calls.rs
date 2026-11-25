@@ -98,7 +98,7 @@ impl Inkling2Layer {
     pub(super) fn msg_gates(
         &self,
         gpu: &dyn GpuBackend,
-        n: usize,
+        (n, exact): (usize, bool),
         which: std::ops::Range<usize>,
         (h, h_stride): (DevicePtr, usize),
         (m, m_stride): (DevicePtr, usize),
@@ -122,6 +122,7 @@ impl Inkling2Layer {
                 out_stride,
                 z: self.shared.gate_z,
                 rows: n,
+                decode_rows: exact,
                 hidden: self.dims.hidden,
                 rank: self.p.gate_rank,
                 eps: self.p.eps,
@@ -168,11 +169,18 @@ impl Inkling2Layer {
 
     /// The routed experts over this forward's `n` rows (router output in
     /// `ids` / `weights`, input `mlp_normed`, output `moe_out`): grouped GEMMs
-    /// for prefill-sized row counts, the decode GEMVs otherwise.
-    pub(super) fn routed_experts(&self, gpu: &dyn GpuBackend, n: usize, stream: u64) -> Result<()> {
+    /// for prefill-sized row counts, the decode GEMVs otherwise and for every
+    /// verify run (`exact`: the decode numerics, BF16 expert inputs).
+    pub(super) fn routed_experts(
+        &self,
+        gpu: &dyn GpuBackend,
+        n: usize,
+        exact: bool,
+        stream: u64,
+    ) -> Result<()> {
         let (s, w, d, p, h) = (&self.shared, &self.w, &self.dims, &self.p, self.dims.hidden);
         if n > 1 {
-            let grouped = n >= ops::MOE_GROUPED_MIN_ROWS;
+            let grouped = !exact && n >= ops::MOE_GROUPED_MIN_ROWS;
             let args = ops::MoePrefill {
                 x: s.mlp_normed,
                 experts: if grouped {
