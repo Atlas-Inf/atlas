@@ -13,10 +13,11 @@ use spark_runtime::weights::WeightStore;
 use crate::mistral_loader::MistralWeightLoader;
 use crate::weight_loader::LongcatWeightLoader;
 use crate::weight_loader::{
-    DeepSeekV4WeightLoader, DflashConfig, Gemma4WeightLoader, Glm5WeightLoader, LagunaWeightLoader,
-    MinimaxM2WeightLoader, ModelWeightLoader, NemotronHWeightLoader, NllbWeightLoader,
-    Qwen3VLWeightLoader, Qwen3WeightLoader, Qwen4ExpWeightLoader, Qwen35DenseWeightLoader,
-    Qwen35WeightLoader, RicursiveWeightLoader, Step3p7WeightLoader,
+    BailingWeightLoader, DeepSeekV4WeightLoader, DflashConfig, Gemma4WeightLoader,
+    Glm5WeightLoader, LagunaWeightLoader, MinimaxM2WeightLoader, ModelWeightLoader,
+    NemotronHWeightLoader, NllbWeightLoader, Qwen3VLWeightLoader, Qwen3WeightLoader,
+    Qwen4ExpWeightLoader, Qwen35DenseWeightLoader, Qwen35WeightLoader, RicursiveWeightLoader,
+    Step3p7WeightLoader,
 };
 
 mod dspark_admission;
@@ -136,6 +137,10 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         "deepseek_v4" => Ok(Box::new(DeepSeekV4WeightLoader)),
         "glm5_next" => Ok(Box::new(Glm5WeightLoader)),
         "hy_v4_flash" => Ok(Box::new(crate::weight_loader::hy4::Hy4WeightLoader)),
+        // Bailing-Moe-V3-VL family (Ling-3.2-air NVFP4): KDA + gated-MLA
+        // hybrid, 512-expert sigmoid-routed MoE with expert bias and per-layer
+        // SwiGLU clamp limits, one NEXTN MTP layer at layers.42.
+        "bailing_moe_v3_vl" => Ok(Box::new(BailingWeightLoader)),
         _ => bail!(
             "Unsupported model type: '{}' (normalized: '{}'). \
              Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, holo3_1_moe, qwen3_vl_moe, qwen4_exp, nemotron_h, nemotron_h_puzzle, nemotron_h_omni, gemma4, mistral, minimax_m2, step3p7, laguna, deepseek_v4, m2m_100",
