@@ -36,6 +36,11 @@ pub(crate) enum Linear {
     Nvfp4 {
         q: QuantizedWeight,
         prefill: DevicePtr,
+        /// AMD only: `q.weight`/`q.weight_scale` repacked into the WMMA tile
+        /// replay `w4a16_wmma` reads (same bytes, permuted); NULL elsewhere or
+        /// when the kernel is absent.
+        wmma_packed: DevicePtr,
+        wmma_scales: DevicePtr,
     },
 }
 
@@ -263,6 +268,50 @@ fn spark_experts(
     }))
 }
 
+/// AMD only: repack an NVFP4 projection into the `w4a16_wmma` tile replay
+/// (N%128 and K%64 required; NULL,NULL otherwise or when the kernel is
+/// absent). The pretile is the same bytes permuted, so it adds
+/// `N*K/2 + N*K/16` device bytes beside `q`.
+fn wmma_pretile(
+    store: &WeightStore,
+    gpu: &dyn GpuBackend,
+    q: &str,
+) -> Result<(DevicePtr, DevicePtr)> {
+    if !cfg!(atlas_scale) {
+        return Ok((DevicePtr::NULL, DevicePtr::NULL));
+    }
+    let w = store
+        .get(&format!("{q}.weight"))
+        .with_context(|| format!("inkling2 tensor {q}.weight"))?;
+    let s = store
+        .get(&format!("{q}.weight_scale"))
+        .with_context(|| format!("inkling2 tensor {q}.weight_scale"))?;
+    let n = w.shape[0];
+    let k = w.shape[1] * 2;
+    let kernel = crate::layers::try_kernel(gpu, "inkling2_w4a16_wmma", "w4a16_wmma_pretile");
+    if kernel.0 == 0 || !n.is_multiple_of(128) || !k.is_multiple_of(64) {
+        return Ok((DevicePtr::NULL, DevicePtr::NULL));
+    }
+    let pk = gpu
+        .alloc(n * k / 2)
+        .with_context(|| format!("allocate {q} wmma packed"))?;
+    let sc = gpu
+        .alloc(n * k / 16)
+        .with_context(|| format!("allocate {q} wmma scales"))?;
+    KernelLaunch::new(gpu, kernel)
+        .grid([u32::try_from(n / 128 * (k / 64))?, 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(w.ptr)
+        .arg_ptr(s.ptr)
+        .arg_ptr(pk)
+        .arg_ptr(sc)
+        .arg_u32(u32::try_from(n)?)
+        .arg_u32(u32::try_from(k)?)
+        .launch(0)?;
+    gpu.synchronize(0)?;
+    Ok((pk, sc))
+}
+
 /// Handles for physical layer `l` (layout already checked by the plan).
 pub(crate) fn physical(
     store: &WeightStore,
@@ -295,9 +344,12 @@ pub(crate) fn physical(
         let q = format!("{SPARK}.layers.{l}.self_attn.{spark}");
         let bf16 = p(&format!("{a}.{ckpt}.weight"))?;
         Ok(if store.contains(&format!("{q}.weight")) {
+            let (wmma_packed, wmma_scales) = wmma_pretile(store, gpu, &q)?;
             Linear::Nvfp4 {
                 q: crate::weight_map::quantized(store, &q, gpu)?,
                 prefill: bf16,
+                wmma_packed,
+                wmma_scales,
             }
         } else {
             Linear::Bf16(bf16)
