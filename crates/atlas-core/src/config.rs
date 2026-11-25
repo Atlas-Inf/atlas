@@ -33,6 +33,12 @@ pub struct ModelConfig {
     /// Independent HC, IndexPool and Engram metadata; not an executable model.
     #[serde(skip)]
     pub hy4: Option<Hy4Config>,
+    /// Bailing-Moe-V3-VL family facts (Ling-3.2-air): the group-limited
+    /// router constants and the per-layer SwiGLU clamp lists, parsed only by
+    /// the `bailing_moe_v3_vl` arm; the spark-model Ling family driver
+    /// (`model/bailing_c1.rs`) is the consumer.
+    #[serde(skip)]
+    pub bailing: Option<BailingParams>,
     // ── Core dimensions ──
     pub hidden_size: usize,
     #[serde(default)]
@@ -815,6 +821,7 @@ mod ngram;
 mod ngram_qwen4exp;
 mod parsers;
 pub use hy4::{Hy4Attention, Hy4Config, Hy4Mlp, Hy4Rope, Hy4Ropes};
+pub use parsers::BailingParams;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -830,9 +837,9 @@ pub use parsers::{
     parse_mistral_params, parse_peft_adapter_config, parse_quantization_config,
 };
 pub(crate) use parsers::{
-    parse_deepseek_v4, parse_gemma4_params, parse_glm5_next, parse_glm5_vision_config,
-    parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp, parse_ricursive,
-    parse_step3p7, parse_vision_config,
+    parse_bailing, parse_deepseek_v4, parse_gemma4_params, parse_glm5_next,
+    parse_glm5_vision_config, parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp,
+    parse_ricursive, parse_step3p7, parse_vision_config,
 };
 pub use vision::{OmniVisionConfig, PixelBounds, VisionConfig, VisionTokenBudgets};
 

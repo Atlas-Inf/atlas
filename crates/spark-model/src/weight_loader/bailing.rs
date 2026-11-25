@@ -2,16 +2,14 @@
 
 //! Bailing-Moe-V3-VL weight loader — Ling-3.2-air (NVFP4).
 //!
-//! This PR is the config parse ([`config`]), the exact safetensors name
-//! mapping ([`names`] + [`plan`], validated once per load), the MTP layer
-//! map ([`mtp`]) and the text-only vision skip ([`vision`]). Decode layers
-//! themselves are NOT constructed here yet: the Ling KDA/gated-MLA/MoE
-//! kernels are being landed by the sibling kernels PRs
-//! (`kernels/gb10/ling-3.2-air/nvfp4/{kda,gated_mla,moe_decode,ling_mtp_eh}.cu`),
-//! and constructing [`crate::layer::TransformerLayer`]s for them is the
-//! integration step. Until then [`ModelWeightLoader::load_layers`] builds
-//! and validates the whole-checkpoint plan and fails with a loud pointer at
-//! that wiring, rather than silently misloading.
+//! The config parse ([`config`]), the exact safetensors name mapping
+//! ([`names`] + [`plan`], validated once per load), the MTP layer map
+//! ([`mtp`]) and the text-only vision skip ([`vision`]) come from PR #115.
+//! The decode-path wiring landed with the family driver campaign slice:
+//! [`load_layers`] now builds the layer stack via [`layers`] on top of
+//! `crate::model::bailing_c1` (decode-only, text-only, conservative;
+//! see that module for the step sequence, module-to-kernel table and the
+//! deliberate seams: MTP drafting, KDA slot-pool decode, graphs, vision).
 //!
 //! NVFP4 expert loading reuses the GLM-5 precedent
 //! (`weight_loader/glm5/fp4l.rs` + `weight_map` primitives): routed experts
@@ -27,16 +25,28 @@
 
 mod config;
 mod gate;
+mod layers;
 mod mtp;
 mod names;
 mod plan;
 mod vision;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, ensure};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::WeightStore;
+
+/// The gated-MLA layers write BF16 pool rows this phase; refuse a
+/// quantized-KV pool loudly at load instead of corrupting the cache.
+fn ensure_kv_bf16(idx: usize, dtype: KvCacheDtype) -> Result<()> {
+    let _ = idx;
+    ensure!(
+        dtype == KvCacheDtype::Bf16,
+        "ling: this phase writes BF16 paged K rows; pass --kv-dtype bf16"
+    );
+    Ok(())
+}
 
 use crate::layer::TransformerLayer;
 use crate::weight_loader::ModelWeightLoader;
@@ -67,17 +77,17 @@ impl ModelWeightLoader for BailingWeightLoader {
         &self,
         store: &WeightStore,
         config: &ModelConfig,
-        _gpu: &dyn GpuBackend,
-        _layer_kv_dtypes: &[KvCacheDtype],
+        gpu: &dyn GpuBackend,
+        layer_kv_dtypes: &[KvCacheDtype],
     ) -> Result<Vec<Box<dyn TransformerLayer>>> {
         let plan = plan::build(store, config)?;
         tracing::info!("bailing: checkpoint plan validated ({})", plan.summary());
-        bail!(
-            "bailing: Ling-3.2-air decode kernels are not wired into the layer \
-             factory yet ({}); the checkpoint plan validated — see \
-             weight_loader/bailing.rs for the integration seam",
-            plan.summary()
-        );
+        // Text-only, conservative: the gated-MLA layers write BF16 pool
+        // rows; an FP8/KV-quantized pool is out of this phase.
+        for (idx, dtype) in layer_kv_dtypes.iter().enumerate() {
+            ensure_kv_bf16(idx, *dtype)?;
+        }
+        layers::load_all(store, config, gpu, layer_kv_dtypes, &plan)
     }
 
     fn load_embedding(

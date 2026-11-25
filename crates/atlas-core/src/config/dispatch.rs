@@ -10,8 +10,8 @@ use anyhow::{Context, Result};
 
 use super::{
     LayerType, ModelConfig, default_conv_kernel, default_partial_rotary, default_rms_eps,
-    default_rope_theta, finalize_config, parse_deepseek_v4, parse_gemma4_params, parse_glm5_next,
-    parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_mistral_params,
+    default_rope_theta, finalize_config, parse_bailing, parse_deepseek_v4, parse_gemma4_params,
+    parse_glm5_next, parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_mistral_params,
     parse_quantization_config, parse_qwen4_exp, parse_ricursive, parse_step3p7,
     parse_vision_config, validate_config,
 };
@@ -256,6 +256,9 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
         "step3p7" => parse_step3p7(&raw),
         "deepseek_v4" => parse_deepseek_v4(json),
         "glm5_next" => parse_glm5_next(&raw),
+        // Bailing-Moe-V3-VL (Ling-3.2-air NVFP4): KDA / gated-MLA hybrid
+        // with a 512-expert sigmoid-routed MoE and one NEXTN layer. Text-only.
+        "bailing_moe_v3_vl" => parse_bailing(&raw),
         _ => {
             // Flat config (qwen3_next, etc.)
             let mut config: ModelConfig =
