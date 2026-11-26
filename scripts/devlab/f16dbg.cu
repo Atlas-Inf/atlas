@@ -167,6 +167,52 @@ __device__ __forceinline__ void ink_hip_gemm_tile_f16(
     }
 }
 
+// probe 1: dump the dequantized B fragment for one warp column each lane:
+// out[lane * 32 + i] = dequantized value for column bn(lane), k = i (16 codes x2 halves).
+extern "C" __global__ void dump_b(
+    const unsigned char* wc, const unsigned char* ws, float g, float* out, unsigned int K
+) {
+    const unsigned int lane = threadIdx.x % 32;
+    const unsigned int bn = threadIdx.x / 32 * 16 + (lane & 15);
+    const unsigned char* wc_row = wc + (unsigned long long)bn * (K / 2);
+    const unsigned char* ws_row = ws + (unsigned long long)bn * (K / 16);
+    const uint4 reg_c = *(const uint4*)(wc_row);
+    const unsigned int reg_s = *(const unsigned short*)(ws_row);
+    const unsigned int w[4] = {reg_c.x, reg_c.y, reg_c.z, reg_c.w};
+    float* o = out + threadIdx.x * 32;
+    for (int h = 0; h < 2; h++) {
+        const _Float16 s16h = (_Float16)(ink_hip_e4m3((reg_s >> (8 * h)) & 0xFF) * g);
+        const unsigned int s16 = *(const unsigned short*)&s16h;
+        const unsigned int scale_pk = s16 | (s16 << 16);
+        unsigned int pk[8];
+        for (int i = 0; i < 8; i++) {
+            const unsigned int byte = (w[h * 2 + i / 4] >> (8 * (i % 4))) & 0xFF;
+            const unsigned int sel = ((byte & 7u) << 8) | (((byte >> 4) & 7u) << 24);
+            unsigned int mags;
+            asm("v_perm_b32 %0, %1, %2, %3" : "=v"(mags) : "v"(0x3E3C3800u), "v"(0x46444240u), "v"(sel));
+            const unsigned int sgn = mags | ((byte & 8u) << 12) | ((byte & 0x80u) << 24);
+            asm("v_pk_mul_f16 %0, %1, %2" : "=v"(pk[i]) : "v"(sgn), "v"(scale_pk));
+        }
+        for (int i = 0; i < 8; i++) {
+            const _Float16* h2 = (const _Float16*)&pk[i];
+            o[h * 16 + 2 * i] = (float)h2[0];
+            o[h * 16 + 2 * i + 1] = (float)h2[1];
+        }
+    }
+}
+
+// probe 2: one f16 WMMA on known operands, dump acc. A[r][k], B[n][k] staged as
+// the tile does: lane l holds a[i] = A[(l&15)][i], b[i] = B[(l&15)][i].
+extern "C" __global__ void wmma_probe(const _Float16* A, const _Float16* B, float* out) {
+    const unsigned int lane = threadIdx.x % 32;
+    ink_v16f a, b;
+    for (int i = 0; i < 16; i++) { a[i] = A[(lane & 15) * 16 + i]; b[i] = B[(lane & 15) * 16 + i]; }
+    ink_v8f acc = ink_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc);
+    for (int e = 0; e < 8; e++)
+        out[(2 * e + (lane >> 4)) * 16 + (lane & 15)] = acc[e];
+}
+
 extern "C" __global__ void __launch_bounds__(256) run_tile(
     const __nv_bfloat16* A, const unsigned char* wc, const unsigned char* ws, float g,
     __nv_bfloat16* C, int m_count, unsigned int N, unsigned int K, int nonpkrtz
@@ -198,6 +244,55 @@ int main() {
     hipMemcpy(dA, hA.data(), hA.size() * 2, hipMemcpyHostToDevice);
     hipMemcpy(dC, hC.data(), hC.size(), hipMemcpyHostToDevice);
     hipMemcpy(dS, hS.data(), hS.size(), hipMemcpyHostToDevice);
+
+    // ---- probe 1: dequantized B ----
+    {
+        float* dD; hipMalloc(&dD, 32 * 32 * 4);
+        dump_b<<<1, 32>>>(dC, dS, g, dD, K);
+        if (hipDeviceSynchronize() != hipSuccess) { printf("dump_b FAIL\n"); return 2; }
+        std::vector<float> hd(32 * 32);
+        hipMemcpy(hd.data(), dD, hd.size() * 4, hipMemcpyDeviceToHost);
+        int bad = 0;
+        for (int lane = 0; lane < 32; lane++) {
+            const int n = lane & 15;
+            for (int k = 0; k < 32; k++) {
+                const unsigned char sb = hS[n * (K / 16) + k / 16];
+                const _Float16 s16 = (_Float16)(host_e4m3(sb) * g);
+                const unsigned char byte = hC[n * (K / 2) + k / 2];
+                const int code = (k & 1) ? (byte >> 4) : (byte & 0xF);
+                const float want = (float)((_Float16)E2M1[code] * s16);
+                const float got = hd[lane * 32 + k];
+                if (fabsf(got - want) > 1e-3f) { if (bad++ < 8) printf("B bad lane=%d k=%d n=%d got=%f want=%f (code=%d byte=%02x s=%02x)\n", lane, k, n, got, want, code, byte, sb); }
+            }
+        }
+        printf("probe1 dump_b bad=%d\n", bad);
+        hipFree(dD);
+    }
+
+    // ---- probe 2: f16 WMMA layout ----
+    {
+        _Float16* dWA; _Float16* dWB; float* dWO;
+        hipMalloc(&dWA, 256 * 2); hipMalloc(&dWB, 256 * 2); hipMalloc(&dWO, 256 * 4);
+        std::vector<_Float16> wA(256), wB(256);
+        for (auto& v : wA) v = (_Float16)(((float)(rand() % 17) - 8.0f) / 4.0f);
+        for (auto& v : wB) v = (_Float16)(((float)(rand() % 17) - 8.0f) / 4.0f);
+        hipMemcpy(dWA, wA.data(), 512, hipMemcpyHostToDevice);
+        hipMemcpy(dWB, wB.data(), 512, hipMemcpyHostToDevice);
+        wmma_probe<<<1, 32>>>(dWA, dWB, dWO);
+        if (hipDeviceSynchronize() != hipSuccess) { printf("wmma_probe FAIL\n"); return 2; }
+        std::vector<float> wo(256);
+        hipMemcpy(wo.data(), dWO, 1024, hipMemcpyDeviceToHost);
+        int bad = 0;
+        for (int l = 0; l < 32; l++) for (int e = 0; e < 8; e++) {
+            const int r = 2 * e + (l >> 4), c = l & 15;
+            float want = 0;
+            for (int k = 0; k < 16; k++) want += (float)wA[r * 16 + k] * (float)wB[c * 16 + k];
+            const float got = wo[r * 16 + c];
+            if (fabsf(got - want) > 0.01f) { if (bad++ < 8) printf("W bad r=%d c=%d got=%f want=%f\n", r, c, got, want); }
+        }
+        printf("probe2 wmma_f16 bad=%d\n", bad);
+        hipFree(dWA); hipFree(dWB); hipFree(dWO);
+    }
 
     // host reference: C[m][n] = sum_k f32(f16(A[m,k])) * f32(f16(e2m1(code) * f16(e4m3(scale)*f16? g)))
     // NOTE the kernel rounds e4m3*g to f16 once per 16-k group and the product to f16.
