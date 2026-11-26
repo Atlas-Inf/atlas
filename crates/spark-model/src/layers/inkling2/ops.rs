@@ -70,6 +70,14 @@ pub(crate) struct Inkling2Kernels {
     /// epilogue (bit-identical to GEMM + `inkling2_softcap_swiglu`); NULL elsewhere.
     pub moe_gemm_nvfp4_swiglu: KernelHandle,
     pub moe_gemm_mxfp8_swiglu: KernelHandle,
+    /// strix-hip only: the device-side row-tile list (gb10's `inkling2_moe_tiles`
+    /// convention) and the GEMM entries that consume it, launching only the
+    /// tiles that exist; NULL elsewhere.
+    pub moe_tiles_bf16: KernelHandle,
+    pub moe_gemm_nvfp4_tl: KernelHandle,
+    pub moe_gemm_mxfp8_tl: KernelHandle,
+    pub moe_gemm_nvfp4_swiglu_tl: KernelHandle,
+    pub moe_gemm_mxfp8_swiglu_tl: KernelHandle,
 }
 
 /// A strix-hip-only kernel of this target's `inkling2_moe_gemm` module; NULL on other targets.
@@ -136,6 +144,36 @@ impl Inkling2Kernels {
                 gpu,
                 "inkling2_moe_gemm",
                 "inkling2_moe_gemm_mxfp8_swiglu",
+            ),
+            moe_tiles_bf16: crate::layers::try_kernel_gated(
+                cfg!(atlas_scale),
+                gpu,
+                "inkling2_moe_gemm",
+                "inkling2_moe_tiles_bf16",
+            ),
+            moe_gemm_nvfp4_tl: crate::layers::try_kernel_gated(
+                cfg!(atlas_scale),
+                gpu,
+                "inkling2_moe_gemm",
+                "inkling2_moe_gemm_nvfp4_tl",
+            ),
+            moe_gemm_mxfp8_tl: crate::layers::try_kernel_gated(
+                cfg!(atlas_scale),
+                gpu,
+                "inkling2_moe_gemm",
+                "inkling2_moe_gemm_mxfp8_tl",
+            ),
+            moe_gemm_nvfp4_swiglu_tl: crate::layers::try_kernel_gated(
+                cfg!(atlas_scale),
+                gpu,
+                "inkling2_moe_gemm",
+                "inkling2_moe_gemm_nvfp4_swiglu_tl",
+            ),
+            moe_gemm_mxfp8_swiglu_tl: crate::layers::try_kernel_gated(
+                cfg!(atlas_scale),
+                gpu,
+                "inkling2_moe_gemm",
+                "inkling2_moe_gemm_mxfp8_swiglu_tl",
             ),
         })
     }

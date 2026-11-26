@@ -200,6 +200,33 @@ __device__ __forceinline__ void ink_hip_gemm_tile(
     }
 }
 
+// Same convention as gb10's inkling2_moe_tiles (kernels/gb10/inkling-2-mini/
+// nvfp4/inkling2_moe_gemm.cu): tiles[0] = the row tiles' number, tiles[1 + t] =
+// expert << 16 | m-tile within the expert (in mtile-row units). grid (1),
+// block E rounded up to a warp. Launching only the tiles that exist drops the
+// ~94% of CTAs that would otherwise exit on the m0 >= m_count guard when the
+// grid spans the full token count per expert.
+extern "C" __global__ void __launch_bounds__(1024) inkling2_moe_tiles_bf16(
+    const int* __restrict__ offsets, int* __restrict__ tiles, const unsigned int E, const unsigned int mtile
+) {
+    __shared__ int warp_sums[32];
+    const unsigned int e = threadIdx.x, lane = e % 32, warp = e / 32;
+    const int n = e < E ? (offsets[e + 1] - offsets[e] + (int)mtile - 1) / (int)mtile : 0;
+    int incl = n;   // inclusive scan within the warp, then across warps
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int v = __shfl_up_sync(0xffffffffu, incl, o);
+        if ((int)lane >= o) incl += v;
+    }
+    if (lane == 31) warp_sums[warp] = incl;
+    __syncthreads();
+    int before = 0;
+    for (unsigned int w = 0; w < warp; w++) before += warp_sums[w];
+    const int start = before + incl - n;
+    for (int i = 0; i < n; i++) tiles[1 + start + i] = (int)(e << 16) | i;
+    if (e == blockDim.x - 1) tiles[0] = start + n;
+}
+
 // Routed experts: blockIdx.z is the expert; its rows are offsets[e] .. offsets[e + 1].
 extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
@@ -253,6 +280,70 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_mxfp8_swiglu
     const unsigned int e = blockIdx.z;
     const int m_start = offsets[e], m_count = offsets[e + 1] - m_start;
     const int m0 = blockIdx.y * 64;
+    if (m0 >= m_count) return;
+    const unsigned long long ne = (unsigned long long)e * N;
+    ink_hip_gemm_tile<true, 64, true>(A, codes + ne * K, scales + ne * (K / 32), 1.0f, C, m_start, m_count, m0, rows, N, K, cg, cu);
+}
+
+// Tile-list variants: the same GEMMs over the (expert, m-tile) list
+// inkling2_moe_tiles_bf16 writes, blockIdx.y selecting the tile — one grid
+// dimension fewer than the blockIdx.z = expert launches above. Same math per
+// tile, so the outputs are bit-identical.
+extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4_tl(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales, const float* __restrict__ s2, __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ offsets, const int* __restrict__ rows, const int* __restrict__ tiles,
+    const unsigned int N, const unsigned int K
+) {
+    if (blockIdx.y >= (unsigned int)tiles[0]) return;
+    const unsigned int t = (unsigned int)tiles[1 + blockIdx.y], e = t >> 16;
+    const int m_start = offsets[e], m_count = offsets[e + 1] - m_start;
+    const int m0 = (int)(t & 0xFFFFu) * 128;
+    if (m0 >= m_count) return;
+    const unsigned long long ne = (unsigned long long)e * N;
+    ink_hip_gemm_tile<false, 128, false>(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K, 0.0f, 0.0f);
+}
+
+extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4_swiglu_tl(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales, const float* __restrict__ s2, __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ offsets, const int* __restrict__ rows, const int* __restrict__ tiles,
+    const unsigned int N, const unsigned int K, const float cg, const float cu
+) {
+    if (blockIdx.y >= (unsigned int)tiles[0]) return;
+    const unsigned int t = (unsigned int)tiles[1 + blockIdx.y], e = t >> 16;
+    const int m_start = offsets[e], m_count = offsets[e + 1] - m_start;
+    const int m0 = (int)(t & 0xFFFFu) * 128;
+    if (m0 >= m_count) return;
+    const unsigned long long ne = (unsigned long long)e * N;
+    ink_hip_gemm_tile<false, 128, true>(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K, cg, cu);
+}
+
+extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_mxfp8_tl(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales, __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ offsets, const int* __restrict__ rows, const int* __restrict__ tiles,
+    const unsigned int N, const unsigned int K
+) {
+    if (blockIdx.y >= (unsigned int)tiles[0]) return;
+    const unsigned int t = (unsigned int)tiles[1 + blockIdx.y], e = t >> 16;
+    const int m_start = offsets[e], m_count = offsets[e + 1] - m_start;
+    const int m0 = (int)(t & 0xFFFFu) * 64;
+    if (m0 >= m_count) return;
+    const unsigned long long ne = (unsigned long long)e * N;
+    ink_hip_gemm_tile<true, 64, false>(A, codes + ne * K, scales + ne * (K / 32), 1.0f, C, m_start, m_count, m0, rows, N, K, 0.0f, 0.0f);
+}
+
+extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_mxfp8_swiglu_tl(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales, __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ offsets, const int* __restrict__ rows, const int* __restrict__ tiles,
+    const unsigned int N, const unsigned int K, const float cg, const float cu
+) {
+    if (blockIdx.y >= (unsigned int)tiles[0]) return;
+    const unsigned int t = (unsigned int)tiles[1 + blockIdx.y], e = t >> 16;
+    const int m_start = offsets[e], m_count = offsets[e + 1] - m_start;
+    const int m0 = (int)(t & 0xFFFFu) * 64;
     if (m0 >= m_count) return;
     const unsigned long long ne = (unsigned long long)e * N;
     ink_hip_gemm_tile<true, 64, true>(A, codes + ne * K, scales + ne * (K / 32), 1.0f, C, m_start, m_count, m0, rows, N, K, cg, cu);
