@@ -95,6 +95,7 @@ fn ling_mla_moe_prefill_repro_gpu() -> Result<()> {
         0,
         true,  // whole prompt
         true,  // packed (upstream repro default)
+        1,     // ctx_tag: this call's epoch
         false, // staged
         &block_table,
         stream,

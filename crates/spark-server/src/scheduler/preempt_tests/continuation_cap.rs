@@ -8,8 +8,8 @@
 //! (8193)". Production dodged it with `--max-prefill-tokens 32768`, so any
 //! agent session crossing 32k prompt tokens died mid-prefill.
 
-use super::queue_first_chunk::{Tick, chunks, request};
 use super::PreemptStubModel;
+use super::queue_first_chunk::{Tick, chunks, request};
 
 /// Tick drives the real phases with this budget for both
 /// `max_prefill_tokens` and `max_batch_tokens` (see `Tick::admit`).
@@ -56,7 +56,11 @@ fn unchunkable_mla_prompt_past_the_arena_fails_cleanly() {
     let mut t = Tick::new(&model, false, false);
     let (bad, mut rx_bad) = request(40);
     t.admit(vec![bad]);
-    assert_eq!(chunks(&model), vec![(0, BUDGET)], "chunk 0 honors the budget");
+    assert_eq!(
+        chunks(&model),
+        vec![(0, BUDGET)],
+        "chunk 0 honors the budget"
+    );
     t.step_spec(false, false);
     assert!(
         rx_bad.try_recv().unwrap().is_err(),

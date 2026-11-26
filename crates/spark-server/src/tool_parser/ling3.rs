@@ -184,22 +184,26 @@ mod tests {
 
     #[test]
     fn parses_glued_poolside_shape_without_newlines() {
-        let call = parse_ling3_call("Bash<arg_key>command</arg_key><arg_value>pwd</arg_value>").expect("ling3 call");
+        let call = parse_ling3_call("Bash<arg_key>command</arg_key><arg_value>pwd</arg_value>")
+            .expect("ling3 call");
         assert_eq!(call.function.name, "Bash");
         assert_eq!(args_of(&call)["command"], "pwd");
     }
 
     #[test]
     fn parses_literal_backslash_n_separators() {
-        let call =
-            parse_ling3_call("get_weather\\n<arg_key>city</arg_key>\\n<arg_value>Tokyo</arg_value>\\n").expect("ling3 call");
+        let call = parse_ling3_call(
+            "get_weather\\n<arg_key>city</arg_key>\\n<arg_value>Tokyo</arg_value>\\n",
+        )
+        .expect("ling3 call");
         assert_eq!(call.function.name, "get_weather");
         assert_eq!(args_of(&call)["city"], "Tokyo");
     }
 
     #[test]
     fn parses_name_glued_to_first_argument_tag() {
-        let call = parse_ling3_call("ping<arg_key>host</arg_key><arg_value>localhost</arg_value>").expect("ling3 call");
+        let call = parse_ling3_call("ping<arg_key>host</arg_key><arg_value>localhost</arg_value>")
+            .expect("ling3 call");
         assert_eq!(call.function.name, "ping");
         assert_eq!(args_of(&call)["host"], "localhost");
     }
@@ -267,8 +271,7 @@ mod tests {
 
     #[test]
     fn envelope_scan_finds_tool_calls_in_newlined_output() {
-        let raw =
-            "Let me check.\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Tokyo</arg_value>\n</tool_call>";
+        let raw = "Let me check.\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Tokyo</arg_value>\n</tool_call>";
         let (content, calls) = parse_tool_calls_promoting_bare_names(raw);
         assert_eq!(content.as_deref(), Some("Let me check."));
         assert_eq!(calls.len(), 1);
@@ -278,8 +281,7 @@ mod tests {
 
     #[test]
     fn multiple_calls_in_separate_envelopes() {
-        let raw =
-            "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Tokyo</arg_value>\n</tool_call>\n<tool_call>get_time\n</tool_call>";
+        let raw = "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Tokyo</arg_value>\n</tool_call>\n<tool_call>get_time\n</tool_call>";
         let (_content, calls) = parse_tool_calls_promoting_bare_names(raw);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].function.name, "get_weather");

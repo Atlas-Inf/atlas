@@ -21,8 +21,9 @@
 //! always read the paged path.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 use spark_runtime::kv_cache::PagedKvCache;
@@ -124,13 +125,31 @@ fn proj_gemm(
 
 /// The layer's contiguous prefill context: the sequence's K/V rows AS THE
 /// PREFILL KERNEL READS THEM (normed latent + roped tail), used as the
-/// `kv_base` prefix of `ling_mla_prefill_attn`. Refilled per prefill call
-/// from the paged pools (`ling_mla_ctx_gather`), so correctness never
-/// depends on what an earlier pass left in it.
+/// `kv_base` prefix of `ling_mla_prefill_attn`. Bound once at
+/// [`LingMlaLayer::ctx_pool`] to the whole max window and never grown;
+/// what an earlier call left in the mirror is deliberately untrusted —
+/// the elide stamp decides whether the mirror contents ARE the current
+/// call's prefix or must be re-gathered from the paged pools.
 struct CtxPools {
     k: DevicePtr,
     v: DevicePtr,
+    /// Mirror capacity in rows: bound at first use to
+    /// `max(config.max_seq_len, MAX_PREFILL_ROWS)`.
     rows: usize,
+    /// Elide stamp: mirror rows `[0, stamp_rows)` hold the prefix rows of
+    /// the prefill call whose per-call epoch is `stamp_tag`.
+    stamp_tag: u64,
+    stamp_rows: usize,
+}
+
+/// True when the context mirror already holds exactly the chunk's prefix
+/// rows `[0, chunk_start)` for this prefill call: the call's earlier
+/// sub-chunks wrote them contiguously. One-shot by design — a foreign
+/// call's epoch never matches, so a stale mirror can never elide a
+/// foreign sequence's prefix.
+fn ctx_elides_prefix(mirror_tag: u64, mirror_rows: usize, tag: u64, chunk_start: usize) -> bool {
+    // Epoch 0 (the pristine stamp) never elides, even at (0, 0).
+    tag != 0 && tag == mirror_tag && chunk_start == mirror_rows
 }
 
 pub(crate) struct LingMlaLayer {
@@ -151,8 +170,17 @@ pub(crate) struct LingMlaLayer {
     rope_theta: f64,
     /// Layer-owned V latent pools, lazily sized to the paged pool.
     v_pool: Mutex<Option<DevicePtr>>,
-    /// Layer-owned packed prefill context, lazily sized to the paged pool.
+    /// Layer-owned packed prefill context, bound once to the whole max
+    /// window (see `ctx_pool`): the contiguous mirror + the elide stamp.
     ctx: Mutex<Option<CtxPools>>,
+    /// Whole-window context-mirror size in rows:
+    /// `max(config.max_seq_len, MAX_PREFILL_ROWS)`.
+    max_window: usize,
+    /// Per-prefill-call epoch for the elide stamp (chunks of one
+    /// TransformerLayer::prefill call share a tag; every new call — a new
+    /// request or a continued request's next step — gets a fresh one, so
+    /// a stale mirror can never falsely elide a foreign prefix).
+    ctx_epoch: AtomicU64,
 }
 
 impl LingMlaLayer {
@@ -192,6 +220,8 @@ impl LingMlaLayer {
             rope_theta: config.rope_theta,
             v_pool: Mutex::new(None),
             ctx: Mutex::new(None),
+            max_window: config.max_seq_len.max(MAX_PREFILL_ROWS),
+            ctx_epoch: AtomicU64::new(0),
         })
     }
 
@@ -216,41 +246,53 @@ impl LingMlaLayer {
         Ok(p)
     }
 
-    /// The layer's packed prefill context for a chunk that needs
-    /// `need_rows` = prefix + chunk rows: grown by powers of two from the
-    /// prefill cap and capped at [`MAX_PREFILL_ROWS`] (a 799k-row mirror of
-    /// the whole paged pool would defeat the conservative-memory envelope;
-    /// over-cap chunks keep the legacy paged path). The contents are
-    /// per-pass scratch — the gather refills the prefix from the paged
-    /// pools every prefill call — so growth never changes correctness,
-    /// only capacity.
-    fn ctx_pools(&self, gpu: &dyn GpuBackend, need_rows: usize) -> Result<Option<CtxPools>> {
-        if need_rows > MAX_PREFILL_ROWS {
-            return Ok(None);
-        }
+    /// The layer's packed prefill context: `window` rows of the sequence's
+    /// own K/V in the packed form the attention kernel reads, bound ONCE
+    /// to the whole max window and never grown. The old grow path
+    /// re-allocated the mirror while the previous chunk's in-flight writer
+    /// kernels still targeted it — CUDA_ERROR_ILLEGAL_ADDRESS, sticky
+    /// ("prefill chunk layer 7", 16.4k request) — so growth is deleted,
+    /// not fenced: a pool that never reallocs cannot race.
+    fn ctx_pool(
+        &self,
+        gpu: &dyn GpuBackend,
+        need_rows: usize,
+    ) -> Result<MutexGuard<'_, Option<CtxPools>>> {
+        ensure!(
+            need_rows <= self.max_window,
+            "ling MLA layer {}: prefill chunk ({} rows) exceeds the whole-window context mirror ({}) — max_seq_len violated",
+            self.attn_idx,
+            need_rows,
+            self.max_window
+        );
         let mut cell = self.ctx.lock();
-        if cell.as_ref().map_or(true, |p| p.rows < need_rows) {
-            let grow = cell
-                .as_ref()
-                .map_or(1024, |p| p.rows)
-                .max(need_rows.next_power_of_two())
-                .min(MAX_PREFILL_ROWS);
-            let k = gpu.alloc(grow * MLA_K_ROW_BF16 * 2)?;
-            gpu.memset(k, 0, grow * MLA_K_ROW_BF16 * 2)?;
-            let v = gpu.alloc(grow * MLA_V_ROW_BF16 * 2)?;
-            gpu.memset(v, 0, grow * MLA_V_ROW_BF16 * 2)?;
+        if cell.is_none() {
+            let rows = self.max_window;
+            let k = gpu.alloc(rows * MLA_K_ROW_BF16 * 2)?;
+            gpu.memset(k, 0, rows * MLA_K_ROW_BF16 * 2)?;
+            let v = gpu.alloc(rows * MLA_V_ROW_BF16 * 2)?;
+            gpu.memset(v, 0, rows * MLA_V_ROW_BF16 * 2)?;
             tracing::info!(
-                "ling MLA layer {}: allocated the packed prefill context ({} K/V rows)",
+                "ling MLA layer {}: bound the packed prefill context at the full {}-row window ({} MiB)",
                 self.attn_idx,
-                grow
+                rows,
+                rows * (MLA_K_ROW_BF16 + MLA_V_ROW_BF16) * 2 / (1024 * 1024)
             );
-            *cell = Some(CtxPools { k, v, rows: grow });
+            *cell = Some(CtxPools {
+                k,
+                v,
+                rows,
+                stamp_tag: 0,
+                stamp_rows: 0,
+            });
         }
-        Ok(cell.as_ref().map(|p| CtxPools {
-            k: p.k,
-            v: p.v,
-            rows: p.rows,
-        }))
+        Ok(cell)
+    }
+
+    fn next_ctx_tag(&self) -> u64 {
+        // Epoch 0 is reserved for the pristine stamp, so a fresh mirror
+        // never elides a gather.
+        self.ctx_epoch.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     fn kernel_checks(&self, kv_cache: &PagedKvCache) -> Result<(u32, u32)> {
@@ -787,6 +829,7 @@ impl LingMlaLayer {
         seq_len_start: usize,
         whole_prompt: bool,
         packed: bool,
+        ctx_tag: u64,
         staged: bool,
         block_table: &[u32],
         stream: u64,
@@ -796,20 +839,43 @@ impl LingMlaLayer {
         let hidden_w = s.hidden as u32;
         let rows_u32 = rows as u32;
         if packed {
-            if let Some(ctx) = self.ctx_pools(gpu, seq_len_start + rows)? {
-                let v_pool = self.v_cache_pool(gpu, kv_cache)?;
-                return self.attention_half_packed(
-                    gpu,
-                    hidden,
-                    kv_cache,
-                    rows,
-                    seq_len_start,
-                    &ctx,
-                    v_pool,
-                    block_table,
-                    stream,
-                );
+            let mut cell = self.ctx_pool(gpu, seq_len_start + rows)?;
+            let mirror = cell
+                .as_mut()
+                .expect("packed prefill context pool binds at first use");
+            // Elide the prefix re-gather when this prefill call's earlier
+            // sub-chunks already left exactly the chunk's prefix rows in
+            // the mirror: same per-call tag (one TransformerLayer::prefill
+            // call over one sequence; every other call carries a fresh
+            // tag, so a foreign sequence's rows can never falsely elide)
+            // and exactly contiguous extent. Otherwise the ctx_gather
+            // below refills the prefix from the paged pools — the
+            // correctness envelope is unchanged.
+            let elide =
+                ctx_elides_prefix(mirror.stamp_tag, mirror.stamp_rows, ctx_tag, seq_len_start);
+            let v_pool = self.v_cache_pool(gpu, kv_cache)?;
+            let result = self.attention_half_packed(
+                gpu,
+                hidden,
+                kv_cache,
+                rows,
+                seq_len_start,
+                mirror,
+                v_pool,
+                elide,
+                block_table,
+                stream,
+            );
+            // The mirror now holds [0, seq_len_start + rows) of this call's
+            // sequence (gathered prefix + chunk rows): arm the next
+            // sub-chunk's elision. On Err the stamp stays stale — worst
+            // case one redundant gather.
+            if result.is_ok() {
+                mirror.stamp_tag = ctx_tag;
+                mirror.stamp_rows = seq_len_start + rows;
             }
+            result?;
+            return Ok(());
         }
         ops::rms_norm(
             gpu,
@@ -934,6 +1000,7 @@ impl LingMlaLayer {
         seq_len_start: usize,
         ctx: &CtxPools,
         v_pool: DevicePtr,
+        elide: bool,
         block_table: &[u32],
         stream: u64,
     ) -> Result<()> {
@@ -977,7 +1044,13 @@ impl LingMlaLayer {
             s.mla_block_table,
             stream,
         )?;
-        if seq_len_start > 0 {
+        // Elide the prefix re-gather when the elide stamp proves this
+        // prefill call's earlier sub-chunks already wrote exactly
+        // [0, seq_len_start) of this sequence into the mirror (see the
+        // caller's ctx_elides_prefix check); the fallback ctx_gather
+        // refills the prefix from the paged pools.Skipped or not, the
+        // chunk's own rows land right after the prefix below.
+        if seq_len_start > 0 && !elide {
             self.ctx_gather(
                 gpu,
                 kv_cache,
@@ -1168,6 +1241,7 @@ impl TransformerLayer for LingMlaLayer {
             // The packed path is a prefill shape: a per-verify gather of
             // the prompt prefix would run on every decode step.
             false,
+            0, // ctx_tag (packed=false: unused)
             staged,
             block_table,
             stream,
@@ -1205,6 +1279,10 @@ impl TransformerLayer for LingMlaLayer {
         let fast = std::env::var("ATLAS_LING_MLA_FAST_PREFILL").as_deref() == Ok("1")
             && seq_len_start == 0;
         let cap = self.scratch.rows;
+        // One epoch per TransformerLayer::prefill call: this call's
+        // sub-chunks share the tag (the elide stamp recognizes exactly
+        // this call's contiguously-written prefix).
+        let ctx_tag = self.next_ctx_tag();
         for (n, chunk) in (0..num_tokens).step_by(cap).enumerate() {
             let chunk_rows = (num_tokens - chunk).min(cap);
             self.attention_half_prefill(
@@ -1215,6 +1293,7 @@ impl TransformerLayer for LingMlaLayer {
                 seq_len_start + chunk,
                 fast && n == 0 && num_tokens <= cap,
                 packed,
+                ctx_tag,
                 false,
                 block_table,
                 stream,
@@ -1381,3 +1460,36 @@ mod mla_gpu_parity_tests;
 #[cfg(test)]
 #[path = "e2e_gpu_parity_tests.rs"]
 mod e2e_gpu_parity_tests;
+
+#[cfg(test)]
+mod ctx_pool_tests {
+    use super::ctx_elides_prefix;
+
+    #[test]
+    fn elides_exactly_contiguous_same_call() {
+        // chunk 0 wrote [0, 512); chunk 1 starts at 512 of the same call.
+        assert!(ctx_elides_prefix(7, 512, 7, 512));
+        // chunk 2 continues the chain.
+        assert!(ctx_elides_prefix(7, 1024, 7, 1024));
+    }
+
+    #[test]
+    fn gathers_on_tag_mismatch() {
+        // A new prefill call (fresh epoch) must re-gather: the mirror may
+        // hold a DIFFERENT sequence's rows.
+        assert!(!ctx_elides_prefix(7, 512, 8, 512));
+        // The pristine stamp (epoch 0) never matches a real call's tag
+        // (epochs start at 1).
+        assert!(!ctx_elides_prefix(0, 0, 0, 0));
+        assert!(!ctx_elides_prefix(0, 512, 0, 512));
+    }
+
+    #[test]
+    fn gathers_on_non_contiguous_chunk_start() {
+        // Same tag but chunk_start past the stamp (a gap — the paged path
+        // ran a sub-chunk in between): the mirror does not cover
+        // [0, chunk_start) contiguously.
+        assert!(!ctx_elides_prefix(7, 512, 7, 1024));
+        assert!(!ctx_elides_prefix(7, 1024, 7, 512));
+    }
+}
