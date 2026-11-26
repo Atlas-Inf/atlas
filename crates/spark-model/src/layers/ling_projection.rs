@@ -23,34 +23,12 @@ pub(crate) fn bf16_prompt_rows(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    if m > BATCHED_GEMV_ROWS {
-        return ops::bf16_gemm(input, weight.weight.0, output, m, n, k, stream);
+    if m <= ops::DENSE_GEMV_BATCHM_MAX_M {
+        ops::dense_gemv_batchm(gpu, batch_gemv, input, weight, output, m, n, k, n, stream)
+    } else {
+        ops::bf16_gemm(input, weight.weight.0, output, m, n, k, stream)
     }
-    // Decode and verify widths: the batched GEMV in 8-row chunks, so a row of a
-    // batched verify is the bytes serial decode computes for it (the GEMM's
-    // reduction order differs). Measured at no cost to an 8-sequence verify.
-    let max_m = ops::DENSE_GEMV_BATCHM_MAX_M;
-    for first in (0..m).step_by(max_m as usize) {
-        let offset = first as usize * 2;
-        ops::dense_gemv_batchm(
-            gpu,
-            batch_gemv,
-            input.offset(offset * k as usize),
-            weight,
-            output.offset(offset * n as usize),
-            max_m.min(m - first),
-            n,
-            k,
-            n,
-            stream,
-        )?;
-    }
-    Ok(())
 }
-
-/// Widest row count taken by the batched GEMV: a batched verify of sixteen
-/// sequences' two rows. Wider prompt chunks take the BF16 GEMM.
-const BATCHED_GEMV_ROWS: u32 = 32;
 
 #[derive(Clone, Copy)]
 pub struct LingProjectionScratch {
@@ -71,19 +49,14 @@ impl LingProjectionScratch {
     }
 }
 
-/// Row tiers of the NVFP4 decode copy: rows past the last take the BF16 path.
-const DECODE_TIERS: [u32; 3] = [8, 16, 32];
-
 #[derive(Clone, Copy)]
 enum Format {
     Bf16 {
         batch_gemv: KernelHandle,
-        /// The NVFP4 copy, its one-row kernel and its 8-, 16- and 32-row
-        /// tiers (`DECODE_TIERS`).
         decode_nvfp4: Option<(
             crate::weight_map::QuantizedWeight,
             KernelHandle,
-            [KernelHandle; 3],
+            KernelHandle,
         )>,
     },
     Fp8 {
@@ -142,11 +115,7 @@ impl LingProjection {
                     Some((
                         packed,
                         gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
-                        [
-                            gpu.kernel("w4a16_gemv", "w4a16_gemv_batch8")?,
-                            gpu.kernel("w4a16_gemv", "w4a16_gemv_batch16")?,
-                            gpu.kernel("w4a16_gemv", "w4a16_gemv_batch32")?,
-                        ],
+                        gpu.kernel("w4a16_gemv", "w4a16_gemv_batch8")?,
                     ))
                 } else {
                     None
@@ -228,18 +197,15 @@ impl LingProjection {
                 batch_gemv,
                 decode_nvfp4,
             } => {
-                if let Some((weight, one, tiers)) = decode_nvfp4 {
+                if let Some((weight, one, batch)) = decode_nvfp4 {
                     if rows == 1 {
                         return ops::w4a16_gemv(
                             gpu, one, input, &weight, output, self.n, self.k, stream,
                         );
                     }
-                    // Decode and verify rows, up to a batched verify of
-                    // sixteen sequences' two rows: each tier computes a row as
-                    // it would alone, so a verify row matches its decode row.
-                    if let Some(i) = DECODE_TIERS.iter().position(|&m| rows <= m) {
+                    if rows <= 8 {
                         return ops::w4a16_gemv_batchm(
-                            gpu, tiers[i], input, &weight, output, rows, self.n, self.k, stream,
+                            gpu, batch, input, &weight, output, rows, self.n, self.k, stream,
                         );
                     }
                 }

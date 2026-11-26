@@ -238,6 +238,11 @@ impl LingMoeFfn {
             } else {
                 None
             },
+            router_gemm: if a16 {
+                Some(gpu.kernel("gemm", "dense_gemm_bf16_f32out")?)
+            } else {
+                None
+            },
             router: gpu.kernel("ling_router", "ling_grouped_top8")?,
             quant: gpu.kernel("per_token_group_quant_fp8", "per_token_group_quant_fp8")?,
             gemm: gpu.kernel("fp8_gemm_t_blockscaled", "fp8_gemm_t_blockscaled")?,
