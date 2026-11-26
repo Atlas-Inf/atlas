@@ -201,6 +201,25 @@ extern "C" __global__ void dump_b(
     }
 }
 
+// raw: out[lane*8+i] = mags word, out2[lane*8+i] = pk word for h=0 bytes
+extern "C" __global__ void dump_raw(
+    const unsigned char* wc, const unsigned char* ws, float g, unsigned int* out, unsigned int* out2, unsigned int K
+) {
+    const unsigned int lane = threadIdx.x % 32;
+    const unsigned int bn = threadIdx.x / 32 * 16 + (lane & 15);
+    const unsigned char* wc_row = wc + (unsigned long long)bn * (K / 2);
+    const uint4 reg_c = *(const uint4*)(wc_row);
+    const unsigned int w[4] = {reg_c.x, reg_c.y, reg_c.z, reg_c.w};
+    for (int i = 0; i < 8; i++) {
+        const unsigned int byte = (w[i / 4] >> (8 * (i % 4))) & 0xFF;
+        const unsigned int sel = ((byte & 7u) << 8) | (((byte >> 4) & 7u) << 24);
+        unsigned int mags;
+        asm("v_perm_b32 %0, %1, %2, %3" : "=v"(mags) : "v"(0x3E3C3800u), "v"(0x46444240u), "v"(sel));
+        out[threadIdx.x * 8 + i] = mags;
+        out2[threadIdx.x * 8 + i] = byte;
+    }
+}
+
 // probe 2: one f16 WMMA on known operands, dump acc. A[r][k], B[n][k] staged as
 // the tile does: lane l holds a[i] = A[(l&15)][i], b[i] = B[(l&15)][i].
 extern "C" __global__ void wmma_probe(const _Float16* A, const _Float16* B, float* out) {
@@ -267,6 +286,15 @@ int main() {
         }
         printf("probe1 dump_b bad=%d\n", bad);
         hipFree(dD);
+        unsigned int *dR, *dR2; hipMalloc(&dR, 32 * 8 * 4); hipMalloc(&dR2, 32 * 8 * 4);
+        dump_raw<<<1, 32>>>(dC, dS, g, dR, dR2, K);
+        if (hipDeviceSynchronize() != hipSuccess) { printf("dump_raw FAIL\n"); return 2; }
+        std::vector<unsigned int> rm(256), rb(256);
+        hipMemcpy(rm.data(), dR, 1024, hipMemcpyDeviceToHost);
+        hipMemcpy(rb.data(), dR2, 1024, hipMemcpyDeviceToHost);
+        for (int i = 0; i < 8; i++)
+            printf("raw lane0 byte%d: byte=%02x mags=%08x\n", i, rb[i], rm[i]);
+        hipFree(dR); hipFree(dR2);
     }
 
     // ---- probe 2: f16 WMMA layout ----
