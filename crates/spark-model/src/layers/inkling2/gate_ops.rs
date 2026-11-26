@@ -20,6 +20,11 @@ pub(crate) struct MsgGate<'a> {
     pub m_stride: usize,
     pub out: DevicePtr,
     pub out_stride: usize,
+    /// The `h` and `m` rows' sums of squares, `[plane, rows]` fp32 with a plane
+    /// a `stride / hidden` rows on: their `block_res` wrote them when
+    /// [`fused_takes`] the rows (NULL otherwise)
+    pub sq_h: DevicePtr,
+    pub sq_m: DevicePtr,
     /// `[gates, rows, rank]` fp32 scratch
     pub z: DevicePtr,
     pub rows: usize,
@@ -39,6 +44,13 @@ const OUT_ROWS: u32 = 16;
 /// `inkling2_msg_gate_fused`: rows a CTA takes, and the rows from which a
 /// launch takes it (its 16-row MMA tiles; decode rows keep the two kernels).
 const FUSED_ROWS: usize = 16;
+
+/// Whether `rows` take `inkling2_msg_gate_fused`, which reads the rows' sums
+/// of squares from their producer (prefill rows: decode and verify rows keep
+/// the two decode kernels).
+pub(crate) fn fused_takes(rows: usize, decode_rows: bool, rank: usize, hidden: usize) -> bool {
+    !decode_rows && rows >= FUSED_ROWS && rank == MAX_GATE_RANK && hidden.is_multiple_of(64)
+}
 
 pub(crate) fn msg_gate(
     gpu: &dyn GpuBackend,
@@ -67,16 +79,18 @@ pub(crate) fn msg_gate(
     let pick = |f: fn(&MessageGate) -> DevicePtr, i: usize| f(&a.gates[i.min(n - 1)]);
     let rows = u32_of(a.rows, "rows")?;
     // (on AMD the fused gate is the WMMA port in inkling2_head_ops.cu's AMD branch)
-    if !a.decode_rows
-        && a.rows >= FUSED_ROWS
-        && a.rank == MAX_GATE_RANK
-        && a.hidden.is_multiple_of(64)
-    {
+    if fused_takes(a.rows, a.decode_rows, a.rank, a.hidden) {
+        ensure!(
+            !a.sq_h.is_null() && !a.sq_m.is_null(),
+            "inkling2: fused message gate without its rows' sums of squares"
+        );
         let mut f = KernelLaunch::new(gpu, kernels.msg_gate_fused)
             .grid([rows.div_ceil(FUSED_ROWS as u32), 1, 1])
             .block([256, 1, 1])
             .arg_ptr(a.h)
-            .arg_ptr(a.m);
+            .arg_ptr(a.m)
+            .arg_ptr(a.sq_h)
+            .arg_ptr(a.sq_m);
         for w in [
             |g: &MessageGate| g.down,
             |g: &MessageGate| g.forget,

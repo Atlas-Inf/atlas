@@ -246,6 +246,9 @@ pub(crate) struct BlockRes {
     pub num_queries: usize,
     /// per-row chunk sums scratch, [`block_res_sums_per_row`] fp32 each
     pub sums: DevicePtr,
+    /// `[queries, rows]` fp32 for each output's sum of squares (a message
+    /// gate's rms), or NULL
+    pub sq: DevicePtr,
     pub eps: f32,
 }
 
@@ -265,11 +268,17 @@ pub(crate) fn block_res(
         a.partial_f32.is_null() != a.partial_bf16.is_null(),
         "inkling2 block residual needs exactly one partial"
     );
-    if a.rows > RES_ROW_CTA_MIN_ROWS {
-        // prefill rows: both passes in one CTA a row
+    if a.rows > RES_ROW_CTA_MIN_ROWS || !a.sq.is_null() {
+        // prefill rows (and any whose sums of squares a gate reads: they need a row
+        // in one CTA): both passes in one CTA a row, 8 channels a thread
+        ensure!(
+            a.hidden.is_multiple_of(256) && a.hidden / 8 <= 1024,
+            "inkling2 block residual rows: hidden {} not 256-aligned",
+            a.hidden
+        );
         return KernelLaunch::new(gpu, kernels.block_res_row)
             .grid([u32_of(a.rows, "rows")?, 1, 1])
-            .block([RES_CHUNK as u32, 1, 1])
+            .block([u32_of(a.hidden / 8, "hidden")?, 1, 1])
             .arg_ptr(a.blocks)
             .arg_ptr(a.partial_f32)
             .arg_ptr(a.partial_bf16)
@@ -282,6 +291,7 @@ pub(crate) fn block_res(
             .arg_u64(a.block_stride as u64)
             .arg_u32(u32_of(a.num_queries, "queries")?)
             .arg_f32(a.eps)
+            .arg_ptr(a.sq)
             .launch(stream);
     }
     // decode rows spread their channels over the GPU

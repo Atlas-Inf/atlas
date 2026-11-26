@@ -17,6 +17,11 @@ use super::ops::{self, DecodeAttn, HeadNorm};
 use super::weights::{InputNorms, KvConv};
 use crate::layer::ForwardContext;
 
+/// Planes of `Shared::res_sq`: res3's three, msg4's four, then mlp_in.
+const SQ_RES3: usize = 0;
+const SQ_MSG4: usize = 3;
+const SQ_MLP: usize = 7;
+
 impl Inkling2Layer {
     /// This visit over the batch's rows; `conv_states` are the sequences'
     /// conv-state bases, in batch order.
@@ -78,6 +83,16 @@ impl Inkling2Layer {
         let x = hidden;
         let res = |i: usize| s.res3.offset(i * rf);
         let normed = |i: usize| s.normed3.offset(i * rb);
+        // later passes gate their inputs by messages; a fused gate reads its rows'
+        // sums of squares, which their block residuals write (planes SQ_* of res_sq)
+        let gated_inputs = v.pass > 0;
+        let sq = |plane: usize| {
+            if gated_inputs && ops::fused_takes(n, exact, self.p.gate_rank, h) {
+                s.res_sq.offset(plane * n * 4)
+            } else {
+                DevicePtr::NULL
+            }
+        };
 
         // attention inputs (fp32 in res3 unless layer 0)
         let n_in = if v.full { 3 } else { 1 };
@@ -92,11 +107,10 @@ impl Inkling2Layer {
                 x,
                 w.attn_query,
                 n_in,
-                s.res3,
+                (s.res3, sq(SQ_RES3)),
                 stream,
             )?;
         }
-        let gated_inputs = v.pass > 0;
         if gated_inputs {
             let ll = v
                 .loop_layer
@@ -111,7 +125,7 @@ impl Inkling2Layer {
                 s.msg_h,
                 q,
                 4,
-                s.msg4,
+                (s.msg4, sq(SQ_MSG4)),
                 stream,
             )?;
             // q, k, v inputs gated by their messages in one pass; SWA layers fan
@@ -124,6 +138,7 @@ impl Inkling2Layer {
                 (res(0), if v.full { row_elems } else { 0 }),
                 (s.msg4, row_elems),
                 (res(0), row_elems),
+                (sq(SQ_RES3), sq(SQ_MSG4)),
                 stream,
             )?;
         }
@@ -229,7 +244,7 @@ impl Inkling2Layer {
             super::layer::MAX_VERIFY_ROWS,
             ops::attn_slots(d.max_rows, d.max_seqs),
         );
-        if body == ops::AttnBody::Prefill {
+        let gated = if body == ops::AttnBody::Prefill {
             // a prefill chunk of one sequence: tensor cores
             ops::prefill_attn(
                 gpu,
@@ -239,6 +254,8 @@ impl Inkling2Layer {
                     k_cache: k_pool,
                     v_cache: v_pool,
                     out: s.attn,
+                    gate: s.gate,
+                    gated: s.gated,
                     block_table: kv_table,
                     rel: s.rn,
                     rel_proj: w.rel_proj,
@@ -256,7 +273,7 @@ impl Inkling2Layer {
                     rel_extent: p.rel_extent,
                 },
                 stream,
-            )?;
+            )?
         } else {
             // decode and verify rows split their keys over the GPU; prefill
             // rows have rows enough
@@ -293,8 +310,11 @@ impl Inkling2Layer {
                 },
                 stream,
             )?;
+            false
+        };
+        if !gated {
+            gm.gate_mul(gpu, s.attn, s.gate, s.gated, n * d.q_dim, stream)?;
         }
-        gm.gate_mul(gpu, s.attn, s.gate, s.gated, n * d.q_dim, stream)?;
         gm.proj(gpu, (n, exact), s.gated, w.wo, s.proj, h, d.q_dim, stream)?;
         self.journal_inputs(gpu, batch, [s.proj], 2, stream)?;
         self.conv(
@@ -329,7 +349,7 @@ impl Inkling2Layer {
             DevicePtr::NULL,
             w.mlp_query,
             1,
-            s.mlp_in,
+            (s.mlp_in, sq(SQ_MLP)),
             stream,
         )?;
         if gated_inputs {
@@ -341,6 +361,7 @@ impl Inkling2Layer {
                 (s.mlp_in, 0),
                 (mlp_msg, 0),
                 (s.mlp_in, 0),
+                (sq(SQ_MLP), sq(SQ_MSG4 + 3)),
                 stream,
             )?;
         }
@@ -410,7 +431,7 @@ impl Inkling2Layer {
                 hidden,
                 self.g.output_query,
                 1,
-                s.final_out,
+                (s.final_out, DevicePtr::NULL),
                 stream,
             )?;
             gm.cast_bf16(gpu, s.final_out, hidden, n * h, stream)?;

@@ -35,7 +35,7 @@ __device__ __forceinline__ float ink_state(const __nv_bfloat16* __restrict__ blo
 // chunks * INK_THREADS), so a row spreads over the GPU. `_sums` writes each chunk's
 // per-state sum of squares and query dots, `_out` adds the chunks up, takes the softmax
 // and writes its channels. Grid (chunks, rows) for both. Prefill rows: `_row`, one CTA a
-// row for both passes.
+// row for both passes, 8 channels a thread.
 
 // This chunk's per-state sum of squares and query dots of `row` into sums[0 .. PER)
 // (global or shared): [state][0] = sum s^2, [state][1 + q] = sum q . s.
@@ -180,10 +180,21 @@ extern "C" __global__ void inkling2_block_res_out(
                 gridDim.x, rows, H, nb, row_stride, block_stride, nq, eps);
 }
 
-// Both passes for prefill rows, one CTA a row: the sums stay in shared memory and the
-// second read of the row's states is served by the cache. Bit for bit the two kernels
-// with one chunk a row. grid (rows), block INK_THREADS.
-extern "C" __global__ void inkling2_block_res_row(
+// Both passes for prefill rows, one CTA a row and 8 channels a thread: every state's 8
+// channels load once (16-byte loads) and stay in registers for the softmax and the
+// output, the sums reduce across the CTA. Each output's sum of squares goes to `sq`
+// (or nowhere with NULL), sq[q * rows + row], for the loop message gates' rms. The same
+// formulas as the two decode kernels, summed in its own order. grid (rows), block H / 8.
+__device__ __forceinline__ void ink_bf16x8(const uint4 u, float* f) {
+    const unsigned int w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        f[2 * i] = __uint_as_float(w[i] << 16);
+        f[2 * i + 1] = __uint_as_float(w[i] & 0xffff0000u);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(1024) inkling2_block_res_row(
     const __nv_bfloat16* __restrict__ blocks,
     const float* __restrict__ partial_f32,
     const __nv_bfloat16* __restrict__ partial_bf16,
@@ -195,13 +206,131 @@ extern "C" __global__ void inkling2_block_res_row(
     const unsigned int row_stride,
     const unsigned long long block_stride,
     const unsigned int nq,
-    const float eps
+    const float eps,
+    float* __restrict__ sq                      // [nq, rows] or NULL
 ) {
     atlas_pdl_enter();
-    __shared__ float sums[INK_RES_PER];
+    __shared__ float red[32][INK_RES_PER];
+    __shared__ float p[INK_MAX_Q][INK_MAX_STATES];   // softmax weight x rstd
     const unsigned long long row = blockIdx.x;
-    ink_res_sums(blocks, partial_f32, partial_bf16, queries, sums, row, 0, 1, H, nb, row_stride, block_stride, nq);
+    const unsigned int ns = nb + 1, e0 = threadIdx.x * 8, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const unsigned int warps = blockDim.x / 32;
+    // the row's states: saved blocks as BF16 words, the partial as fp32
+    uint4 bs[INK_MAX_STATES - 1];
+#pragma unroll
+    for (unsigned int j = 0; j < INK_MAX_STATES - 1; j++) {
+        if (j >= nb) break;
+        bs[j] = *(const uint4*)(blocks + row * row_stride + (unsigned long long)j * block_stride + e0);
+    }
+    float pt[8];
+    if (partial_f32 != nullptr) {
+        const float4 a = *(const float4*)(partial_f32 + row * H + e0), b = *(const float4*)(partial_f32 + row * H + e0 + 4);
+        pt[0] = a.x; pt[1] = a.y; pt[2] = a.z; pt[3] = a.w; pt[4] = b.x; pt[5] = b.y; pt[6] = b.z; pt[7] = b.w;
+    } else {
+        ink_bf16x8(*(const uint4*)(partial_bf16 + row * H + e0), pt);
+    }
+    auto state = [&](unsigned int j, float* f) {
+        if (j < nb) ink_bf16x8(bs[j], f);
+        else
+#pragma unroll
+            for (int i = 0; i < 8; i++) f[i] = pt[i];
+    };
+    float qv[INK_MAX_Q][8];
+#pragma unroll
+    for (unsigned int q = 0; q < INK_MAX_Q; q++)
+#pragma unroll
+        for (int i = 0; i < 8; i++) qv[q][i] = q < nq ? queries[(unsigned long long)q * H + e0 + i] : 0.0f;
+
+    // per state: sum of squares and each query's dot, reduced over the CTA
+#pragma unroll
+    for (unsigned int j = 0; j < INK_MAX_STATES; j++) {
+        if (j >= ns) break;
+        float f[8], acc[1 + INK_MAX_Q] = {};
+        state(j, f);
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            acc[0] += f[i] * f[i];
+#pragma unroll
+            for (unsigned int q = 0; q < INK_MAX_Q; q++) acc[1 + q] += qv[q][i] * f[i];
+        }
+#pragma unroll
+        for (unsigned int q = 0; q <= INK_MAX_Q; q++) {
+            float v = acc[q];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffff, v, off);
+            if (lane == 0) red[warp][j * (1 + INK_MAX_Q) + q] = v;
+        }
+    }
     __syncthreads();
-    ink_res_out(blocks, partial_f32, partial_bf16, sums, out, row, 0, 1, rows, H, nb, row_stride, block_stride, nq,
-                eps);
+    if (threadIdx.x < nq) {
+        const unsigned int q = threadIdx.x;
+        float logit[INK_MAX_STATES], rstd[INK_MAX_STATES], mx = -1e30f;
+#pragma unroll
+        for (unsigned int j = 0; j < INK_MAX_STATES; j++) {
+            if (j >= ns) break;
+            float ss = 0.0f, d = 0.0f;
+            for (unsigned int w = 0; w < warps; w++) {
+                ss += red[w][j * (1 + INK_MAX_Q)];
+                d += red[w][j * (1 + INK_MAX_Q) + 1 + q];
+            }
+            rstd[j] = rsqrtf(ss / (float)H + eps);
+            logit[j] = d * rstd[j] * rsqrtf((float)H);
+            mx = fmaxf(mx, logit[j]);
+        }
+        float sum = 0.0f;
+#pragma unroll
+        for (unsigned int j = 0; j < INK_MAX_STATES; j++) {
+            if (j >= ns) break;
+            logit[j] = __expf(logit[j] - mx);
+            sum += logit[j];
+        }
+#pragma unroll
+        for (unsigned int j = 0; j < INK_MAX_STATES; j++) {
+            if (j >= ns) break;
+            p[q][j] = logit[j] / sum * rstd[j];
+        }
+    }
+    __syncthreads();
+
+    // outputs from the registers
+    float o[INK_MAX_Q][8] = {};
+#pragma unroll
+    for (unsigned int j = 0; j < INK_MAX_STATES; j++) {
+        if (j >= ns) break;
+        float f[8];
+        state(j, f);
+#pragma unroll
+        for (unsigned int q = 0; q < INK_MAX_Q; q++) {
+            const float w = q < nq ? p[q][j] : 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; i++) o[q][i] += w * f[i];
+        }
+    }
+    float ss[INK_MAX_Q];
+#pragma unroll
+    for (unsigned int q = 0; q < INK_MAX_Q; q++) {
+        ss[q] = 0.0f;
+        if (q >= nq) break;
+        float* dst = out + ((unsigned long long)q * rows + row) * H + e0;
+        *(float4*)dst = make_float4(o[q][0], o[q][1], o[q][2], o[q][3]);
+        *(float4*)(dst + 4) = make_float4(o[q][4], o[q][5], o[q][6], o[q][7]);
+#pragma unroll
+        for (int i = 0; i < 8; i++) ss[q] += o[q][i] * o[q][i];
+    }
+    if (sq != nullptr) {
+        __syncthreads();   // red is reused
+#pragma unroll
+        for (unsigned int q = 0; q < INK_MAX_Q; q++) {
+            float v = ss[q];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffff, v, off);
+            if (lane == 0) red[warp][q] = v;
+        }
+        __syncthreads();
+        if (threadIdx.x < nq) {
+            float v = 0.0f;
+            for (unsigned int w = 0; w < warps; w++) v += red[w][threadIdx.x];
+            sq[(unsigned long long)threadIdx.x * rows + row] = v;
+        }
+    }
 }

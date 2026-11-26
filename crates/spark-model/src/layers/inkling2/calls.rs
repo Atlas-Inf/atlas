@@ -67,7 +67,7 @@ impl Inkling2Layer {
         partial_bf16: DevicePtr,
         queries: DevicePtr,
         nq: usize,
-        out: DevicePtr,
+        (out, sq): (DevicePtr, DevicePtr),
         stream: u64,
     ) -> Result<()> {
         ops::block_res(
@@ -86,6 +86,7 @@ impl Inkling2Layer {
                 block_stride: self.dims.block_stride(),
                 num_queries: nq,
                 sums: self.shared.res_sums,
+                sq,
                 eps: 1e-6,
             },
             stream,
@@ -93,7 +94,8 @@ impl Inkling2Layer {
     }
 
     /// Message gates `which` (consecutive, at most three) of this loop layer;
-    /// strides in fp32 elements between the gates' `h`, `m` and `out` rows.
+    /// strides in fp32 elements between the gates' `h`, `m` and `out` rows;
+    /// `sq` the `h` and `m` rows' sums of squares (`MsgGate::sq_h`, `sq_m`).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn msg_gates(
         &self,
@@ -103,6 +105,7 @@ impl Inkling2Layer {
         (h, h_stride): (DevicePtr, usize),
         (m, m_stride): (DevicePtr, usize),
         (out, out_stride): (DevicePtr, usize),
+        (sq_h, sq_m): (DevicePtr, DevicePtr),
         stream: u64,
     ) -> Result<()> {
         let gates = self
@@ -120,6 +123,8 @@ impl Inkling2Layer {
                 m_stride,
                 out,
                 out_stride,
+                sq_h,
+                sq_m,
                 z: self.shared.gate_z,
                 rows: n,
                 decode_rows: exact,
