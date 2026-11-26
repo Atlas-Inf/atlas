@@ -605,6 +605,7 @@ fn mla_layer5_parity() -> Result<()> {
         0,
         false,
         false, // packed: legacy paged groups (the packed path runs in phase 4)
+        0,     // ctx_tag (packed=false: unused)
         false, // staged
         &rig.block_table,
         stream,
@@ -684,6 +685,7 @@ fn mla_layer5_parity() -> Result<()> {
         12,
         false,
         false, // packed: legacy paged groups (the packed path runs in phase 4)
+        0,     // ctx_tag (packed=false: unused)
         false, // staged
         &rig.block_table,
         stream,
@@ -784,6 +786,7 @@ fn mla_layer5_parity() -> Result<()> {
         0,
         false,
         true,  // packed
+        1,     // ctx_tag: this call's epoch
         false, // staged
         &rig.block_table,
         stream,
@@ -834,6 +837,7 @@ fn mla_layer5_parity() -> Result<()> {
         12,
         false,
         true,  // packed: the gather refills prefix rows [0, 12) from the pool
+        2,     // ctx_tag: a fresh call's epoch (the gather path must run)
         false, // staged
         &rig.block_table,
         stream,
@@ -915,6 +919,7 @@ fn mla_layer5_prefill_fast_parity() -> Result<()> {
         true,  // whole prompt: contiguous K/V + ling_mla_prefill_attn
         false, // packed: legacy fast path (the packed default runs in phase 4
         // of mla_layer5_parity and end to end in the e2e gate)
+        0,     // ctx_tag (packed=false: unused)
         false, // staged
         &rig.block_table,
         stream,
