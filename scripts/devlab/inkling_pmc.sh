@@ -24,16 +24,22 @@ RP=$(command -v rocprofv3 || command -v /opt/rocm/bin/rocprofv3 || true)
 log "pmc host $(hostname) ref $(git rev-parse --short=9 HEAD) rocprofv3: $RP"
 
 # --- counters available on this agent ---------------------------------------------------
-"$RP" --list-counters > "$OUT/counters.txt" 2>"$OUT/counters.err" \
-  || "$RP" --list-metrics > "$OUT/counters.txt" 2>>"$OUT/counters.err" || true
+# This rocprofv3 has no --list-counters; probe each candidate against /bin/true
+# (a name the tool rejects fails at argument parse before any GPU is touched).
 CANDS="SQ_INSTS SQ_INSTS_VALU SQ_INSTS_SALU SQ_INSTS_VMEM SQ_INSTS_SMEM SQ_INSTS_LDS SQ_INSTS_FLAT \
 SQ_INSTS_EXP SQ_INSTS_MMA SQ_INSTS_VFMA SQ_INSTS_WMMA SQ_WAVES SQ_BUSY_CYCLES SQ_IDLE_ANY \
 SQ_WAIT_ANY SQ_WAIT_TOTAL SQ_WAIT_INST_LDS SQ_WAIT_INST_VMEM SQ_LDS_BANK_CONFLICT SQ_LDS_IDX_ACTIVE \
 GRBM_COUNT GRBM_GUI_ACTIVE TCC_HIT TCC_MISS TCC_EA_RDREQ TCC_EA_WRREQ \
 TCC_EA_RDREQ_32B TCC_EA_RDREQ_64B TCC_EA_WRREQ_32B TCC_EA_WRREQ_64B"
-USE=""
-for c in $CANDS; do grep -qw "$c" "$OUT/counters.txt" 2>/dev/null && USE="$USE $c"; done
-[ -z "$USE" ] && USE="SQ_INSTS_VALU SQ_INSTS_LDS SQ_WAVES TCC_EA_RDREQ TCC_EA_WRREQ TCC_HIT TCC_MISS"
+USE=""; : > "$OUT/counters.txt"
+for c in $CANDS; do
+  if "$RP" --pmc "$c" -- /bin/true > /dev/null 2>>"$OUT/counters.err"; then
+    USE="$USE $c"; echo "$c" >> "$OUT/counters.txt"
+  fi
+done
+# too many counters per pass serializes the replay into many passes; cap at 12,
+# keeping the mix/shape counters first
+USE=$(echo $USE | tr ' ' '\n' | head -12 | tr '\n' ' ')
 log "pmc counters:$USE"
 
 # --- per-dispatch kernel table + counters ----------------------------------------------
@@ -143,11 +149,13 @@ if [ $DO_CIRU = 1 ]; then
     rm -rf "$CR/src"; git clone -q https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151.git "$CR/src" \
       && git -C "$CR/src" checkout -q v1.5.0 || { log "ciru clone failed"; exit 0; }
     log "ciru $(git -C "$CR/src" rev-parse --short=9 HEAD) (v1.5.0)"
-    command -v uv >/dev/null \
-      || ( curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$CR/bin" sh && PATH="$CR/bin:$PATH" ) || true
+    if ! command -v uv >/dev/null; then
+      curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$CR/bin" sh > "$OUT/uv-install.log" 2>&1
+      export PATH="$CR/bin:$PATH"
+    fi
     ( uv venv "$CR/venv" \
         && uv pip install -q --python "$CR/venv/bin/python" --target "$CR/tdeps" --no-deps 'huggingface-hub==1.31.0' 'safetensors==0.8.0' ) \
-      > "$OUT/ciru-venv.log" 2>&1 || { log "CIRU VENV FAILED"; exit 0; }
+      > "$OUT/ciru-venv.log" 2>&1 || { log "CIRU VENV FAILED: $(tail -2 "$OUT/ciru-venv.log" | tr '\n' ' ')"; exit 0; }
     ( cd "$CR/src" && bash scripts/install.sh --venv "$CR/venv" --transformers-deps "$CR/tdeps" --prefix "$CR/opt" ) \
       > "$OUT/ciru-install.log" 2>&1 || { log "CIRU INSTALL FAILED: $(grep -aiE 'error|fail' "$OUT/ciru-install.log" | tail -3 | cut -c1-200)"; exit 0; }
   fi
