@@ -211,7 +211,7 @@ __device__ __forceinline__ void ink_hip_gemm_tile(
 }
 
 // Routed experts: blockIdx.z is the expert; its rows are offsets[e] .. offsets[e + 1].
-extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4(
+extern "C" __global__ void __launch_bounds__(256, 2) inkling2_moe_gemm_nvfp4(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
     const unsigned char* __restrict__ scales, const float* __restrict__ s2, __nv_bfloat16* __restrict__ C,
     const int* __restrict__ offsets, const int* __restrict__ rows, const unsigned int N, const unsigned int K
@@ -227,7 +227,7 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4(
 // Same GEMM with the softcapped SwiGLU folded into the epilogue: C is the
 // activation buffer of N / 2 columns (the gate/up pairs reduced in-register).
 // Bit-identical to inkling2_moe_gemm_nvfp4 -> inkling2_softcap_swiglu.
-extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4_swiglu(
+extern "C" __global__ void __launch_bounds__(256, 2) inkling2_moe_gemm_nvfp4_swiglu(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
     const unsigned char* __restrict__ scales, const float* __restrict__ s2, __nv_bfloat16* __restrict__ C,
     const int* __restrict__ offsets, const int* __restrict__ rows, const unsigned int N, const unsigned int K,
@@ -241,7 +241,7 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4_swiglu
     ink_hip_gemm_tile<false, 128, true>(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K, cg, cu);
 }
 
-extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_mxfp8(
+extern "C" __global__ void __launch_bounds__(256, 2) inkling2_moe_gemm_mxfp8(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
     const unsigned char* __restrict__ scales, __nv_bfloat16* __restrict__ C,
     const int* __restrict__ offsets, const int* __restrict__ rows, const unsigned int N, const unsigned int K
@@ -254,7 +254,7 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_mxfp8(
     ink_hip_gemm_tile<true, 64, false>(A, codes + ne * K, scales + ne * (K / 32), 1.0f, C, m_start, m_count, m0, rows, N, K, 0.0f, 0.0f);
 }
 
-extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_mxfp8_swiglu(
+extern "C" __global__ void __launch_bounds__(256, 2) inkling2_moe_gemm_mxfp8_swiglu(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
     const unsigned char* __restrict__ scales, __nv_bfloat16* __restrict__ C,
     const int* __restrict__ offsets, const int* __restrict__ rows, const unsigned int N, const unsigned int K,
