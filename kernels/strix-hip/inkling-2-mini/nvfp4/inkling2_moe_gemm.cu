@@ -39,6 +39,14 @@ __device__ __forceinline__ ink_v16bf ink_ld16(const __nv_bfloat16* p) {
     return x.v;
 }
 
+// E2M1 -> fp32 by bit math, identical to the INK_HIP_E2M1 table values
+// (magnitudes 0..6 exact in fp32; code 8 gives -0.0, matching the table).
+__device__ __forceinline__ float ink_hip_e2m1(unsigned int c) {
+    const unsigned int m3 = c & 7u;
+    const unsigned int mag = m3 < 2u ? m3 * 0x3F000000u : ((126u + (m3 >> 1)) << 23) | ((m3 & 1u) << 22);
+    return __uint_as_float(((c & 8u) << 28) | mag);
+}
+
 __device__ __forceinline__ float ink_hip_e4m3(unsigned int b) {
     const unsigned int s = (b >> 7) & 1u, e = (b >> 3) & 0xFu, m = b & 0x7u;
     float v;
@@ -216,11 +224,9 @@ __device__ __forceinline__ void ink_hip_gemm_tile_t2(
     const unsigned int N, const unsigned int K, const float cg, const float cu
 ) {
     __shared__ __align__(16) __nv_bfloat16 As[128][INK_PITCH];
-    __shared__ float lut[16];
     __shared__ int src[128];
     const unsigned int n0 = blockIdx.x * INK_GN;
     const unsigned int tid = threadIdx.x, lane = tid % 32;
-    if (tid < 16) lut[tid] = INK_HIP_E2M1[tid];
     for (int r = tid; r < 128; r += 256) src[r] = m0 + r < m_count ? (rows ? rows[m_start + m0 + r] : m_start + m0 + r) : -1;
     __syncthreads();
 
@@ -283,8 +289,8 @@ __device__ __forceinline__ void ink_hip_gemm_tile_t2(
 #pragma unroll
                 for (int i = 0; i < 8; i++) {
                     const unsigned int byte = (w[h * 2 + i / 4] >> (8 * (i % 4))) & 0xFF;
-                    pk[i] = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(lut[byte & 0xF] * s)) |
-                            ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(lut[byte >> 4] * s)) << 16);
+                    pk[i] = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(ink_hip_e2m1(byte & 0xF) * s)) |
+                            ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(ink_hip_e2m1(byte >> 4) * s)) << 16);
                 }
                 b_frag[h] = *(ink_v16bf*)pk;
             }
