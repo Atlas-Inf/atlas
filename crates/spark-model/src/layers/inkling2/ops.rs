@@ -78,6 +78,8 @@ pub(crate) struct Inkling2Kernels {
     pub moe_gemm_mxfp8_tl: KernelHandle,
     pub moe_gemm_nvfp4_swiglu_tl: KernelHandle,
     pub moe_gemm_mxfp8_swiglu_tl: KernelHandle,
+    pub moe_gemm_nvfp4_t2: KernelHandle,
+    pub moe_gemm_nvfp4_swiglu_t2: KernelHandle,
 }
 
 /// A strix-hip-only kernel of this target's `inkling2_moe_gemm` module; NULL on other targets.
@@ -174,6 +176,18 @@ impl Inkling2Kernels {
                 gpu,
                 "inkling2_moe_gemm",
                 "inkling2_moe_gemm_mxfp8_swiglu_tl",
+            ),
+            moe_gemm_nvfp4_t2: crate::layers::try_kernel_gated(
+                cfg!(atlas_scale),
+                gpu,
+                "inkling2_moe_gemm",
+                "inkling2_moe_gemm_nvfp4_t2",
+            ),
+            moe_gemm_nvfp4_swiglu_t2: crate::layers::try_kernel_gated(
+                cfg!(atlas_scale),
+                gpu,
+                "inkling2_moe_gemm",
+                "inkling2_moe_gemm_nvfp4_swiglu_t2",
             ),
         })
     }

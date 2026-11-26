@@ -200,6 +200,143 @@ __device__ __forceinline__ void ink_hip_gemm_tile(
     }
 }
 
+// Transposed-warp NVFP4 variant: each warp owns 16 output columns for the
+// whole 128-row tile (8 M fragments x 1 N fragment per K step), so the lane's
+// B row is fixed across K and its codes stream straight from global into
+// registers one step ahead — no B staging pass, no shared B at all (LDS drops
+// to the A tile alone) and every code is dequantised exactly once per CTA,
+// where the shared tile would dequant the same fragment in every warp. The
+// dequant math (E2M1 -> fp32 -> * s -> RTNE BF16) and the per-element K
+// accumulation order are unchanged -> bit-identical to ink_hip_gemm_tile.
+template <bool SW>
+__device__ __forceinline__ void ink_hip_gemm_tile_t2(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ wc,
+    const unsigned char* __restrict__ ws, const float g, __nv_bfloat16* __restrict__ C,
+    const int m_start, const int m_count, const int m0, const int* __restrict__ rows,
+    const unsigned int N, const unsigned int K, const float cg, const float cu
+) {
+    __shared__ __align__(16) __nv_bfloat16 As[128][INK_PITCH];
+    __shared__ float lut[16];
+    __shared__ int src[128];
+    const unsigned int n0 = blockIdx.x * INK_GN;
+    const unsigned int tid = threadIdx.x, lane = tid % 32;
+    if (tid < 16) lut[tid] = INK_HIP_E2M1[tid];
+    for (int r = tid; r < 128; r += 256) src[r] = m0 + r < m_count ? (rows ? rows[m_start + m0 + r] : m_start + m0 + r) : -1;
+    __syncthreads();
+
+    // warp w owns output columns n0 + w * 16 + (lane & 15); its B row in the
+    // (N x K) weight tile is fixed, so the per-step prefetch is per lane.
+    const unsigned int bn = n0 + tid / 32 * 16 + (lane & 15);
+    const bool b_ok = bn < N;
+    const unsigned char* wc_row = wc + (unsigned long long)bn * (K / 2);
+    const unsigned char* ws_row = ws + (unsigned long long)bn * (K / 16);
+    constexpr int A_ITERS = 2; // 128 rows x 4 16-byte chunks / 256 threads
+    const __nv_bfloat16* a_ptr[A_ITERS];
+    int a_off[A_ITERS];
+    bool a_val[A_ITERS];
+#pragma unroll
+    for (int it = 0; it < A_ITERS; it++) {
+        const int idx = it * 256 + (int)tid, r = idx / 4, col = (idx % 4) * 8;
+        const int sr = src[r];
+        a_val[it] = sr >= 0;
+        a_ptr[it] = A + (unsigned long long)sr * K + col;
+        a_off[it] = r * INK_PITCH + col;
+    }
+    ink_v8f acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) acc[j] = ink_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+
+    uint4 reg_a[A_ITERS];
+    uint4 reg_c;
+    unsigned int reg_s = 0;
+    auto prefetch = [&](const unsigned int k0) {
+#pragma unroll
+        for (int it = 0; it < A_ITERS; it++)
+            reg_a[it] = a_val[it] ? *(const uint4*)(a_ptr[it] + k0) : make_uint4(0, 0, 0, 0);
+        if (b_ok) {
+            reg_c = *(const uint4*)(wc_row + k0 / 2); // 16 bytes = the K32's 32 codes
+            reg_s = *(const unsigned short*)(ws_row + k0 / 16); // both halves' scales
+        } else {
+            reg_c = make_uint4(0, 0, 0, 0);
+            reg_s = 0;
+        }
+    };
+    prefetch(0);
+    for (unsigned int k0 = 0; k0 < K; k0 += INK_GK) {
+#pragma unroll
+        for (int it = 0; it < A_ITERS; it++)
+            *(uint4*)((__nv_bfloat16*)As + a_off[it]) = reg_a[it];
+        __syncthreads();
+        // snapshot this step's codes/scales, issue the next global loads, then
+        // dequant under them: reg_c / reg_s are the next K step's by the time
+        // the fragments are built.
+        const uint4 cur_c = reg_c;
+        const unsigned int cur_s = reg_s;
+        if (k0 + INK_GK < K) prefetch(k0 + INK_GK);
+        ink_v16bf b_frag[2];
+        {
+            const unsigned int w[4] = {cur_c.x, cur_c.y, cur_c.z, cur_c.w};
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const float s = ink_hip_e4m3((cur_s >> (8 * h)) & 0xFF) * g;
+                unsigned int pk[8];
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    const unsigned int byte = (w[h * 2 + i / 4] >> (8 * (i % 4))) & 0xFF;
+                    pk[i] = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(lut[byte & 0xF] * s)) |
+                            ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(lut[byte >> 4] * s)) << 16);
+                }
+                b_frag[h] = *(ink_v16bf*)pk;
+            }
+        }
+        {
+            // 8 M fragments against this warp's single B fragment per half step.
+            for (int h = 0; h < 2; h++) {
+#pragma unroll
+                for (int im = 0; im < 8; im++) {
+                    if (m0 + im * 16 < m_count) {
+                        const ink_v16bf a = ink_ld16(&As[im * 16 + (lane & 15)][h * 16]);
+                        acc[im] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b_frag[h], acc[im]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    const unsigned int c = bn; // this lane's output column
+    if (!SW) {
+        if (c < N) {
+#pragma unroll
+            for (int im = 0; im < 8; im++) {
+#pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    const int r = m0 + im * 16 + 2 * e + (int)(lane >> 4);
+                    if (r < m_count) C[(unsigned long long)(m_start + r) * N + c] = __float2bfloat16(acc[im][e]);
+                }
+            }
+        }
+        return;
+    }
+    // SW epilogue: the same in-register gate/up pairing; adjacent columns are
+    // still adjacent lanes (c = w * 16 + (lane & 15)).
+    const unsigned int I = N / 2;
+#pragma unroll
+    for (int im = 0; im < 8; im++) {
+#pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const int r = m0 + im * 16 + 2 * e + (int)(lane >> 4);
+            const float g16 = __bfloat162float(__float2bfloat16(acc[im][e]));
+            const float u16 = __shfl_xor_sync(0xffffffffu, g16, 1);
+            const float v = tanhf(g16 / cg) * cg * (1.0f / (1.0f + __expf(-g16))) * tanhf(u16 / cu) * cu;
+            const unsigned int h = ((lane & 15) & 1) == 0
+                ? (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v)) : 0u;
+            const unsigned int h2 = __shfl_down_sync(0xffffffffu, h, 2);
+            if (r < m_count && c < N && ((lane & 15) & 3) == 0)
+                *(unsigned int*)(C + (unsigned long long)(m_start + r) * I + (c >> 1)) = h | (h2 << 16);
+        }
+    }
+}
+
 // Same convention as gb10's inkling2_moe_tiles (kernels/gb10/inkling-2-mini/
 // nvfp4/inkling2_moe_gemm.cu): tiles[0] = the row tiles' number, tiles[1 + t] =
 // expert << 16 | m-tile within the expert (in mtile-row units). grid (1),
@@ -347,6 +484,39 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_mxfp8_swiglu
     if (m0 >= m_count) return;
     const unsigned long long ne = (unsigned long long)e * N;
     ink_hip_gemm_tile<true, 64, true>(A, codes + ne * K, scales + ne * (K / 32), 1.0f, C, m_start, m_count, m0, rows, N, K, cg, cu);
+}
+
+// Transposed-warp tile-list entries (ink_hip_gemm_tile_t2): same (expert,
+// m-tile) decode as the _tl kernels, NVFP4 only — the MXFP8 rows keep the
+// staged-tile _tl path.
+extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4_t2(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales, const float* __restrict__ s2, __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ offsets, const int* __restrict__ rows, const int* __restrict__ tiles,
+    const unsigned int N, const unsigned int K
+) {
+    if (blockIdx.y >= (unsigned int)tiles[0]) return;
+    const unsigned int t = (unsigned int)tiles[1 + blockIdx.y], e = t >> 16;
+    const int m_start = offsets[e], m_count = offsets[e + 1] - m_start;
+    const int m0 = (int)(t & 0xFFFFu) * 128;
+    if (m0 >= m_count) return;
+    const unsigned long long ne = (unsigned long long)e * N;
+    ink_hip_gemm_tile_t2<false>(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K, 0.0f, 0.0f);
+}
+
+extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4_swiglu_t2(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales, const float* __restrict__ s2, __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ offsets, const int* __restrict__ rows, const int* __restrict__ tiles,
+    const unsigned int N, const unsigned int K, const float cg, const float cu
+) {
+    if (blockIdx.y >= (unsigned int)tiles[0]) return;
+    const unsigned int t = (unsigned int)tiles[1 + blockIdx.y], e = t >> 16;
+    const int m_start = offsets[e], m_count = offsets[e + 1] - m_start;
+    const int m0 = (int)(t & 0xFFFFu) * 128;
+    if (m0 >= m_count) return;
+    const unsigned long long ne = (unsigned long long)e * N;
+    ink_hip_gemm_tile_t2<true>(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K, cg, cu);
 }
 
 // The softcapped SwiGLU between the grouped GEMMs (kept here: gb10 dropped its BF16-row

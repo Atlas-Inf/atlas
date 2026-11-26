@@ -55,7 +55,7 @@ pub(super) fn moe_prefill_bf16(
         && if e.mxfp8 {
             k.moe_gemm_mxfp8_tl.0 != 0
         } else {
-            k.moe_gemm_nvfp4_tl.0 != 0
+            k.moe_gemm_nvfp4_tl.0 != 0 || k.moe_gemm_nvfp4_t2.0 != 0
         };
     if tl {
         KernelLaunch::new(gpu, k.moe_tiles_bf16)
@@ -79,6 +79,8 @@ pub(super) fn moe_prefill_bf16(
             gpu,
             if e.mxfp8 {
                 k.moe_gemm_mxfp8_tl
+            } else if k.moe_gemm_nvfp4_t2.0 != 0 {
+                k.moe_gemm_nvfp4_t2
             } else {
                 k.moe_gemm_nvfp4_tl
             },
@@ -133,6 +135,8 @@ pub(super) fn moe_prefill_bf16(
     };
     let swiglu_tl = if e.mxfp8 {
         k.moe_gemm_mxfp8_swiglu_tl
+    } else if k.moe_gemm_nvfp4_swiglu_t2.0 != 0 {
+        k.moe_gemm_nvfp4_swiglu_t2
     } else {
         k.moe_gemm_nvfp4_swiglu_tl
     };
