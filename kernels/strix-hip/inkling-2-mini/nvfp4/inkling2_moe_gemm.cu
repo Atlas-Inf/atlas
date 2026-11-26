@@ -184,18 +184,17 @@ __device__ __forceinline__ void ink_hip_gemm_tile(
 #pragma unroll
     for (int j = 0; j < NSUB; j++) {
         const unsigned int c = n0 + wn + j * 16 + (lane & 15);
-        if (c >= N) continue;
 #pragma unroll
         for (int e = 0; e < 8; e++) {
             const int r = m0 + wm + 2 * e + (int)(lane >> 4);
-            if (r >= m_count) continue;
+            // the shuffles run converged on every lane; only the write is guarded
             const float g16 = __bfloat162float(__float2bfloat16(acc[j][e]));
             const float u16 = __shfl_xor_sync(0xffffffffu, g16, 1);
             const float v = tanhf(g16 / cg) * cg * (1.0f / (1.0f + __expf(-g16))) * tanhf(u16 / cu) * cu;
             const unsigned int h = ((lane & 15) & 1) == 0
                 ? (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v)) : 0u;
             const unsigned int h2 = __shfl_down_sync(0xffffffffu, h, 2);
-            if (((lane & 15) & 3) == 0)
+            if (r < m_count && c < N && ((lane & 15) & 3) == 0)
                 *(unsigned int*)(C + (unsigned long long)(m_start + r) * I + (c >> 1)) = h | (h2 << 16);
         }
     }
