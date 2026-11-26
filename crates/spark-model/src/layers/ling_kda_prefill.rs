@@ -60,7 +60,7 @@ impl LingKdaLayer {
         input_norm: DevicePtr,
         tokens: usize,
         states: &[LingKdaState],
-        verify_boundary: Option<(DevicePtr, DevicePtr)>,
+        verify_snapshots: &[(DevicePtr, DevicePtr)],
         fp32_workspace: Option<DevicePtr>,
         scratch: LingKdaPrefillScratch,
         projection: LingProjectionScratch,
@@ -69,23 +69,25 @@ impl LingKdaLayer {
         ensure!(tokens > 0, "Ling KDA prefill needs at least one token");
         ensure!(tokens <= u32::MAX as usize, "Ling KDA prefill is too long");
         ensure!(!input_norm.is_null(), "Ling KDA prefill input is null");
+        // A verify is two rows per sequence (the committed token and its
+        // draft), with one snapshot per sequence: (H, convolution windows)
+        // after its first row, the state a rejected draft rolls back to.
+        let verify = !verify_snapshots.is_empty();
         ensure!(
-            states.len() == 1 || states.len() == tokens,
+            !verify || (verify_snapshots.len() == states.len() && tokens == 2 * states.len()),
+            "Ling verify snapshots ({}) need two rows for each of {} sequences, not {tokens}",
+            verify_snapshots.len(),
+            states.len()
+        );
+        ensure!(
+            verify || states.len() == 1 || states.len() == tokens,
             "expected a prompt state or one state per decode row"
         );
         for state in states {
             state.validate()?;
         }
-        ensure!(
-            verify_boundary.is_none() || (tokens == 2 && states.len() == 1),
-            "Ling verify snapshot requires two temporal rows"
-        );
         let rows_per_state = tokens / states.len();
-        let chunk = if verify_boundary.is_some() {
-            1
-        } else {
-            rows_per_state
-        };
+        let chunk = if verify { 1 } else { rows_per_state };
         let row_bytes = LING_KDA_PROJECTION_SIZE * 2;
         scratch.validate()?;
         let rows = tokens as u32;
@@ -142,7 +144,7 @@ impl LingKdaLayer {
                         stream,
                     )?;
                     if offset == 0
-                        && let Some((_, conv)) = verify_boundary
+                        && let Some(&(_, conv)) = verify_snapshots.get(index)
                     {
                         gpu.copy_d2d_async(
                             state_ptr,
@@ -211,23 +213,18 @@ impl LingKdaLayer {
                 stream,
             )?;
         } else if rows_per_state == 1 && (2..=8).contains(&states.len()) {
-            let mut launch = spark_runtime::kernel_args::KernelLaunch::new(gpu, self.batch_k)
-                .grid([LING_KDA_HEADS as u32, rows, 1])
-                .block([128, 1, 1])
-                .arg_ptr(scratch.qkv)
-                .arg_ptr(scratch.raw_gate)
-                .arg_ptr(scratch.raw_beta)
-                .arg_ptr(self.weights.a_log.weight)
-                .arg_ptr(self.weights.dt_bias.weight)
-                .arg_ptr(scratch.recurrent);
-            for i in 0..8 {
-                launch = launch.arg_ptr(states.get(i).map_or(DevicePtr::NULL, |state| state.h));
+            self.batch_recurrent(gpu, &scratch, states, 1, 0, stream)?;
+        } else if verify && states.len() > 1 {
+            // Every sequence's first row in one launch, the snapshots a
+            // rejected draft rolls back to, then every second row.
+            for (group, chunk) in states.chunks(8).enumerate() {
+                let base = 2 * 8 * group as u32;
+                self.batch_recurrent(gpu, &scratch, chunk, 2, base, stream)?;
+                for (state, &(snapshot, _)) in chunk.iter().zip(&verify_snapshots[8 * group..]) {
+                    gpu.copy_d2d_async(state.h, snapshot, LingKdaState::h_state_bytes(), stream)?;
+                }
+                self.batch_recurrent(gpu, &scratch, chunk, 2, base + 1, stream)?;
             }
-            launch
-                .arg_u32(LING_KDA_HEADS as u32)
-                .arg_u32(LING_KDA_HEAD_DIM as u32)
-                .arg_f32(self.config.lower_bound)
-                .launch(stream)?;
         } else {
             for (index, state) in states.iter().enumerate() {
                 let first = index * rows_per_state;
@@ -250,7 +247,7 @@ impl LingKdaLayer {
                         stream,
                     )?;
                     if offset == 0
-                        && let Some((snapshot, _)) = verify_boundary
+                        && let Some(&(snapshot, _)) = verify_snapshots.get(index)
                     {
                         gpu.copy_d2d_async(
                             state.h,
@@ -284,5 +281,41 @@ impl LingKdaLayer {
             stream,
         )?;
         Ok(scratch.output)
+    }
+
+    /// `ling_kda_batch`: one recurrent step for each of up to eight states,
+    /// state i taking row `i * row_stride + row_base` of the step's planes.
+    fn batch_recurrent(
+        &self,
+        gpu: &dyn GpuBackend,
+        scratch: &LingKdaPrefillScratch,
+        states: &[LingKdaState],
+        row_stride: u32,
+        row_base: u32,
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(
+            (1..=8).contains(&states.len()),
+            "ling_kda_batch carries 1..=8 states"
+        );
+        let mut launch = spark_runtime::kernel_args::KernelLaunch::new(gpu, self.batch_k)
+            .grid([LING_KDA_HEADS as u32, states.len() as u32, 1])
+            .block([128, 1, 1])
+            .arg_ptr(scratch.qkv)
+            .arg_ptr(scratch.raw_gate)
+            .arg_ptr(scratch.raw_beta)
+            .arg_ptr(self.weights.a_log.weight)
+            .arg_ptr(self.weights.dt_bias.weight)
+            .arg_ptr(scratch.recurrent);
+        for i in 0..8 {
+            launch = launch.arg_ptr(states.get(i).map_or(DevicePtr::NULL, |state| state.h));
+        }
+        launch
+            .arg_u32(LING_KDA_HEADS as u32)
+            .arg_u32(LING_KDA_HEAD_DIM as u32)
+            .arg_f32(self.config.lower_bound)
+            .arg_u32(row_stride)
+            .arg_u32(row_base)
+            .launch(stream)
     }
 }

@@ -36,10 +36,6 @@ impl LingMoeFfn {
         ensure!(ctx.config.hidden_size == self.hidden);
         let rows = u32::try_from(num_tokens)
             .map_err(|_| anyhow::anyhow!("Ling A16 prefill row count exceeds CUDA launch range"))?;
-        let router_gemm = self
-            .kernels
-            .router_gemm
-            .ok_or_else(|| anyhow::anyhow!("Ling A16 router GEMM kernel is unavailable"))?;
         let silu_kernel = self
             .kernels
             .silu_bf16
@@ -153,35 +149,32 @@ impl LingMoeFfn {
         // Keep routing entirely on device.  The existing Ling router block
         // indexes logits by blockIdx.x, so launching one block per row gives
         // exactly the one-token tie-breaking implementation for every row.
-        if rows <= ops::DENSE_GEMV_BATCHM_MAX_M {
-            ops::dense_gemv_batchm(
-                ctx.gpu,
-                self.kernels.router_batch_gemv.expect("A16 batched router"),
-                input,
-                &self.router,
-                ctx.buffers.gate_logits_f32(),
-                rows,
-                EXPERTS as u32,
-                self.hidden as u32,
-                EXPERTS as u32,
-                stream,
-            )?;
-        } else if rows >= 32 {
+        // Decode and verify widths (a batched verify of up to sixteen
+        // sequences' two rows) take the batched GEMV in 8-row chunks: each
+        // row is routed exactly as it would be alone, and faster than the
+        // scalar GEMM these widths took before.
+        if rows < 32 {
+            let max_m = ops::DENSE_GEMV_BATCHM_MAX_M;
+            for first in (0..rows).step_by(max_m as usize) {
+                ops::dense_gemv_batchm(
+                    ctx.gpu,
+                    self.kernels.router_batch_gemv.expect("A16 batched router"),
+                    input.offset(first as usize * self.hidden * 2),
+                    &self.router,
+                    ctx.buffers
+                        .gate_logits_f32()
+                        .offset(first as usize * EXPERTS * 4),
+                    max_m.min(rows - first),
+                    EXPERTS as u32,
+                    self.hidden as u32,
+                    EXPERTS as u32,
+                    stream,
+                )?;
+            }
+        } else {
             ops::bf16_gemm_f32out(
                 input,
                 self.router.weight.0,
-                ctx.buffers.gate_logits_f32(),
-                rows,
-                EXPERTS as u32,
-                self.hidden as u32,
-                stream,
-            )?;
-        } else {
-            ops::dense_gemm(
-                ctx.gpu,
-                router_gemm,
-                input,
-                &self.router,
                 ctx.buffers.gate_logits_f32(),
                 rows,
                 EXPERTS as u32,

@@ -487,7 +487,7 @@ impl LingDecoderLayer {
         residual: DevicePtr,
         num_tokens: usize,
         states: &[LingKdaState],
-        verify_boundary: Option<(DevicePtr, DevicePtr)>,
+        verify_snapshots: &[(DevicePtr, DevicePtr)],
         ctx: &ForwardContext<'_>,
         stream: u64,
     ) -> Result<()> {
@@ -553,7 +553,7 @@ impl LingDecoderLayer {
                 normed,
                 num_tokens,
                 states,
-                verify_boundary,
+                verify_snapshots,
                 fp32_workspace,
                 scratch,
                 projection,

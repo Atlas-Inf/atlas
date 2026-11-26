@@ -186,7 +186,7 @@ fn mock_prefill_dispatches_one_batched_kda_chain() {
             DevicePtr(0x25_0000),
             2,
             &[state],
-            None,
+            &[],
             None,
             prefill_scratch(),
             projection_scratch,
@@ -197,6 +197,85 @@ fn mock_prefill_dispatches_one_batched_kda_chain() {
     // Six batched projections, three token-parallel convolutions, then pack,
     // recurrent, gated norm, and output projection. No per-token loop.
     assert_eq!(gpu.launch_count(), 13);
+}
+
+/// A sequence's KDA state and verify snapshot, allocated: the three
+/// convolution windows are contiguous, as the layer requires.
+fn verify_state(gpu: &MockGpuBackend) -> (LingKdaState, (DevicePtr, DevicePtr)) {
+    let conv = LingKdaState::conv_state_bytes();
+    let windows = gpu.alloc(3 * conv).unwrap();
+    let state = LingKdaState {
+        q_conv: windows,
+        k_conv: windows.offset(conv),
+        v_conv: windows.offset(2 * conv),
+        h: gpu.alloc(LingKdaState::h_state_bytes()).unwrap(),
+    };
+    let snapshot = (
+        gpu.alloc(LingKdaState::h_state_bytes()).unwrap(),
+        gpu.alloc(3 * conv).unwrap(),
+    );
+    (state, snapshot)
+}
+
+#[test]
+fn mock_multi_sequence_verify_snapshots_each_sequence_after_its_first_row() {
+    let gpu = MockGpuBackend::new();
+    let weights = LingKdaWeights::load(&gpu, &test_store(), "").unwrap();
+    let layer = LingKdaLayer::new(weights, LingKdaConfig::pinned(), &gpu).unwrap();
+    let (a, a_snapshot) = verify_state(&gpu);
+    let (b, b_snapshot) = verify_state(&gpu);
+    let states = [a, b];
+    let snapshots = [a_snapshot, b_snapshot];
+    let projection_scratch = LingProjectionScratch::new(DevicePtr::NULL, 0, DevicePtr::NULL, 0);
+
+    layer
+        .forward_prefill(
+            &gpu,
+            DevicePtr(0x25_0000),
+            4,
+            &states,
+            &snapshots,
+            None,
+            prefill_scratch(),
+            projection_scratch,
+            9,
+        )
+        .unwrap();
+    // Six projections over all four rows; per sequence, three convolutions
+    // for each of its two rows; one batched recurrence over every first row
+    // and one over every second row; then pack, gated norm and output
+    // projection over all four rows.
+    assert_eq!(gpu.launch_count(), 6 + 2 * 3 * 2 + 2 + 3);
+    // Each sequence's three convolution windows and recurrent matrix after
+    // its first row: the state a rejected draft rolls back to.
+    assert_eq!(gpu.d2d_count(), 2 * 4);
+}
+
+#[test]
+fn verify_snapshots_must_match_two_rows_per_sequence() {
+    let gpu = MockGpuBackend::new();
+    let weights = LingKdaWeights::load(&gpu, &test_store(), "").unwrap();
+    let layer = LingKdaLayer::new(weights, LingKdaConfig::pinned(), &gpu).unwrap();
+    let (a, snapshot) = verify_state(&gpu);
+    let (b, _) = verify_state(&gpu);
+    let states = [a, b];
+    let projection_scratch = LingProjectionScratch::new(DevicePtr::NULL, 0, DevicePtr::NULL, 0);
+    for (rows, snapshots) in [(4, &[snapshot][..]), (6, &[snapshot, snapshot][..])] {
+        let err = layer
+            .forward_prefill(
+                &gpu,
+                DevicePtr(0x25_0000),
+                rows,
+                &states,
+                snapshots,
+                None,
+                prefill_scratch(),
+                projection_scratch,
+                9,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("verify snapshot"), "{err}");
+    }
 }
 
 #[test]

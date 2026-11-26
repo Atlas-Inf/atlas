@@ -20,6 +20,7 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 use spark_runtime::weights::{WeightDtype, WeightStore};
 use std::any::Any;
 
+mod batch;
 mod proposer;
 
 struct State {
@@ -66,6 +67,7 @@ pub(crate) struct LingMtp {
     norm_k: KernelHandle,
     gemv: KernelHandle,
     argmax: KernelHandle,
+    batch: batch::BatchKernels,
 }
 
 impl LingMtp {
@@ -143,6 +145,7 @@ impl LingMtp {
             norm_k: gpu.kernel("ling_norm", "ling_rms_norm")?,
             gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
             argmax: gpu.kernel("argmax", "argmax_bf16")?,
+            batch: batch::BatchKernels::load(gpu, blocks, c.vocab_size)?,
         })
     }
 

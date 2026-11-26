@@ -113,6 +113,31 @@ impl DraftProposer for LingMtp {
         };
         Ok(vec![id])
     }
+    fn propose_batch(
+        &self,
+        last_tokens: &[u32],
+        target_hiddens: &[DevicePtr],
+        positions: &[usize],
+        num_drafts: usize,
+        states: &mut [&mut dyn ProposerState],
+        _owners: Option<&[SequenceGeneration]>,
+        ctx: &ForwardContext,
+        stream: u64,
+        _out_conf: Option<&mut Vec<Vec<f32>>>,
+        grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
+    ) -> Result<Option<Vec<Vec<u32>>>> {
+        if num_drafts != 1 || grammar_bitmasks.is_some_and(|m| m.iter().any(Option::is_some)) {
+            return Ok(None);
+        }
+        self.propose_rows(last_tokens, target_hiddens, positions, states, ctx, stream)
+    }
+    fn propose_batch_max(
+        &self,
+        _buffers: &spark_runtime::buffers::BufferArena,
+        _config: &atlas_core::config::ModelConfig,
+    ) -> usize {
+        super::batch::MAX_ROWS
+    }
     fn prefill_drafter(
         &self,
         tokens: &[u32],

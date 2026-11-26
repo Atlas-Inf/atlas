@@ -56,9 +56,8 @@ impl TransformerModel {
     /// is armed. Everything outside falls back to the per-seq loop.
     pub(super) fn can_batch_verify_dispatch(&self, ks: &[usize]) -> bool {
         let n = ks.len();
-        // Ling's layers have no multi-sequence verify: several drafting
-        // sequences take the per-sequence verify.
-        if self.config.model_type == "bailing_moe_v3_vl" {
+        // Ling verifies its one native draft: two rows per sequence.
+        if self.config.model_type == "bailing_moe_v3_vl" && ks.iter().any(|&k| k != 2) {
             return false;
         }
         // One sequence only on the exact lane past its own 4-row verify
@@ -376,10 +375,13 @@ impl TransformerModel {
         let mut slots = [0i64; super::verify_e2::VERIFY_ROW_CAP];
         let mut seq_lens = [0i32; super::verify_e2::VERIFY_ROW_CAP];
         for (i, seq) in seqs.iter().enumerate() {
+            // Rotary position: `seq_len` except past a Ling image, whose
+            // generated text continues from the image's shifted position.
+            let first_position = self.decode_position(seq);
             for j in 0..ks[i] {
                 let r = off[i] + j;
                 let pos = seq.seq_len + j;
-                positions[r] = pos as u32;
+                positions[r] = first_position + j as u32;
                 let physical_block = seq.physical_block_for(pos / bs).unwrap_or(0);
                 slots[r] = (physical_block as i64) * (bs as i64) + ((pos % bs) as i64);
                 // Per-row causal clamp: row r attends through its own position.
