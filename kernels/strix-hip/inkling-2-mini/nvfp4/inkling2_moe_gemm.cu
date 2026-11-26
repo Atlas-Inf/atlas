@@ -73,29 +73,61 @@ __device__ __forceinline__ void ink_hip_gemm_tile(
 #pragma unroll
     for (int j = 0; j < NSUB; j++) acc[j] = ink_v8f{0, 0, 0, 0, 0, 0, 0, 0};
 
-    for (unsigned int k0 = 0; k0 < K; k0 += INK_GK) {
-        // activations: TM rows x 32 BF16 = TM * 4 chunks of 16 bytes
-        for (int c = tid; c < TM * 4; c += 256) {
-            const int r = c / 4, col = (c % 4) * 8;
-            uint4 v = make_uint4(0, 0, 0, 0);
-            if (src[r] >= 0) v = *(const uint4*)(A + (unsigned long long)src[r] * K + k0 + col);
-            *(uint4*)&As[r][col] = v;
+    // Per-thread loads fixed across the K loop: A chunk it of A_ITERS 16-byte
+    // chunks (row r, column (idx%4)*8), and weight row bn half bh (16 values,
+    // one scale per K step). The next K32's global loads are issued into
+    // registers under this step's WMMAs (prefetch below), so the dequant and the
+    // stores stay the only work between the two barriers.
+    constexpr int A_ITERS = TM * 4 / 256;
+    const __nv_bfloat16* a_ptr[A_ITERS];
+    int a_off[A_ITERS];
+    bool a_val[A_ITERS];
+#pragma unroll
+    for (int it = 0; it < A_ITERS; it++) {
+        const int idx = it * 256 + (int)tid, r = idx / 4, col = (idx % 4) * 8;
+        const int sr = src[r];
+        a_val[it] = sr >= 0;
+        a_ptr[it] = A + (unsigned long long)sr * K + col;
+        a_off[it] = r * INK_PITCH + col;
+    }
+    const unsigned int br = tid / 2, bh = tid % 2, bn = n0 + br;
+    const bool b_ok = bn < N;
+    const unsigned char* ws_row = ws + (unsigned long long)bn * (MX ? K / 32 : K / 16);
+    const unsigned char* wc_row = wc + (unsigned long long)bn * (MX ? K : K / 2) + bh * (MX ? 16 : 8);
+
+    uint4 reg_a[A_ITERS];
+    uint4 reg_q;
+    unsigned int reg_s = 0;
+    auto prefetch = [&](const unsigned int k0) {
+#pragma unroll
+        for (int it = 0; it < A_ITERS; it++)
+            reg_a[it] = a_val[it] ? *(const uint4*)(a_ptr[it] + k0) : make_uint4(0, 0, 0, 0);
+        if (b_ok) {
+            reg_s = MX ? ws_row[k0 / 32] : ws_row[k0 / 16 + bh];
+            if (MX) reg_q = *(const uint4*)(wc_row + k0);
+            else {
+                const uint2 q = *(const uint2*)(wc_row + k0 / 2);
+                reg_q.x = q.x; reg_q.y = q.y;
+            }
         }
+    };
+
+    prefetch(0);
+    for (unsigned int k0 = 0; k0 < K; k0 += INK_GK) {
+#pragma unroll
+        for (int it = 0; it < A_ITERS; it++)
+            *(uint4*)((__nv_bfloat16*)As + a_off[it]) = reg_a[it];
         // weights: thread t dequantises row t / 2, half t % 2 (16 values, one NVFP4 scale)
         {
-            const unsigned int r = tid / 2, h = tid % 2, n = n0 + r;
             float v[16];
-            if (n < N) {
+            if (b_ok) {
+                const unsigned int w[4] = {reg_q.x, reg_q.y, reg_q.z, reg_q.w};
                 if (MX) {
-                    const float s = exp2f((float)ws[(unsigned long long)n * (K / 32) + k0 / 32] - 127.0f);
-                    const uint4 q = *(const uint4*)(wc + (unsigned long long)n * K + k0 + h * 16);
-                    const unsigned int w[4] = {q.x, q.y, q.z, q.w};
+                    const float s = exp2f((float)reg_s - 127.0f);
 #pragma unroll
                     for (int i = 0; i < 16; i++) v[i] = ink_hip_e4m3((w[i / 4] >> (8 * (i % 4))) & 0xFF) * s;
                 } else {
-                    const float s = ink_hip_e4m3(ws[(unsigned long long)n * (K / 16) + k0 / 16 + h]) * g;
-                    const uint2 q = *(const uint2*)(wc + (unsigned long long)n * (K / 2) + k0 / 2 + h * 8);
-                    const unsigned int w[2] = {q.x, q.y};
+                    const float s = ink_hip_e4m3(reg_s) * g;
 #pragma unroll
                     for (int i = 0; i < 8; i++) {
                         const unsigned int byte = (w[i / 4] >> (8 * (i % 4))) & 0xFF;
@@ -112,11 +144,12 @@ __device__ __forceinline__ void ink_hip_gemm_tile(
             for (int i = 0; i < 8; i++)
                 pk[i] = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v[2 * i])) |
                         ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(v[2 * i + 1])) << 16);
-            uint4* dst = (uint4*)&Bs[r][h * 16];
+            uint4* dst = (uint4*)&Bs[br][bh * 16];
             dst[0] = make_uint4(pk[0], pk[1], pk[2], pk[3]);
             dst[1] = make_uint4(pk[4], pk[5], pk[6], pk[7]);
         }
         __syncthreads();
+        if (k0 + INK_GK < K) prefetch(k0 + INK_GK);
         if (m0 + wm < m_count) {
 #pragma unroll
             for (int kk = 0; kk < INK_GK; kk += 16) {
