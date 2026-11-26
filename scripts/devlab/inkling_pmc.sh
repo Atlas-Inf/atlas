@@ -163,7 +163,8 @@ if [ $DO_CIRU = 1 ]; then
   fi
   CK=$(hf_get jcbtc/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151 "" edcbab56fedf986ac6d6da5fbe6ede0f163556e5) \
     || { log "ciru bundle download failed"; exit 0; }
-  "$RP" --kernel-trace --stats --pmc $USE --output-format csv -d "$OUT/rpc" -o ciru -- \
+  # trace only for ciru: --pmc over vLLM's spawned worker tree stalls its startup
+  "$RP" --kernel-trace --stats --output-format csv -d "$OUT/rpc" -o ciru -- \
     "$CR/opt/serve.sh" --model "$CK" --mode single --context 65536 --port $PORT --served-model-name main \
     > "$OUT/serve-pmc-ciru.log" 2>&1 &
   CPID=$!
