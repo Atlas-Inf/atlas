@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Ling's single appended predictor uses the next token embedding, the
 //! normalized target hidden, and an MLA + MoE body with its own attention KV.
+//!
+//! "Normalized" means the target's final RMSNorm (`model.norm`) and then the
+//! predictor's own `hnorm`, as in the reference implementation, whose target
+//! model returns its final-normed rows to the predictor. Atlas's target hands
+//! over the raw residual stream, so the predictor applies `model.norm` itself.
 
 use crate::layer::{AttnMetadataDev, ForwardContext, LayerState, TransformerLayer};
-use crate::layers::dflash_head::SequenceGeneration;
 use crate::layers::mtp_meta::pack_mtp_attn_meta;
 use crate::layers::{ling_decoder, ops};
-use crate::speculative::{DraftProposer, ProposerState};
+use crate::speculative::ProposerState;
 use crate::weight_map::DenseWeight;
 use anyhow::{Context, Result, ensure};
 use atlas_core::config::ModelConfig;
@@ -15,6 +19,8 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 use spark_runtime::weights::{WeightDtype, WeightStore};
 use std::any::Any;
+
+mod proposer;
 
 struct State {
     blocks: Vec<u32>,
@@ -45,6 +51,7 @@ pub(crate) struct LingMtp {
     draft_head: Option<(crate::weight_map::QuantizedWeight, KernelHandle)>,
     enorm: DenseWeight,
     hnorm: DenseWeight,
+    target_norm: DenseWeight,
     merge: DenseWeight,
     norm: DenseWeight,
     cache: Mutex<PagedKvCache>,
@@ -114,6 +121,14 @@ impl LingMtp {
             draft_head: None,
             enorm: weight("enorm", &[width])?,
             hnorm: weight("hnorm", &[width])?,
+            target_norm: {
+                let t = store.get("model.norm.weight")?;
+                ensure!(
+                    t.dtype == WeightDtype::BF16 && t.shape == [width],
+                    "unexpected Ling final norm format"
+                );
+                DenseWeight { weight: t.ptr }
+            },
             merge: weight("eh_proj", &[width, 2 * width])?,
             norm: weight("final_layernorm", &[width])?,
             cache: Mutex::new(cache),
@@ -199,6 +214,24 @@ impl LingMtp {
                 (self.hidden, &self.enorm, 0),
                 (target.offset(start * 2 * h), &self.hnorm, 2 * h),
             ] {
+                // The embedding is normalized first, so `hidden` is free to
+                // hold the target rows after `model.norm`.
+                let input = if offset == 0 {
+                    input
+                } else {
+                    ops::rms_norm(
+                        gpu,
+                        self.norm_k,
+                        input,
+                        &self.target_norm,
+                        self.hidden,
+                        rows as u32,
+                        h as u32,
+                        ctx.config.rms_norm_eps as f32,
+                        stream,
+                    )?;
+                    self.hidden
+                };
                 ops::rms_norm(
                     gpu,
                     self.norm_k,
@@ -290,7 +323,8 @@ impl LingMtp {
             &self.enorm,
             self.pair,
         )?;
-        normalize(target, &self.hnorm, self.pair.offset(h * 2))?;
+        normalize(target, &self.target_norm, self.hidden)?;
+        normalize(self.hidden, &self.hnorm, self.pair.offset(h * 2))?;
         ops::dense_gemv(
             gpu,
             self.gemv,
@@ -351,177 +385,6 @@ impl LingMtp {
         )?;
         s.rows += 1;
         s.pair = Some(position);
-        Ok(())
-    }
-}
-
-impl DraftProposer for LingMtp {
-    fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
-        Ok(Box::new(State {
-            blocks: vec![],
-            rows: 0,
-            capacity_exhausted: false,
-            pair: None,
-            body: self.body.alloc_state(gpu)?,
-        }))
-    }
-    fn propose(
-        &self,
-        last_token: u32,
-        target_hidden: DevicePtr,
-        position: usize,
-        num_drafts: usize,
-        value: &mut dyn ProposerState,
-        _owner: Option<SequenceGeneration>,
-        ctx: &ForwardContext,
-        stream: u64,
-        _embed: Option<DevicePtr>,
-        mask: Option<&[i32]>,
-        _stack: Option<DevicePtr>,
-    ) -> Result<Vec<u32>> {
-        ensure!(num_drafts == 1, "Ling has one native draft stage");
-        let s = state(value)?;
-        {
-            let cache = self.cache.lock();
-            if s.capacity_exhausted
-                || (s.rows == s.blocks.len() * cache.block_size() && cache.num_free_blocks() == 0)
-            {
-                s.capacity_exhausted = true;
-                return Ok(vec![]);
-            }
-        }
-        self.append(
-            last_token,
-            target_hidden,
-            position.saturating_sub(1),
-            s,
-            ctx,
-            stream,
-        )?;
-        let h = ctx.config.hidden_size as u32;
-        let vocab = ctx.config.vocab_size as u32;
-        ops::rms_norm(
-            ctx.gpu,
-            self.norm_k,
-            self.hidden,
-            &self.norm,
-            self.residual,
-            1,
-            h,
-            ctx.config.rms_norm_eps as f32,
-            stream,
-        )?;
-        if let Some((weight, kernel)) = &self.draft_head {
-            ops::w4a16_gemv(
-                ctx.gpu,
-                *kernel,
-                self.residual,
-                weight,
-                self.logits,
-                vocab,
-                h,
-                stream,
-            )?;
-        } else {
-            ops::dense_gemv(
-                ctx.gpu,
-                self.gemv,
-                self.residual,
-                &self.head,
-                self.logits,
-                vocab,
-                h,
-                stream,
-            )?;
-        }
-        let id = if let Some(mask) = mask {
-            super::deepseek_v4_mtp::argmax_grammar_masked(
-                ctx.gpu,
-                self.logits,
-                vocab as usize,
-                mask,
-                position,
-            )?
-        } else {
-            ops::argmax_bf16(
-                ctx.gpu,
-                self.argmax,
-                self.logits,
-                self.residual,
-                vocab,
-                stream,
-            )?;
-            let mut raw = [0; 4];
-            ctx.gpu
-                .copy_d2h_on_stream(self.residual, &mut raw, stream)?;
-            u32::from_le_bytes(raw)
-        };
-        Ok(vec![id])
-    }
-    fn prefill_drafter(
-        &self,
-        tokens: &[u32],
-        hiddens: DevicePtr,
-        value: &mut dyn ProposerState,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<usize> {
-        let s = state(value)?;
-        if s.rows > 0 {
-            return Ok(0);
-        }
-        self.prime(tokens.get(1..).unwrap_or(&[]), hiddens, 0, s, ctx, stream)
-    }
-    fn drafter_rows(&self, value: &mut dyn ProposerState) -> usize {
-        state(value).map_or(0, |s| s.rows)
-    }
-    fn last_pair_key(&self, value: &mut dyn ProposerState) -> Option<usize> {
-        state(value).ok().and_then(|s| s.pair)
-    }
-    fn catchup_drafter(
-        &self,
-        tokens: &[u32],
-        hiddens: DevicePtr,
-        row_base: usize,
-        pos_base: usize,
-        value: &mut dyn ProposerState,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<usize> {
-        let s = state(value)?;
-        ensure!(row_base == s.rows, "Ling MTP catch-up boundary mismatch");
-        self.prime(
-            tokens.get(1..).unwrap_or(&[]),
-            hiddens,
-            pos_base.saturating_sub(1),
-            s,
-            ctx,
-            stream,
-        )
-    }
-    fn after_verify(
-        &self,
-        _accepted: usize,
-        _owner: Option<SequenceGeneration>,
-        _state: &mut dyn ProposerState,
-        _stream: u64,
-    ) -> Result<()> {
-        // One proposal consumed the committed anchor token. Its private KV row
-        // remains valid whether the proposed next token was accepted or rejected.
-        Ok(())
-    }
-    fn free_state(
-        &self,
-        _gpu: &dyn GpuBackend,
-        _owner: Option<SequenceGeneration>,
-        value: &mut dyn ProposerState,
-    ) -> Result<()> {
-        let s = state(value)?;
-        self.cache.lock().free_blocks(&s.blocks);
-        s.blocks.clear();
-        s.rows = 0;
-        s.capacity_exhausted = false;
-        s.pair = None;
         Ok(())
     }
 }
