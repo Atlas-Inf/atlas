@@ -66,6 +66,10 @@ pub(crate) struct Inkling2Kernels {
     pub moe_gemm_nvfp4: KernelHandle,
     pub moe_gemm_mxfp8: KernelHandle,
     pub softcap_swiglu: KernelHandle,
+    /// strix-hip only: the w13 GEMMs with the softcapped SwiGLU folded into the
+    /// epilogue (bit-identical to GEMM + `inkling2_softcap_swiglu`); NULL elsewhere.
+    pub moe_gemm_nvfp4_swiglu: KernelHandle,
+    pub moe_gemm_mxfp8_swiglu: KernelHandle,
 }
 
 /// A strix-hip-only kernel of this target's `inkling2_moe_gemm` module; NULL on other targets.
@@ -121,6 +125,18 @@ impl Inkling2Kernels {
             moe_gemm_nvfp4: amd_kernel(gpu, "inkling2_moe_gemm_nvfp4")?,
             moe_gemm_mxfp8: amd_kernel(gpu, "inkling2_moe_gemm_mxfp8")?,
             softcap_swiglu: amd_kernel(gpu, "inkling2_softcap_swiglu")?,
+            moe_gemm_nvfp4_swiglu: crate::layers::try_kernel_gated(
+                cfg!(atlas_scale),
+                gpu,
+                "inkling2_moe_gemm",
+                "inkling2_moe_gemm_nvfp4_swiglu",
+            ),
+            moe_gemm_mxfp8_swiglu: crate::layers::try_kernel_gated(
+                cfg!(atlas_scale),
+                gpu,
+                "inkling2_moe_gemm",
+                "inkling2_moe_gemm_mxfp8_swiglu",
+            ),
         })
     }
 }

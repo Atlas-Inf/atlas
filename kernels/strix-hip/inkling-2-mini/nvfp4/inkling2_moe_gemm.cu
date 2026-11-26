@@ -48,12 +48,12 @@ __device__ __forceinline__ float ink_hip_e4m3(unsigned int b) {
     return s ? -v : v;
 }
 
-template <bool MX, int TM>
+template <bool MX, int TM, bool SW>
 __device__ __forceinline__ void ink_hip_gemm_tile(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ wc,
     const unsigned char* __restrict__ ws, const float g, __nv_bfloat16* __restrict__ C,
     const int m_start, const int m_count, const int m0, const int* __restrict__ rows,
-    const unsigned int N, const unsigned int K
+    const unsigned int N, const unsigned int K, const float cg, const float cu
 ) {
     constexpr int WM = TM / 16;            // warps along M
     constexpr int WN = 8 / WM;             // warps along N
@@ -161,6 +161,26 @@ __device__ __forceinline__ void ink_hip_gemm_tile(
         }
         __syncthreads();
     }
+    if (!SW) {
+#pragma unroll
+        for (int j = 0; j < NSUB; j++) {
+            const unsigned int c = n0 + wn + j * 16 + (lane & 15);
+            if (c >= N) continue;
+#pragma unroll
+            for (int e = 0; e < 8; e++) {
+                const int r = m0 + wm + 2 * e + (int)(lane >> 4);
+                if (r < m_count) C[(unsigned long long)(m_start + r) * N + c] = __float2bfloat16(acc[j][e]);
+            }
+        }
+        return;
+    }
+    // SW: softcapped SwiGLU on the gate/up column pairs, exactly as
+    // inkling2_softcap_swiglu reads them from gu: g = even column's BF16-rounded
+    // accumulator, u = the odd neighbour's, the same fp32 expression, the
+    // activation written BF16. Adjacent columns sit in adjacent lanes, so the
+    // pair is one xor shuffle; two i values pack into one u32 via a down
+    // shuffle (CIRU's epilogue shape, adapted).
+    const unsigned int I = N / 2;
 #pragma unroll
     for (int j = 0; j < NSUB; j++) {
         const unsigned int c = n0 + wn + j * 16 + (lane & 15);
@@ -168,7 +188,15 @@ __device__ __forceinline__ void ink_hip_gemm_tile(
 #pragma unroll
         for (int e = 0; e < 8; e++) {
             const int r = m0 + wm + 2 * e + (int)(lane >> 4);
-            if (r < m_count) C[(unsigned long long)(m_start + r) * N + c] = __float2bfloat16(acc[j][e]);
+            if (r >= m_count) continue;
+            const float g16 = __bfloat162float(__float2bfloat16(acc[j][e]));
+            const float u16 = __shfl_xor_sync(0xffffffffu, g16, 1);
+            const float v = tanhf(g16 / cg) * cg * (1.0f / (1.0f + __expf(-g16))) * tanhf(u16 / cu) * cu;
+            const unsigned int h = ((lane & 15) & 1) == 0
+                ? (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v)) : 0u;
+            const unsigned int h2 = __shfl_down_sync(0xffffffffu, h, 2);
+            if (((lane & 15) & 3) == 0)
+                *(unsigned int*)(C + (unsigned long long)(m_start + r) * I + (c >> 1)) = h | (h2 << 16);
         }
     }
 }
@@ -184,7 +212,24 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4(
     const int m0 = blockIdx.y * 128;
     if (m0 >= m_count) return;
     const unsigned long long ne = (unsigned long long)e * N;
-    ink_hip_gemm_tile<false, 128>(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K);
+    ink_hip_gemm_tile<false, 128, false>(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K, 0.0f, 0.0f);
+}
+
+// Same GEMM with the softcapped SwiGLU folded into the epilogue: C is the
+// activation buffer of N / 2 columns (the gate/up pairs reduced in-register).
+// Bit-identical to inkling2_moe_gemm_nvfp4 -> inkling2_softcap_swiglu.
+extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4_swiglu(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales, const float* __restrict__ s2, __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ offsets, const int* __restrict__ rows, const unsigned int N, const unsigned int K,
+    const float cg, const float cu
+) {
+    const unsigned int e = blockIdx.z;
+    const int m_start = offsets[e], m_count = offsets[e + 1] - m_start;
+    const int m0 = blockIdx.y * 128;
+    if (m0 >= m_count) return;
+    const unsigned long long ne = (unsigned long long)e * N;
+    ink_hip_gemm_tile<false, 128, true>(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K, cg, cu);
 }
 
 extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_mxfp8(
@@ -197,7 +242,21 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_mxfp8(
     const int m0 = blockIdx.y * 64;
     if (m0 >= m_count) return;
     const unsigned long long ne = (unsigned long long)e * N;
-    ink_hip_gemm_tile<true, 64>(A, codes + ne * K, scales + ne * (K / 32), 1.0f, C, m_start, m_count, m0, rows, N, K);
+    ink_hip_gemm_tile<true, 64, false>(A, codes + ne * K, scales + ne * (K / 32), 1.0f, C, m_start, m_count, m0, rows, N, K, 0.0f, 0.0f);
+}
+
+extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_mxfp8_swiglu(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales, __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ offsets, const int* __restrict__ rows, const unsigned int N, const unsigned int K,
+    const float cg, const float cu
+) {
+    const unsigned int e = blockIdx.z;
+    const int m_start = offsets[e], m_count = offsets[e + 1] - m_start;
+    const int m0 = blockIdx.y * 64;
+    if (m0 >= m_count) return;
+    const unsigned long long ne = (unsigned long long)e * N;
+    ink_hip_gemm_tile<true, 64, true>(A, codes + ne * K, scales + ne * (K / 32), 1.0f, C, m_start, m_count, m0, rows, N, K, cg, cu);
 }
 
 // The softcapped SwiGLU between the grouped GEMMs (kept here: gb10 dropped its BF16-row

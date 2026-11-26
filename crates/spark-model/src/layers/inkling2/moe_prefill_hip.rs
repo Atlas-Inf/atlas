@@ -77,25 +77,51 @@ pub(super) fn moe_prefill_bf16(
             .arg_u32(kk)
             .launch(stream)
     };
-    gemm(
-        a.x,
-        e.w13,
-        e.w13_scale,
-        e.w13_global,
-        a.gu,
-        sorted_rows,
-        2 * i,
-        h,
-    )?;
-    KernelLaunch::new(gpu, k.softcap_swiglu)
-        .grid([u32_of(te, "slots")?, i.div_ceil(256), 1])
-        .block([256, 1, 1])
-        .arg_ptr(a.gu)
-        .arg_ptr(a.act)
-        .arg_u32(i)
-        .arg_f32(a.gate_softcap)
-        .arg_f32(a.up_softcap)
-        .launch(stream)?;
+    let swiglu = if e.mxfp8 {
+        k.moe_gemm_mxfp8_swiglu
+    } else {
+        k.moe_gemm_nvfp4_swiglu
+    };
+    if swiglu.0 != 0 {
+        // w13 with the softcapped SwiGLU folded into its epilogue (same launch
+        // shape as the plain GEMM, N = 2I outputs -> I activations, gate and up
+        // rows interleaved as stored); bit-identical to GEMM + softcap_swiglu.
+        let l = KernelLaunch::new(gpu, swiglu)
+            .grid([(2 * i).div_ceil(GEMM_N_TILE), m_tiles, ne])
+            .block([256, 1, 1])
+            .arg_ptr(a.x)
+            .arg_ptr(e.w13)
+            .arg_ptr(e.w13_scale);
+        let l = if e.mxfp8 { l } else { l.arg_ptr(e.w13_global) };
+        l.arg_ptr(a.act)
+            .arg_ptr(offsets)
+            .arg_ptr(sorted_rows)
+            .arg_u32(2 * i)
+            .arg_u32(h)
+            .arg_f32(a.gate_softcap)
+            .arg_f32(a.up_softcap)
+            .launch(stream)?;
+    } else {
+        gemm(
+            a.x,
+            e.w13,
+            e.w13_scale,
+            e.w13_global,
+            a.gu,
+            sorted_rows,
+            2 * i,
+            h,
+        )?;
+        KernelLaunch::new(gpu, k.softcap_swiglu)
+            .grid([u32_of(te, "slots")?, i.div_ceil(256), 1])
+            .block([256, 1, 1])
+            .arg_ptr(a.gu)
+            .arg_ptr(a.act)
+            .arg_u32(i)
+            .arg_f32(a.gate_softcap)
+            .arg_f32(a.up_softcap)
+            .launch(stream)?;
+    }
     gemm(
         a.act,
         e.w2,
