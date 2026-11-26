@@ -293,7 +293,17 @@ impl TransformerModel {
             return Ok(false);
         }
         let (h, v, bf16) = (self.config.hidden_size, self.config.vocab_size, 2usize);
-        let width = if self.lm_head_nvfp4.is_some() { 16 } else { 8 };
+        // one call when `ATLAS_SKINNY_MMA` takes them all (its rows do not
+        // depend on the call's width): the head is read once
+        let width = match self.lm_head_nvfp4 {
+            Some(_)
+                if crate::layers::inkling2::glue::skinny_takes(rows, self.config.hidden_size) =>
+            {
+                rows
+            }
+            Some(_) => 16,
+            None => 8,
+        };
         let kernel = match self.lm_head_nvfp4 {
             Some(_) => self.w4a16_gemv_batch16_kernel,
             None => self.dense_gemv_batchm_kernel,

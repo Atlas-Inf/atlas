@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Row-invariance and accuracy gate for the `ATLAS_SKINNY_MMA` kernels
-//! (`kernels/gb10/qwen3.6-27b/nvfp4/skinny_mma.cu`, `layers/ops/skinny_mma.rs`).
+//! (`kernels/gb10/common/skinny_mma.cu`, `layers/ops/skinny_mma.rs`).
 //!
 //! 1. BYTES. On every served Qwen3.8-27B shape, an M-row call (M =
 //!    1..=`MAX_ROWS`, past 16 rows several 16-row launches) must write
@@ -21,6 +21,8 @@
 //!   ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=qwen3.8-27b ATLAS_TARGET_QUANT=nvfp4 \
 //!   cargo run -p spark-model --release --features cuda,gpu-examples \
 //!     --example skinny_mma_microtest
+//!
+//! (`ATLAS_TARGET_MODEL=inkling-2-mini` runs it on Inkling 2 Mini's set.)
 
 use anyhow::Result;
 use half::bf16;
@@ -109,6 +111,40 @@ const SHAPES: &[(&str, Family, usize, usize, u32, u32)] = &[
         256,
     ),
     ("qg tail     [  500 x 1024]", Family::Qg, 500, 1024, 5, 50),
+    // Inkling 2 Mini's Spark projections (hidden 2,304) and vocabulary head
+    (
+        "w4 ink q    [ 3072 x 2304]",
+        Family::W4a16,
+        3072,
+        2304,
+        0,
+        0,
+    ),
+    (
+        "w4 ink k/v  [ 1024 x 2304]",
+        Family::W4a16,
+        1024,
+        2304,
+        0,
+        0,
+    ),
+    (
+        "w4 ink o    [ 2304 x 3072]",
+        Family::W4a16,
+        2304,
+        3072,
+        0,
+        0,
+    ),
+    ("w4 ink rel  [  384 x 2304]", Family::W4a16, 384, 2304, 0, 0),
+    (
+        "w4 ink head [200058 x 2304]",
+        Family::W4a16,
+        200_058,
+        2304,
+        0,
+        0,
+    ),
     (
         "w8 gdn qkvz [16384 x 5120]",
         Family::W8a16,
@@ -313,9 +349,10 @@ fn gemv_today(g: &dyn GpuBackend, sh: &Shape, op: &Ops, t: usize, c: DevicePtr) 
 }
 
 fn main() -> Result<()> {
-    let set = atlas_kernels::ptx_for_model("qwen3.8-27b")
-        .or_else(|| atlas_kernels::ptx_for_model("qwen3.6-27b"))
-        .expect("no qwen3.8-27b or qwen3.6-27b ptx set: build with ATLAS_TARGET_MODEL=qwen3.8-27b");
+    let set = ["qwen3.8-27b", "qwen3.6-27b", "inkling-2-mini"]
+        .into_iter()
+        .find_map(atlas_kernels::ptx_for_model)
+        .expect("no qwen3.8-27b, qwen3.6-27b or inkling-2-mini ptx set: build with ATLAS_TARGET_MODEL=qwen3.8-27b");
     println!("kernel set: {}", set.target.model);
     let backend = AtlasCudaBackend::new(0, &set.modules)?;
     let g: &dyn GpuBackend = &backend;
