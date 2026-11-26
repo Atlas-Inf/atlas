@@ -153,7 +153,9 @@ if [ $DO_CIRU = 1 ]; then
       curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$CR/bin" sh > "$OUT/uv-install.log" 2>&1
       export PATH="$CR/bin:$PATH"
     fi
-    ( uv venv --python 3.12 "$CR/venv" \
+    ( uv venv -q --clear --python 3.12 "$CR/venv" \
+        && uv pip install -q --python "$CR/venv/bin/python" --extra-index-url https://wheels.vllm.ai/rocm/0.34.0/rocm100/ \
+          'vllm==0.34.0+rocm100' 'huggingface-hub==2.4.0' 'safetensors==0.8.0' \
         && uv pip install -q --python "$CR/venv/bin/python" --target "$CR/tdeps" --no-deps 'huggingface-hub==1.31.0' 'safetensors==0.8.0' ) \
       > "$OUT/ciru-venv.log" 2>&1 || { log "CIRU VENV FAILED: $(tail -2 "$OUT/ciru-venv.log" | tr '\n' ' ')"; exit 0; }
     ( cd "$CR/src" && bash scripts/install.sh --venv "$CR/venv" --transformers-deps "$CR/tdeps" --prefix "$CR/opt" ) \
