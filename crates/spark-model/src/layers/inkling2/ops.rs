@@ -57,9 +57,10 @@ pub(crate) struct Inkling2Kernels {
     pub moe_gemm_w8a8: KernelHandle,
     pub moe_tiles: KernelHandle,
     pub quant_fp4: KernelHandle,
-    pub situ_quant_fp4: KernelHandle,
+    /// the experts' gate_up GEMMs with the SwiGLU quantized in their epilogues
+    pub moe_fused_gate_up_fp4: KernelHandle,
     pub quant_mxfp8: KernelHandle,
-    pub situ_quant_mxfp8: KernelHandle,
+    pub moe_fused_gate_up_mx8: KernelHandle,
     /// AMD (strix-hip) only, from kernels/strix-hip/inkling-2-mini/nvfp4/inkling2_moe_gemm.cu:
     /// the BF16-row grouped expert GEMMs and the softcapped SwiGLU between them, which prefill
     /// takes there instead of the gb10 block-scaled W4A4 / W8A8 path (NULL elsewhere)
@@ -115,9 +116,9 @@ impl Inkling2Kernels {
             moe_gemm_w8a8: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_gemm_w8a8")?,
             moe_tiles: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_tiles")?,
             quant_fp4: gpu.kernel("inkling2_moe_prefill", "inkling2_quant_fp4")?,
-            situ_quant_fp4: gpu.kernel("inkling2_moe_prefill", "inkling2_situ_quant_fp4")?,
+            moe_fused_gate_up_fp4: gpu.kernel("inkling2_moe_prefill", "inkling2_moe_fused_gate_up_fp4")?,
             quant_mxfp8: gpu.kernel("inkling2_moe_prefill", "inkling2_quant_mxfp8")?,
-            situ_quant_mxfp8: gpu.kernel("inkling2_moe_prefill", "inkling2_situ_quant_mxfp8")?,
+            moe_fused_gate_up_mx8: gpu.kernel("inkling2_moe_prefill", "inkling2_moe_fused_gate_up_mx8")?,
             moe_gemm_nvfp4: amd_kernel(gpu, "inkling2_moe_gemm_nvfp4")?,
             moe_gemm_mxfp8: amd_kernel(gpu, "inkling2_moe_gemm_mxfp8")?,
             softcap_swiglu: amd_kernel(gpu, "inkling2_softcap_swiglu")?,

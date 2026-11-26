@@ -106,7 +106,8 @@ pub(crate) struct Shared {
     pub proj: DevicePtr,
     pub mlp_normed: DevicePtr,
     pub act: DevicePtr,
-    /// prefill MoE: interleaved gate/up `[rows * top_k, 2 * inter]` and sort scratch
+    /// prefill MoE: `moe_gu_bytes` (AMD's interleaved gate/up rows; gb10's fused
+    /// gate_up scratch) and sort scratch
     pub gu: DevicePtr,
     pub moe_sort: DevicePtr,
     pub y: DevicePtr,
@@ -197,7 +198,7 @@ impl Shared {
             proj: a.take(r * h * b),
             mlp_normed: a.take(r * h * b),
             act: a.take(r * d.top_k * d.inter * b),
-            gu: a.take(r * d.top_k * 2 * d.inter * b),
+            gu: a.take(super::ops::moe_gu_bytes(r * d.top_k, d.inter, d.experts)),
             moe_sort: a.take(super::ops::moe_sort_bytes(r * d.top_k, d.experts)),
             y: a.take(r * d.top_k * h * b),
             moe_out: a.take(r * h * b),
