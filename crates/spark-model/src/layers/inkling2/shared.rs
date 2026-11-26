@@ -72,6 +72,8 @@ pub(crate) struct Shared {
     /// `[8, rows]` sums of squares of the message gates' fp32 inputs:
     /// res3's three planes, msg4's four, mlp_in (`forward.rs` `SQ_*`)
     pub res_sq: DevicePtr,
+    /// `[rows, 4, 9]` fp32: the message mix's weights (`BlockRes::p_out`)
+    pub msg_p: DevicePtr,
     /// attention split partials: decode rows x splits, or prefill rows x 1
     pub attn_partials: DevicePtr,
     /// the per-head prefill attention's relative-bias table `[rows, heads,
@@ -159,6 +161,7 @@ impl Shared {
             gate_z: a.take(3 * r * super::ops::MAX_GATE_RANK * f),
             res_sums: a.take(r * super::ops::block_res_sums_per_row(h) * f),
             res_sq: a.take(8 * r * f),
+            msg_p: a.take(r * super::ops::MAX_RES_QUERIES * super::ops::MAX_BLOCK_STATES * f),
             rel_table: a.take(
                 r.min(super::ops::REL_TABLE_ROWS) * d.heads * super::ops::MAX_REL_EXTENT * b,
             ),

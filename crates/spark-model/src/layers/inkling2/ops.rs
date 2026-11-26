@@ -274,6 +274,9 @@ pub(crate) struct BlockRes {
     pub sq: DevicePtr,
     /// Each output RMS-normed into BF16 as well (`out` may then be NULL)
     pub norm: Option<ResNorm>,
+    /// `[rows, 4, 9]` fp32 for the row's mix weights (a fused message gate
+    /// rebuilds the outputs from them; `out` may then be NULL), or NULL
+    pub p_out: DevicePtr,
     pub eps: f32,
 }
 
@@ -302,7 +305,7 @@ pub(crate) fn block_res(
         a.partial_f32.is_null() != a.partial_bf16.is_null(),
         "inkling2 block residual needs exactly one partial"
     );
-    if a.rows > RES_ROW_CTA_MIN_ROWS || !a.sq.is_null() || a.norm.is_some() {
+    if a.rows > RES_ROW_CTA_MIN_ROWS || !a.sq.is_null() || a.norm.is_some() || !a.p_out.is_null() {
         // prefill rows (and any whose sums of squares a gate or a norm reads: they
         // need a row in one CTA): both passes in one CTA a row, 8 channels a thread
         ensure!(
@@ -341,6 +344,7 @@ pub(crate) fn block_res(
             .arg_ptr(n.w[2])
             .arg_ptr(n.y)
             .arg_f32(n.eps)
+            .arg_ptr(a.p_out)
             .launch(stream);
     }
     ensure!(!a.out.is_null(), "inkling2 block residual: decode rows need the fp32 output");

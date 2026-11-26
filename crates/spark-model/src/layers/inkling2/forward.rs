@@ -83,15 +83,38 @@ impl Inkling2Layer {
         let x = hidden;
         let res = |i: usize| s.res3.offset(i * rf);
         let normed = |i: usize| s.normed3.offset(i * rb);
-        // later passes gate their inputs by messages; a fused gate reads its rows'
-        // sums of squares, which their block residuals write (planes SQ_* of res_sq)
+        // decode and verify rows read keys split over the GPU; a prefill chunk of one
+        // sequence takes the prefill kernels
+        let body = ops::attn_body(
+            batch.seqs.len(),
+            batch.rows_per_seq,
+            super::layer::MAX_VERIFY_ROWS,
+            ops::attn_slots(d.max_rows, d.max_seqs),
+        );
+        let prefill = body == ops::AttnBody::Prefill;
+        // later passes gate their inputs by messages; a prefill chunk's fused gate reads
+        // its rows' sums of squares, which their block residuals write (planes SQ_* of
+        // res_sq), and (gb10) rebuilds the messages from their sources with the mix
+        // weights the message block residual writes instead of the fp32 messages
         let gated_inputs = v.pass > 0;
+        let fused_gate = gated_inputs && prefill && ops::fused_takes(n, false, self.p.gate_rank, h);
+        let rebuilt_msgs = fused_gate && !cfg!(atlas_scale);
         let sq = |plane: usize| {
-            if gated_inputs && ops::fused_takes(n, exact, self.p.gate_rank, h) {
+            if fused_gate {
                 s.res_sq.offset(plane * n * 4)
             } else {
                 DevicePtr::NULL
             }
+        };
+        let msg = |first: usize| {
+            rebuilt_msgs.then(|| ops::MsgSources {
+                blocks: s.msg_blocks,
+                block_stride: d.block_stride(),
+                num_blocks: v.message_blocks,
+                partial: s.msg_h,
+                p: s.msg_p,
+                first,
+            })
         };
 
         // attention inputs (fp32 in res3 unless layer 0), then their norms into normed3
@@ -102,19 +125,11 @@ impl Inkling2Layer {
             InputNorms::Shared(nw) => vec![nw; 3],
             InputNorms::Separate { q, k, v: vn } => vec![q, k, vn],
         };
-        // decode and verify rows read keys split over the GPU; a prefill chunk of one
-        // sequence takes the prefill kernels
-        let body = ops::attn_body(
-            batch.seqs.len(),
-            batch.rows_per_seq,
-            super::layer::MAX_VERIFY_ROWS,
-            ops::attn_slots(d.max_rows, d.max_seqs),
-        );
         // a prefill chunk's rows no message gate rewrites: the block residual norms
         // its own outputs (the fp32 rows never leave the kernel). Decode rows keep
         // verify's kernels, so text with drafts stays the text without.
         let res_norm = |ws: &[DevicePtr], y: DevicePtr| {
-            let fused = body == ops::AttnBody::Prefill && !gated_inputs;
+            let fused = prefill && !gated_inputs;
             let wq = |q: usize| ws[q.min(ws.len() - 1)];
             fused.then(|| ops::ResNorm {
                 w: [wq(0), wq(1), wq(2)],
@@ -138,7 +153,7 @@ impl Inkling2Layer {
                 x,
                 w.attn_query,
                 n_in,
-                (out, sq(SQ_RES3), in_norm),
+                (out, sq(SQ_RES3), in_norm, DevicePtr::NULL),
                 stream,
             )?;
         }
@@ -156,7 +171,11 @@ impl Inkling2Layer {
                 s.msg_h,
                 q,
                 4,
-                (s.msg4, sq(SQ_MSG4), None),
+                if rebuilt_msgs {
+                    (DevicePtr::NULL, sq(SQ_MSG4), None, s.msg_p)
+                } else {
+                    (s.msg4, sq(SQ_MSG4), None, DevicePtr::NULL)
+                },
                 stream,
             )?;
             // q, k, v inputs gated by their messages in one pass; SWA layers fan
@@ -164,12 +183,13 @@ impl Inkling2Layer {
             let row_elems = n * h;
             self.msg_gates(
                 gpu,
-                (n, exact),
+                (n, prefill),
                 0..3,
                 (res(0), if v.full { row_elems } else { 0 }),
                 (s.msg4, row_elems),
                 (res(0), row_elems),
                 (sq(SQ_RES3), sq(SQ_MSG4)),
+                msg(0),
                 stream,
             )?;
         }
@@ -387,8 +407,8 @@ impl Inkling2Layer {
             w.mlp_query,
             1,
             match mlp_norm {
-                Some(_) => (DevicePtr::NULL, DevicePtr::NULL, mlp_norm),
-                None => (s.mlp_in, sq(SQ_MLP), None),
+                Some(_) => (DevicePtr::NULL, DevicePtr::NULL, mlp_norm, DevicePtr::NULL),
+                None => (s.mlp_in, sq(SQ_MLP), None, DevicePtr::NULL),
             },
             stream,
         )?;
@@ -396,12 +416,13 @@ impl Inkling2Layer {
             let mlp_msg = s.msg4.offset(3 * rf);
             self.msg_gates(
                 gpu,
-                (n, exact),
+                (n, prefill),
                 3..4,
                 (s.mlp_in, 0),
                 (mlp_msg, 0),
                 (s.mlp_in, 0),
                 (sq(SQ_MLP), sq(SQ_MSG4 + 3)),
+                msg(3),
                 stream,
             )?;
         }
@@ -475,7 +496,7 @@ impl Inkling2Layer {
                 hidden,
                 self.g.output_query,
                 1,
-                (s.final_out, DevicePtr::NULL, None),
+                (s.final_out, DevicePtr::NULL, None, DevicePtr::NULL),
                 stream,
             )?;
             gm.cast_bf16(gpu, s.final_out, hidden, n * h, stream)?;

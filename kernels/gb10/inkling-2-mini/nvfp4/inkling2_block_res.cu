@@ -186,8 +186,11 @@ extern "C" __global__ void inkling2_block_res_out(
 // (or nowhere with NULL), sq[q * rows + row], for the loop message gates' rms. With
 // `normed`, output q also leaves RMS-normed as inkling2_rmsnorm writes it,
 // BF16(w_q * (o * rsqrt(mean(o^2) + norm_eps))) at normed + q * rows * H, so the fp32
-// output need not be written (`out` NULL) and read back. The same formulas as the two
-// decode kernels and inkling2_rmsnorm, summed in its own order. grid (rows), block H / 8.
+// output need not be written (`out` NULL) and read back. `p_out` takes the row's mix
+// weights (softmax x rstd, p[q][state]): the fused message gate rebuilds the outputs
+// from the states with them, bit for bit, instead of reading fp32 outputs. The same
+// formulas as the two decode kernels and inkling2_rmsnorm, summed in its own order.
+// grid (rows), block H / 8.
 __device__ __forceinline__ void ink_bf16x8(const uint4 u, float* f) {
     const unsigned int w[4] = {u.x, u.y, u.z, u.w};
 #pragma unroll
@@ -215,7 +218,8 @@ extern "C" __global__ void __launch_bounds__(1024) inkling2_block_res_row(
     const __nv_bfloat16* __restrict__ nw1,
     const __nv_bfloat16* __restrict__ nw2,
     __nv_bfloat16* __restrict__ normed,         // [nq, rows, H] or NULL
-    const float norm_eps
+    const float norm_eps,
+    float* __restrict__ p_out                   // [rows, INK_MAX_Q, INK_MAX_STATES] or NULL
 ) {
     atlas_pdl_enter();
     __shared__ float red[32][INK_RES_PER];
@@ -296,6 +300,7 @@ extern "C" __global__ void __launch_bounds__(1024) inkling2_block_res_row(
         for (unsigned int j = 0; j < INK_MAX_STATES; j++) {
             if (j >= ns) break;
             p[q][j] = logit[j] / sum * rstd[j];
+            if (p_out != nullptr) p_out[(row * INK_MAX_Q + q) * INK_MAX_STATES + j] = p[q][j];
         }
     }
     __syncthreads();

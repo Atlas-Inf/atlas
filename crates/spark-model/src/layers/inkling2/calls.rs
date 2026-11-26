@@ -67,7 +67,7 @@ impl Inkling2Layer {
         partial_bf16: DevicePtr,
         queries: DevicePtr,
         nq: usize,
-        (out, sq, norm): (DevicePtr, DevicePtr, Option<ops::ResNorm>),
+        (out, sq, norm, p_out): (DevicePtr, DevicePtr, Option<ops::ResNorm>, DevicePtr),
         stream: u64,
     ) -> Result<()> {
         ops::block_res(
@@ -88,6 +88,7 @@ impl Inkling2Layer {
                 sums: self.shared.res_sums,
                 sq,
                 norm,
+                p_out,
                 eps: 1e-6,
             },
             stream,
@@ -96,17 +97,19 @@ impl Inkling2Layer {
 
     /// Message gates `which` (consecutive, at most three) of this loop layer;
     /// strides in fp32 elements between the gates' `h`, `m` and `out` rows;
-    /// `sq` the `h` and `m` rows' sums of squares (`MsgGate::sq_h`, `sq_m`).
+    /// `sq` the `h` and `m` rows' sums of squares (`MsgGate::sq_h`, `sq_m`);
+    /// `msg` the messages' sources when the fused gate rebuilds them.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn msg_gates(
         &self,
         gpu: &dyn GpuBackend,
-        (n, exact): (usize, bool),
+        (n, prefill): (usize, bool),
         which: std::ops::Range<usize>,
         (h, h_stride): (DevicePtr, usize),
         (m, m_stride): (DevicePtr, usize),
         (out, out_stride): (DevicePtr, usize),
         (sq_h, sq_m): (DevicePtr, DevicePtr),
+        msg: Option<ops::MsgSources>,
         stream: u64,
     ) -> Result<()> {
         let gates = self
@@ -126,9 +129,10 @@ impl Inkling2Layer {
                 out_stride,
                 sq_h,
                 sq_m,
+                msg,
                 z: self.shared.gate_z,
                 rows: n,
-                decode_rows: exact,
+                decode_rows: !prefill,
                 hidden: self.dims.hidden,
                 rank: self.p.gate_rank,
                 eps: self.p.eps,

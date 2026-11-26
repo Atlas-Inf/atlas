@@ -267,6 +267,11 @@ __device__ __forceinline__ ink_fg_v16bf ink_fg_ld16(const __nv_bfloat16* p) {
 extern "C" __global__ void __launch_bounds__(256) inkling2_msg_gate_fused(
     const float* h, const float* m,
     const float* __restrict__ sq_h, const float* __restrict__ sq_m,   // rows' sums of squares
+    // gb10: the messages rebuilt from their sources (inkling2_block_res_row's mix),
+    // m unused: message stack blocks, its partial, the rows' mix weights
+    const __nv_bfloat16* __restrict__ mblk, const __nv_bfloat16* __restrict__ mpart,
+    const float* __restrict__ mp, const unsigned long long mbstride, const unsigned int mnb,
+    const unsigned int mq0,
     const __nv_bfloat16* __restrict__ D0, const __nv_bfloat16* __restrict__ D1, const __nv_bfloat16* __restrict__ D2,
     const __nv_bfloat16* __restrict__ F0, const __nv_bfloat16* __restrict__ F1, const __nv_bfloat16* __restrict__ F2,
     const __nv_bfloat16* __restrict__ G0, const __nv_bfloat16* __restrict__ G1, const __nv_bfloat16* __restrict__ G2,
@@ -393,13 +398,23 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_msg_gate_fused(
 // step, F z and G z for every gate and
 // out = (1 - tanh(F z)) * h + tanh(G z) * m, each element's inputs for all gates read
 // before any of its outputs is written (out may alias h). The rms come from the sums of
-// squares inkling2_block_res_row wrote with the rows, so a row is read twice (z, out); the
-// two-kernel path re-reads every row once per four rank outputs.
-// Rank 64. grid (ceil(rows / 16)), block 256.
+// squares inkling2_block_res_row wrote with the rows. The messages are never stored in
+// fp32: z and the outputs rebuild them from the message stack's BF16 states with the
+// rows' mix weights (inkling2_block_res_row p_out), in the mix's own operation order, so
+// every value is the fp32 message bit for bit, and all of a launch's gates share one read
+// of the states a step. The two-kernel path re-reads every row once per four rank outputs.
+// Rank 64. grid (ceil(rows / 16)), block 256, dynamic shared memory INK_FG_SMEM.
 #define INK_FG_ROWS 16
 #define INK_FG_K 64
 #define INK_FG_CH 64
 #define INK_FG_PITCH (INK_FG_K + 8)   // BF16 pitch: conflict-free fragment loads
+#define INK_FG_Q 4    // messages a row (inkling2_block_res.cu INK_MAX_Q)
+#define INK_FG_S 9    // states a mix (INK_MAX_STATES)
+#define INK_FG_SA (2 * INK_MAX_GATES * INK_FG_ROWS * INK_FG_PITCH * 2)
+#define INK_FG_SD (2 * INK_MAX_GATES * INK_MAX_RANK * INK_FG_PITCH * 2)
+#define INK_FG_SZ (INK_MAX_GATES * INK_FG_ROWS * INK_FG_PITCH * 2)
+#define INK_FG_SP (INK_FG_ROWS * INK_FG_Q * INK_FG_S * 4)
+#define INK_FG_SMEM (INK_FG_SA + INK_FG_SD + INK_FG_SZ + INK_FG_SP + INK_MAX_GATES * INK_FG_ROWS * 2 * 4)   // gate_ops.rs FUSED_SMEM
 
 __device__ __forceinline__ void ink_mma16816(float* c, const unsigned int* a, unsigned int b0, unsigned int b1) {
     asm volatile(
@@ -420,6 +435,11 @@ __device__ __forceinline__ void ink_frag_a(const __nv_bfloat16 (*s)[INK_FG_PITCH
 extern "C" __global__ void __launch_bounds__(256) inkling2_msg_gate_fused(
     const float* h, const float* m,
     const float* __restrict__ sq_h, const float* __restrict__ sq_m,   // rows' sums of squares
+    // gb10: the messages rebuilt from their sources (inkling2_block_res_row's mix),
+    // m unused: message stack blocks, its partial, the rows' mix weights
+    const __nv_bfloat16* __restrict__ mblk, const __nv_bfloat16* __restrict__ mpart,
+    const float* __restrict__ mp, const unsigned long long mbstride, const unsigned int mnb,
+    const unsigned int mq0,
     const __nv_bfloat16* __restrict__ D0, const __nv_bfloat16* __restrict__ D1, const __nv_bfloat16* __restrict__ D2,
     const __nv_bfloat16* __restrict__ F0, const __nv_bfloat16* __restrict__ F1, const __nv_bfloat16* __restrict__ F2,
     const __nv_bfloat16* __restrict__ G0, const __nv_bfloat16* __restrict__ G1, const __nv_bfloat16* __restrict__ G2,
@@ -433,74 +453,144 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_msg_gate_fused(
     const float eps
 ) {
     atlas_pdl_enter();
-    constexpr unsigned int RANK = INK_MAX_RANK;
-    __shared__ float s_rstd[INK_MAX_GATES][INK_FG_ROWS][2];
-    __shared__ __align__(16) __nv_bfloat16 s_a[2][INK_FG_ROWS][INK_FG_PITCH];
+    constexpr unsigned int RANK = INK_MAX_RANK, G3 = INK_MAX_GATES;
     static_assert(RANK * INK_FG_K / 8 == 512 && INK_FG_CH * RANK / 8 == 512, "a weight stage: two 16-byte loads a thread");
-    // weight stages, two buffers each: D (z: 0, 1), then F (0, 1) and G (2, 3)
-    __shared__ __align__(16) __nv_bfloat16 s_w[4][RANK][INK_FG_PITCH];
-    __shared__ __align__(16) __nv_bfloat16 s_z[INK_MAX_GATES][INK_FG_ROWS][INK_FG_PITCH];
+    extern __shared__ __align__(16) unsigned char ink_fg_smem[];
+    // z: inputs and D tiles, two stages of every gate; outputs: F (0, 1) and G (2, 3) in the D region
+    typedef __nv_bfloat16 Row[INK_FG_PITCH];
+    Row (*s_a)[G3][INK_FG_ROWS] = (Row (*)[G3][INK_FG_ROWS])ink_fg_smem;                      // [2][G3][16]
+    Row (*s_d)[G3][RANK] = (Row (*)[G3][RANK])(ink_fg_smem + INK_FG_SA);                       // [2][G3][64]
+    Row (*s_w)[RANK] = (Row (*)[RANK])(ink_fg_smem + INK_FG_SA);                               // [4][64]
+    Row (*s_z)[INK_FG_ROWS] = (Row (*)[INK_FG_ROWS])(ink_fg_smem + INK_FG_SA + INK_FG_SD);    // [G3][16]
+    float (*s_p)[INK_FG_Q][INK_FG_S] =
+        (float (*)[INK_FG_Q][INK_FG_S])(ink_fg_smem + INK_FG_SA + INK_FG_SD + INK_FG_SZ);       // [16][Q][S]
+    float (*s_rstd)[INK_FG_ROWS][2] =
+        (float (*)[INK_FG_ROWS][2])(ink_fg_smem + INK_FG_SA + INK_FG_SD + INK_FG_SZ + INK_FG_SP);
     const unsigned int row0 = blockIdx.x * INK_FG_ROWS, nr = min(INK_FG_ROWS, rows - row0);
     const unsigned int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
     const unsigned int g8 = lane / 4, t2 = (lane % 4) * 2;
+    const unsigned int ns = mnb + 1;                      // message sources: the blocks, then the partial
+    const unsigned int hplanes = h_stride == 0 ? 1 : gates;
+    auto src = [&](unsigned int j) { return j < mnb ? mblk + j * mbstride : mpart; };
 
     // rms of every gate's h and m rows from the sums of squares their producer wrote
-    // (inkling2_block_res_row), planes `stride / H` rows apart
+    // (inkling2_block_res_row), planes `stride / H` rows apart; the rows' mix weights
     for (unsigned int t = tid; t < gates * INK_FG_ROWS * 2; t += 256) {
         const unsigned int g = t / (2 * INK_FG_ROWS), q = (t / 2) % INK_FG_ROWS, half = t % 2;
         float s = 0.0f;
         if (q < nr) s = half ? sq_m[g * (m_stride / H) + row0 + q] : sq_h[g * (h_stride / H) + row0 + q];
         s_rstd[g][q][half] = rsqrtf(s / (float)H + eps);
     }
+    for (unsigned int t = tid; t < INK_FG_ROWS * INK_FG_Q * INK_FG_S; t += 256) {
+        const unsigned int q = t / (INK_FG_Q * INK_FG_S);
+        (&s_p[0][0][0])[t] = q < nr ? mp[(unsigned long long)(row0 + q) * INK_FG_Q * INK_FG_S + t % (INK_FG_Q * INK_FG_S)] : 0.0f;
+    }
     __syncthreads();
 
-    // z per gate: warp w owns rank columns 8w .. 8w + 7; each step's inputs load into
-    // registers while the step before runs its MMAs (one barrier a step)
-    const unsigned int ar = tid / 16, ac = (tid % 16) * 4;   // this thread's 4 inputs a step
-    for (unsigned int g = 0; g < gates; g++) {
-        const float* hg = h + g * h_stride;
-        const float* mg = m + g * m_stride;
-        const __nv_bfloat16* d = ink_pick(D0, D1, D2, g);
-        float4 v;
-        uint4 dw[2];
-        auto fetch = [&](unsigned int k0) {
-            v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            if (ar < nr) v = *(const float4*)((k0 < H ? hg + k0 : mg + (k0 - H)) + (unsigned long long)(row0 + ar) * H + ac);
+    // z for every gate at once: warp w owns rank columns 8w .. 8w + 7. Steps over h (the
+    // gates' planes, one when they share it), then over the messages, rebuilt from the
+    // sources (sum_j p[q][j] s_j in state order, fp32: the block residual's own outputs);
+    // a step's loads in flight over the step before, one barrier a step.
+    const unsigned int ar = tid / 16, ac = (tid % 16) * 4;   // this thread's 4 inputs of a row
+    float4 hv[G3];
+    uint2 sv[INK_FG_S];
+    uint4 dw[G3][2];
+    auto fetch = [&](unsigned int k0) {
+        if (k0 < H) {
 #pragma unroll
-            for (unsigned int j = 0; j < 2; j++) {
-                const unsigned int i = tid + 256 * j, r = i / (INK_FG_K / 8), c = (i % (INK_FG_K / 8)) * 8;
-                dw[j] = *(const uint4*)(d + (unsigned long long)r * 2 * H + k0 + c);
+            for (unsigned int g = 0; g < G3; g++) {
+                if (g >= hplanes) break;
+                hv[g] = ar < nr ? *(const float4*)(h + g * h_stride + (unsigned long long)(row0 + ar) * H + k0 + ac)
+                                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
-        };
-        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        fetch(0);
-        for (unsigned int k0 = 0, buf = 0; k0 < 2 * H; k0 += INK_FG_K, buf ^= 1) {
-            const float sc = s_rstd[g][ar][k0 < H ? 0 : 1];
-            *(__nv_bfloat162*)&s_a[buf][ar][ac] = __floats2bfloat162_rn(v.x * sc, v.y * sc);
-            *(__nv_bfloat162*)&s_a[buf][ar][ac + 2] = __floats2bfloat162_rn(v.z * sc, v.w * sc);
+        } else {
 #pragma unroll
-            for (unsigned int j = 0; j < 2; j++) {
-                const unsigned int i = tid + 256 * j, r = i / (INK_FG_K / 8), c = (i % (INK_FG_K / 8)) * 8;
-                *(uint4*)&s_w[buf][r][c] = dw[j];
+            for (unsigned int j = 0; j < INK_FG_S; j++) {
+                if (j >= ns) break;
+                sv[j] = ar < nr ? *(const uint2*)(src(j) + (unsigned long long)(row0 + ar) * H + (k0 - H) + ac)
+                                : make_uint2(0u, 0u);
             }
-            if (k0 + INK_FG_K < 2 * H) fetch(k0 + INK_FG_K);
-            __syncthreads();
+        }
+#pragma unroll
+        for (unsigned int g = 0; g < G3; g++) {
+            if (g >= gates) break;
+            const __nv_bfloat16* d = ink_pick(D0, D1, D2, g);
+#pragma unroll
+            for (unsigned int jj = 0; jj < 2; jj++) {
+                const unsigned int i = tid + 256 * jj, r = i / (INK_FG_K / 8), c = (i % (INK_FG_K / 8)) * 8;
+                dw[g][jj] = *(const uint4*)(d + (unsigned long long)r * 2 * H + k0 + c);
+            }
+        }
+    };
+    float acc[G3][4] = {};
+    fetch(0);
+    for (unsigned int k0 = 0, buf = 0; k0 < 2 * H; k0 += INK_FG_K, buf ^= 1) {
+        if (k0 < H) {
+#pragma unroll
+            for (unsigned int g = 0; g < G3; g++) {
+                if (g >= gates) break;
+                const float4 v = hv[g < hplanes ? g : 0];
+                const float sc = s_rstd[g][ar][0];
+                *(__nv_bfloat162*)&s_a[buf][g][ar][ac] = __floats2bfloat162_rn(v.x * sc, v.y * sc);
+                *(__nv_bfloat162*)&s_a[buf][g][ar][ac + 2] = __floats2bfloat162_rn(v.z * sc, v.w * sc);
+            }
+        } else {
+            float mm[G3][4] = {};
+#pragma unroll
+            for (unsigned int j = 0; j < INK_FG_S; j++) {
+                if (j >= ns) break;
+                const float f[4] = {__uint_as_float(sv[j].x << 16), __uint_as_float(sv[j].x & 0xffff0000u),
+                                    __uint_as_float(sv[j].y << 16), __uint_as_float(sv[j].y & 0xffff0000u)};
+#pragma unroll
+                for (unsigned int g = 0; g < G3; g++) {
+                    if (g >= gates) break;
+                    const float w = s_p[ar][mq0 + g][j];
+#pragma unroll
+                    for (int e = 0; e < 4; e++) mm[g][e] += w * f[e];
+                }
+            }
+#pragma unroll
+            for (unsigned int g = 0; g < G3; g++) {
+                if (g >= gates) break;
+                const float sc = s_rstd[g][ar][1];
+                *(__nv_bfloat162*)&s_a[buf][g][ar][ac] = __floats2bfloat162_rn(mm[g][0] * sc, mm[g][1] * sc);
+                *(__nv_bfloat162*)&s_a[buf][g][ar][ac + 2] = __floats2bfloat162_rn(mm[g][2] * sc, mm[g][3] * sc);
+            }
+        }
+#pragma unroll
+        for (unsigned int g = 0; g < G3; g++) {
+            if (g >= gates) break;
+#pragma unroll
+            for (unsigned int jj = 0; jj < 2; jj++) {
+                const unsigned int i = tid + 256 * jj, r = i / (INK_FG_K / 8), c = (i % (INK_FG_K / 8)) * 8;
+                *(uint4*)&s_d[buf][g][r][c] = dw[g][jj];
+            }
+        }
+        if (k0 + INK_FG_K < 2 * H) fetch(k0 + INK_FG_K);
+        __syncthreads();
+#pragma unroll
+        for (unsigned int g = 0; g < G3; g++) {
+            if (g >= gates) break;
 #pragma unroll
             for (unsigned int kk = 0; kk < INK_FG_K; kk += 16) {
                 unsigned int a[4];
-                ink_frag_a(s_a[buf], kk, g8, t2, a);
-                const __nv_bfloat16* b = &s_w[buf][8 * warp + g8][kk + t2];
-                ink_mma16816(acc, a, *(const unsigned int*)b, *(const unsigned int*)(b + 8));
+                ink_frag_a(s_a[buf][g], kk, g8, t2, a);
+                const __nv_bfloat16* b = &s_d[buf][g][8 * warp + g8][kk + t2];
+                ink_mma16816(acc[g], a, *(const unsigned int*)b, *(const unsigned int*)(b + 8));
             }
         }
-        *(__nv_bfloat162*)&s_z[g][g8][8 * warp + t2] = __floats2bfloat162_rn(acc[0], acc[1]);
-        *(__nv_bfloat162*)&s_z[g][g8 + 8][8 * warp + t2] = __floats2bfloat162_rn(acc[2], acc[3]);
+    }
+#pragma unroll
+    for (unsigned int g = 0; g < G3; g++) {
+        if (g >= gates) break;
+        *(__nv_bfloat162*)&s_z[g][g8][8 * warp + t2] = __floats2bfloat162_rn(acc[g][0], acc[g][1]);
+        *(__nv_bfloat162*)&s_z[g][g8 + 8][8 * warp + t2] = __floats2bfloat162_rn(acc[g][2], acc[g][3]);
     }
     __syncthreads();
 
     // outputs, 64 channels a step: warp w owns channels c0 + 8w .. + 7. Step st takes
     // channels (st / gates) * 64 of gate st % gates; its F and G tiles load while the step
-    // before runs, and its h and m elements load before its barrier.
+    // before runs. A channel step's h and rebuilt messages load before its first barrier.
     const unsigned int steps = (H / INK_FG_CH) * gates;
     uint4 fw[2], gw[2];
     auto fetch_fg = [&](unsigned int st) {
@@ -517,9 +607,36 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_msg_gate_fused(
     fetch_fg(0);
     for (unsigned int c0 = 0, st = 0; c0 < H; c0 += INK_FG_CH) {
         const unsigned int ch = c0 + 8 * warp + t2;
-        float res[INK_MAX_GATES][4];
+        // this thread's 4 elements (rows g8, g8 + 8; channels ch, ch + 1) of every gate's h and m
+        float hv4[G3][4], mv4[G3][4] = {};
 #pragma unroll
-        for (unsigned int g = 0; g < INK_MAX_GATES; g++) {
+        for (int jr = 0; jr < 2; jr++) {
+            const unsigned int q = g8 + 8 * jr;
+            const unsigned long long at = (unsigned long long)(row0 + q) * H + ch;
+#pragma unroll
+            for (unsigned int g = 0; g < G3; g++) {
+                if (g >= gates) break;
+                const float2 v = q < nr && g < hplanes ? *(const float2*)(h + g * h_stride + at) : make_float2(0.0f, 0.0f);
+                hv4[g][2 * jr] = v.x;
+                hv4[g][2 * jr + 1] = v.y;
+            }
+#pragma unroll
+            for (unsigned int j = 0; j < INK_FG_S; j++) {
+                if (j >= ns) break;
+                const unsigned int u = q < nr ? *(const unsigned int*)(src(j) + at) : 0u;
+                const float f0 = __uint_as_float(u << 16), f1 = __uint_as_float(u & 0xffff0000u);
+#pragma unroll
+                for (unsigned int g = 0; g < G3; g++) {
+                    if (g >= gates) break;
+                    const float w = s_p[q][mq0 + g][j];
+                    mv4[g][2 * jr] += w * f0;
+                    mv4[g][2 * jr + 1] += w * f1;
+                }
+            }
+        }
+        float res[G3][4];
+#pragma unroll
+        for (unsigned int g = 0; g < G3; g++) {
             if (g >= gates) break;
             const unsigned int buf = st & 1;
 #pragma unroll
@@ -529,14 +646,6 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_msg_gate_fused(
                 *(uint4*)&s_w[2 + buf][r][c] = gw[j];
             }
             if (st + 1 < steps) fetch_fg(st + 1);
-            float hv[4], mv[4];
-#pragma unroll
-            for (int j = 0; j < 4; j++) {
-                const unsigned int q = g8 + 8 * (j / 2);
-                const unsigned long long at = (unsigned long long)(row0 + q) * H + ch + (j % 2);
-                hv[j] = q < nr ? h[g * h_stride + at] : 0.0f;
-                mv[j] = q < nr ? m[g * m_stride + at] : 0.0f;
-            }
             __syncthreads();
             float fa[4] = {0.0f, 0.0f, 0.0f, 0.0f}, ga[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
@@ -548,12 +657,13 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_msg_gate_fused(
                 ink_mma16816(fa, a, *(const unsigned int*)bf, *(const unsigned int*)(bf + 8));
                 ink_mma16816(ga, a, *(const unsigned int*)bg, *(const unsigned int*)(bg + 8));
             }
+            const unsigned int hg = g < hplanes ? g : 0;
 #pragma unroll
-            for (int j = 0; j < 4; j++) res[g][j] = (1.0f - tanhf(fa[j])) * hv[j] + tanhf(ga[j]) * mv[j];
+            for (int j = 0; j < 4; j++) res[g][j] = (1.0f - tanhf(fa[j])) * hv4[hg][j] + tanhf(ga[j]) * mv4[g][j];
             st++;
         }
 #pragma unroll
-        for (unsigned int g = 0; g < INK_MAX_GATES; g++) {
+        for (unsigned int g = 0; g < G3; g++) {
             if (g >= gates) break;
 #pragma unroll
             for (int j = 0; j < 4; j++) {
