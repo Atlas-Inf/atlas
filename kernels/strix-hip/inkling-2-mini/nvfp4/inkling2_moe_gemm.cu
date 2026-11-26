@@ -431,10 +431,12 @@ __device__ __forceinline__ void ink_hip_gemm_tile_f16(
                     const unsigned int byte = (w[h * 2 + i / 4] >> (8 * (i % 4))) & 0xFF;
                     // table[0..7] = the f16 high bytes of the E2M1 magnitudes;
                     // byte slots 0/2 read index 0 (0x00) -> the f16 low bytes.
+                    // v_perm_b32's byte pool is {src1 low, src0 high}: codes 0-3
+                    // live in the second operand here.
                     const unsigned int sel = ((byte & 7u) << 8) | (((byte >> 4) & 7u) << 24);
                     unsigned int mags;
                     asm("v_perm_b32 %0, %1, %2, %3"
-                        : "=v"(mags) : "v"(0x3E3C3800u), "v"(0x46444240u), "v"(sel));
+                        : "=v"(mags) : "v"(0x46444240u), "v"(0x3E3C3800u), "v"(sel));
                     const unsigned int sgn = mags | ((byte & 8u) << 12) | ((byte & 0x80u) << 24);
                     asm("v_pk_mul_f16 %0, %1, %2" : "=v"(pk[i]) : "v"(sgn), "v"(scale_pk));
                 }

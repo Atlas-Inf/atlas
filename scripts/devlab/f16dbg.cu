@@ -134,7 +134,7 @@ __device__ __forceinline__ void ink_hip_gemm_tile_f16(
                     const unsigned int sel = ((byte & 7u) << 8) | (((byte >> 4) & 7u) << 24);
                     unsigned int mags;
                     asm("v_perm_b32 %0, %1, %2, %3"
-                        : "=v"(mags) : "v"(0x3E3C3800u), "v"(0x46444240u), "v"(sel));
+                        : "=v"(mags) : "v"(0x46444240u), "v"(0x3E3C3800u), "v"(sel));
                     const unsigned int sgn = mags | ((byte & 8u) << 12) | ((byte & 0x80u) << 24);
                     asm("v_pk_mul_f16 %0, %1, %2" : "=v"(pk[i]) : "v"(sgn), "v"(scale_pk));
                 }
@@ -189,7 +189,7 @@ extern "C" __global__ void dump_b(
             const unsigned int byte = (w[h * 2 + i / 4] >> (8 * (i % 4))) & 0xFF;
             const unsigned int sel = ((byte & 7u) << 8) | (((byte >> 4) & 7u) << 24);
             unsigned int mags;
-            asm("v_perm_b32 %0, %1, %2, %3" : "=v"(mags) : "v"(0x3E3C3800u), "v"(0x46444240u), "v"(sel));
+            asm("v_perm_b32 %0, %1, %2, %3" : "=v"(mags) : "v"(0x46444240u), "v"(0x3E3C3800u), "v"(sel));
             const unsigned int sgn = mags | ((byte & 8u) << 12) | ((byte & 0x80u) << 24);
             asm("v_pk_mul_f16 %0, %1, %2" : "=v"(pk[i]) : "v"(sgn), "v"(scale_pk));
         }
@@ -214,7 +214,7 @@ extern "C" __global__ void dump_raw(
         const unsigned int byte = (w[i / 4] >> (8 * (i % 4))) & 0xFF;
         const unsigned int sel = ((byte & 7u) << 8) | (((byte >> 4) & 7u) << 24);
         unsigned int mags;
-        asm("v_perm_b32 %0, %1, %2, %3" : "=v"(mags) : "v"(0x3E3C3800u), "v"(0x46444240u), "v"(sel));
+        asm("v_perm_b32 %0, %1, %2, %3" : "=v"(mags) : "v"(0x46444240u), "v"(0x3E3C3800u), "v"(sel));
         out[threadIdx.x * 8 + i] = mags;
         out2[threadIdx.x * 8 + i] = byte;
     }
