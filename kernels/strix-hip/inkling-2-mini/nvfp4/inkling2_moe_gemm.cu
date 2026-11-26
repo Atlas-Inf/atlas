@@ -337,6 +337,155 @@ __device__ __forceinline__ void ink_hip_gemm_tile_t2(
     }
 }
 
+typedef _Float16 ink_v16f __attribute__((ext_vector_type(16)));
+
+// F16 operand variant of ink_hip_gemm_tile_t2 (same transposed warp layout,
+// same tile-list launch). Documented numerics change, NOT bit-identical: A is
+// staged f16 (v_cvt_pkrtz of the bf16 rows; |x| > 65504 would go inf — the
+// gate's pd/NLL legs cover the activation range), and B dequantises to f16 —
+// the E2M1 magnitudes come from a v_perm byte-select table (CIRU's
+// unpack_nvfp4_16_u4 shape, Apache-2.0) and the per-16 E4M3 scale multiplies
+// as one v_pk_mul_f16, so the per-byte dequant is ~10 instructions instead of
+// ~24 in the bf16 path. Accumulation stays f32 per element over the same K
+// order; the epilogue rounds f32 -> bf16 as before.
+template <bool SW>
+__device__ __forceinline__ void ink_hip_gemm_tile_f16(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ wc,
+    const unsigned char* __restrict__ ws, const float g, __nv_bfloat16* __restrict__ C,
+    const int m_start, const int m_count, const int m0, const int* __restrict__ rows,
+    const unsigned int N, const unsigned int K, const float cg, const float cu
+) {
+    __shared__ __align__(16) _Float16 As[128][INK_PITCH];
+    __shared__ int src[128];
+    const unsigned int n0 = blockIdx.x * INK_GN;
+    const unsigned int tid = threadIdx.x, lane = tid % 32;
+    for (int r = tid; r < 128; r += 256) src[r] = m0 + r < m_count ? (rows ? rows[m_start + m0 + r] : m_start + m0 + r) : -1;
+    __syncthreads();
+
+    const unsigned int bn = n0 + tid / 32 * 16 + (lane & 15);
+    const bool b_ok = bn < N;
+    const unsigned char* wc_row = wc + (unsigned long long)bn * (K / 2);
+    const unsigned char* ws_row = ws + (unsigned long long)bn * (K / 16);
+    constexpr int A_ITERS = 2;
+    const __nv_bfloat16* a_ptr[A_ITERS];
+    int a_off[A_ITERS];
+    bool a_val[A_ITERS];
+#pragma unroll
+    for (int it = 0; it < A_ITERS; it++) {
+        const int idx = it * 256 + (int)tid, r = idx / 4, col = (idx % 4) * 8;
+        const int sr = src[r];
+        a_val[it] = sr >= 0;
+        a_ptr[it] = A + (unsigned long long)sr * K + col;
+        a_off[it] = r * INK_PITCH + col;
+    }
+    ink_v8f acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) acc[j] = ink_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+
+    uint4 reg_a[A_ITERS];
+    uint4 reg_c;
+    unsigned int reg_s = 0;
+    auto prefetch = [&](const unsigned int k0) {
+#pragma unroll
+        for (int it = 0; it < A_ITERS; it++)
+            reg_a[it] = a_val[it] ? *(const uint4*)(a_ptr[it] + k0) : make_uint4(0, 0, 0, 0);
+        if (b_ok) {
+            reg_c = *(const uint4*)(wc_row + k0 / 2);
+            reg_s = *(const unsigned short*)(ws_row + k0 / 16);
+        } else {
+            reg_c = make_uint4(0, 0, 0, 0);
+            reg_s = 0;
+        }
+    };
+    prefetch(0);
+    for (unsigned int k0 = 0; k0 < K; k0 += INK_GK) {
+#pragma unroll
+        for (int it = 0; it < A_ITERS; it++) {
+            const unsigned int u[4] = {reg_a[it].x, reg_a[it].y, reg_a[it].z, reg_a[it].w};
+            uint4 out;
+            unsigned int* o = &out.x;
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const float f0 = __bfloat162float(*(const __nv_bfloat16*)&((const unsigned short*)&u[i])[0]);
+                const float f1 = __bfloat162float(*(const __nv_bfloat16*)&((const unsigned short*)&u[i])[1]);
+                asm("v_cvt_pkrtz_f16_f32 %0, %1, %2" : "=v"(o[i]) : "v"(f0), "v"(f1));
+            }
+            *(uint4*)((_Float16*)As + a_off[it]) = out;
+        }
+        __syncthreads();
+        const uint4 cur_c = reg_c;
+        const unsigned int cur_s = reg_s;
+        if (k0 + INK_GK < K) prefetch(k0 + INK_GK);
+        ink_v16f b_frag[2];
+        {
+            const unsigned int w[4] = {cur_c.x, cur_c.y, cur_c.z, cur_c.w};
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                // f16(E4M3(scale) * s2[e]): the fp32 scale as fp16, broadcast.
+                const _Float16 s16h = (_Float16)(ink_hip_e4m3((cur_s >> (8 * h)) & 0xFF) * g);
+                const unsigned int s16 = *(const unsigned short*)&s16h;
+                const unsigned int scale_pk = s16 | (s16 << 16);
+                unsigned int pk[8];
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    const unsigned int byte = (w[h * 2 + i / 4] >> (8 * (i % 4))) & 0xFF;
+                    // table[0..7] = the f16 high bytes of the E2M1 magnitudes;
+                    // byte slots 0/2 read index 0 (0x00) -> the f16 low bytes.
+                    const unsigned int sel = ((byte & 7u) << 8) | (((byte >> 4) & 7u) << 24);
+                    unsigned int mags;
+                    asm("v_perm_b32 %0, %1, %2, %3"
+                        : "=v"(mags) : "v"(0x3E3C3800u), "v"(0x46444240u), "v"(sel));
+                    const unsigned int sgn = mags | ((byte & 8u) << 12) | ((byte & 0x80u) << 24);
+                    asm("v_pk_mul_f16 %0, %1, %2" : "=v"(pk[i]) : "v"(sgn), "v"(scale_pk));
+                }
+                b_frag[h] = *(ink_v16f*)pk;
+            }
+        }
+        {
+            for (int h = 0; h < 2; h++) {
+#pragma unroll
+                for (int im = 0; im < 8; im++) {
+                    if (m0 + im * 16 < m_count) {
+                        const ink_v16f a = *(const ink_v16f*)&As[im * 16 + (lane & 15)][h * 16];
+                        acc[im] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b_frag[h], acc[im]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    const unsigned int c = bn;
+    if (!SW) {
+        if (c < N) {
+#pragma unroll
+            for (int im = 0; im < 8; im++) {
+#pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    const int r = m0 + im * 16 + 2 * e + (int)(lane >> 4);
+                    if (r < m_count) C[(unsigned long long)(m_start + r) * N + c] = __float2bfloat16(acc[im][e]);
+                }
+            }
+        }
+        return;
+    }
+    const unsigned int I = N / 2;
+#pragma unroll
+    for (int im = 0; im < 8; im++) {
+#pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const int r = m0 + im * 16 + 2 * e + (int)(lane >> 4);
+            const float g16 = __bfloat162float(__float2bfloat16(acc[im][e]));
+            const float u16 = __shfl_xor_sync(0xffffffffu, g16, 1);
+            const float v = tanhf(g16 / cg) * cg * (1.0f / (1.0f + __expf(-g16))) * tanhf(u16 / cu) * cu;
+            const unsigned int h = ((lane & 15) & 1) == 0
+                ? (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v)) : 0u;
+            const unsigned int h2 = __shfl_down_sync(0xffffffffu, h, 2);
+            if (r < m_count && c < N && ((lane & 15) & 3) == 0)
+                *(unsigned int*)(C + (unsigned long long)(m_start + r) * I + (c >> 1)) = h | (h2 << 16);
+        }
+    }
+}
+
 // Same convention as gb10's inkling2_moe_tiles (kernels/gb10/inkling-2-mini/
 // nvfp4/inkling2_moe_gemm.cu): tiles[0] = the row tiles' number, tiles[1 + t] =
 // expert << 16 | m-tile within the expert (in mtile-row units). grid (1),
@@ -517,6 +666,38 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4_swiglu
     if (m0 >= m_count) return;
     const unsigned long long ne = (unsigned long long)e * N;
     ink_hip_gemm_tile_t2<true>(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K, cg, cu);
+}
+
+// F16-operand tile-list entries (ink_hip_gemm_tile_f16): same (expert,
+// m-tile) decode, NVFP4 only.
+extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4_f16(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales, const float* __restrict__ s2, __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ offsets, const int* __restrict__ rows, const int* __restrict__ tiles,
+    const unsigned int N, const unsigned int K
+) {
+    if (blockIdx.y >= (unsigned int)tiles[0]) return;
+    const unsigned int t = (unsigned int)tiles[1 + blockIdx.y], e = t >> 16;
+    const int m_start = offsets[e], m_count = offsets[e + 1] - m_start;
+    const int m0 = (int)(t & 0xFFFFu) * 128;
+    if (m0 >= m_count) return;
+    const unsigned long long ne = (unsigned long long)e * N;
+    ink_hip_gemm_tile_f16<false>(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K, 0.0f, 0.0f);
+}
+
+extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4_swiglu_f16(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales, const float* __restrict__ s2, __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ offsets, const int* __restrict__ rows, const int* __restrict__ tiles,
+    const unsigned int N, const unsigned int K, const float cg, const float cu
+) {
+    if (blockIdx.y >= (unsigned int)tiles[0]) return;
+    const unsigned int t = (unsigned int)tiles[1 + blockIdx.y], e = t >> 16;
+    const int m_start = offsets[e], m_count = offsets[e + 1] - m_start;
+    const int m0 = (int)(t & 0xFFFFu) * 128;
+    if (m0 >= m_count) return;
+    const unsigned long long ne = (unsigned long long)e * N;
+    ink_hip_gemm_tile_f16<true>(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K, cg, cu);
 }
 
 // The softcapped SwiGLU between the grouped GEMMs (kept here: gb10 dropped its BF16-row
