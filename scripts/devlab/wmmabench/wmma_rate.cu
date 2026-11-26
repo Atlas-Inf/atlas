@@ -27,14 +27,12 @@ double run(K k, int warps_per_cta, int ctas, int iters) {
     v8f* out; hipMalloc(&out, warps_per_cta * ctas * 32 * sizeof(v8f));
     k<<<ctas, warps_per_cta * 32>>>(out, iters); // warm
     hipDeviceSynchronize();
-    long long t0 = clock64();
     hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
     hipEventRecord(e0);
     k<<<ctas, warps_per_cta * 32>>>(out, iters);
     hipEventRecord(e1);
     hipEventSynchronize(e1);
     float ms; hipEventElapsedTime(&ms, e0, e1);
-    (void)t0;
     hipFree(out);
     return (double)iters * warps_per_cta * ctas / (ms * 1e3); // wmma/us
 }
