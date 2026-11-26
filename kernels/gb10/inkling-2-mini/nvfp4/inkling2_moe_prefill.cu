@@ -206,7 +206,8 @@ extern "C" __global__ void inkling2_quant_mxfp8(const __nv_bfloat16* __restrict_
 // waiting (at most N / 128 - 1 of a row tile wait); in-order taking also keeps the
 // experts' weights in L2 as the hardware's own block order does (round-robin items let
 // the CTAs drift apart: 25% slower). done[0 .. row tiles] is zeroed by
-// inkling2_moe_tiles; partial [slots, N / 128] F32.
+// inkling2_moe_tiles; partial [row tiles, N / 128, 128] F32 (tile-major: a slot-major
+// [slots, N / 128] made every store and __ldcg strided, 6.4 vs 5.3 ms a visit).
 // grid (any, 2 an SM resident), block 256.
 #define INK_GU_PITCH 72   // BF16 a staged row: 64 values + 8 (conflict-free MMA-layout stores)
 extern "C" __global__ void __launch_bounds__(256, 2) inkling2_moe_fused_gate_up_fp4(
@@ -261,14 +262,14 @@ extern "C" __global__ void __launch_bounds__(256, 2) inkling2_moe_fused_gate_up_
                 }
             }
         __syncthreads();
-        // the rows' maxima over this tile's 64 values (rows past the expert's: none)
+        // the rows' maxima over this tile's 64 values (rows past the expert's: unused)
         {
             const unsigned int r = tid >> 1, half = tid & 1u;
             float m = 0.0f;
 #pragma unroll
             for (unsigned int i = 0; i < 32; i++) m = fmaxf(m, fabsf(__bfloat162float(sw[r][32 * half + i])));
             m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
-            if (half == 0 && r < rows_left) partial[((unsigned long long)m_start + m0 + r) * nx + n0 / 128] = m;
+            if (half == 0) partial[((unsigned long long)rt * nx + n0 / 128) * 128 + r] = m;
         }
         __syncthreads();
         if (tid == 0) {
@@ -280,9 +281,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) inkling2_moe_fused_gate_up_
         __syncthreads();
         if (tid < 128) {
             float amax = 0.0f;
-            if (tid < rows_left)
-                for (unsigned int x = 0; x < nx; x++)
-                    amax = fmaxf(amax, __ldcg(&partial[((unsigned long long)m_start + m0 + tid) * nx + x]));
+            for (unsigned int x = 0; x < nx; x++) amax = fmaxf(amax, __ldcg(&partial[((unsigned long long)rt * nx + x) * 128 + tid]));
             rinfo[tid] = ink_fp4_row(amax);
             if (n0 == 0 && tid < rows_left) outer[m_start + m0 + tid] = rinfo[tid].outer;
         }

@@ -169,7 +169,8 @@ pub(crate) fn moe_gu_bytes(slots: usize, inter: usize, experts: usize) -> usize 
     if cfg!(atlas_scale) {
         slots * 2 * inter * 2
     } else {
-        slots * (2 * inter).div_ceil(128) * 4 + (max_row_tiles(slots, experts) + 1) * 4
+        let tiles = max_row_tiles(slots, experts);
+        tiles * (2 * inter).div_ceil(128) * LOWP_M_TILE * 4 + (tiles + 1) * 4
     }
 }
 
@@ -281,11 +282,11 @@ fn moe_prefill_lowp(
             .launch(stream)?;
     }
     // the experts' row tiles, one CTA row each; for NVFP4 the fused gate_up's per-row
-    // partial maxima [slots, 2 I / 128] and its row-tile and work counters, in gu
+    // partial maxima [row tiles, 2 I / 128, 128] and its row-tile and work counters, in gu
     ensure!(a.num_experts <= 1024, "inkling2: over 1024 experts");
     let tiles = to_perm.offset(te * 4);
     let m_tiles = u32_of(max_row_tiles(te, a.num_experts), "row tiles")?;
-    let (partial, done) = (a.gu, a.gu.offset(te * (2 * a.inter / 128) * 4));
+    let (partial, done) = (a.gu, a.gu.offset(m_tiles as usize * (2 * a.inter / 128) * LOWP_M_TILE * 4));
     KernelLaunch::new(gpu, k.moe_tiles)
         .grid([1, 1, 1])
         .block([u32_of(a.num_experts.next_multiple_of(32), "experts")?, 1, 1])
