@@ -122,16 +122,33 @@ pub(super) fn moe_prefill_bf16(
             .arg_f32(a.up_softcap)
             .launch(stream)?;
     }
-    gemm(
-        a.act,
-        e.w2,
-        e.w2_scale,
-        e.w2_global,
-        a.y,
-        DevicePtr::NULL,
-        h,
-        i,
-    )?;
+    if k.moe_gemm_nvfp4_n256.0 != 0 && !e.mxfp8 {
+        // down GEMM at 256 output columns per CTA (512 threads); bit-identical
+        KernelLaunch::new(gpu, k.moe_gemm_nvfp4_n256)
+            .grid([h.div_ceil(256), m_tiles, ne])
+            .block([512, 1, 1])
+            .arg_ptr(a.act)
+            .arg_ptr(e.w2)
+            .arg_ptr(e.w2_scale)
+            .arg_ptr(e.w2_global)
+            .arg_ptr(a.y)
+            .arg_ptr(offsets)
+            .arg_ptr(DevicePtr::NULL)
+            .arg_u32(h)
+            .arg_u32(i)
+            .launch(stream)?;
+    } else {
+        gemm(
+            a.act,
+            e.w2,
+            e.w2_scale,
+            e.w2_global,
+            a.y,
+            DevicePtr::NULL,
+            h,
+            i,
+        )?;
+    }
     super::super::ops::moe_unpermute_reduce_indexed(
         gpu,
         k.moe_unpermute,

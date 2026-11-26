@@ -48,24 +48,25 @@ __device__ __forceinline__ float ink_hip_e4m3(unsigned int b) {
     return s ? -v : v;
 }
 
-template <bool MX, int TM, bool SW>
+template <bool MX, int TM, int GN, int NT, bool SW>
 __device__ __forceinline__ void ink_hip_gemm_tile(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ wc,
     const unsigned char* __restrict__ ws, const float g, __nv_bfloat16* __restrict__ C,
     const int m_start, const int m_count, const int m0, const int* __restrict__ rows,
     const unsigned int N, const unsigned int K, const float cg, const float cu
 ) {
+    static_assert(NT == 2 * GN, "each thread stages half of one weight row");
     constexpr int WM = TM / 16;            // warps along M
-    constexpr int WN = 8 / WM;             // warps along N
-    constexpr int NSUB = INK_GN / WN / 16; // 16-wide output sub-tiles per warp
+    constexpr int WN = (NT / 32) / WM;     // warps along N
+    constexpr int NSUB = GN / WN / 16;     // 16-wide output sub-tiles per warp
     __shared__ __align__(16) __nv_bfloat16 As[TM][INK_PITCH];
-    __shared__ __align__(16) __nv_bfloat16 Bs[INK_GN][INK_PITCH];
+    __shared__ __align__(16) __nv_bfloat16 Bs[GN][INK_PITCH];
     __shared__ float lut[16];
     __shared__ int src[TM];
-    const unsigned int n0 = blockIdx.x * INK_GN;
+    const unsigned int n0 = blockIdx.x * GN;
     const unsigned int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
     if (tid < 16) lut[tid] = INK_HIP_E2M1[tid];
-    for (int r = tid; r < TM; r += 256) src[r] = m0 + r < m_count ? (rows ? rows[m_start + m0 + r] : m_start + m0 + r) : -1;
+    for (int r = tid; r < TM; r += NT) src[r] = m0 + r < m_count ? (rows ? rows[m_start + m0 + r] : m_start + m0 + r) : -1;
     __syncthreads();
 
     const int wm = (int)(warp % WM) * 16, wn = (int)(warp / WM) * (NSUB * 16);
@@ -78,13 +79,13 @@ __device__ __forceinline__ void ink_hip_gemm_tile(
     // one scale per K step). The next K32's global loads are issued into
     // registers under this step's WMMAs (prefetch below), so the dequant and the
     // stores stay the only work between the two barriers.
-    constexpr int A_ITERS = TM * 4 / 256;
+    constexpr int A_ITERS = TM * 4 / NT;
     const __nv_bfloat16* a_ptr[A_ITERS];
     int a_off[A_ITERS];
     bool a_val[A_ITERS];
 #pragma unroll
     for (int it = 0; it < A_ITERS; it++) {
-        const int idx = it * 256 + (int)tid, r = idx / 4, col = (idx % 4) * 8;
+        const int idx = it * NT + (int)tid, r = idx / 4, col = (idx % 4) * 8;
         const int sr = src[r];
         a_val[it] = sr >= 0;
         a_ptr[it] = A + (unsigned long long)sr * K + col;
@@ -211,7 +212,24 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4(
     const int m0 = blockIdx.y * 128;
     if (m0 >= m_count) return;
     const unsigned long long ne = (unsigned long long)e * N;
-    ink_hip_gemm_tile<false, 128, false>(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K, 0.0f, 0.0f);
+    ink_hip_gemm_tile<false, 128, 128, 256, false>(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K, 0.0f, 0.0f);
+}
+
+// Down-GEMM shape: 256 output columns per CTA on 512 threads (16 warps as
+// 8 M x 2 N, still 8 sub-tiles of 16 per warp). The A tile and the source-row
+// gather are staged once per 256 columns instead of 128; dequant, WMMA order
+// and the accumulator layout are unchanged, so the result is bit-identical.
+extern "C" __global__ void __launch_bounds__(512) inkling2_moe_gemm_nvfp4_n256(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales, const float* __restrict__ s2, __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ offsets, const int* __restrict__ rows, const unsigned int N, const unsigned int K
+) {
+    const unsigned int e = blockIdx.z;
+    const int m_start = offsets[e], m_count = offsets[e + 1] - m_start;
+    const int m0 = blockIdx.y * 128;
+    if (m0 >= m_count) return;
+    const unsigned long long ne = (unsigned long long)e * N;
+    ink_hip_gemm_tile<false, 128, 256, 512, false>(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K, 0.0f, 0.0f);
 }
 
 // Same GEMM with the softcapped SwiGLU folded into the epilogue: C is the
@@ -228,7 +246,7 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_nvfp4_swiglu
     const int m0 = blockIdx.y * 128;
     if (m0 >= m_count) return;
     const unsigned long long ne = (unsigned long long)e * N;
-    ink_hip_gemm_tile<false, 128, true>(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K, cg, cu);
+    ink_hip_gemm_tile<false, 128, 128, 256, true>(A, codes + ne * (K / 2), scales + ne * (K / 16), s2[e], C, m_start, m_count, m0, rows, N, K, cg, cu);
 }
 
 extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_mxfp8(
@@ -241,7 +259,7 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_mxfp8(
     const int m0 = blockIdx.y * 64;
     if (m0 >= m_count) return;
     const unsigned long long ne = (unsigned long long)e * N;
-    ink_hip_gemm_tile<true, 64, false>(A, codes + ne * K, scales + ne * (K / 32), 1.0f, C, m_start, m_count, m0, rows, N, K, 0.0f, 0.0f);
+    ink_hip_gemm_tile<true, 64, 128, 256, false>(A, codes + ne * K, scales + ne * (K / 32), 1.0f, C, m_start, m_count, m0, rows, N, K, 0.0f, 0.0f);
 }
 
 extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_mxfp8_swiglu(
@@ -255,7 +273,7 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_gemm_mxfp8_swiglu
     const int m0 = blockIdx.y * 64;
     if (m0 >= m_count) return;
     const unsigned long long ne = (unsigned long long)e * N;
-    ink_hip_gemm_tile<true, 64, true>(A, codes + ne * K, scales + ne * (K / 32), 1.0f, C, m_start, m_count, m0, rows, N, K, cg, cu);
+    ink_hip_gemm_tile<true, 64, 128, 256, true>(A, codes + ne * K, scales + ne * (K / 32), 1.0f, C, m_start, m_count, m0, rows, N, K, cg, cu);
 }
 
 // The softcapped SwiGLU between the grouped GEMMs (kept here: gb10 dropped its BF16-row

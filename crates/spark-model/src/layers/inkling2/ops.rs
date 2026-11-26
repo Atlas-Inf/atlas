@@ -70,6 +70,9 @@ pub(crate) struct Inkling2Kernels {
     /// epilogue (bit-identical to GEMM + `inkling2_softcap_swiglu`); NULL elsewhere.
     pub moe_gemm_nvfp4_swiglu: KernelHandle,
     pub moe_gemm_mxfp8_swiglu: KernelHandle,
+    /// strix-hip only: the down GEMM at 256 output columns per CTA on 512
+    /// threads (bit-identical to `moe_gemm_nvfp4` at 128); NULL elsewhere.
+    pub moe_gemm_nvfp4_n256: KernelHandle,
 }
 
 /// A strix-hip-only kernel of this target's `inkling2_moe_gemm` module; NULL on other targets.
@@ -136,6 +139,12 @@ impl Inkling2Kernels {
                 gpu,
                 "inkling2_moe_gemm",
                 "inkling2_moe_gemm_mxfp8_swiglu",
+            ),
+            moe_gemm_nvfp4_n256: crate::layers::try_kernel_gated(
+                cfg!(atlas_scale),
+                gpu,
+                "inkling2_moe_gemm",
+                "inkling2_moe_gemm_nvfp4_n256",
             ),
         })
     }
