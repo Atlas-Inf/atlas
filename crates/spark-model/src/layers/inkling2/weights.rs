@@ -83,8 +83,9 @@ pub(crate) struct PhysicalWeights {
     pub wv: Linear,
     pub wr: Linear,
     pub rel_proj: DevicePtr,
-    /// `rel_proj` transposed to F32 `[rel_extent, d_rel]` (the prefill attention reads
-    /// one distance's weights as 16-byte loads)
+    /// `rel_proj` by distance for the prefill attention: on AMD (`atlas_scale`) F32
+    /// `[rel_extent, d_rel]`, read as 16-byte loads; on gb10 the BF16 lanes of
+    /// [`bias_lanes`], one 8-byte load per bias MMA fragment
     pub rel_proj_t: DevicePtr,
     pub q_scale: DevicePtr,
     pub rel_scale: DevicePtr,
@@ -154,6 +155,44 @@ fn transposed_f32(store: &WeightStore, gpu: &dyn GpuBackend, name: &str) -> Resu
     let dev = gpu
         .alloc(out.len())
         .with_context(|| format!("allocate {name} transposed"))?;
+    gpu.copy_h2d(&out, dev)?;
+    Ok(dev)
+}
+
+/// `inkling2_flash_prefill`'s bias weights: BF16 `proj [16, extent]` regrouped by
+/// distance, row `d` holding lane quad `q`'s m16n8k16 B fragment (`proj[2q][d]`,
+/// `proj[2q + 1][d]`, `proj[2q + 8][d]`, `proj[2q + 9][d]`) for q = 0..4, then a zero
+/// row at `extent` for the distances past the bias's reach.
+pub(crate) fn bias_lanes(raw: &[u8], rows: usize, cols: usize) -> Result<Vec<u8>> {
+    ensure!(
+        rows == 16 && raw.len() == rows * cols * 2,
+        "inkling2 bias lanes: proj [{rows}, {cols}]"
+    );
+    let mut out = vec![0u8; (cols + 1) * rows * 2];
+    for d in 0..cols {
+        for q in 0..4 {
+            for (i, k) in [2 * q, 2 * q + 1, 2 * q + 8, 2 * q + 9].into_iter().enumerate() {
+                let (src, dst) = ((k * cols + d) * 2, (d * rows + q * 4 + i) * 2);
+                out[dst..dst + 2].copy_from_slice(&raw[src..src + 2]);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn lanes_bf16(store: &WeightStore, gpu: &dyn GpuBackend, name: &str) -> Result<DevicePtr> {
+    let t = store
+        .get(name)
+        .with_context(|| format!("inkling2 tensor {name}"))?;
+    let [rows, cols] = t.shape[..] else {
+        anyhow::bail!("inkling2 {name}: shape {:?}", t.shape);
+    };
+    let mut raw = vec![0u8; rows * cols * 2];
+    gpu.copy_d2h(t.ptr, &mut raw)?;
+    let out = bias_lanes(&raw, rows, cols).with_context(|| name.to_string())?;
+    let dev = gpu
+        .alloc(out.len())
+        .with_context(|| format!("allocate {name} lanes"))?;
     gpu.copy_h2d(&out, dev)?;
     Ok(dev)
 }
@@ -383,7 +422,11 @@ pub(crate) fn physical(
         wv: linear("wv_dv", "v_proj.linear")?,
         wr: linear("wr_du", "relative_position_bias.linear")?,
         rel_proj: p(&format!("{a}.rel_logits_proj.proj"))?,
-        rel_proj_t: transposed_f32(store, gpu, &format!("{a}.rel_logits_proj.proj"))?,
+        rel_proj_t: if cfg!(atlas_scale) {
+            transposed_f32(store, gpu, &format!("{a}.rel_logits_proj.proj"))?
+        } else {
+            lanes_bf16(store, gpu, &format!("{a}.rel_logits_proj.proj"))?
+        },
         q_scale: p(&format!("{a}.q_l2_clip.scale"))?,
         rel_scale: p(&format!("{a}.rel_l2_clip.scale"))?,
         gate: linear("gate_attn", "o_proj.gate_proj")?,
@@ -408,3 +451,7 @@ pub(crate) fn physical(
         mlp_query: p(&format!("{PREFIX}.attn_res.mlp_queries.{l}"))?,
     })
 }
+
+#[cfg(test)]
+#[path = "weights_tests.rs"]
+mod tests;

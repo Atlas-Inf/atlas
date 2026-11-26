@@ -166,7 +166,8 @@ pub(crate) struct PrefillAttn {
     pub block_table: DevicePtr,
     pub rel: DevicePtr,
     pub rel_proj: DevicePtr,
-    /// `rel_proj` as F32 `[rel_extent, d_rel]`
+    /// `rel_proj` by distance (`PhysicalWeights::rel_proj_t`: F32 on AMD, the
+    /// flash kernel's BF16 lanes on gb10)
     pub rel_proj_t: DevicePtr,
     /// `[q_len, heads, rel_extent]` BF16 scratch (the per-head kernel's table)
     pub bias: DevicePtr,
@@ -189,12 +190,13 @@ const FLASH_MIN_ROWS: usize = 64;
 /// Rows of the per-head kernel's bias table (`Shared::rel_table`): the runs
 /// below [`FLASH_MIN_ROWS`], the only ones that take it.
 pub(crate) const REL_TABLE_ROWS: usize = FLASH_MIN_ROWS - 1;
-/// `inkling2_flash_prefill.cu` FP_GROUP: query heads per KV head; FP_D_REL.
-const FLASH_GROUP: usize = 3;
+/// `inkling2_flash_prefill.cu` FP_D_REL.
 const FLASH_D_REL: usize = 16;
-/// `inkling2_flash_prefill.cu` FP_SMEM: double-buffered K/V tiles, then each
-/// of the 12 warps' fp32 bias tile (16 rows x a 52-float pitch).
-const FLASH_SMEM: u32 = 2 * 2 * 32 * 136 * 2 + 12 * 16 * 52 * 4;
+/// The AMD (strix-hip) body's FP_GROUP: query heads per KV head.
+const AMD_FLASH_GROUP: usize = 3;
+/// `inkling2_flash_prefill.cu` FP_SMEM (dynamic; the K and V tiles are
+/// static): each of the 4 warps' BF16 bias tile, 16 rows x an 88-element pitch.
+const FLASH_SMEM: u32 = 4 * 16 * 88 * 2;
 
 /// Whether the output left gated (`a.gated`, the flash kernel) or ungated in
 /// `a.out` for the caller's gate.
@@ -214,9 +216,11 @@ pub(crate) fn prefill_attn(
     );
     let q_len = u32_of(a.q_len, "q_len")?;
     let kv_heads = u32_of(a.kv_heads, "kv heads")?;
-    let flash =
-        a.q_len >= FLASH_MIN_ROWS && a.heads == FLASH_GROUP * a.kv_heads && a.d_rel == FLASH_D_REL;
-    if flash && cfg!(atlas_scale) {
+    if cfg!(atlas_scale)
+        && a.q_len >= FLASH_MIN_ROWS
+        && a.heads == AMD_FLASH_GROUP * a.kv_heads
+        && a.d_rel == FLASH_D_REL
+    {
         // AMD (strix-hip): the wave32 WMMA port of the previous flash kernel, one CTA per
         // (KV head, 64 tokens) computing the bias where it adds it; the output leaves
         // ungated for the caller's gate
@@ -242,13 +246,21 @@ pub(crate) fn prefill_attn(
             .launch(stream)?;
         return Ok(false);
     }
-    if flash {
-        // a prefill chunk: one CTA per (KV head, 64 tokens) shares each K/V tile
-        // with the group's query heads, computing the bias where it adds it and
-        // gating its output
+    if !cfg!(atlas_scale)
+        && a.q_len >= FLASH_MIN_ROWS
+        && a.heads.is_multiple_of(a.kv_heads)
+        && a.d_rel == FLASH_D_REL
+    {
+        ensure!(
+            a.block_size.is_power_of_two(),
+            "inkling2 flash prefill: block size {} is not a power of two",
+            a.block_size
+        );
+        // a prefill chunk: one CTA per (query head, 64 tokens), computing the
+        // bias where it adds it and gating its output
         KernelLaunch::new(gpu, k.flash_prefill)
-            .grid([kv_heads, q_len.div_ceil(64), 1])
-            .block([384, 1, 1])
+            .grid([heads * q_len.div_ceil(64), 1, 1])
+            .block([128, 1, 1])
             .shared_mem(FLASH_SMEM)
             .arg_ptr(a.q)
             .arg_ptr(a.k_cache)
