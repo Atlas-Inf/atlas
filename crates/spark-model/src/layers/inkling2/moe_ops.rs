@@ -164,7 +164,9 @@ pub(crate) fn moe_sort_bytes(expanded: usize, experts: usize) -> usize {
 }
 
 fn max_row_tiles(expanded: usize, experts: usize) -> usize {
-    expanded.div_ceil(LOWP_M_TILE) + experts
+    // the bound covers the smallest row tile a target's tile list packs at:
+    // strix-hip's MXFP8 grouped GEMM tiles at 64 rows where w4a4/w8a8 run 128.
+    expanded.div_ceil(LOWP_M_TILE.min(64)) + experts
 }
 
 pub(crate) fn moe_prefill(
