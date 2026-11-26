@@ -79,7 +79,7 @@ pub(super) fn moe_prefill_bf16(
             gpu,
             if e.mxfp8 {
                 k.moe_gemm_mxfp8_tl
-            } else if k.moe_gemm_nvfp4_f16.0 != 0 {
+            } else if k.moe_gemm_nvfp4_f16.0 != 0 && kk % 64 == 0 {
                 k.moe_gemm_nvfp4_f16
             } else if k.moe_gemm_nvfp4_t2.0 != 0 {
                 k.moe_gemm_nvfp4_t2
@@ -137,7 +137,7 @@ pub(super) fn moe_prefill_bf16(
     };
     let swiglu_tl = if e.mxfp8 {
         k.moe_gemm_mxfp8_swiglu_tl
-    } else if k.moe_gemm_nvfp4_swiglu_f16.0 != 0 {
+    } else if k.moe_gemm_nvfp4_swiglu_f16.0 != 0 && h % 64 == 0 {
         k.moe_gemm_nvfp4_swiglu_f16
     } else if k.moe_gemm_nvfp4_swiglu_t2.0 != 0 {
         k.moe_gemm_nvfp4_swiglu_t2

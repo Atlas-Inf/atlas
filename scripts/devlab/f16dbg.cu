@@ -49,7 +49,8 @@ __device__ __forceinline__ void ink_hip_gemm_tile_f16(
     const int m_start, const int m_count, const int m0, const int* __restrict__ rows,
     const unsigned int N, const unsigned int K, const float cg, const float cu
 ) {
-    __shared__ __align__(16) _Float16 As[128][INK_PITCH];
+    constexpr int FPITCH = 72;
+    __shared__ __align__(16) _Float16 As[128][FPITCH];
     __shared__ int src[128];
     const unsigned int n0 = blockIdx.x * INK_GN;
     const unsigned int tid = threadIdx.x, lane = tid % 32;
@@ -60,39 +61,40 @@ __device__ __forceinline__ void ink_hip_gemm_tile_f16(
     const bool b_ok = bn < N;
     const unsigned char* wc_row = wc + (unsigned long long)bn * (K / 2);
     const unsigned char* ws_row = ws + (unsigned long long)bn * (K / 16);
-    constexpr int A_ITERS = 2;
+    constexpr int A_ITERS = 4;
     const __nv_bfloat16* a_ptr[A_ITERS];
     int a_off[A_ITERS];
     bool a_val[A_ITERS];
 #pragma unroll
     for (int it = 0; it < A_ITERS; it++) {
-        const int idx = it * 256 + (int)tid, r = idx / 4, col = (idx % 4) * 8;
+        const int idx = it * 256 + (int)tid, r = idx / 8, col = (idx % 8) * 8;
         const int sr = src[r];
         a_val[it] = sr >= 0;
         a_ptr[it] = A + (unsigned long long)sr * K + col;
-        a_off[it] = r * INK_PITCH + col;
+        a_off[it] = r * FPITCH + col;
     }
     ink_v8f acc[8];
 #pragma unroll
     for (int j = 0; j < 8; j++) acc[j] = ink_v8f{0, 0, 0, 0, 0, 0, 0, 0};
 
     uint4 reg_a[A_ITERS];
-    uint4 reg_c;
+    uint4 reg_c[2];
     unsigned int reg_s = 0;
     auto prefetch = [&](const unsigned int k0) {
 #pragma unroll
         for (int it = 0; it < A_ITERS; it++)
             reg_a[it] = a_val[it] ? *(const uint4*)(a_ptr[it] + k0) : make_uint4(0, 0, 0, 0);
         if (b_ok) {
-            reg_c = *(const uint4*)(wc_row + k0 / 2);
-            reg_s = *(const unsigned short*)(ws_row + k0 / 16);
+            reg_c[0] = *(const uint4*)(wc_row + k0 / 2);
+            reg_c[1] = *(const uint4*)(wc_row + k0 / 2 + 16);
+            reg_s = *(const unsigned int*)(ws_row + k0 / 16);
         } else {
-            reg_c = make_uint4(0, 0, 0, 0);
+            reg_c[0] = reg_c[1] = make_uint4(0, 0, 0, 0);
             reg_s = 0;
         }
     };
     prefetch(0);
-    for (unsigned int k0 = 0; k0 < K; k0 += INK_GK) {
+    for (unsigned int k0 = 0; k0 < K; k0 += 64) {
 #pragma unroll
         for (int it = 0; it < A_ITERS; it++) {
             const unsigned int u[4] = {reg_a[it].x, reg_a[it].y, reg_a[it].z, reg_a[it].w};
@@ -116,14 +118,15 @@ __device__ __forceinline__ void ink_hip_gemm_tile_f16(
             *(uint4*)((_Float16*)As + a_off[it]) = out;
         }
         __syncthreads();
-        const uint4 cur_c = reg_c;
+        const uint4 cur_c[2] = {reg_c[0], reg_c[1]};
         const unsigned int cur_s = reg_s;
-        if (k0 + INK_GK < K) prefetch(k0 + INK_GK);
-        ink_v16f b_frag[2];
+        if (k0 + 64 < K) prefetch(k0 + 64);
+        ink_v16f b_frag[4];
         {
-            const unsigned int w[4] = {cur_c.x, cur_c.y, cur_c.z, cur_c.w};
+            const unsigned int w[8] = {cur_c[0].x, cur_c[0].y, cur_c[0].z, cur_c[0].w,
+                                       cur_c[1].x, cur_c[1].y, cur_c[1].z, cur_c[1].w};
 #pragma unroll
-            for (int h = 0; h < 2; h++) {
+            for (int h = 0; h < 4; h++) {
                 const _Float16 s16h = (_Float16)(ink_hip_e4m3((cur_s >> (8 * h)) & 0xFF) * g);
                 const unsigned int s16 = *(const unsigned short*)&s16h;
                 const unsigned int scale_pk = s16 | (s16 << 16);
@@ -142,7 +145,7 @@ __device__ __forceinline__ void ink_hip_gemm_tile_f16(
             }
         }
         {
-            for (int h = 0; h < 2; h++) {
+            for (int h = 0; h < 4; h++) {
 #pragma unroll
                 for (int im = 0; im < 8; im++) {
                     if (m0 + im * 16 < m_count) {
@@ -246,7 +249,7 @@ static float bf2f(__nv_bfloat16 b) { unsigned short u = *(unsigned short*)&b; un
 static __nv_bfloat16 f2bf(float f) { unsigned int u = *(unsigned int*)&f; u = (u + 0x8000 + ((u >> 16) & 1)) >> 16; __nv_bfloat16 b; *(unsigned short*)&b = (unsigned short)u; return b; }
 
 int main() {
-    const unsigned int N = 128, K = 64; const int M = 100; const float g = 1.5f;
+    const unsigned int N = 128, K = 128; const int M = 100; const float g = 1.5f;
     std::vector<__nv_bfloat16> hA(M * K);
     std::vector<unsigned char> hC(N * (K / 2)), hS(N * (K / 16));
     std::vector<__nv_bfloat16> hO(M * N);
