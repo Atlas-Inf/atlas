@@ -133,9 +133,7 @@ pub(crate) fn ling_cap_trace() -> bool {
 /// Strict `== "1"`, read once.
 pub(crate) fn ling_graph_stage_debug() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("ATLAS_LING_DECODE_GRAPH_DEBUG_STAGE").as_deref() == Ok("1")
-    })
+    *ON.get_or_init(|| std::env::var("ATLAS_LING_DECODE_GRAPH_DEBUG_STAGE").as_deref() == Ok("1"))
 }
 
 /// Whether the dispatches WRITE the Ling family's staged metadata this

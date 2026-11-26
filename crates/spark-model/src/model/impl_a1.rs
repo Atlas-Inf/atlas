@@ -774,7 +774,7 @@ impl TransformerModel {
             ssm_tier_store,
             max_blocks_per_seq,
             ling_cap_trace_slab: std::sync::OnceLock::new(),
-        dummy_kv_block,
+            dummy_kv_block,
             profile,
             profile_first_pending: std::sync::atomic::AtomicBool::new(profile_first),
             proposer,

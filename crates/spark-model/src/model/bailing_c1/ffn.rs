@@ -213,7 +213,9 @@ impl LingFfn {
         if rows >= 16 {
             // Prefill shape: the GEMMs read the weights once on tensor
             // cores instead of re-streaming them per 32-row bucket pass.
-            self.cublas_swiglu(gpu, x, &w.gate, &w.up, &w.down, s.shared_h, out, rows, 0.0, stream)
+            self.cublas_swiglu(
+                gpu, x, &w.gate, &w.up, &w.down, s.shared_h, out, rows, 0.0, stream,
+            )
         } else {
             for (start, batch) in row_batches(rows, 32) {
                 let h = s.shared_h.offset(start as usize * self.inter * 2);

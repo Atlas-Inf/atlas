@@ -833,7 +833,7 @@ fn mla_layer5_parity() -> Result<()> {
         4,
         12,
         false,
-        true, // packed: the gather refills prefix rows [0, 12) from the pool
+        true,  // packed: the gather refills prefix rows [0, 12) from the pool
         false, // staged
         &rig.block_table,
         stream,
@@ -912,9 +912,9 @@ fn mla_layer5_prefill_fast_parity() -> Result<()> {
         &mut rig.kv,
         N,
         0,
-        true, // whole prompt: contiguous K/V + ling_mla_prefill_attn
+        true,  // whole prompt: contiguous K/V + ling_mla_prefill_attn
         false, // packed: legacy fast path (the packed default runs in phase 4
-               // of mla_layer5_parity and end to end in the e2e gate)
+        // of mla_layer5_parity and end to end in the e2e gate)
         false, // staged
         &rig.block_table,
         stream,

@@ -47,16 +47,16 @@ use parking_lot::Mutex;
 use std::any::Any;
 
 use anyhow::Result;
+use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
-use atlas_core::config::ModelConfig;
 
 use crate::layer::{ForwardContext, LayerState, TransformerLayer};
 use crate::layers::ops;
 use crate::speculative::{DraftProposer, ProposerState};
-use crate::weight_map::DenseWeight;
 use crate::weight_loader::bailing::LingMtpModule;
+use crate::weight_map::DenseWeight;
 
 /// Rows per `prefill_drafter` chunk (also the eh-pair staging row cap).
 const PREFILL_CHUNK: usize = 64;

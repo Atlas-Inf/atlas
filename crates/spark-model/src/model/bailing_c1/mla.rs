@@ -224,11 +224,7 @@ impl LingMlaLayer {
     /// per-pass scratch — the gather refills the prefix from the paged
     /// pools every prefill call — so growth never changes correctness,
     /// only capacity.
-    fn ctx_pools(
-        &self,
-        gpu: &dyn GpuBackend,
-        need_rows: usize,
-    ) -> Result<Option<CtxPools>> {
+    fn ctx_pools(&self, gpu: &dyn GpuBackend, need_rows: usize) -> Result<Option<CtxPools>> {
         if need_rows > MAX_PREFILL_ROWS {
             return Ok(None);
         }
@@ -296,37 +292,13 @@ impl LingMlaLayer {
             )?;
         } else {
             proj_gemm(
-                gpu,
-                k,
-                normed,
-                &w.q_proj,
-                s.mla_q,
-                rows,
-                q_row,
-                hidden,
-                stream,
+                gpu, k, normed, &w.q_proj, s.mla_q, rows, q_row, hidden, stream,
             )?;
             proj_gemm(
-                gpu,
-                k,
-                normed,
-                &w.kv_a,
-                s.mla_kv_a,
-                rows,
-                kv_dim,
-                hidden,
-                stream,
+                gpu, k, normed, &w.kv_a, s.mla_kv_a, rows, kv_dim, hidden, stream,
             )?;
             ops::dense_gemm(
-                gpu,
-                k.gemm_k,
-                normed,
-                &w.g_proj,
-                s.mla_g,
-                rows,
-                self.heads,
-                hidden,
-                stream,
+                gpu, k.gemm_k, normed, &w.g_proj, s.mla_g, rows, self.heads, hidden, stream,
             )?;
         }
         Ok(())
@@ -383,7 +355,11 @@ impl LingMlaLayer {
         let k = &self.kernels;
         let row_tile = rows.min(64);
         KernelLaunch::new(gpu, k.mla_q_absorb_k)
-            .grid([self.heads, div_ceil(self.kv_lora, 256), div_ceil(rows, row_tile)])
+            .grid([
+                self.heads,
+                div_ceil(self.kv_lora, 256),
+                div_ceil(rows, row_tile),
+            ])
             .block([256, 1, 1])
             .arg_ptr(s.mla_q)
             .arg_ptr(self.weights.w_uk.weight)
@@ -583,7 +559,14 @@ impl LingMlaLayer {
     ) -> Result<()> {
         let (block_size, _) = self.kernel_checks(kv_cache)?;
         KernelLaunch::new(gpu, self.kernels.mla_ctx_gather_k)
-            .grid([div_ceil(kv_base as u32 * (MLA_K_ROW_BF16 + MLA_V_ROW_BF16) as u32, 256), 1, 1])
+            .grid([
+                div_ceil(
+                    kv_base as u32 * (MLA_K_ROW_BF16 + MLA_V_ROW_BF16) as u32,
+                    256,
+                ),
+                1,
+                1,
+            ])
             .block([256, 1, 1])
             .arg_ptr(kv_cache.k_pool_ptr(self.attn_idx))
             .arg_ptr(v_pool)
@@ -651,10 +634,7 @@ impl LingMlaLayer {
             );
             gpu.copy_h2d_async(
                 unsafe {
-                    std::slice::from_raw_parts(
-                        table_i32.as_ptr() as *const u8,
-                        table_i32.len() * 4,
-                    )
+                    std::slice::from_raw_parts(table_i32.as_ptr() as *const u8, table_i32.len() * 4)
                 },
                 s.mla_block_table,
                 stream,
@@ -871,14 +851,7 @@ impl LingMlaLayer {
         )?;
         self.q_absorb(gpu, rows_u32, positions, stream)?;
         if whole_prompt && seq_len_start == 0 {
-            self.prefill_attn_contig(
-                gpu,
-                s.mla_k_contig,
-                s.mla_v_contig,
-                rows_u32,
-                0,
-                stream,
-            )?;
+            self.prefill_attn_contig(gpu, s.mla_k_contig, s.mla_v_contig, rows_u32, 0, stream)?;
         } else {
             // Continuing chunk: 8-row groups over the paged cache. A staged
             // step reads the prestaged base_len/table instead (`staged`
@@ -1152,7 +1125,7 @@ impl TransformerLayer for LingMlaLayer {
         )
     }
 
-        fn decode_batched(
+    fn decode_batched(
         &self,
         hidden: DevicePtr,
         _residual: DevicePtr,
@@ -1330,14 +1303,21 @@ impl TransformerLayer for LingMlaLayer {
             let bbytes = 64 * MLA_V_ROW_BF16 * 2;
             let mut buf = vec![0u8; bbytes];
             for &b in blocks {
-                if gpu.copy_d2h(v_pool.offset((b as usize) * bbytes), &mut buf).is_err() {
+                if gpu
+                    .copy_d2h(v_pool.offset((b as usize) * bbytes), &mut buf)
+                    .is_err()
+                {
                     vhs.push('?');
                     continue;
                 }
                 if !vhs.is_empty() {
                     vhs.push(',');
                 }
-                vhs.push_str(&format!("{}:{:016x}", b, crate::model::trait_impl::ling_cap_trace::ling_cap_fnv1a(&buf)));
+                vhs.push_str(&format!(
+                    "{}:{:016x}",
+                    b,
+                    crate::model::trait_impl::ling_cap_trace::ling_cap_fnv1a(&buf)
+                ));
             }
         } else {
             vhs.push_str("NOPOOL");

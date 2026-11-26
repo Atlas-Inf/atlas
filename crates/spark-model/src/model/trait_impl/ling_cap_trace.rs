@@ -36,8 +36,7 @@ pub(in crate::model) fn ling_cap_fnv1a(bytes: &[u8]) -> u64 {
 
 impl TransformerModel {
     fn on(&self) -> bool {
-        self.config.model_type == "bailing_moe_v3_vl"
-            && crate::model::graph_flags::ling_cap_trace()
+        self.config.model_type == "bailing_moe_v3_vl" && crate::model::graph_flags::ling_cap_trace()
     }
 
     /// The per-serve slab, allocated once on first use. Layout: per layer
@@ -101,7 +100,10 @@ impl TransformerModel {
                 hs.push(',');
             }
             let off = l * 2 * row_bytes;
-            hs.push_str(&format!("{:016x}", ling_cap_fnv1a(&host[off..off + rows * row_bytes])));
+            hs.push_str(&format!(
+                "{:016x}",
+                ling_cap_fnv1a(&host[off..off + rows * row_bytes])
+            ));
         }
         let lb = rows * self.config.vocab_size * 2;
         let mut logits_host = vec![0u8; lb];
