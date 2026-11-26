@@ -216,6 +216,7 @@ __device__ __forceinline__ void ink_hip_gemm_tile(
 // where the shared tile would dequant the same fragment in every warp. The
 // dequant math (E2M1 -> fp32 -> * s -> RTNE BF16) and the per-element K
 // accumulation order are unchanged -> bit-identical to ink_hip_gemm_tile.
+// K step is 64 (four 16-k halves per barrier round-trip); bit-identical.
 template <bool SW>
 __device__ __forceinline__ void ink_hip_gemm_tile_t2(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ wc,
@@ -223,7 +224,8 @@ __device__ __forceinline__ void ink_hip_gemm_tile_t2(
     const int m_start, const int m_count, const int m0, const int* __restrict__ rows,
     const unsigned int N, const unsigned int K, const float cg, const float cu
 ) {
-    __shared__ __align__(16) __nv_bfloat16 As[128][INK_PITCH];
+    constexpr int FGK = 64, FPITCH = FGK + 8;
+    __shared__ __align__(16) __nv_bfloat16 As[128][FPITCH];
     __shared__ int src[128];
     const unsigned int n0 = blockIdx.x * INK_GN;
     const unsigned int tid = threadIdx.x, lane = tid % 32;
@@ -236,39 +238,40 @@ __device__ __forceinline__ void ink_hip_gemm_tile_t2(
     const bool b_ok = bn < N;
     const unsigned char* wc_row = wc + (unsigned long long)bn * (K / 2);
     const unsigned char* ws_row = ws + (unsigned long long)bn * (K / 16);
-    constexpr int A_ITERS = 2; // 128 rows x 4 16-byte chunks / 256 threads
+    constexpr int A_ITERS = 4; // 128 rows x 8 16-byte chunks / 256 threads
     const __nv_bfloat16* a_ptr[A_ITERS];
     int a_off[A_ITERS];
     bool a_val[A_ITERS];
 #pragma unroll
     for (int it = 0; it < A_ITERS; it++) {
-        const int idx = it * 256 + (int)tid, r = idx / 4, col = (idx % 4) * 8;
+        const int idx = it * 256 + (int)tid, r = idx / 8, col = (idx % 8) * 8;
         const int sr = src[r];
         a_val[it] = sr >= 0;
         a_ptr[it] = A + (unsigned long long)sr * K + col;
-        a_off[it] = r * INK_PITCH + col;
+        a_off[it] = r * FPITCH + col;
     }
     ink_v8f acc[8];
 #pragma unroll
     for (int j = 0; j < 8; j++) acc[j] = ink_v8f{0, 0, 0, 0, 0, 0, 0, 0};
 
     uint4 reg_a[A_ITERS];
-    uint4 reg_c;
+    uint4 reg_c[2];
     unsigned int reg_s = 0;
     auto prefetch = [&](const unsigned int k0) {
 #pragma unroll
         for (int it = 0; it < A_ITERS; it++)
             reg_a[it] = a_val[it] ? *(const uint4*)(a_ptr[it] + k0) : make_uint4(0, 0, 0, 0);
         if (b_ok) {
-            reg_c = *(const uint4*)(wc_row + k0 / 2); // 16 bytes = the K32's 32 codes
-            reg_s = *(const unsigned short*)(ws_row + k0 / 16); // both halves' scales
+            reg_c[0] = *(const uint4*)(wc_row + k0 / 2);      // first 32 codes
+            reg_c[1] = *(const uint4*)(wc_row + k0 / 2 + 16); // next 32
+            reg_s = *(const unsigned int*)(ws_row + k0 / 16); // all four halves' scales
         } else {
-            reg_c = make_uint4(0, 0, 0, 0);
+            reg_c[0] = reg_c[1] = make_uint4(0, 0, 0, 0);
             reg_s = 0;
         }
     };
     prefetch(0);
-    for (unsigned int k0 = 0; k0 < K; k0 += INK_GK) {
+    for (unsigned int k0 = 0; k0 < K; k0 += FGK) {
 #pragma unroll
         for (int it = 0; it < A_ITERS; it++)
             *(uint4*)((__nv_bfloat16*)As + a_off[it]) = reg_a[it];
@@ -276,14 +279,15 @@ __device__ __forceinline__ void ink_hip_gemm_tile_t2(
         // snapshot this step's codes/scales, issue the next global loads, then
         // dequant under them: reg_c / reg_s are the next K step's by the time
         // the fragments are built.
-        const uint4 cur_c = reg_c;
+        const uint4 cur_c[2] = {reg_c[0], reg_c[1]};
         const unsigned int cur_s = reg_s;
-        if (k0 + INK_GK < K) prefetch(k0 + INK_GK);
-        ink_v16bf b_frag[2];
+        if (k0 + FGK < K) prefetch(k0 + FGK);
+        ink_v16bf b_frag[4];
         {
-            const unsigned int w[4] = {cur_c.x, cur_c.y, cur_c.z, cur_c.w};
+            const unsigned int w[8] = {cur_c[0].x, cur_c[0].y, cur_c[0].z, cur_c[0].w,
+                                       cur_c[1].x, cur_c[1].y, cur_c[1].z, cur_c[1].w};
 #pragma unroll
-            for (int h = 0; h < 2; h++) {
+            for (int h = 0; h < 4; h++) {
                 const float s = ink_hip_e4m3((cur_s >> (8 * h)) & 0xFF) * g;
                 unsigned int pk[8];
 #pragma unroll
@@ -297,7 +301,7 @@ __device__ __forceinline__ void ink_hip_gemm_tile_t2(
         }
         {
             // 8 M fragments against this warp's single B fragment per half step.
-            for (int h = 0; h < 2; h++) {
+            for (int h = 0; h < 4; h++) {
 #pragma unroll
                 for (int im = 0; im < 8; im++) {
                     if (m0 + im * 16 < m_count) {
