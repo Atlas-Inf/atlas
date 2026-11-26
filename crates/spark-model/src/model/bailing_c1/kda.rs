@@ -61,33 +61,38 @@ fn regresident_prefill() -> bool {
 }
 
 /// `ATLAS_LING_PROJ_GEMM_MIN_ROWS`: the smallest chunk the prefill
-/// projections take the house BF16 tensor-core GEMM for (cuBLASLt; the
-/// CUTLASS tiles of `ATLAS_BF16_GEMM_CUTLASS=1` from 256 rows inside
-/// `ops::bf16_gemm`). Default 16. Read once.
+/// projections take the BF16 tensor-core lane for. Default 16; `0` restores
+/// the scalar-only floor. The lane never touches cuBLASLt's heuristic
+/// first pick — the split-K it picked for these small-M shapes corrupted
+/// every projection from a serve's second request on (PR #131) — it takes
+/// the heuristic's in-order k-chain kernel instead, byte-identical to the
+/// scalar path at any row count, and falls back to the scalar floor when
+/// the runtime offers no k-chain for the shape or the library is absent.
+/// Read once.
 fn proj_gemm_min_rows() -> u32 {
     static MIN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *MIN.get_or_init(|| {
-        // DEFAULT OFF (u32::MAX never engages the tensor-core lane):
-        // from a serve's SECOND request on, the cuBLASLt algo the lane
-        // picked for these small-M shapes corrupted every projection (the
-        // first use, on freshly zeroed scratch, was correct) — short chat
-        // prompts committed 156892 (eot) as their first token and answered
-        // empty. Reproduces with spec on/off and both head dtypes;
-        // pre-zeroing the output D did NOT help, so the fault is inside
-        // the cuBLASLt call (suspect: per-lane workspace reuse by the
-        // split-K reduction), for the runtime owner. Opt-in with 16 to
-        // restore the packed-prefill lane.
-        std::env::var("ATLAS_LING_PROJ_GEMM_MIN_ROWS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(u32::MAX)
-            .max(1)
+        proj_gemm_min_rows_from(
+            std::env::var("ATLAS_LING_PROJ_GEMM_MIN_ROWS")
+                .ok()
+                .as_deref(),
+        )
     })
 }
 
-/// One prefill-shaped projection: the house BF16 tensor-core GEMM
-/// (`ops::bf16_gemm`, HF `[N, K]` weight layout) from the M threshold up,
-/// the scalar GEMM below it.
+/// The threshold resolution, split out for the unit test. `None` = env
+/// absent (default 16); `Some("0")` = the scalar-only floor (u32::MAX);
+/// `Some(other)` = that row count, clamped to >= 1.
+fn proj_gemm_min_rows_from(v: Option<&str>) -> u32 {
+    match v {
+        None => 16,
+        Some("0") => u32::MAX,
+        Some(s) => s.parse::<u32>().ok().unwrap_or(16).max(1),
+    }
+}
+
+/// One prefill-shaped projection: the BF16 tensor-core lane from the M
+/// threshold up, the scalar GEMM below it.
 #[allow(clippy::too_many_arguments)]
 fn proj_gemm(
     gpu: &dyn GpuBackend,
@@ -101,10 +106,33 @@ fn proj_gemm(
     stream: u64,
 ) -> Result<()> {
     if rows >= proj_gemm_min_rows() {
-        ops::bf16_gemm(input, weight.weight.0, output, rows, n, k_dim, stream)
-    } else {
-        ops::dense_gemm(gpu, k.gemm_k, input, weight, output, rows, n, k_dim, stream)
+        // The in-order k-chain (`_any`: the heuristic's first in-order
+        // m16n8k16 kernel, tiles 256x128 / 128x256 / 128x64 / 64x256 / 64x64).
+        // Byte-identical to the scalar path over the same operands and
+        // never a split-K. A declined or unavailable lane falls back to the
+        // scalar floor below — the heuristic's first pick is not a valid
+        // option for these shapes (PR #131).
+        let kchain_ok = spark_runtime::cublaslt::bf16_gemm_act_weight_t_kchain_any(
+            input.0,
+            weight.weight.0,
+            output.0,
+            [rows, n, k_dim],
+            stream,
+        )
+        .unwrap_or_else(|e| {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "ling prefill TC lane unavailable ({e}); projections fall back to the scalar path"
+                );
+            }
+            false
+        });
+        if kchain_ok {
+            return Ok(());
+        }
     }
+    ops::dense_gemm(gpu, k.gemm_k, input, weight, output, rows, n, k_dim, stream)
 }
 
 pub(crate) struct LingKdaWeights {
@@ -1111,5 +1139,47 @@ impl TransformerLayer for LingKdaLayer {
     /// switch off the family stays eager, as before.
     fn decode_graph_unsupported(&self) -> bool {
         !crate::model::graph_flags::ling_decode_graph()
+    }
+}
+
+#[cfg(test)]
+mod proj_gemm_threshold_tests {
+    use super::proj_gemm_min_rows_from;
+
+    #[test]
+    fn default_is_16_and_zero_restores_the_floor() {
+        assert_eq!(proj_gemm_min_rows_from(None), 16);
+        assert_eq!(proj_gemm_min_rows_from(Some("0")), u32::MAX);
+    }
+
+    #[test]
+    fn explicit_values_engage_at_their_row_count() {
+        assert_eq!(proj_gemm_min_rows_from(Some("16")), 16);
+        assert_eq!(proj_gemm_min_rows_from(Some("3")), 3);
+        assert_eq!(proj_gemm_min_rows_from(Some("8192")), 8192);
+    }
+
+    #[test]
+    fn unparsable_falls_back_to_default() {
+        assert_eq!(proj_gemm_min_rows_from(Some("not-a-number")), 16);
+    }
+
+    /// The lane must never route back through the heuristic first pick
+    /// (the split-K path that corrupted small-M projections, PR #131).
+    #[test]
+    fn lane_is_kchain_never_the_heuristic_first_pick() {
+        let src = include_str!("kda.rs");
+        assert!(src.contains("bf16_gemm_act_weight_t_kchain_any"));
+        let body = src
+            .splitn(2, "fn proj_gemm(")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(
+            !body.contains("ops::bf16_gemm("),
+            "proj_gemm must never call the heuristic first-pick lane"
+        );
     }
 }
