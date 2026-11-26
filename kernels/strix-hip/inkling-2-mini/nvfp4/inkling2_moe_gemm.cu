@@ -112,44 +112,53 @@ __device__ __forceinline__ void ink_hip_gemm_tile(
         }
     };
 
+    // The next K32's weights are dequantised into packed registers under this
+    // step's WMMAs (its global loads issued first, so the codes have landed by
+    // the time the ALU work runs), and staged to LDS at the top of the next
+    // step: between the two barriers remain only the smem stores.
+    uint4 reg_pk[2];
+    auto dequant = [&]() {
+        float v[16];
+        if (b_ok) {
+            const unsigned int w[4] = {reg_q.x, reg_q.y, reg_q.z, reg_q.w};
+            if (MX) {
+                const float s = exp2f((float)reg_s - 127.0f);
+#pragma unroll
+                for (int i = 0; i < 16; i++) v[i] = ink_hip_e4m3((w[i / 4] >> (8 * (i % 4))) & 0xFF) * s;
+            } else {
+                const float s = ink_hip_e4m3(reg_s) * g;
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    const unsigned int byte = (w[i / 4] >> (8 * (i % 4))) & 0xFF;
+                    v[2 * i] = lut[byte & 0xF] * s;
+                    v[2 * i + 1] = lut[byte >> 4] * s;
+                }
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 16; i++) v[i] = 0.0f;
+        }
+        unsigned int pk[8];
+#pragma unroll
+        for (int i = 0; i < 8; i++)
+            pk[i] = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v[2 * i])) |
+                    ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(v[2 * i + 1])) << 16);
+        reg_pk[0] = make_uint4(pk[0], pk[1], pk[2], pk[3]);
+        reg_pk[1] = make_uint4(pk[4], pk[5], pk[6], pk[7]);
+    };
+
     prefetch(0);
+    dequant();
     for (unsigned int k0 = 0; k0 < K; k0 += INK_GK) {
 #pragma unroll
         for (int it = 0; it < A_ITERS; it++)
             *(uint4*)((__nv_bfloat16*)As + a_off[it]) = reg_a[it];
-        // weights: thread t dequantises row t / 2, half t % 2 (16 values, one NVFP4 scale)
-        {
-            float v[16];
-            if (b_ok) {
-                const unsigned int w[4] = {reg_q.x, reg_q.y, reg_q.z, reg_q.w};
-                if (MX) {
-                    const float s = exp2f((float)reg_s - 127.0f);
-#pragma unroll
-                    for (int i = 0; i < 16; i++) v[i] = ink_hip_e4m3((w[i / 4] >> (8 * (i % 4))) & 0xFF) * s;
-                } else {
-                    const float s = ink_hip_e4m3(reg_s) * g;
-#pragma unroll
-                    for (int i = 0; i < 8; i++) {
-                        const unsigned int byte = (w[i / 4] >> (8 * (i % 4))) & 0xFF;
-                        v[2 * i] = lut[byte & 0xF] * s;
-                        v[2 * i + 1] = lut[byte >> 4] * s;
-                    }
-                }
-            } else {
-#pragma unroll
-                for (int i = 0; i < 16; i++) v[i] = 0.0f;
-            }
-            unsigned int pk[8];
-#pragma unroll
-            for (int i = 0; i < 8; i++)
-                pk[i] = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v[2 * i])) |
-                        ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(v[2 * i + 1])) << 16);
-            uint4* dst = (uint4*)&Bs[br][bh * 16];
-            dst[0] = make_uint4(pk[0], pk[1], pk[2], pk[3]);
-            dst[1] = make_uint4(pk[4], pk[5], pk[6], pk[7]);
-        }
+        uint4* dst = (uint4*)&Bs[br][bh * 16];
+        dst[0] = reg_pk[0];
+        dst[1] = reg_pk[1];
         __syncthreads();
-        if (k0 + INK_GK < K) prefetch(k0 + INK_GK);
+        const bool more = k0 + INK_GK < K;
+        if (more) prefetch(k0 + INK_GK);
         if (m0 + wm < m_count) {
 #pragma unroll
             for (int kk = 0; kk < INK_GK; kk += 16) {
@@ -159,6 +168,7 @@ __device__ __forceinline__ void ink_hip_gemm_tile(
                     acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, ink_ld16(&Bs[wn + j * 16 + (lane & 15)][kk]), acc[j]);
             }
         }
+        if (more) dequant();
         __syncthreads();
     }
     if (!SW) {
