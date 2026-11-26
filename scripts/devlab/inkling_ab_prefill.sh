@@ -17,6 +17,28 @@ HFC=${HF_HOME:-$HOME/.cache/huggingface}
 log() { echo "[$(date -u +%H:%M:%SZ)] $*" | tee -a "$RES"; }
 log "ab-prefill: B=$(git rev-parse --short=9 HEAD) vs A=$PARENT  host $(hostname)"
 
+# --- ISA stats for the touched kernels under this runner's hipcc --------------------------------------
+COMPAT=$PWD/crates/atlas-kernels/hip/compat
+HIPCC=$(command -v hipcc || echo /opt/rocm/bin/hipcc)
+for FP in kernels/strix-hip/inkling-2-mini/nvfp4/inkling2_moe_gemm.cu; do
+  [ -f "$FP" ] || continue
+  T=$(mktemp -d)
+  "$HIPCC" -x hip --genco --offload-arch=gfx1151 -O3 -I"$COMPAT" \
+    -include hip/hip_runtime.h -include atlas_hip_cache_hints.h -DHDIM=128 \
+    --save-temps=obj "$FP" -o "$T/x.co" >"$T/cc.log" 2>&1 || {
+      log "$(basename "$FP") compile FAILED: $(tail -3 "$T/cc.log")"; continue; }
+  S=$(ls "$T"/*-hip*.s 2>/dev/null | head -1)
+  [ -n "$S" ] && python3 - "$S" >> "$RES" <<'PY'
+import re,sys
+cur=None
+for ln in open(sys.argv[1]):
+    m=re.search(r'\.globl\s+(\S+)',ln)
+    if m: cur=m.group(1)
+    if cur and re.search(r'(vgpr_count|spill_count|group_segment_fixed_size|private_segment_fixed_size):',ln):
+        print(f"  isa {cur} {ln.strip()}")
+PY
+done
+
 git fetch --depth=50 origin "$PARENT" || { log "fetch $PARENT failed"; exit 2; }
 git worktree add --detach base FETCH_HEAD || { log "worktree add failed"; exit 2; }
 log "base worktree at $(git -C base rev-parse --short=9 HEAD); building A"
