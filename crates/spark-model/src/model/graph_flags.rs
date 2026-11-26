@@ -116,6 +116,16 @@ pub(crate) fn ling_graph_step_tick() {
     }
 }
 
+/// `ATLAS_LING_CAP_TRACE=1`: captured-mode per-layer fingerprints for the
+/// family's decode / K=2 verify graphs (`trait_impl/ling_cap_trace.rs`).
+/// Unlike every other diagnostic this one does NOT force its steps eager —
+/// the per-layer shadows bake INTO the capture; the flush runs after the
+/// replay. Strict `== "1"`, read once.
+pub(crate) fn ling_cap_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_LING_CAP_TRACE").as_deref() == Ok("1"))
+}
+
 /// `ATLAS_LING_DECODE_GRAPH_DEBUG_STAGE=1`: the bailing family prestages its
 /// step metadata (`TransformerLayer::decode_meta_prestage`) and the Ling
 /// layers read the staging EAGERLY, without capturing — the in-process A/B
@@ -123,16 +133,27 @@ pub(crate) fn ling_graph_step_tick() {
 /// Strict `== "1"`, read once.
 pub(crate) fn ling_graph_stage_debug() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("ATLAS_LING_DECODE_GRAPH_DEBUG_STAGE").as_deref() == Ok("1")
-    })
+    *ON.get_or_init(|| std::env::var("ATLAS_LING_DECODE_GRAPH_DEBUG_STAGE").as_deref() == Ok("1"))
 }
 
-/// Whether the dispatches WRITE the Ling family's staged metadata this step:
-/// the family switch or its staging-debug arm is on. Read once per process.
+/// Whether the dispatches WRITE the Ling family's staged metadata this
+/// step: the family switch or its staging-debug arm is on.
+///
+/// LIVE, not latched: `ling_decode_graph()`'s arming is step-counter
+/// dependent, so a `OnceLock` snapshot taken at the FIRST read freezes the
+/// pre-arming answer. With `ATLAS_LING_DECODE_GRAPH_ARM_AFTER >= 2` the
+/// first dispatch tick lands before the threshold, the snapshot latched
+/// false, and the staging writes NEVER ran again — while the layer vetoes
+/// (fresh reads) dropped at the threshold and both layer kinds captured
+/// into `ling_meta_staged` reads of staging buffers nobody had written.
+/// That was the ARM-after replay nondeterminism: stale scratch contents
+/// baked into the capture and replayed, alternating with the scratch
+/// residue of whatever last touched the buffers (the period-2 attractor).
+/// The consumption gate (`ling_meta_staged`) always intended "the dispatch
+/// wrote the staging for THIS configuration"; now writes really do track
+/// the arming per step.
 pub(crate) fn ling_staging_writes() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| ling_decode_graph() || ling_graph_stage_debug())
+    ling_decode_graph() || ling_graph_stage_debug()
 }
 
 /// Whether a Ling layer consumes the staged metadata on THIS forward: a

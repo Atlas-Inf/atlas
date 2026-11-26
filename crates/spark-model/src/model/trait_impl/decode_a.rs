@@ -334,6 +334,7 @@ impl TransformerModel {
             && graph.0 != 0
         {
             self.gpu.launch_graph(*graph, stream)?;
+            self.ling_cap_trace_flush("dec", seq, 1, stream)?;
             seq.tokens.push(token);
             seq.seq_len += 1;
             return Ok(self.decode_logits_ptr());
@@ -476,6 +477,7 @@ impl TransformerModel {
             }
         }
 
+        self.ling_cap_trace_flush("dec", seq, 1, stream)?;
         seq.tokens.push(token);
         seq.seq_len += 1;
 

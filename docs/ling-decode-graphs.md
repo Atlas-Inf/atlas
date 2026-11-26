@@ -16,6 +16,38 @@ slot-pool prerequisite (PR #129) is merged; what this slice landed on top:
   eagerly — the fallback machinery works as designed);
 - the in-process A/B lever `ATLAS_LING_DECODE_GRAPH_ARM_AFTER=<steps>`.
 
+Two follow-up findings, both root-caused and fixed since the flip:
+
+- **Re-capture storm** (PR #133, merged): `free_sequence` ->
+  `invalidate_slot_graphs` dropped the slot-keyed graphs on every free.
+  That teardown is required for qwen/GLM (their captures bake per-seq state
+  freed with the sequence); the Ling family's captures are slot-pure and
+  serve-static, so it now keeps them (`ling_slot_graphs_retained`).
+- **`ARM_AFTER` staging latch** (the replay nondeterminism): the stage-WRITE
+  gate `ling_staging_writes` snapshotted `ling_decode_graph()` (arming is
+  step-counter-dependent) in a `OnceLock` at its FIRST read. With
+  `ARM_AFTER >= 2` the first tick lands below the threshold, the snapshot
+  latches false, and the staged-metadata writes never run — while the
+  vetoes and the stage-READ gate read the arming LIVE, so both layer kinds
+  captured into reads of staging nobody wrote. Every capture/replay from
+  the threshold on computed against stale scratch (the period-2 attractor
+  and the flat determinism in the follow-up windows). The gate is now
+  evaluated per step; the pool agent ARM_AFTER table (`arm2`/`arm16`
+  broken, `arm1` green) flips all-green with the fix.
+
+Two more follow-ups on the same wheel (the second red finding, in
+flight): the ARM-after spec-arm residual traced to the K=2 verify's
+ATTENTION dispatch: the gated-MLA layer has no `decode_multi_seq_rows`
+override, so the default per-row loop ran the captured rows against the
+staged ROW-0 metadata (draft rows keyed to row-0 positions — fingerprint
+dumps read `pos=[base, 1]` at every verify), and the eager arm masked it
+by re-uploading per row. Fix: the single-owner verify window fans through
+`decode_batched` — the multi-row staged arm, matching the SSM side of the
+verify. Same wheel, adjacent spoke: `kv_only_rows` capped its absolute
+position at the scratch ROW count, refusing every drafter-context chunk
+past it (`64 rows at 128 exceed the scratch cap`) — speculation silently
+died on real-context prompts; the bound is now the chunk width only.
+
 Target: >= 36 tok/s single-stream greedy on one GB10 Spark (vLLM
 single-node 35.8) — an nsys 50 ms decode step dominated by launch overhead
 plus the M=2 verify projections.

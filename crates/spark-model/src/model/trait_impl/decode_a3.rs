@@ -60,6 +60,7 @@ impl TransformerModel {
                 stream,
             )?;
             self.trace_lightning_hidden_rows("m1", seq.seq_len, i, hidden, 1, stream)?;
+            self.ling_cap_trace_capture(i, hidden, 1, stream)?;
             // CBD per-layer hidden fingerprint at decode step 0 (eager only).
             // Localizes the FIRST layer whose post-layer hidden diverges
             // cold-vs-ON / ON-vs-ON → pins the bug to that layer's read set.

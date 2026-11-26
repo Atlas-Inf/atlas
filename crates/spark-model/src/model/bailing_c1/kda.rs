@@ -34,7 +34,6 @@
 //! step of that sequence, just not shared across steps like the indexed
 //! pair is).
 
-
 use std::sync::Arc;
 
 use anyhow::Result;

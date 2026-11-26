@@ -442,11 +442,8 @@ pub fn build_model(
     // its proposer after construction. Rank 0 only: no other rank drafts.
     let ling_mtp_module =
         if config.model_type == "bailing_moe_v3_vl" && use_speculative && config.ep_rank == 0 {
-            match crate::weight_loader::bailing::load_ling_mtp_module(
-                &store,
-                &config,
-                gpu.as_ref(),
-            ) {
+            match crate::weight_loader::bailing::load_ling_mtp_module(&store, &config, gpu.as_ref())
+            {
                 Ok(m) => {
                     if m.is_some() {
                         tracing::info!(

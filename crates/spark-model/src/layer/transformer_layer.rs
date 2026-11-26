@@ -283,6 +283,12 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
+    /// Debug (`ATLAS_LING_CAP_TRACE`): dump this layer's staged step
+    /// metadata and pool fingerprints for the traced step. No-op on every
+    /// layer family but the Ling gated-MLA.
+    fn ling_cap_dump_meta(&self, _gpu: &dyn GpuBackend, _blocks: &[u32], _stream: u64, _tag: &str) {
+    }
+
     /// True when [`Self::decode_graph_unsupported`] is an indexer whose only
     /// step-dependent work, inside its inert bound, is the ingest a staged
     /// run splits off (`layers/qsa_staged.rs`): the qwen4_exp piecewise

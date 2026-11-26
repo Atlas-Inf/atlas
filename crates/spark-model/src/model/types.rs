@@ -233,6 +233,10 @@ pub struct TransformerModel {
     pub(super) max_blocks_per_seq: u32,
     /// Permanent KV cache block for padding sequences in batched decode.
     pub(super) dummy_kv_block: u32,
+    /// Debug slab for `ATLAS_LING_CAP_TRACE=1` captured-mode per-layer
+    /// fingerprints (`trait_impl/ling_cap_trace.rs`). Never written with
+    /// the flag off; allocated once on first traced step.
+    pub(super) ling_cap_trace_slab: std::sync::OnceLock<spark_runtime::gpu::DevicePtr>,
     /// Profile mode: skip graphs, sync+time each layer. Set ATLAS_PROFILE=1.
     pub(super) profile: bool,
     /// One-shot profile flag for the next prefill request only. Set

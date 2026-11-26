@@ -95,6 +95,15 @@ fn proj_gemm_min_rows() -> u32 {
 /// One prefill-shaped projection: the house BF16 tensor-core GEMM
 /// (`ops::bf16_gemm`) from the M threshold up, the scalar one below it.
 #[allow(clippy::too_many_arguments)]
+/// Whether a `decode_multi_seq_rows` window is `num_rows` rows of ONE
+/// sequence: exactly one state and every row names it (the MTP verify's
+/// `row_owner = [0; k]` with the sequence's own layer state). Distinct
+/// sequences per row (the a2 multi-request lane) keep the trait's default
+/// per-row loop.
+fn single_owner_window(states_len: usize, row_owner: &[usize]) -> bool {
+    states_len == 1 && !row_owner.is_empty() && row_owner.iter().all(|&o| o == 0)
+}
+
 fn proj_gemm(
     gpu: &dyn GpuBackend,
     k: &LingKernels,
@@ -215,11 +224,7 @@ impl LingMlaLayer {
     /// per-pass scratch — the gather refills the prefix from the paged
     /// pools every prefill call — so growth never changes correctness,
     /// only capacity.
-    fn ctx_pools(
-        &self,
-        gpu: &dyn GpuBackend,
-        need_rows: usize,
-    ) -> Result<Option<CtxPools>> {
+    fn ctx_pools(&self, gpu: &dyn GpuBackend, need_rows: usize) -> Result<Option<CtxPools>> {
         if need_rows > MAX_PREFILL_ROWS {
             return Ok(None);
         }
@@ -287,37 +292,13 @@ impl LingMlaLayer {
             )?;
         } else {
             proj_gemm(
-                gpu,
-                k,
-                normed,
-                &w.q_proj,
-                s.mla_q,
-                rows,
-                q_row,
-                hidden,
-                stream,
+                gpu, k, normed, &w.q_proj, s.mla_q, rows, q_row, hidden, stream,
             )?;
             proj_gemm(
-                gpu,
-                k,
-                normed,
-                &w.kv_a,
-                s.mla_kv_a,
-                rows,
-                kv_dim,
-                hidden,
-                stream,
+                gpu, k, normed, &w.kv_a, s.mla_kv_a, rows, kv_dim, hidden, stream,
             )?;
             ops::dense_gemm(
-                gpu,
-                k.gemm_k,
-                normed,
-                &w.g_proj,
-                s.mla_g,
-                rows,
-                self.heads,
-                hidden,
-                stream,
+                gpu, k.gemm_k, normed, &w.g_proj, s.mla_g, rows, self.heads, hidden, stream,
             )?;
         }
         Ok(())
@@ -374,7 +355,11 @@ impl LingMlaLayer {
         let k = &self.kernels;
         let row_tile = rows.min(64);
         KernelLaunch::new(gpu, k.mla_q_absorb_k)
-            .grid([self.heads, div_ceil(self.kv_lora, 256), div_ceil(rows, row_tile)])
+            .grid([
+                self.heads,
+                div_ceil(self.kv_lora, 256),
+                div_ceil(rows, row_tile),
+            ])
             .block([256, 1, 1])
             .arg_ptr(s.mla_q)
             .arg_ptr(self.weights.w_uk.weight)
@@ -574,7 +559,14 @@ impl LingMlaLayer {
     ) -> Result<()> {
         let (block_size, _) = self.kernel_checks(kv_cache)?;
         KernelLaunch::new(gpu, self.kernels.mla_ctx_gather_k)
-            .grid([div_ceil(kv_base as u32 * (MLA_K_ROW_BF16 + MLA_V_ROW_BF16) as u32, 256), 1, 1])
+            .grid([
+                div_ceil(
+                    kv_base as u32 * (MLA_K_ROW_BF16 + MLA_V_ROW_BF16) as u32,
+                    256,
+                ),
+                1,
+                1,
+            ])
             .block([256, 1, 1])
             .arg_ptr(kv_cache.k_pool_ptr(self.attn_idx))
             .arg_ptr(v_pool)
@@ -642,10 +634,7 @@ impl LingMlaLayer {
             );
             gpu.copy_h2d_async(
                 unsafe {
-                    std::slice::from_raw_parts(
-                        table_i32.as_ptr() as *const u8,
-                        table_i32.len() * 4,
-                    )
+                    std::slice::from_raw_parts(table_i32.as_ptr() as *const u8, table_i32.len() * 4)
                 },
                 s.mla_block_table,
                 stream,
@@ -729,9 +718,18 @@ impl LingMlaLayer {
         let k = &self.kernels;
         let hidden_w = s.hidden as u32;
         let rows_u32 = rows as u32;
+        // `seq_len_start` is an ABSOLUTE sequence position — the NEXTN
+        // drafter's context prefill walks the whole prompt in chunks, so any
+        // position-constrained bound here refuses every chunk past the
+        // scratch row count ("64 rows at 128 exceed the scratch cap" —
+        // speculation silently died for real-context prompts and the serve
+        // fell to serial decode). Only the CHUNK width occupies scratch;
+        // positions beyond the table fail properly in `upload_meta` when
+        // the block table is shorter than the chunk's last position.
         ensure!(
-            rows <= s.rows && seq_len_start + rows <= s.rows,
-            "ling MLA kv-only: {rows} rows at {seq_len_start} exceed the scratch cap"
+            rows <= s.rows,
+            "ling MLA kv-only: {rows} rows exceed the scratch cap {cap}",
+            cap = s.rows
         );
         ops::rms_norm(
             gpu,
@@ -853,14 +851,7 @@ impl LingMlaLayer {
         )?;
         self.q_absorb(gpu, rows_u32, positions, stream)?;
         if whole_prompt && seq_len_start == 0 {
-            self.prefill_attn_contig(
-                gpu,
-                s.mla_k_contig,
-                s.mla_v_contig,
-                rows_u32,
-                0,
-                stream,
-            )?;
+            self.prefill_attn_contig(gpu, s.mla_k_contig, s.mla_v_contig, rows_u32, 0, stream)?;
         } else {
             // Continuing chunk: 8-row groups over the paged cache. A staged
             // step reads the prestaged base_len/table instead (`staged`
@@ -1069,6 +1060,71 @@ impl TransformerLayer for LingMlaLayer {
     /// serves rows 1..=8 with per-row causal over the just-written block —
     /// PR #112's verify-row support), base_len naming the entries before
     /// the window. A single row runs the plain decode path unchanged.
+    /// The K=2 MTP verify arrives here as `num_rows` rows of ONE sequence:
+    /// `row_owner` all-zero, one shared layer state. The trait default
+    /// would decode each row separately — correct eagerly (each row
+    /// uploads its own position), exactly wrong under a captured graph:
+    /// the staged arm keys every row to the ROW-0 entries of the
+    /// prestaged metadata (`ling_meta_staged` carries no row index), so
+    /// draft/bonus rows computed at the row-0 position. That was the
+    /// ARM-after replay nondeterminism — the first divergence lands at
+    /// the FIRST gated-MLA layer's verify (`ATLAS_LING_CAP_TRACE` staged
+    /// dumps read `pos=[base, 1]`: row 1 keyed to warmup-era staging).
+    /// Fan the single-owner window through the multi-row arm instead —
+    /// the same `decode_batched` route the verify's SSM branch already
+    /// takes — so an eager or captured step alike reads the `rows`-wide
+    /// prestage Phase 1 wrote (`decode_meta_prestage(rows = k)`):
+    /// positions/slots/base_len/block table as a K-row window.
+    fn decode_multi_seq_rows<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_rows: usize,
+        seq_states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        row_owner: &[usize],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if single_owner_window(seq_states.len(), row_owner) {
+            let mut block_table = block_tables.first().cloned().unwrap_or_default();
+            let mut disk_block_ids = Vec::new();
+            let mut disk_last = Vec::new();
+            return self.decode_batched(
+                hidden,
+                residual,
+                num_rows,
+                seq_states[0],
+                kv_cache,
+                seq_lens.first().copied().unwrap_or(0),
+                &mut block_table,
+                &mut disk_block_ids,
+                &mut disk_last,
+                ctx,
+                stream,
+            );
+        }
+        let mut owned: Vec<Box<dyn LayerState>> = (0..num_rows)
+            .map(|_| self.alloc_state(ctx.gpu))
+            .collect::<Result<_>>()?;
+        let mut refs: Vec<&mut (dyn LayerState + 'static)> =
+            owned.iter_mut().map(|s| s.as_mut()).collect();
+        self.decode_multi_seq(
+            hidden,
+            residual,
+            num_rows,
+            num_rows,
+            &mut refs,
+            kv_cache,
+            seq_lens,
+            block_tables,
+            ctx,
+            stream,
+        )
+    }
+
     fn decode_batched(
         &self,
         hidden: DevicePtr,
@@ -1210,8 +1266,111 @@ impl TransformerLayer for LingMlaLayer {
         !crate::model::graph_flags::ling_decode_graph()
     }
 
+    /// `ATLAS_LING_CAP_TRACE` readset dump: the staged metadata values
+    /// (positions/slots/base_len plus a slice of the staged block table,
+    /// tail garbage included) and one FNV per physical block of the
+    /// layer-owned V-latent pool (block size 64, the served config).
+    fn ling_cap_dump_meta(&self, gpu: &dyn GpuBackend, blocks: &[u32], stream: u64, tag: &str) {
+        let s = &self.scratch;
+        let mut pos = [0u8; 32];
+        let mut slots = [0u8; 32];
+        let mut base = [0u8; 4];
+        let mut tbl = [0u8; 132 * 4];
+        let _ = gpu.synchronize(stream);
+        let has = gpu.copy_d2h(s.mla_pos, &mut pos).is_ok()
+            && gpu.copy_d2h(s.mla_slots, &mut slots).is_ok()
+            && gpu.copy_d2h(s.mla_base_len, &mut base).is_ok()
+            && gpu.copy_d2h(s.mla_block_table, &mut tbl).is_ok();
+        if !has {
+            return;
+        }
+        let posv: Vec<u32> = pos
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let slotv: Vec<i64> = slots
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let tblv: Vec<i32> = tbl
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let basev = u32::from_le_bytes(base);
+        let mut vhs = String::new();
+        let v_pool = *self.v_pool.lock();
+        if let Some(v_pool) = v_pool {
+            let bbytes = 64 * MLA_V_ROW_BF16 * 2;
+            let mut buf = vec![0u8; bbytes];
+            for &b in blocks {
+                if gpu
+                    .copy_d2h(v_pool.offset((b as usize) * bbytes), &mut buf)
+                    .is_err()
+                {
+                    vhs.push('?');
+                    continue;
+                }
+                if !vhs.is_empty() {
+                    vhs.push(',');
+                }
+                vhs.push_str(&format!(
+                    "{}:{:016x}",
+                    b,
+                    crate::model::trait_impl::ling_cap_trace::ling_cap_fnv1a(&buf)
+                ));
+            }
+        } else {
+            vhs.push_str("NOPOOL");
+        }
+        tracing::warn!(
+            "LING_CAP_META[{tag}] pos={:?} slots={:?} base={} tbl[0..10]={:?} vpool=[{}]",
+            &posv[..2],
+            &slotv[..2],
+            basev,
+            &tblv[..10],
+            vhs
+        );
+    }
+
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
+    }
+}
+
+#[cfg(test)]
+mod verify_rows_routing_tests {
+    use super::single_owner_window;
+
+    #[test]
+    fn mtp_verify_window_is_single_owner() {
+        // The K=2 verify: k rows, one shared state, every row owner 0.
+        assert!(single_owner_window(1, &[0]));
+        assert!(single_owner_window(1, &[0, 0]));
+    }
+
+    #[test]
+    fn distinct_owners_and_degenerate_windows_are_not() {
+        // The a2 multi-request lane names different states per row.
+        assert!(!single_owner_window(1, &[0, 1]));
+        assert!(!single_owner_window(2, &[0, 1]));
+        assert!(!single_owner_window(2, &[0, 0]));
+        // No rows to own: keep the default loop.
+        assert!(!single_owner_window(1, &[]));
+    }
+
+    /// The verify must keep fanning single-owner windows through the
+    /// multi-row arm — if this file ever loses the override, the captured
+    /// draft rows key to row-0 staging and the replay diverges (see the
+    /// override's doc comment).
+    #[test]
+    fn decode_multi_seq_rows_overrides_the_default_loop() {
+        let src = include_str!("mla.rs");
+        assert!(src.contains("fn decode_multi_seq_rows"));
+        assert!(src.contains("single_owner_window(seq_states.len()"));
+        assert!(
+            src.contains("return self.decode_batched("),
+            "single-owner windows must fan through decode_batched"
+        );
     }
 }
 

@@ -47,7 +47,6 @@ pub use kernel_pick::*;
 
 pub(crate) use deepseek_v4_mtp::argmax_grammar_masked;
 pub use deepseek_v4_mtp::{DeepseekV4MtpHead, DeepseekV4MtpProposerState};
-pub use ling_mtp::{LingMtpHead, LingMtpProposerState};
 pub use dense_ffn::{DenseFfnLayer, DenseFfnWeights, FfnActivation};
 pub use dflash_head::{
     BlockDiffusionDraftHead, DflashLayer, DflashProposerState, DflashQuantization,
@@ -57,6 +56,7 @@ pub(crate) use glm5_kda::{
     kda_batched_ffn_enabled, kda_conv_planes_enabled, kda_flash_prefill_word,
     kda_multi_seq_enabled, kda_side_proj_lt_enabled, verify_fused_tp_hc_enabled,
 };
+pub use ling_mtp::{LingMtpHead, LingMtpProposerState};
 pub use moe::MoeLayer;
 pub use moe_grouped_decode::{
     moe_grouped_decode_decide, moe_grouped_decode_enabled, moe_grouped_decode_for,
