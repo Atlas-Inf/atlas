@@ -720,6 +720,7 @@ pub fn run(
         let t_loop = std::time::Instant::now();
         let prefill_queue_was_empty = prefilling.is_empty();
         let in_flight_before = active.len() + prefilling.len();
+        let decoding_before = !active.is_empty();
         ttft_trace::begin_tick();
         start_new_requests(
             &*model,
@@ -771,19 +772,23 @@ pub fn run(
                 .map_or(num_drafts, |max| num_drafts.min(max)),
             dflash_verify_raw_argmax: use_mtp && dflash_verify_raw_argmax,
         };
-        // Under EP a new prompt's first chunk ran inline just above. End
-        // the tick before its second chunk: decoders get their step, and
-        // prompts that arrived during the first chunk are admitted at the
-        // next boundary (two back-to-back 8K chunks held both ~6 s).
+        // A new prompt's first chunk ran inline just above. Under EP, or
+        // while sequences were decoding, end the tick before its second
+        // chunk: decoders get their step, and prompts that arrived during
+        // the first chunk are admitted at the next boundary (two
+        // back-to-back 8K chunks held both ~6 s under EP; on Inkling 2 Mini
+        // a stream beside a 32K-token prompt waited 3.47 s for two 8K
+        // chunks, 2.09 s for one).
         // (ATLAS_GLM_WARM_CHUNK_RUN: not when that chunk computed nothing.
         // ATLAS_GLM_PREFILL_YIELD_MS: nor when it queued its first chunk for
         // the continue phase, which then ran nothing yet.)
-        let head_just_started = (model.is_ep() || phase_continue_prefills::decode_share::enabled())
-            && prefill_queue_was_empty
-            && prefilling.first().is_some_and(|p| {
-                !phase_continue_prefills::follows_first_chunk(p)
-                    && !phase_continue_prefills::layer_yield::queued(&sched.levers, &*model, p)
-            });
+        let head_just_started =
+            (model.is_ep() || decoding_before || phase_continue_prefills::decode_share::enabled())
+                && prefill_queue_was_empty
+                && prefilling.first().is_some_and(|p| {
+                    !phase_continue_prefills::follows_first_chunk(p)
+                        && !phase_continue_prefills::layer_yield::queued(&sched.levers, &*model, p)
+                });
         let did_mixed_step = !head_just_started
             && continue_in_progress_prefills(
                 &*model,
