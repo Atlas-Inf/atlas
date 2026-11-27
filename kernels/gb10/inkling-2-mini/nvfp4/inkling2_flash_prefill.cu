@@ -29,11 +29,16 @@
 //
 // grid (num_q_heads * ceil(q_len / 64)), block 128, dynamic shared memory FP_SMEM bytes.
 // HDIM 128, d_rel 16, num_q_heads a multiple of num_kv_heads, block_size a power of two.
+//
+// AMD (strix-hip) keeps the wave32 WMMA port of the previous kernel below: one CTA per
+// (KV head, 64 tokens), block 384, output left ungated for the caller's gate
+// (inkling2/attn_ops.rs launches it that way under cfg!(atlas_scale)).
 
 #if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
-// AMD (strix-hip) port of the flash body below onto wave32 bf16 WMMA
-// (gfx1151). Same tile geometry and semantics: CTA = (KV head, 64 query
-// rows), 12 warps = 3 query heads x 4 row-tiles of 16. K/V smem tiles are
+// AMD (strix-hip) port of the previous gb10 flash body (one KV head and 64
+// query rows a CTA, 32-key tiles, output ungated) onto wave32 bf16 WMMA
+// (gfx1151): CTA = (KV head, 64 query rows), 12 warps = 3 query heads x
+// 4 row-tiles of 16. K/V smem tiles are
 // shared by all three query heads of the group — one read serves 192 rows.
 // Register online softmax with the fragment layout's half-warp shfl
 // reductions (score element e of lane l is row 2e+(l>>4), col l&15), the
