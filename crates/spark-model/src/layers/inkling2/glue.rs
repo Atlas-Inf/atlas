@@ -467,35 +467,4 @@ impl GlueKernels {
             .arg_u32(n as u32)
             .launch(s)
     }
-
-    /// The window layers' KV slots and block tables for `rows` rows
-    /// (`inkling2_window_meta`): `meta`'s, through the window `map`.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn window_meta(
-        &self,
-        gpu: &dyn GpuBackend,
-        meta: &super::batch::Meta,
-        map: DevicePtr,
-        (local_slots, local_tables): (DevicePtr, DevicePtr),
-        rows: usize,
-        block_size: usize,
-        window: usize,
-        s: u64,
-    ) -> Result<()> {
-        let tables = if meta.table_stride == 0 { 1 } else { rows };
-        KernelLaunch::new(gpu, self.window_meta)
-            .grid([tables as u32, 1, 1])
-            .block([128, 1, 1])
-            .arg_ptr(meta.slots)
-            .arg_ptr(meta.positions)
-            .arg_ptr(meta.block_table)
-            .arg_ptr(map)
-            .arg_ptr(local_slots)
-            .arg_ptr(local_tables)
-            .arg_u32(rows as u32)
-            .arg_u32(meta.table_stride as u32)
-            .arg_u32(block_size as u32)
-            .arg_u32(window as u32)
-            .launch(s)
-    }
 }
