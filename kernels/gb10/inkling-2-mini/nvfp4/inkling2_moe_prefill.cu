@@ -218,8 +218,8 @@ extern "C" __global__ void __launch_bounds__(256, 2) inkling2_moe_fused_gate_up_
     float* __restrict__ partial, int* __restrict__ done,
     const int* __restrict__ offsets, const int* __restrict__ tiles, const int* __restrict__ rows,
     const unsigned int N, const unsigned int K, const float cg, const float cu) {
-    __shared__ __align__(16) W4Smem sm;
     atlas_pdl_enter();
+    __shared__ __align__(16) W4Smem sm;
     static_assert(sizeof(sm.a) + sizeof(sm.b) >= 128 * INK_GU_PITCH * 2 + 128 * sizeof(InkFp4Row), "staging");
     __nv_bfloat16 (*sw)[INK_GU_PITCH] = (__nv_bfloat16 (*)[INK_GU_PITCH])&sm.a[0][0][0];
     InkFp4Row* rinfo = (InkFp4Row*)((unsigned char*)&sm.a[0][0][0] + 128 * INK_GU_PITCH * 2);
@@ -313,8 +313,8 @@ extern "C" __global__ void __launch_bounds__(256, 2) inkling2_moe_fused_gate_up_
     unsigned char* __restrict__ q, unsigned char* __restrict__ s,
     const int* __restrict__ offsets, const int* __restrict__ tiles, const int* __restrict__ rows,
     const unsigned int N, const unsigned int K, const float cg, const float cu) {
-    __shared__ __align__(16) W4Smem sm;
     atlas_pdl_enter();
+    __shared__ __align__(16) W4Smem sm;
     __nv_bfloat16 (*sw)[INK_GU_PITCH] = (__nv_bfloat16 (*)[INK_GU_PITCH])&sm.a[0][0][0];
     // volatile: ptxas otherwise schedules this read before the PDL wait (as in
     // inkling2_moe_fused_gate_up_fp4), and the previous visit's count would decide
