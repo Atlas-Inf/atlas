@@ -13,7 +13,7 @@ use spark_runtime::kv_cache::PagedKvCache;
 
 use super::batch::Batch;
 use super::layer::Inkling2Layer;
-use super::ops::{self, DecodeAttn, HeadNorm};
+use super::ops::{self, DecodeAttn};
 use super::weights::{InputNorms, KvConv};
 use crate::layer::ForwardContext;
 
@@ -143,7 +143,11 @@ impl Inkling2Layer {
             None
         };
         if has_res {
-            let out = if in_norm.is_some() { DevicePtr::NULL } else { s.res3 };
+            let out = if in_norm.is_some() {
+                DevicePtr::NULL
+            } else {
+                s.res3
+            };
             self.block_res(
                 gpu,
                 n,
@@ -199,94 +203,24 @@ impl Inkling2Layer {
             let src_bf16 = if has_res { DevicePtr::NULL } else { x };
             let in_plane = if has_res { n * h } else { 0 };
             gm.rmsnorms(
-                gpu, n, src_f32, src_bf16, in_plane, &ws, normed(0), h, p.eps, stream,
+                gpu,
+                n,
+                src_f32,
+                src_bf16,
+                in_plane,
+                &ws,
+                normed(0),
+                h,
+                p.eps,
+                stream,
             )?;
         }
         self.project(gpu, n, exact, stream)?;
 
-        // k/v convs, then the per-head epilogues
         // each state: k, v, post-attention, post-MLP convs (fp32 elements)
         let kvs = d.kv_dim * (p.conv_k - 1);
         let hs = h * (p.conv_k - 1);
-        self.journal_inputs(gpu, batch, [s.k_lin, s.v_lin], 0, stream)?;
-        self.conv(
-            gpu,
-            n,
-            seqs,
-            s.k_lin,
-            ops::ConvOut::Plain(s.kc),
-            states,
-            0,
-            w.k_conv,
-            s.dyn_k,
-            d.kv_dim,
-            p.head_dim,
-            stream,
-        )?;
-        self.conv(
-            gpu,
-            n,
-            seqs,
-            s.v_lin,
-            ops::ConvOut::Plain(s.vc),
-            states,
-            kvs,
-            w.v_conv,
-            s.dyn_v,
-            d.kv_dim,
-            p.head_dim,
-            stream,
-        )?;
-        let clip = HeadNorm::Clip {
-            threshold: p.qk_clip,
-        };
-        // full layers scale q and the relative-bias queries by log length
-        let log_pos = if v.full {
-            meta.positions
-        } else {
-            DevicePtr::NULL
-        };
-        self.head_norm(
-            gpu, n, s.q, s.qn, w.q_scale, log_pos, p.heads, p.head_dim, clip, stream,
-        )?;
-        self.head_norm(
-            gpu,
-            n,
-            s.kc,
-            s.kn,
-            DevicePtr::NULL,
-            DevicePtr::NULL,
-            p.kv_heads,
-            p.head_dim,
-            clip,
-            stream,
-        )?;
-        self.head_norm(
-            gpu,
-            n,
-            s.vc,
-            s.vn,
-            DevicePtr::NULL,
-            DevicePtr::NULL,
-            p.kv_heads,
-            p.head_dim,
-            HeadNorm::Rms { eps: p.eps },
-            stream,
-        )?;
-        self.head_norm(
-            gpu,
-            n,
-            s.r,
-            s.rn,
-            w.rel_scale,
-            log_pos,
-            p.heads,
-            p.d_rel,
-            HeadNorm::Clip {
-                threshold: p.rel_clip,
-            },
-            stream,
-        )?;
+        self.kv_convs_and_head_norms(gpu, batch, states, meta.positions, stream)?;
 
         // KV of every row first, then each row attends over its own prefix
         let (k_pool, v_pool) = (
