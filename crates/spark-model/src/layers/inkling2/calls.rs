@@ -19,7 +19,7 @@ impl Inkling2Layer {
         n: usize,
         num_seqs: usize,
         x: DevicePtr,
-        out: DevicePtr,
+        out: ops::ConvOut,
         states: DevicePtr,
         state_offset: usize,
         conv: KvConv,
@@ -67,7 +67,7 @@ impl Inkling2Layer {
         partial_bf16: DevicePtr,
         queries: DevicePtr,
         nq: usize,
-        (out, sq): (DevicePtr, DevicePtr),
+        (out, sq, norm): (DevicePtr, DevicePtr, Option<ops::ResNorm>),
         stream: u64,
     ) -> Result<()> {
         ops::block_res(
@@ -87,6 +87,7 @@ impl Inkling2Layer {
                 num_queries: nq,
                 sums: self.shared.res_sums,
                 sq,
+                norm,
                 eps: 1e-6,
             },
             stream,

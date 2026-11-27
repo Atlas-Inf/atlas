@@ -9,8 +9,6 @@ pub(super) const INKLING2_PDL_KERNELS: &[&str] = &[
     "inkling2_rmsnorm",
     "inkling2_head_norm",
     "inkling2_gate_mul",
-    "inkling2_residual",
-    "inkling2_layer_out",
     "inkling2_f32_to_bf16",
     "inkling2_window_meta",
     "inkling2_sconv",

@@ -4,8 +4,6 @@
 // PR #51050, Apache-2.0):
 //   inkling2_rmsnorm      BF16(w * x * rsqrt(mean(x^2) + eps)), x fp32 or BF16
 //   inkling2_gate_mul     BF16(a * sigmoid(g))   (attention output gate)
-//   inkling2_residual     r = (restart ? 0 : x) + c   (fp32; x, c BF16)
-//   inkling2_layer_out    BF16(r + m)                 (r fp32, m BF16)
 //   inkling2_f32_to_bf16
 //   inkling2_window_meta  the window layers' slots and block tables, through the window map
 
@@ -95,22 +93,6 @@ extern "C" __global__ void inkling2_gate_mul(const __nv_bfloat16* __restrict__ a
     if (i >= n) return;
     const float gv = __bfloat162float(g[i]);
     out[i] = __float2bfloat16(__bfloat162float(a[i]) / (1.0f + __expf(-gv)));
-}
-
-extern "C" __global__ void inkling2_residual(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ c,
-                                             float* __restrict__ r, unsigned int n, unsigned int restart) {
-    atlas_pdl_enter();
-    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    r[i] = (restart ? 0.0f : __bfloat162float(x[i])) + __bfloat162float(c[i]);
-}
-
-extern "C" __global__ void inkling2_layer_out(const float* __restrict__ r, const __nv_bfloat16* __restrict__ m,
-                                              __nv_bfloat16* __restrict__ out, unsigned int n) {
-    atlas_pdl_enter();
-    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    out[i] = __float2bfloat16(r[i] + __bfloat162float(m[i]));
 }
 
 extern "C" __global__ void inkling2_f32_to_bf16(const float* __restrict__ x, __nv_bfloat16* __restrict__ out,

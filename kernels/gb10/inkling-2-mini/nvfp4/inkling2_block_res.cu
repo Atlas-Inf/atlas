@@ -183,8 +183,11 @@ extern "C" __global__ void inkling2_block_res_out(
 // Both passes for prefill rows, one CTA a row and 8 channels a thread: every state's 8
 // channels load once (16-byte loads) and stay in registers for the softmax and the
 // output, the sums reduce across the CTA. Each output's sum of squares goes to `sq`
-// (or nowhere with NULL), sq[q * rows + row], for the loop message gates' rms. The same
-// formulas as the two decode kernels, summed in its own order. grid (rows), block H / 8.
+// (or nowhere with NULL), sq[q * rows + row], for the loop message gates' rms. With
+// `normed`, output q also leaves RMS-normed as inkling2_rmsnorm writes it,
+// BF16(w_q * (o * rsqrt(mean(o^2) + norm_eps))) at normed + q * rows * H, so the fp32
+// output need not be written (`out` NULL) and read back. The same formulas as the two
+// decode kernels and inkling2_rmsnorm, summed in its own order. grid (rows), block H / 8.
 __device__ __forceinline__ void ink_bf16x8(const uint4 u, float* f) {
     const unsigned int w[4] = {u.x, u.y, u.z, u.w};
 #pragma unroll
@@ -207,7 +210,12 @@ extern "C" __global__ void __launch_bounds__(1024) inkling2_block_res_row(
     const unsigned long long block_stride,
     const unsigned int nq,
     const float eps,
-    float* __restrict__ sq                      // [nq, rows] or NULL
+    float* __restrict__ sq,                     // [nq, rows] or NULL
+    const __nv_bfloat16* __restrict__ nw0,      // output q's norm weight (normed only)
+    const __nv_bfloat16* __restrict__ nw1,
+    const __nv_bfloat16* __restrict__ nw2,
+    __nv_bfloat16* __restrict__ normed,         // [nq, rows, H] or NULL
+    const float norm_eps
 ) {
     atlas_pdl_enter();
     __shared__ float red[32][INK_RES_PER];
@@ -311,26 +319,48 @@ extern "C" __global__ void __launch_bounds__(1024) inkling2_block_res_row(
     for (unsigned int q = 0; q < INK_MAX_Q; q++) {
         ss[q] = 0.0f;
         if (q >= nq) break;
-        float* dst = out + ((unsigned long long)q * rows + row) * H + e0;
-        *(float4*)dst = make_float4(o[q][0], o[q][1], o[q][2], o[q][3]);
-        *(float4*)(dst + 4) = make_float4(o[q][4], o[q][5], o[q][6], o[q][7]);
+        if (out != nullptr) {
+            float* dst = out + ((unsigned long long)q * rows + row) * H + e0;
+            *(float4*)dst = make_float4(o[q][0], o[q][1], o[q][2], o[q][3]);
+            *(float4*)(dst + 4) = make_float4(o[q][4], o[q][5], o[q][6], o[q][7]);
+        }
 #pragma unroll
         for (int i = 0; i < 8; i++) ss[q] += o[q][i] * o[q][i];
     }
-    if (sq != nullptr) {
-        __syncthreads();   // red is reused
+    if (sq == nullptr && normed == nullptr) return;
+    __syncthreads();   // red is reused
+    __shared__ float tot[INK_MAX_Q];
 #pragma unroll
-        for (unsigned int q = 0; q < INK_MAX_Q; q++) {
-            float v = ss[q];
+    for (unsigned int q = 0; q < INK_MAX_Q; q++) {
+        float v = ss[q];
 #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffff, v, off);
-            if (lane == 0) red[warp][q] = v;
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffff, v, off);
+        if (lane == 0) red[warp][q] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < nq) {
+        float v = 0.0f;
+        for (unsigned int w = 0; w < warps; w++) v += red[w][threadIdx.x];
+        tot[threadIdx.x] = v;
+        if (sq != nullptr) sq[(unsigned long long)threadIdx.x * rows + row] = v;
+    }
+    if (normed == nullptr) return;
+    __syncthreads();
+#pragma unroll
+    for (unsigned int q = 0; q < INK_MAX_Q; q++) {
+        if (q >= nq) break;
+        const __nv_bfloat16* w = q == 0 ? nw0 : (q == 1 ? nw1 : nw2);
+        const float rstd = rsqrtf(tot[q] / (float)H + norm_eps);
+        float wf[8];
+        ink_bf16x8(*(const uint4*)(w + e0), wf);
+        unsigned int pk[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            // inkling2_rmsnorm: (w * fp32(x) * rstd), one cast at the end
+            const __nv_bfloat162 b = __floats2bfloat162_rn(wf[2 * i] * (o[q][2 * i] * rstd),
+                                                           wf[2 * i + 1] * (o[q][2 * i + 1] * rstd));
+            pk[i] = *(const unsigned int*)&b;
         }
-        __syncthreads();
-        if (threadIdx.x < nq) {
-            float v = 0.0f;
-            for (unsigned int w = 0; w < warps; w++) v += red[w][threadIdx.x];
-            sq[(unsigned long long)threadIdx.x * rows + row] = v;
-        }
+        *(uint4*)(normed + ((unsigned long long)q * rows + row) * H + e0) = make_uint4(pk[0], pk[1], pk[2], pk[3]);
     }
 }
