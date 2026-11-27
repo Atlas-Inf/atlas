@@ -238,9 +238,8 @@ pub(super) const MLA_TILE_ROWS: usize = 128;
 /// Query rows a prompt tile attends at once: a whole prefill chunk, so each
 /// chunk expands its prefix from the latent once per layer.
 const MLA_PROMPT_TILE_ROWS: usize = 8192;
-/// Rows a projection GEMM covers inside a prompt tile, kv_b_proj's latent
-/// expansion included. The GEMM's rounding follows its row count, so this,
-/// not the tile height, fixes every row's bytes.
+/// Rows a projection GEMM covers inside a prompt tile at most, and kv_b_proj's
+/// latent expansion pieces. The GEMM's rounding follows its row count.
 const PROJECTION_ROWS: usize = 2048;
 
 /// Width of one cached token: the normalized latent then the rotated RoPE key
@@ -275,6 +274,8 @@ pub struct LingMlaScratch {
     pub attn_gated: DevicePtr,
     pub gate: DevicePtr,
     pub latent: LingLatentScratch,
+    /// Rows each q/kv_a/gate/dense GEMM covers (`LingProjection::forward_pieces`).
+    pub projection_rows: u32,
 }
 
 impl LingMlaScratch {
@@ -299,11 +300,20 @@ impl LingMlaScratch {
             config.num_heads,
         ];
         let row_bytes = 2 * widths.iter().sum::<usize>();
-        let rows = (bytes / row_bytes).min(MLA_PROMPT_TILE_ROWS).min(tokens) / MLA_TILE_ROWS
-            * MLA_TILE_ROWS;
-        if rows <= MLA_TILE_ROWS || arena.is_null() {
+        // Projections keep the 2048-row tiling (the whole prompt, rounded down
+        // to 128 rows, below that) that the attention tiles had before they
+        // grew to a chunk: a GEMM rounds by its row count, so every row keeps
+        // its bytes. Attention tiles are whole multiples of that piece.
+        let piece = tokens.min(PROJECTION_ROWS) / MLA_TILE_ROWS * MLA_TILE_ROWS;
+        let capacity = (bytes / row_bytes).min(MLA_PROMPT_TILE_ROWS);
+        if piece <= MLA_TILE_ROWS || capacity < piece || arena.is_null() {
             return (self, MLA_TILE_ROWS);
         }
+        let rows = if piece < PROJECTION_ROWS {
+            piece
+        } else {
+            capacity / piece * piece
+        };
         let mut offset = 0;
         let [
             q_full,
@@ -329,6 +339,7 @@ impl LingMlaScratch {
                 attn_compact,
                 attn_gated,
                 gate,
+                projection_rows: piece as u32,
                 ..self
             },
             rows,
@@ -550,7 +561,7 @@ impl LingMlaWeights {
                 input,
                 scratch.q_full,
                 rows,
-                PROJECTION_ROWS as u32,
+                scratch.projection_rows,
                 scratch.projection,
                 stream,
             )?;
@@ -560,7 +571,7 @@ impl LingMlaWeights {
             input,
             scratch.kv_a,
             rows,
-            PROJECTION_ROWS as u32,
+            scratch.projection_rows,
             scratch.projection,
             stream,
         )?;
@@ -690,7 +701,7 @@ impl LingMlaWeights {
             input,
             scratch.gate,
             rows,
-            PROJECTION_ROWS as u32,
+            scratch.projection_rows,
             scratch.projection,
             stream,
         )?;
@@ -710,7 +721,7 @@ impl LingMlaWeights {
             scratch.attn_gated,
             output,
             rows,
-            PROJECTION_ROWS as u32,
+            scratch.projection_rows,
             scratch.projection,
             stream,
         )

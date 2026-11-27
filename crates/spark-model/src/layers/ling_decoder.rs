@@ -288,6 +288,7 @@ impl LingDecoderLayer {
             attn_gated: bf16(compact_v)?,
             gate: bf16(config.num_heads)?,
             latent: LingLatentScratch::shared(gpu)?,
+            projection_rows: MLA_TILE_ROWS as u32,
         })
     }
 
