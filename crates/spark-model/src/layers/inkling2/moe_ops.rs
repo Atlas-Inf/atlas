@@ -286,7 +286,10 @@ fn moe_prefill_lowp(
     ensure!(a.num_experts <= 1024, "inkling2: over 1024 experts");
     let tiles = to_perm.offset(te * 4);
     let m_tiles = u32_of(max_row_tiles(te, a.num_experts), "row tiles")?;
-    let (partial, done) = (a.gu, a.gu.offset(m_tiles as usize * (2 * a.inter / 128) * LOWP_M_TILE * 4));
+    let (partial, done) = (
+        a.gu,
+        a.gu.offset(m_tiles as usize * (2 * a.inter / 128) * LOWP_M_TILE * 4),
+    );
     KernelLaunch::new(gpu, k.moe_tiles)
         .grid([1, 1, 1])
         .block([u32_of(a.num_experts.next_multiple_of(32), "experts")?, 1, 1])

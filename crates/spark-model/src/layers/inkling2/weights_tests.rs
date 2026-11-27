@@ -22,7 +22,12 @@ fn bias_lanes_hold_each_quads_fragment_then_a_zero_row() {
     assert_eq!(out.len(), (cols + 1) * 16 * 2);
     for d in 0..cols {
         for q in 0..4 {
-            let want = [tag(2 * q, d), tag(2 * q + 1, d), tag(2 * q + 8, d), tag(2 * q + 9, d)];
+            let want = [
+                tag(2 * q, d),
+                tag(2 * q + 1, d),
+                tag(2 * q + 8, d),
+                tag(2 * q + 9, d),
+            ];
             for (i, w) in want.into_iter().enumerate() {
                 assert_eq!(lane(&out, d, q, i), w, "d {d} q {q} i {i}");
             }

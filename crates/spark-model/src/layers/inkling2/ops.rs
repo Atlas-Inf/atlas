@@ -116,9 +116,11 @@ impl Inkling2Kernels {
             moe_gemm_w8a8: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_gemm_w8a8")?,
             moe_tiles: gpu.kernel("inkling2_moe_gemm", "inkling2_moe_tiles")?,
             quant_fp4: gpu.kernel("inkling2_moe_prefill", "inkling2_quant_fp4")?,
-            moe_fused_gate_up_fp4: gpu.kernel("inkling2_moe_prefill", "inkling2_moe_fused_gate_up_fp4")?,
+            moe_fused_gate_up_fp4: gpu
+                .kernel("inkling2_moe_prefill", "inkling2_moe_fused_gate_up_fp4")?,
             quant_mxfp8: gpu.kernel("inkling2_moe_prefill", "inkling2_quant_mxfp8")?,
-            moe_fused_gate_up_mx8: gpu.kernel("inkling2_moe_prefill", "inkling2_moe_fused_gate_up_mx8")?,
+            moe_fused_gate_up_mx8: gpu
+                .kernel("inkling2_moe_prefill", "inkling2_moe_fused_gate_up_mx8")?,
             moe_gemm_nvfp4: amd_kernel(gpu, "inkling2_moe_gemm_nvfp4")?,
             moe_gemm_mxfp8: amd_kernel(gpu, "inkling2_moe_gemm_mxfp8")?,
             softcap_swiglu: amd_kernel(gpu, "inkling2_softcap_swiglu")?,
@@ -161,9 +163,16 @@ pub(crate) struct ShortConv {
 pub(crate) enum ConvOut {
     Plain(DevicePtr),
     /// `r = (restart ? 0 : x) + y`, fp32
-    AddTo { x: DevicePtr, restart: bool, r: DevicePtr },
+    AddTo {
+        x: DevicePtr,
+        restart: bool,
+        r: DevicePtr,
+    },
     /// `out = BF16(r + y)`
-    Finish { r: DevicePtr, out: DevicePtr },
+    Finish {
+        r: DevicePtr,
+        out: DevicePtr,
+    },
 }
 
 pub(crate) fn short_conv(
@@ -348,7 +357,10 @@ pub(crate) fn block_res(
             .arg_ptr(a.p_out)
             .launch(stream);
     }
-    ensure!(!a.out.is_null(), "inkling2 block residual: decode rows need the fp32 output");
+    ensure!(
+        !a.out.is_null(),
+        "inkling2 block residual: decode rows need the fp32 output"
+    );
     // decode rows spread their channels over the GPU
     let chunks = a.hidden.div_ceil(RES_CHUNK);
     let grid = [u32_of(chunks, "chunks")?, u32_of(a.rows, "rows")?, 1];

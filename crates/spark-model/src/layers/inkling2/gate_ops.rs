@@ -68,7 +68,9 @@ pub(crate) struct MsgSources {
 /// `inkling2_msg_gate_fused`'s dynamic shared memory on gb10 (INK_FG_SMEM):
 /// two stages of three gates' inputs and D tiles, z, the rows' mix weights
 /// and rms.
-const FUSED_SMEM: u32 = (2 * 3 * 16 * 72 * 2 + 2 * 3 * 64 * 72 * 2 + 3 * 16 * 72 * 2 + 16 * 4 * 9 * 4 + 3 * 16 * 2 * 4) as u32;
+const FUSED_SMEM: u32 =
+    (2 * 3 * 16 * 72 * 2 + 2 * 3 * 64 * 72 * 2 + 3 * 16 * 72 * 2 + 16 * 4 * 9 * 4 + 3 * 16 * 2 * 4)
+        as u32;
 
 /// Whether `rows` take `inkling2_msg_gate_fused`, which reads the rows' sums
 /// of squares from their producer (prefill rows: decode and verify rows keep
@@ -113,7 +115,10 @@ pub(crate) fn msg_gate(
         let ms = if cfg!(atlas_scale) {
             None
         } else {
-            Some(a.msg.context("inkling2: fused message gate without its messages' sources")?)
+            Some(
+                a.msg
+                    .context("inkling2: fused message gate without its messages' sources")?,
+            )
         };
         let mut f = KernelLaunch::new(gpu, kernels.msg_gate_fused)
             .grid([rows.div_ceil(FUSED_ROWS as u32), 1, 1])

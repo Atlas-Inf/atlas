@@ -163,9 +163,8 @@ impl Shared {
             res_sums: a.take(r * super::ops::block_res_sums_per_row(h) * f),
             res_sq: a.take(8 * r * f),
             msg_p: a.take(r * super::ops::MAX_RES_QUERIES * super::ops::MAX_BLOCK_STATES * f),
-            rel_table: a.take(
-                r.min(super::ops::REL_TABLE_ROWS) * d.heads * super::ops::MAX_REL_EXTENT * b,
-            ),
+            rel_table: a
+                .take(r.min(super::ops::REL_TABLE_ROWS) * d.heads * super::ops::MAX_REL_EXTENT * b),
             attn_partials: a.take(
                 super::ops::attn_partials_len(
                     super::ops::attn_slots(r, d.max_seqs),

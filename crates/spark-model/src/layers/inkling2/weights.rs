@@ -171,7 +171,10 @@ pub(crate) fn bias_lanes(raw: &[u8], rows: usize, cols: usize) -> Result<Vec<u8>
     let mut out = vec![0u8; (cols + 1) * rows * 2];
     for d in 0..cols {
         for q in 0..4 {
-            for (i, k) in [2 * q, 2 * q + 1, 2 * q + 8, 2 * q + 9].into_iter().enumerate() {
+            for (i, k) in [2 * q, 2 * q + 1, 2 * q + 8, 2 * q + 9]
+                .into_iter()
+                .enumerate()
+            {
                 let (src, dst) = ((k * cols + d) * 2, (d * rows + q * 4 + i) * 2);
                 out[dst..dst + 2].copy_from_slice(&raw[src..src + 2]);
             }
