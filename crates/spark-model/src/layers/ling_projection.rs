@@ -179,6 +179,34 @@ impl LingProjection {
         }
     }
 
+    /// [`Self::forward`] over consecutive pieces of at most `piece` rows. The
+    /// BF16 GEMM's algorithm, and so its rounding, follows the row count: a
+    /// fixed piece keeps every row's bytes whatever `rows` is.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_pieces(
+        &self,
+        gpu: &dyn GpuBackend,
+        input: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        piece: u32,
+        scratch: LingProjectionScratch,
+        stream: u64,
+    ) -> Result<()> {
+        for first in (0..rows).step_by(piece as usize) {
+            let at = first as usize;
+            self.forward(
+                gpu,
+                input.offset(at * self.k as usize * 2),
+                output.offset(at * self.n as usize * 2),
+                (rows - first).min(piece),
+                scratch,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn forward(
         &self,
         gpu: &dyn GpuBackend,

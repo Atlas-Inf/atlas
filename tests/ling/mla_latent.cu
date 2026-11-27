@@ -11,8 +11,7 @@
 // 3. A prompt tile attended over two key tiles (partial kernel + merge)
 //    matches it attended as one tile, and both match the CPU reference.
 #include "../../kernels/gb10/ling-3.2-air/nvfp4/ling_mla_latent.cu"
-#undef HDIM
-#include "../../kernels/gb10/ling-3.2-air/nvfp4/ling_mla_prefill_part.cu"
+#include "../../kernels/gb10/ling-3.2-air/nvfp4/ling_mla_prefill.cu"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -214,8 +213,6 @@ int main() {
     const int offset = 700, prompt = 100, total = offset + prompt, split = 512;
     auto k_rows = allocate<__nv_bfloat16>(size_t(total) * EXP);
     auto v_rows = allocate<__nv_bfloat16>(size_t(total) * EXP);
-    auto ident = allocate<int>((total + BS - 1) / BS);
-    for (int i = 0; i < (total + BS - 1) / BS; ++i) ident[i] = i;
     for (int t = 0; t < total; ++t)
         for (int h = 0; h < H; ++h)
             for (int d = 0; d < 128; ++d) {
@@ -232,22 +229,20 @@ int main() {
             k_rows[size_t(t) * EXP + H * 128 + i] = __float2bfloat16(m.cache[size_t(t) * ROW + R + i]);
     auto pq = allocate<__nv_bfloat16>(prompt * H * 192);
     for (int i = 0; i < prompt * H * 192; ++i) pq[i] = __float2bfloat16(draw(rng));
-    auto single = allocate<__nv_bfloat16>(prompt * H * 192);
-    auto merged = allocate<__nv_bfloat16>(prompt * H * 192);
-    auto tile_o = allocate<float>(prompt * H * 192);
+    auto single = allocate<__nv_bfloat16>(prompt * H * 128);
+    auto merged = allocate<__nv_bfloat16>(prompt * H * 128);
+    auto tile_o = allocate<float>(prompt * H * 128);
     auto tile_ml = allocate<float>(prompt * H * 2);
-    auto acc_o = allocate<float>(prompt * H * 192);
+    auto acc_o = allocate<float>(prompt * H * 128);
     auto acc_ml = allocate<float>(prompt * H * 2);
-    const dim3 grid(H, (prompt + 63) / 64);
-    ling_mla_prefill_part_64<<<grid, 256>>>(pq, k_rows, v_rows, reinterpret_cast<__nv_bfloat16*>(tile_o), ident,
-        prompt, total, offset, H, H, 192, BS, 0, 1, scale, tile_ml);
+    const dim3 grid(H, (prompt + 127) / 128);
+    ling_mla_prefill_rows128_part<<<grid, 256>>>(pq, k_rows, v_rows, tile_o, tile_ml, prompt, total, offset, scale);
     ling_prompt_tile_merge<<<dim3(H, prompt), 64>>>(tile_o, tile_ml, acc_o, acc_ml, single, 1, 1);
     // Tile 0 = keys [0, split), entirely visible; tile 1 = [split, total).
     for (int tile = 0; tile < 2; ++tile) {
         const int begin = tile ? split : 0, end = tile ? total : split;
-        ling_mla_prefill_part_64<<<grid, 256>>>(pq, k_rows + size_t(begin) * EXP, v_rows + size_t(begin) * EXP,
-            reinterpret_cast<__nv_bfloat16*>(tile_o), ident, prompt, end - begin, offset - begin, H, H, 192, BS,
-            0, 1, scale, tile_ml);
+        ling_mla_prefill_rows128_part<<<grid, 256>>>(pq, k_rows + size_t(begin) * EXP, v_rows + size_t(begin) * EXP,
+            tile_o, tile_ml, prompt, end - begin, offset - begin, scale);
         ling_prompt_tile_merge<<<dim3(H, prompt), 64>>>(tile_o, tile_ml, acc_o, acc_ml, merged, tile == 0, tile == 1);
     }
     check(cudaDeviceSynchronize());
@@ -255,7 +250,7 @@ int main() {
     for (int r = 0; r < prompt; ++r) {
         for (int h = 0; h < H; ++h)
             for (int v = 0; v < 128; ++v) {
-                const int i = (r * H + h) * 192 + v;
+                const int i = (r * H + h) * 128 + v;
                 tiled = std::max(tiled, std::abs(f(single[i]) - f(merged[i])));
             }
         if (r % 33) continue;  // the CPU reference is slow; spot-check rows
@@ -263,7 +258,7 @@ int main() {
         reference(m, pq + r * H * 192, offset + r + 1, scale, ref.data());
         for (int h = 0; h < H; ++h)
             for (int v = 0; v < 128; ++v) {
-                ref_worst = std::max(ref_worst, std::abs(f(merged[(r * H + h) * 192 + v]) - ref[h * 128 + v]));
+                ref_worst = std::max(ref_worst, std::abs(f(merged[(r * H + h) * 128 + v]) - ref[h * 128 + v]));
                 ref_peak = std::max(ref_peak, std::abs(ref[h * 128 + v]));
             }
     }

@@ -18,7 +18,7 @@
 //
 // Prompts rebuild full per-head keys and values from the latent in bounded
 // tiles (ling_latent_gather + kv_b_proj + ling_latent_expand), attend each
-// tile with the paged prefill kernel, and merge tiles by their softmax state.
+// tile with ling_mla_prefill, and merge tiles by their softmax state.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -554,9 +554,9 @@ extern "C" __global__ void ling_latent_gather(
     }
 }
 
-// Expanded rows in the layout ling_mla_prefill reads (ling_cache_layout.cuh):
-// K = 32 x 128 NoPE channels then the shared 64-channel RoPE tail, V = 32 x
-// 128 channels then a zero tail (written once at allocation, never here).
+// Expanded rows in the layout ling_mla_prefill reads: K = 32 x 128 NoPE
+// channels then the shared 64-channel RoPE tail, V = 32 x 128 channels (its
+// row keeps K's width; the tail is never read).
 // grid n, block 256; row k lands at scratch row `first + k`.
 extern "C" __global__ void ling_latent_expand(
     const __nv_bfloat16* __restrict__ kv_b,      // [n][32*256]
@@ -577,23 +577,23 @@ extern "C" __global__ void ling_latent_expand(
 }
 
 // Fold one key tile's normalized output and (max, sum) into the running
-// result. The last tile writes the BF16 [rows][32][192] attention output.
+// result. The last tile writes the BF16 [rows][32][128] attention output.
 // grid (heads, rows), block 64: thread i owns channels 2i, 2i + 1 of 128.
 extern "C" __global__ void ling_prompt_tile_merge(
-    const float* __restrict__ tile_o,            // [rows][32][192]
+    const float* __restrict__ tile_o,            // [rows][32][128]
     const float* __restrict__ tile_ml,           // [rows][32][2]
     float* __restrict__ acc_o,
     float* __restrict__ acc_ml,
-    __nv_bfloat16* __restrict__ out,             // [rows][32][192]
+    __nv_bfloat16* __restrict__ out,             // [rows][32][128]
     const unsigned first,
     const unsigned last) {
     const unsigned head = blockIdx.x, row = blockIdx.y, i = threadIdx.x;
     const unsigned at = row * LING_HEADS + head;
-    const float2 t = reinterpret_cast<const float2*>(tile_o + at * LING_QK)[i];
+    const float2 t = reinterpret_cast<const float2*>(tile_o + at * LING_V)[i];
     float2 o = t;
     float m = tile_ml[at * 2], l = tile_ml[at * 2 + 1];
     if (!first) {
-        const float2 a = reinterpret_cast<const float2*>(acc_o + at * LING_QK)[i];
+        const float2 a = reinterpret_cast<const float2*>(acc_o + at * LING_V)[i];
         const float am = acc_ml[at * 2], al = acc_ml[at * 2 + 1];
         const float top = fmaxf(am, m);
         const float wa = al * expf(am - top), wt = l * expf(m - top);
@@ -603,11 +603,11 @@ extern "C" __global__ void ling_prompt_tile_merge(
         l = wa + wt;
     }
     if (last) {
-        __nv_bfloat162* dst = reinterpret_cast<__nv_bfloat162*>(out + at * LING_QK);
+        __nv_bfloat162* dst = reinterpret_cast<__nv_bfloat162*>(out + at * LING_V);
         dst[i] = __floats2bfloat162_rn(o.x, o.y);
         return;
     }
-    reinterpret_cast<float2*>(acc_o + at * LING_QK)[i] = o;
+    reinterpret_cast<float2*>(acc_o + at * LING_V)[i] = o;
     __syncthreads();
     if (i == 0) {
         acc_ml[at * 2] = m;

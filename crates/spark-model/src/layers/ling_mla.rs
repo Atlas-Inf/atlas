@@ -4,9 +4,10 @@
 //!
 //! Ling's full-attention layers are the direct (q_lora-free) Bailing MLA:
 //! q_proj, kv_a_proj_with_mqa + RMSNorm, kv_b_proj, interleaved RoPE,
-//! paged K/V, a head-wise sigmoid gate, and the checkpoint's dense output
-//! projection. Each BF16 cache row stores 128 NoPE channels per head and
-//! one shared 64-channel RoPE tail. Values share an all-zero padding tail.
+//! a paged latent cache, a head-wise sigmoid gate, and the checkpoint's dense
+//! output projection. Each BF16 cache row stores the 512-channel latent and
+//! one shared 64-channel RoPE tail; decode attends it in absorbed form and
+//! prompts expand it into per-head keys and values (`ling_mla_latent.cu`).
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -234,7 +235,13 @@ fn absorb_nvfp4(
 
 /// Maximum rows per MLA projection tile. Decode uses the first row.
 pub(super) const MLA_TILE_ROWS: usize = 128;
-const MLA_PROMPT_TILE_ROWS: usize = 2048;
+/// Query rows a prompt tile attends at once: a whole prefill chunk, so each
+/// chunk expands its prefix from the latent once per layer.
+const MLA_PROMPT_TILE_ROWS: usize = 8192;
+/// Rows a projection GEMM covers inside a prompt tile, kv_b_proj's latent
+/// expansion included. The GEMM's rounding follows its row count, so this,
+/// not the tile height, fixes every row's bytes.
+const PROJECTION_ROWS: usize = 2048;
 
 /// Width of one cached token: the normalized latent then the rotated RoPE key
 /// shared by every head (`ling_mla_latent.cu`). V aliases K in the pool.
@@ -249,8 +256,8 @@ const DECODE_SMEM: u32 = 2 * 32 * 584 * 2 + 2 * 32 * 32 * 4 + 32 * 40 * 2 + 3 * 
 /// Keys a prompt tile rebuilds from the latent before attending them. The
 /// last tile also holds the prompt's own rows, up to MLA_PROMPT_TILE_ROWS.
 const PROMPT_KEY_TILE: usize = 8192;
-/// Expanded per-token row width the paged prefill kernel reads
-/// (`ling_cache_layout.cuh`): 32 x 128 NoPE channels and the RoPE tail.
+/// Expanded per-token row width ling_mla_prefill reads: 32 x 128 NoPE
+/// channels and the RoPE tail.
 const EXPANDED_ROW: usize = 32 * 128 + 64;
 
 /// Scratch layout for a projection tile. All pointers are BF16 except
@@ -264,7 +271,6 @@ pub struct LingMlaScratch {
     pub kv_norm: DevicePtr,
     pub q_rope: DevicePtr,
     pub k_rope: DevicePtr,
-    pub attn_padded: DevicePtr,
     pub attn_compact: DevicePtr,
     pub attn_gated: DevicePtr,
     pub gate: DevicePtr,
@@ -281,7 +287,6 @@ impl LingMlaScratch {
         bytes: usize,
         tokens: usize,
     ) -> (Self, usize) {
-        let padded = config.num_heads * config.qk_head_dim();
         let compact = config.num_heads * config.v_head_dim;
         let widths = [
             config.q_proj_rows(),
@@ -289,7 +294,6 @@ impl LingMlaScratch {
             config.kv_lora_rank,
             config.num_heads * config.qk_rope_head_dim,
             config.qk_rope_head_dim,
-            padded,
             compact,
             compact,
             config.num_heads,
@@ -307,7 +311,6 @@ impl LingMlaScratch {
             kv_norm,
             q_rope,
             k_rope,
-            attn_padded,
             attn_compact,
             attn_gated,
             gate,
@@ -323,7 +326,6 @@ impl LingMlaScratch {
                 kv_norm,
                 q_rope,
                 k_rope,
-                attn_padded,
                 attn_compact,
                 attn_gated,
                 gate,
@@ -347,7 +349,6 @@ pub struct LingLatentScratch {
     expand_kv_b: DevicePtr,
     k_rows: DevicePtr,
     v_rows: DevicePtr,
-    identity: DevicePtr,
     tile_o: DevicePtr,
     tile_ml: DevicePtr,
     acc_o: DevicePtr,
@@ -365,27 +366,19 @@ impl LingLatentScratch {
         let heads = 32;
         let keys = PROMPT_KEY_TILE + MLA_PROMPT_TILE_ROWS;
         let prompt = MLA_PROMPT_TILE_ROWS;
-        let v_rows = gpu.alloc(keys * EXPANDED_ROW * 2)?;
-        // The prefill kernel reads V's padding tail; it stays zero.
-        gpu.memset(v_rows, 0, keys * EXPANDED_ROW * 2)?;
-        let blocks = keys / 16;
-        let identity = gpu.alloc(blocks * 4)?;
-        let table: Vec<u8> = (0..blocks as i32).flat_map(i32::to_le_bytes).collect();
-        gpu.copy_h2d(&table, identity)?;
         let s = Self {
             q_abs: gpu.alloc(MLA_TILE_ROWS * heads * LATENT_ROW * 2)?,
             latent_out: gpu.alloc(MLA_TILE_ROWS * heads * 512 * 2)?,
             part_o: gpu.alloc(DECODE_ROWS * DECODE_SPLITS * heads * 512 * 4)?,
             part_ml: gpu.alloc(DECODE_ROWS * DECODE_SPLITS * heads * 2 * 4)?,
-            gather_latent: gpu.alloc(prompt * 512 * 2)?,
-            gather_rope: gpu.alloc(prompt * 64 * 2)?,
-            expand_kv_b: gpu.alloc(prompt * heads * 256 * 2)?,
+            gather_latent: gpu.alloc(PROJECTION_ROWS * 512 * 2)?,
+            gather_rope: gpu.alloc(PROJECTION_ROWS * 64 * 2)?,
+            expand_kv_b: gpu.alloc(PROJECTION_ROWS * heads * 256 * 2)?,
             k_rows: gpu.alloc(keys * EXPANDED_ROW * 2)?,
-            v_rows,
-            identity,
-            tile_o: gpu.alloc(prompt * heads * 192 * 4)?,
+            v_rows: gpu.alloc(keys * EXPANDED_ROW * 2)?,
+            tile_o: gpu.alloc(prompt * heads * 128 * 4)?,
             tile_ml: gpu.alloc(prompt * heads * 2 * 4)?,
-            acc_o: gpu.alloc(prompt * heads * 192 * 4)?,
+            acc_o: gpu.alloc(prompt * heads * 128 * 4)?,
             acc_ml: gpu.alloc(prompt * heads * 2 * 4)?,
         };
         Ok(*LATENT_SCRATCH.get_or_init(|| s))
@@ -434,8 +427,8 @@ impl LingMlaKernels {
             v_up: latent("ling_v_up")?,
             gather: latent("ling_latent_gather")?,
             expand: latent("ling_latent_expand")?,
-            prefill_attention: gpu.kernel("ling_mla_prefill", "ling_mla_prefill_64")?,
-            prefill_partial: gpu.kernel("ling_mla_prefill_part", "ling_mla_prefill_part_64")?,
+            prefill_attention: gpu.kernel("ling_mla_prefill", "ling_mla_prefill_rows128")?,
+            prefill_partial: gpu.kernel("ling_mla_prefill", "ling_mla_prefill_rows128_part")?,
             tile_merge: latent("ling_prompt_tile_merge")?,
             sigmoid_gate: gpu.kernel("residual_add", "sigmoid_gate_mul_head_broadcast")?,
         })
@@ -552,14 +545,22 @@ impl LingMlaWeights {
         let qdim = config.q_proj_rows() as u32;
 
         if output.is_some() {
-            self.q_proj
-                .forward(gpu, input, scratch.q_full, rows, scratch.projection, stream)?;
+            self.q_proj.forward_pieces(
+                gpu,
+                input,
+                scratch.q_full,
+                rows,
+                PROJECTION_ROWS as u32,
+                scratch.projection,
+                stream,
+            )?;
         }
-        self.kv_a_proj_with_mqa.forward(
+        self.kv_a_proj_with_mqa.forward_pieces(
             gpu,
             input,
             scratch.kv_a,
             rows,
+            PROJECTION_ROWS as u32,
             scratch.projection,
             stream,
         )?;
@@ -679,24 +680,20 @@ impl LingMlaWeights {
                 scale,
                 stream,
             )?;
-            // Narrow [heads, 192] attention output to the true [heads, 128] V
-            // width before applying the head-wise gate and dense projection.
-            gpu.copy_d2d_2d_async(
-                scratch.attn_padded,
-                qk as usize * 2,
-                scratch.attn_compact,
-                vdim as usize * 2,
-                vdim as usize * 2,
-                rows as usize * config.num_heads,
-                stream,
-            )?;
         } else {
             self.absorbed_decode(
                 kernels, gpu, pool, metadata, block_size, scratch, rows, scale, stream,
             )?;
         }
-        self.g_proj
-            .forward(gpu, input, scratch.gate, rows, scratch.projection, stream)?;
+        self.g_proj.forward_pieces(
+            gpu,
+            input,
+            scratch.gate,
+            rows,
+            PROJECTION_ROWS as u32,
+            scratch.projection,
+            stream,
+        )?;
         ops::sigmoid_gate_mul_head_broadcast(
             gpu,
             kernels.sigmoid_gate,
@@ -708,11 +705,12 @@ impl LingMlaWeights {
             rows,
             stream,
         )?;
-        self.dense.forward(
+        self.dense.forward_pieces(
             gpu,
             scratch.attn_gated,
             output,
             rows,
+            PROJECTION_ROWS as u32,
             scratch.projection,
             stream,
         )
@@ -806,6 +804,7 @@ impl LingMlaWeights {
     /// rebuilt from the latent cache through kv_b_proj, PROMPT_KEY_TILE at a
     /// time; the last tile starts at or before the prompt tile and so holds
     /// every row's own key. Each earlier tile is entirely visible to every row.
+    /// Writes the [rows][heads][128] output into `attn_compact`.
     #[allow(clippy::too_many_arguments)]
     fn prompt_attention(
         &self,
@@ -831,8 +830,8 @@ impl LingMlaWeights {
             } else {
                 begin + PROMPT_KEY_TILE
             };
-            for first in (begin..end).step_by(MLA_PROMPT_TILE_ROWS) {
-                let n = (end - first).min(MLA_PROMPT_TILE_ROWS) as u32;
+            for first in (begin..end).step_by(PROJECTION_ROWS) {
+                let n = (end - first).min(PROJECTION_ROWS) as u32;
                 KernelLaunch::new(gpu, kernels.gather)
                     .grid([n, 1, 1])
                     .block([64, 1, 1])
@@ -868,31 +867,25 @@ impl LingMlaWeights {
                 kernels.prefill_partial
             };
             let launch = KernelLaunch::new(gpu, kernel)
-                .grid([32, rows.div_ceil(64), 1])
+                .grid([32, rows.div_ceil(128), 1])
                 .block([256, 1, 1])
                 .arg_ptr(scratch.q_full)
                 .arg_ptr(l.k_rows)
-                .arg_ptr(l.v_rows)
-                .arg_ptr(if single {
-                    scratch.attn_padded
-                } else {
-                    l.tile_o
-                })
-                .arg_ptr(l.identity)
+                .arg_ptr(l.v_rows);
+            let launch = if single {
+                launch.arg_ptr(scratch.attn_compact)
+            } else {
+                launch.arg_ptr(l.tile_o).arg_ptr(l.tile_ml)
+            };
+            launch
                 .arg_u32(rows)
                 .arg_u32((end - begin) as u32)
                 .arg_u32(offset - begin as u32)
-                .arg_u32(32)
-                .arg_u32(32)
-                .arg_u32(192)
-                .arg_u32(16)
-                .arg_u32(0)
-                .arg_u32(1)
-                .arg_f32(scale);
+                .arg_f32(scale)
+                .launch(stream)?;
             if single {
-                return launch.launch(stream);
+                return Ok(());
             }
-            launch.arg_ptr(l.tile_ml).launch(stream)?;
             KernelLaunch::new(gpu, kernels.tile_merge)
                 .grid([32, rows, 1])
                 .block([64, 1, 1])
@@ -900,7 +893,7 @@ impl LingMlaWeights {
                 .arg_ptr(l.tile_ml)
                 .arg_ptr(l.acc_o)
                 .arg_ptr(l.acc_ml)
-                .arg_ptr(scratch.attn_padded)
+                .arg_ptr(scratch.attn_compact)
                 .arg_u32(u32::from(tile == 0))
                 .arg_u32(u32::from(tile + 1 == tiles))
                 .launch(stream)?;

@@ -276,7 +276,6 @@ impl LingDecoderLayer {
         projection: LingProjectionScratch,
     ) -> Result<LingMlaScratch> {
         let bf16 = |elements: usize| gpu.alloc(MLA_TILE_ROWS * elements * 2);
-        let padded = config.num_heads * config.qk_head_dim();
         let compact_v = config.num_heads * config.v_head_dim;
         Ok(LingMlaScratch {
             projection,
@@ -285,7 +284,6 @@ impl LingDecoderLayer {
             kv_norm: bf16(config.kv_lora_rank)?,
             q_rope: bf16(config.num_heads * config.qk_rope_head_dim)?,
             k_rope: bf16(config.qk_rope_head_dim)?,
-            attn_padded: bf16(padded)?,
             attn_compact: bf16(compact_v)?,
             attn_gated: bf16(compact_v)?,
             gate: bf16(config.num_heads)?,
