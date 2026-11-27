@@ -20,8 +20,8 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::block_mgmt::{
-    apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
-    extract_layer_refs, reuse_prefix_match_disk_ids,
+    apply_evicted_blocks, ensure_blocks_through_decode, extract_layer_refs,
+    reuse_prefix_match_disk_ids,
 };
 use super::super::prefix_share::adopt_prefix_match;
 use super::super::ssm_pool::SsmStatePool;
@@ -114,15 +114,7 @@ impl TransformerModel {
                 cap
             );
         }
-        ensure_blocks_through_prefill(
-            seq,
-            blocks_needed - 1,
-            &mut kv_cache,
-            self.prefix_cache.as_ref(),
-            self.gpu.as_ref(),
-            stream,
-            self.levers.kv_poison,
-        )?;
+        self.ensure_prefill_blocks(seq, blocks_needed - 1, &mut kv_cache, stream)?;
 
         // ── Marconi: try to restore SSM state and skip cached prefix ──
         // With intermediate checkpoints, ssm_snapshot_tokens may be less than

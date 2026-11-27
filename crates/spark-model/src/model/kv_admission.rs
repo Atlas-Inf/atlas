@@ -287,11 +287,44 @@ impl TransformerModel {
                 )?;
                 self.reserve_aux_through(seq, (last_block + 1) * bs, stream)?;
                 // Last: a refusal past it would split off held blocks.
-                let first = seq.seq_len;
-                self.kv_window
-                    .sync(seq, first, last_block, kv, self.gpu.as_ref(), stream)
+                self.hold_prefill_window(seq, last_block, kv, stream)
             },
         )
+    }
+
+    /// The blocks and window rows of a prefill forward through logical block
+    /// `last_block`, for the paths that do not vote
+    /// ([`Self::reserve_prefill_blocks`] does). Without the window rows the
+    /// forward writes no sliding-window KV, and the next step finds it gone.
+    pub(in crate::model) fn ensure_prefill_blocks(
+        &self,
+        seq: &mut SequenceState,
+        last_block: usize,
+        kv_cache: &mut PagedKvCache,
+        stream: u64,
+    ) -> Result<()> {
+        ensure_blocks_through_prefill(
+            seq,
+            last_block,
+            kv_cache,
+            self.prefix_cache.as_ref(),
+            self.gpu.as_ref(),
+            stream,
+            self.levers.kv_poison,
+        )?;
+        self.hold_prefill_window(seq, last_block, kv_cache, stream)
+    }
+
+    fn hold_prefill_window(
+        &self,
+        seq: &mut SequenceState,
+        last_block: usize,
+        kv_cache: &mut PagedKvCache,
+        stream: u64,
+    ) -> Result<()> {
+        let first = seq.seq_len;
+        self.kv_window
+            .sync(seq, first, last_block, kv_cache, self.gpu.as_ref(), stream)
     }
 
     /// Make `seq` hold logical block `abs_block_idx` for a decode or verify

@@ -36,6 +36,12 @@ impl TransformerModel {
     ) -> Result<DevicePtr> {
         // Full prefill computes on default; its eager consumer must follow it.
         let stream = self.gpu.default_stream();
+        // Window-bounded KV lends one forward's rows at a time (`kv_window`),
+        // so a whole prompt (a preempted request's resume) runs as chunks.
+        if self.kv_window.is_active() && tokens.len() > 1 {
+            let chunk = self.buffers.max_batch_tokens();
+            return self.prefill_by_chunks(tokens, seq, chunk, stream);
+        }
         self.stamp_overlay_route(seq.adapter_slot);
 
         (|| {

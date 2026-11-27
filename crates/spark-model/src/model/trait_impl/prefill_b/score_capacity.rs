@@ -9,7 +9,12 @@ use super::super::super::types::TransformerModel;
 impl TransformerModel {
     /// Score passes run on one rank and read BF16 logits.
     pub(super) fn score_supported(&self) -> bool {
-        !self.multi_rank_protocol_active() && self.comm.is_none() && !self.use_fp32_logits
+        // Window-bounded KV: a scoring pass's streams would each hold their
+        // whole prompt's window rows, more than the pool lends at once.
+        !self.multi_rank_protocol_active()
+            && self.comm.is_none()
+            && !self.use_fp32_logits
+            && !self.kv_window.is_active()
     }
 
     /// See [`crate::traits::Model::score_capacity`].

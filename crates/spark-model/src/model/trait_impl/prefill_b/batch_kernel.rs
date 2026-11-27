@@ -316,16 +316,7 @@ impl TransformerModel {
             // Block allocation through end of chunk.
             let bs = kv_cache.block_size();
             let end_pos = chunk_start + cl;
-            let blocks_needed = (end_pos - 1) / bs + 1;
-            super::super::super::block_mgmt::ensure_blocks_through_prefill(
-                seq,
-                blocks_needed - 1,
-                &mut kv_cache,
-                self.prefix_cache.as_ref(),
-                self.gpu.as_ref(),
-                stream,
-                self.levers.kv_poison,
-            )?;
+            self.ensure_prefill_blocks(seq, (end_pos - 1) / bs, &mut kv_cache, stream)?;
 
             // Effective processing range. DEFECT 1 fix: pass this stream's
             // proc_off hidden slot so any cache-hit re-embed lands in THIS
@@ -625,6 +616,8 @@ impl TransformerModel {
             seq.tokens
                 .extend_from_slice(&tokens[chunk_start..chunk_start + cl]);
             seq.seq_len = chunk_start + cl;
+            self.kv_window
+                .trim(seq, &mut kv_cache, self.gpu.as_ref(), stream)?;
 
             let logits = if is_last_chunk {
                 self.prefill_b_finalize_last_at(

@@ -223,3 +223,63 @@ fn a_resume_without_its_window_is_refused_lending_nothing() {
     assert_eq!(seq.window_held, 0..0);
     assert_eq!(kv.window_free_blocks(), 63);
 }
+
+/// Two prompts prefilled chunk by chunk in turn, each chunk held then
+/// trimmed, keep both windows in a pool sized for two sequences and one
+/// forward's rows.
+#[test]
+fn interleaved_chunked_prefills_keep_both_windows() {
+    const CHUNK: usize = 128;
+    let gpu = MockGpuBackend::new();
+    let local = WindowPlan::size_blocks(WINDOW, BS, 2, 8, CHUNK, 0);
+    let mut kv = cache(&gpu, local, 0);
+    let window = KvWindow::new(&kv);
+    let mut seqs = [seq_with(&mut kv, 4 * CHUNK), seq_with(&mut kv, 4 * CHUNK)];
+    for chunk in 0..4 {
+        for seq in &mut seqs {
+            let end = (chunk + 1) * CHUNK;
+            let first = seq.seq_len;
+            window
+                .sync(seq, first, (end - 1) / BS, &mut kv, &gpu, 0)
+                .unwrap();
+            seq.seq_len = end;
+            window.trim(seq, &mut kv, &gpu, 0).unwrap();
+        }
+    }
+    for seq in &mut seqs {
+        let first = seq.seq_len;
+        window
+            .sync(seq, first, first / BS, &mut kv, &gpu, 0)
+            .unwrap();
+    }
+}
+
+/// Every prefill path reserves its blocks through the model's
+/// `ensure_prefill_blocks` (or `reserve_prefill_blocks`), which hold the
+/// window rows the forward writes. A direct `ensure_blocks_through_prefill`
+/// leaves them unmapped, and the next step finds them gone.
+#[test]
+fn prefill_blocks_are_reserved_with_their_window() {
+    fn scan(dir: &std::path::Path, offenders: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() {
+                scan(&path, offenders);
+            } else if name.ends_with(".rs")
+                && !name.ends_with("tests.rs")
+                && !matches!(name.as_str(), "block_mgmt.rs" | "kv_admission.rs")
+            {
+                let mut source = std::fs::read_to_string(&path).unwrap();
+                source.retain(|c| !c.is_whitespace());
+                if source.contains("ensure_blocks_through_prefill(") {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    let mut offenders = Vec::new();
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    scan(&src, &mut offenders);
+    assert!(offenders.is_empty(), "{offenders:?}");
+}

@@ -18,8 +18,8 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::block_mgmt::{
-    apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
-    extract_layer_refs, reuse_prefix_match_disk_ids,
+    apply_evicted_blocks, ensure_blocks_through_decode, extract_layer_refs,
+    reuse_prefix_match_disk_ids,
 };
 use super::super::prefix_share::adopt_prefix_match;
 use super::super::ssm_pool::SsmStatePool;
@@ -34,6 +34,27 @@ use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
 impl TransformerModel {
+    /// `tokens` as consecutive prefill chunks of at most `chunk_size`, as the
+    /// scheduler's chunked path runs them; the last chunk's logits.
+    pub(super) fn prefill_by_chunks(
+        &self,
+        tokens: &[u32],
+        seq: &mut SequenceState,
+        chunk_size: usize,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        let mut offset = 0;
+        loop {
+            let chunk_len = (tokens.len() - offset).min(chunk_size);
+            let is_last = offset + chunk_len >= tokens.len();
+            let logits = self.prefill_chunk(tokens, seq, offset, chunk_len, is_last, stream)?;
+            offset += chunk_len;
+            if is_last {
+                return Ok(logits);
+            }
+        }
+    }
+
     pub(super) fn prefill_twophase_dispatch(
         &self,
         tokens: &[u32],
@@ -57,22 +78,12 @@ impl TransformerModel {
                  (arena_cap={arena_cap})",
                 total_len.div_ceil(chunk_size),
             );
-            let mut offset = 0;
-            while offset < total_len {
-                let remaining = total_len - offset;
-                let chunk_len = remaining.min(chunk_size);
-                let is_last = offset + chunk_len >= total_len;
-                let logits = self.prefill_chunk(tokens, seq, offset, chunk_len, is_last, stream)?;
-                offset += chunk_len;
-                if is_last {
-                    return Ok(logits);
-                }
-            }
-            return Ok(DevicePtr::NULL);
+            return self.prefill_by_chunks(tokens, seq, chunk_size, stream);
         }
 
-        // Fall back if GDN buffers were not allocated (no SSM layers).
-        if self.gdn_buf_qkv.is_null() {
+        // Fall back if GDN buffers were not allocated (no SSM layers), or the
+        // window KV holds one chunk's rows at a time (`kv_window`).
+        if self.gdn_buf_qkv.is_null() || self.kv_window.is_active() {
             return self.prefill_chunk(tokens, seq, 0, total_len, true, stream);
         }
 
@@ -241,16 +252,7 @@ impl TransformerModel {
         seq.marconi_skip_to = kv_write_start;
 
         // Allocate all KV blocks upfront for the full sequence.
-        let blocks_needed = (total_len - 1) / bs + 1;
-        ensure_blocks_through_prefill(
-            seq,
-            blocks_needed - 1,
-            &mut kv_cache,
-            self.prefix_cache.as_ref(),
-            self.gpu.as_ref(),
-            stream,
-            self.levers.kv_poison,
-        )?;
+        self.ensure_prefill_blocks(seq, (total_len - 1) / bs, &mut kv_cache, stream)?;
 
         // Determine effective processing range (skip Marconi-cached tokens).
         let (proc_start, proc_count) = if marconi_skip && kv_write_start > 0 {
