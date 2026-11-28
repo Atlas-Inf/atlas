@@ -113,7 +113,7 @@ impl Inkling2Layer {
 }
 
 /// Verify rows a journal holds (a DSpark block is 8).
-pub(super) const MAX_VERIFY_ROWS: usize = 16;
+pub(crate) const MAX_VERIFY_ROWS: usize = 16;
 
 fn seq_state(state: &mut dyn LayerState) -> Result<&mut Inkling2SeqState> {
     state

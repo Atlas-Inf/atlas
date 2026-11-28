@@ -162,7 +162,7 @@ impl Inkling2Layer {
                 .collect()
         };
         ensure!(
-            tables.len() <= d.max_seqs * super::layer::MAX_VERIFY_ROWS * d.max_blocks_per_seq * 4,
+            tables.len() <= d.block_table_bytes(),
             "inkling2: {n} rows' block tables over the table buffer"
         );
         // earlier kernels of this stream may still read the previous forward's metadata

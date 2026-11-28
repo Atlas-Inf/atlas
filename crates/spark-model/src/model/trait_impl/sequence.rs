@@ -231,7 +231,15 @@ impl TransformerModel {
             seq.adapter_id,
         );
         if !seq.block_table.is_empty() {
-            self.kv_cache.lock().free_blocks(&seq.block_table);
+            let mut kv = self.kv_cache.lock();
+            let stream = self.gpu.default_stream();
+            if let Err(e) = self
+                .kv_window
+                .truncate(seq, 0, &mut kv, self.gpu.as_ref(), stream)
+            {
+                tracing::error!("free_sequence: KV window release: {e:#}");
+            }
+            kv.free_blocks(&seq.block_table);
             seq.block_table.clear();
         }
 

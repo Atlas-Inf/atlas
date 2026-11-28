@@ -42,6 +42,13 @@ impl TransformerModel {
         }
         let old = *matched;
         let base = seq.block_table.len() - matched_block_count;
+        let stream = self.gpu.default_stream();
+        if let Err(e) = self
+            .kv_window
+            .truncate(seq, base, kv_cache, self.gpu.as_ref(), stream)
+        {
+            tracing::error!("prefix KV cap: KV window release: {e:#}");
+        }
         for b in seq.block_table.drain(base..).collect::<Vec<_>>() {
             kv_cache.dec_ref(b);
         }

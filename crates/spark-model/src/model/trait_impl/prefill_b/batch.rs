@@ -315,16 +315,7 @@ impl TransformerModel {
                 // Block allocation through end of chunk.
                 let bs = kv_cache.block_size();
                 let end_pos = chunk_start + chunk_len;
-                let blocks_needed = (end_pos - 1) / bs + 1;
-                super::super::super::block_mgmt::ensure_blocks_through_prefill(
-                    seq,
-                    blocks_needed - 1,
-                    &mut kv_cache,
-                    self.prefix_cache.as_ref(),
-                    self.gpu.as_ref(),
-                    stream,
-                    self.levers.kv_poison,
-                )?;
+                self.ensure_prefill_blocks(seq, (end_pos - 1) / bs, &mut kv_cache, stream)?;
 
                 // Phase 2b: proc range (may early-return on full prefix hit
                 // of an intermediate chunk).
@@ -353,6 +344,8 @@ impl TransformerModel {
                         seq.tokens
                             .extend_from_slice(&tokens[chunk_start..chunk_start + chunk_len]);
                         seq.seq_len = chunk_start + chunk_len;
+                        self.kv_window
+                            .trim(seq, &mut kv_cache, self.gpu.as_ref(), stream)?;
                         seq.last_decode_ckpt_block = seq.tokens.len() / bs;
                         return Ok(ptr);
                     }
@@ -430,6 +423,9 @@ impl TransformerModel {
                 seq.tokens
                     .extend_from_slice(&tokens[chunk_start..chunk_start + chunk_len]);
                 seq.seq_len = chunk_start + chunk_len;
+                // Before the next stream reserves: the pool holds one forward's rows.
+                self.kv_window
+                    .trim(seq, &mut kv_cache, self.gpu.as_ref(), stream)?;
                 // #155: prime the decode-checkpoint cadence gate (see prefill_a).
                 seq.last_decode_ckpt_block = seq.tokens.len() / bs;
 

@@ -307,6 +307,8 @@ impl TransformerModel {
         seq.tokens
             .extend_from_slice(&tokens[chunk_start..chunk_start + chunk_len]);
         seq.seq_len = chunk_start + chunk_len;
+        self.kv_window
+            .trim(seq, kv_cache, self.gpu.as_ref(), stream)?;
         // #155: prime the decode-checkpoint cadence gate; the last chunk
         // leaves it at the prompt's complete-block count (see prefill_a).
         seq.last_decode_ckpt_block = seq.tokens.len() / bs;

@@ -265,6 +265,8 @@ impl TransformerModel {
                         &mut matched,
                         kv_cache,
                     )
+                    // and only with the window rows the resume reads
+                    && self.kv_window_adopt(seq, snap_tok, kv_cache, stream)
                 {
                     // Cross-stream ordering: the snapshot we are about to read
                     // was SAVED on the default stream (decode_marconi_checkpoint

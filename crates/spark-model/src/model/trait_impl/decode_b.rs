@@ -19,8 +19,8 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::block_mgmt::{
-    apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
-    extract_layer_refs, reuse_prefix_match_disk_ids,
+    apply_evicted_blocks, ensure_blocks_through_decode, extract_layer_refs,
+    reuse_prefix_match_disk_ids,
 };
 use super::super::ssm_pool::SsmStatePool;
 use super::super::ssm_snapshot::SsmSnapshotPool;
@@ -193,15 +193,11 @@ impl TransformerModel {
 
         // 2b. Allocate KV blocks for prefill sequence
         let prefill_end_pos = prefill_chunk_start + n_prefill;
-        let prefill_blocks_needed = (prefill_end_pos - 1) / bs + 1;
-        ensure_blocks_through_prefill(
+        self.ensure_prefill_blocks(
             prefill_seq,
-            prefill_blocks_needed - 1,
+            (prefill_end_pos - 1) / bs,
             &mut kv_cache,
-            self.prefix_cache.as_ref(),
-            self.gpu.as_ref(),
             stream,
-            self.levers.kv_poison,
         )?;
 
         // ── 3. Upload decode metadata ──
@@ -565,6 +561,8 @@ impl TransformerModel {
             &prefill_tokens[prefill_chunk_start..prefill_chunk_start + n_prefill],
         );
         prefill_seq.seq_len = prefill_chunk_start + n_prefill;
+        self.kv_window
+            .trim(prefill_seq, &mut kv_cache, self.gpu.as_ref(), stream)?;
 
         Ok(crate::traits::MixedForwardResult {
             decode_logits,

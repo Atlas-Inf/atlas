@@ -412,6 +412,7 @@ impl TransformerModel {
             prompt_logprobs: Vec::new(),
             disk_block_ids: Vec::new(),
             disk_last_offloaded_per_layer: vec![0; num_attn_layers],
+            window_held: 0..0,
         })
     }
 

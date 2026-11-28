@@ -259,6 +259,8 @@ impl TransformerModel {
                 seq.tokens
                     .extend_from_slice(&tokens[chunk_start..chunk_start + chunk_len]);
                 seq.seq_len = chunk_start + chunk_len;
+                self.kv_window
+                    .trim(seq, &mut kv_cache, self.gpu.as_ref(), stream)?;
                 seq.last_decode_ckpt_block = seq.tokens.len() / bs;
                 let marks = [t_lookup, t_prefix, t_blocks, t_blocks, t_blocks];
                 self.warm_trace_chunk(seq, total, tp, (span.0, 0), t_pre, marks, None, stream)?;

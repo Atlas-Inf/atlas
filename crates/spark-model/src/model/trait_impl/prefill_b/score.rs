@@ -234,15 +234,7 @@ impl TransformerModel {
                 }
             }
             let end = plan.tokens[i].len();
-            super::super::super::block_mgmt::ensure_blocks_through_prefill(
-                &mut seqs[i],
-                (end - 1) / bs,
-                &mut kv_cache,
-                self.prefix_cache.as_ref(),
-                self.gpu.as_ref(),
-                stream,
-                self.levers.kv_poison,
-            )?;
+            self.ensure_prefill_blocks(&mut seqs[i], (end - 1) / bs, &mut kv_cache, stream)?;
         }
         if !packs.is_empty() {
             self.score_pack_tail_copies(plan, seqs, packs, &kv_cache, stream)?;

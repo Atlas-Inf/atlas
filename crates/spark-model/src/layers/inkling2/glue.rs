@@ -39,6 +39,8 @@ pub(crate) struct GlueKernels {
     pub topk: KernelHandle,
     /// `reshape_and_cache_flash` (BF16 KV)
     pub kv_write: KernelHandle,
+    /// `inkling2_window_meta`: the window layers' slots and block tables
+    pub window_meta: KernelHandle,
     /// Spark NVFP4 projections: one row, many rows
     pub w4a16_gemv: KernelHandle,
     /// AMD (strix-hip): the single-warp `w4a16_gemv_sw` (bit-identical to `w4a16_gemv`,
@@ -92,6 +94,7 @@ impl GlueKernels {
             ),
             topk: gpu.kernel("moe_topk_sig", "moe_topk_sigmoid_batched_f32")?,
             kv_write: gpu.kernel("reshape_and_cache", "reshape_and_cache_flash")?,
+            window_meta: m("inkling2_window_meta")?,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw: if cfg!(atlas_scale) {
                 crate::layers::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw")
@@ -440,6 +443,37 @@ impl GlueKernels {
             .arg_ptr(x)
             .arg_ptr(out)
             .arg_u32(n as u32)
+            .launch(s)
+    }
+
+    /// The window layers' KV slots and block tables for `rows` rows
+    /// (`inkling2_window_meta`): `meta`'s, through the window `map`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn window_meta(
+        &self,
+        gpu: &dyn GpuBackend,
+        meta: &super::batch::Meta,
+        map: DevicePtr,
+        (local_slots, local_tables): (DevicePtr, DevicePtr),
+        rows: usize,
+        block_size: usize,
+        window: usize,
+        s: u64,
+    ) -> Result<()> {
+        let tables = if meta.table_stride == 0 { 1 } else { rows };
+        KernelLaunch::new(gpu, self.window_meta)
+            .grid([tables as u32, 1, 1])
+            .block([128, 1, 1])
+            .arg_ptr(meta.slots)
+            .arg_ptr(meta.positions)
+            .arg_ptr(meta.block_table)
+            .arg_ptr(map)
+            .arg_ptr(local_slots)
+            .arg_ptr(local_tables)
+            .arg_u32(rows as u32)
+            .arg_u32(meta.table_stride as u32)
+            .arg_u32(block_size as u32)
+            .arg_u32(window as u32)
             .launch(s)
     }
 }

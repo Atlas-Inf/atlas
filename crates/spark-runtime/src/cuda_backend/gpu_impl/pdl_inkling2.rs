@@ -12,6 +12,7 @@ pub(super) const INKLING2_PDL_KERNELS: &[&str] = &[
     "inkling2_residual",
     "inkling2_layer_out",
     "inkling2_f32_to_bf16",
+    "inkling2_window_meta",
     "inkling2_sconv",
     "inkling2_sconv_state",
     "inkling2_block_res_sums",

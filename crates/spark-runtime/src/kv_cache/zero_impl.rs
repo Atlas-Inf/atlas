@@ -97,4 +97,41 @@ impl PagedKvCache {
         }
         Ok(())
     }
+
+    /// DIAGNOSTIC (ATLAS_KV_POISON): fill a freshly-allocated block with 0xFF
+    /// (a NaN bit-pattern in both bf16 `0xFFFF` and fp8-e4m3 `0xFF`) instead of
+    /// zero. Any KV region that decode/attention reads but prefill never wrote
+    /// then yields deterministic NaN rather than plausible-but-wrong zeros.
+    /// Used to falsify the "unwritten fresh tail block" hypothesis: if cache-ON
+    /// output goes NaN under poison while cache-OFF stays clean, a fresh block
+    /// is being read unwritten; if both stay clean, fresh KV is fully written
+    /// and the run-to-run nondeterminism originates elsewhere (scratch/scan).
+    pub fn poison_block(
+        &self,
+        block_idx: u32,
+        gpu: &dyn crate::gpu::GpuBackend,
+        stream: u64,
+    ) -> anyhow::Result<()> {
+        // A latent shard stores (and so poisons) only its own blocks.
+        let Some(slot) = self.latent_slot(block_idx) else {
+            return Ok(());
+        };
+        for layer in self.layers.iter().filter(|l| !l.k_pool.is_null()) {
+            let k_offset = slot as usize * layer.k_block_stride;
+            let v_offset = slot as usize * layer.v_block_stride;
+            gpu.memset_async(
+                layer.k_pool.offset(k_offset),
+                0xFF,
+                layer.k_block_stride,
+                stream,
+            )?;
+            gpu.memset_async(
+                layer.v_pool.offset(v_offset),
+                0xFF,
+                layer.v_block_stride,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
 }

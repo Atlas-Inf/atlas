@@ -38,11 +38,20 @@ impl PagedKvCache {
         v_aliases_k: bool,
         placement: KvPlacement,
     ) -> Result<Self> {
-        Self::new_with_k_slots(config, num_blocks, num_blocks, gpu, v_aliases_k, placement)
+        Self::new_with_k_slots(
+            config,
+            num_blocks,
+            num_blocks,
+            gpu,
+            v_aliases_k,
+            placement,
+            &[],
+        )
     }
 
     /// [`Self::new_with_v_alias`] with `k_slots` K-pool block slots per layer
-    /// (`num_blocks` except under a latent shard, see `latent_shard.rs`).
+    /// (`num_blocks` except under a latent shard, see `latent_shard.rs`);
+    /// `window` layers get no pools here (`window.rs` lends theirs).
     pub(super) fn new_with_k_slots(
         config: KvCacheConfig,
         num_blocks: usize,
@@ -50,10 +59,15 @@ impl PagedKvCache {
         gpu: &dyn GpuBackend,
         v_aliases_k: bool,
         placement: KvPlacement,
+        window: &[usize],
     ) -> Result<Self> {
         let mut layers = Vec::with_capacity(config.num_layers);
         let mut total_bytes: usize = 0;
         for i in 0..config.num_layers {
+            if window.contains(&i) {
+                layers.push(LayerPool::window_layer(&config, i));
+                continue;
+            }
             // Per-side block_bytes: for symmetric dtypes both are equal; for
             // asymmetric (e.g. Bf16KTurbo3V) the K pool is allocated bf16-sized
             // and the V pool is allocated turbo3-sized — avoids the 4× V over-
@@ -63,7 +77,7 @@ impl PagedKvCache {
             // Preserve allocation-failure rollback for both ordinary K/V pools
             // and GLM's shared latent pool. An alias owns only one allocation.
             let release = |layers: &[LayerPool]| {
-                for layer in layers {
+                for layer in layers.iter().filter(|l| !l.k_pool.is_null()) {
                     let _ = gpu.free(layer.k_pool);
                     if layer.v_pool != layer.k_pool {
                         let _ = gpu.free(layer.v_pool);
@@ -148,44 +162,8 @@ impl PagedKvCache {
             nvme: Vec::new(),
             latent_shard: None,
             placement,
+            window: None,
         })
-    }
-
-    /// DIAGNOSTIC (ATLAS_KV_POISON): fill a freshly-allocated block with 0xFF
-    /// (a NaN bit-pattern in both bf16 `0xFFFF` and fp8-e4m3 `0xFF`) instead of
-    /// zero. Any KV region that decode/attention reads but prefill never wrote
-    /// then yields deterministic NaN rather than plausible-but-wrong zeros.
-    /// Used to falsify the "unwritten fresh tail block" hypothesis: if cache-ON
-    /// output goes NaN under poison while cache-OFF stays clean, a fresh block
-    /// is being read unwritten; if both stay clean, fresh KV is fully written
-    /// and the run-to-run nondeterminism originates elsewhere (scratch/scan).
-    pub fn poison_block(
-        &self,
-        block_idx: u32,
-        gpu: &dyn crate::gpu::GpuBackend,
-        stream: u64,
-    ) -> anyhow::Result<()> {
-        // A latent shard stores (and so poisons) only its own blocks.
-        let Some(slot) = self.latent_slot(block_idx) else {
-            return Ok(());
-        };
-        for layer in &self.layers {
-            let k_offset = slot as usize * layer.k_block_stride;
-            let v_offset = slot as usize * layer.v_block_stride;
-            gpu.memset_async(
-                layer.k_pool.offset(k_offset),
-                0xFF,
-                layer.k_block_stride,
-                stream,
-            )?;
-            gpu.memset_async(
-                layer.v_pool.offset(v_offset),
-                0xFF,
-                layer.v_block_stride,
-                stream,
-            )?;
-        }
-        Ok(())
     }
 
     /// Increment reference count on a block (for prefix cache sharing).
@@ -239,7 +217,7 @@ impl PagedKvCache {
         }
         if self.block_ref_counts[idx] == 0 {
             self.free_blocks.push(block_idx);
-            self.release_tail_slot_if_freed(block_idx);
+            self.block_freed(block_idx);
             true
         } else {
             false
@@ -314,7 +292,7 @@ impl PagedKvCache {
         }
         if self.block_ref_counts[idx] == 0 {
             self.free_blocks.push(block_idx);
-            self.release_tail_slot_if_freed(block_idx);
+            self.block_freed(block_idx);
         }
     }
 
@@ -349,14 +327,16 @@ impl PagedKvCache {
     #[track_caller]
     pub fn k_pool_ptr(&self, layer_idx: usize) -> DevicePtr {
         self.assert_unsharded("k_pool_ptr");
-        self.layers[layer_idx].k_pool
+        self.window_pools(layer_idx)
+            .map_or(self.layers[layer_idx].k_pool, |p| p.0)
     }
 
     /// Get the full V cache pool pointer for a layer (panics when sharded).
     #[track_caller]
     pub fn v_pool_ptr(&self, layer_idx: usize) -> DevicePtr {
         self.assert_unsharded("v_pool_ptr");
-        self.layers[layer_idx].v_pool
+        self.window_pools(layer_idx)
+            .map_or(self.layers[layer_idx].v_pool, |p| p.1)
     }
 
     /// Cache stride in elements (for FP8/BF16 kernels that need explicit stride).

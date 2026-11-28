@@ -7,6 +7,7 @@
 //   inkling2_residual     r = (restart ? 0 : x) + c   (fp32; x, c BF16)
 //   inkling2_layer_out    BF16(r + m)                 (r fp32, m BF16)
 //   inkling2_f32_to_bf16
+//   inkling2_window_meta  the window layers' slots and block tables, through the window map
 
 #include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
@@ -118,4 +119,40 @@ extern "C" __global__ void inkling2_f32_to_bf16(const float* __restrict__ x, __n
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     out[i] = __float2bfloat16(x[i]);
+}
+
+// Window-bounded KV (spark-runtime kv_cache/window.rs): the sliding-window layers keep their
+// rows at a local block the primary block maps to. This maps each row's KV slot, and each
+// block table's entries from its first row's window (from the 32-key tile holding the first
+// key, where the prefill kernels start) through its last row; the attention never reads the
+// entries outside. Unmapped blocks (graph padding rows' dummy block) go to the null block 0.
+// Grid: one CTA per table (one a row when table_stride > 0, else the rows' shared table);
+// CTA 0 also maps the slots.
+#define INK_NO_WINDOW 0xFFFFFFFFu
+#define INK_KEY_TILE 32u
+
+extern "C" __global__ void inkling2_window_meta(const long long* __restrict__ slots, const int* __restrict__ positions,
+                                                const int* __restrict__ tables, const unsigned int* __restrict__ map,
+                                                long long* __restrict__ local_slots, int* __restrict__ local_tables,
+                                                unsigned int rows, unsigned int table_stride, unsigned int block_size,
+                                                unsigned int window) {
+    atlas_pdl_enter();
+    const unsigned int t = blockIdx.x;
+    if (t == 0) {
+        for (unsigned int r = threadIdx.x; r < rows; r += blockDim.x) {
+            const long long s = slots[r];
+            const unsigned int local = map[(unsigned long long)s / block_size];
+            local_slots[r] = (long long)(local == INK_NO_WINDOW ? 0u : local) * block_size + s % block_size;
+        }
+    }
+    const unsigned int first = (unsigned int)positions[table_stride == 0 ? 0 : t];
+    const unsigned int last = table_stride == 0 ? (unsigned int)positions[rows - 1] : first;
+    const unsigned int key = first + 1 > window ? first + 1 - window : 0u;
+    const unsigned int lo = key / INK_KEY_TILE * INK_KEY_TILE / block_size, hi = last / block_size;
+    const int* table = tables + (unsigned long long)t * table_stride;
+    int* out = local_tables + (unsigned long long)t * table_stride;
+    for (unsigned int b = lo + threadIdx.x; b <= hi; b += blockDim.x) {
+        const unsigned int local = map[(unsigned int)table[b]];
+        out[b] = (int)(local == INK_NO_WINDOW ? 0u : local);
+    }
 }

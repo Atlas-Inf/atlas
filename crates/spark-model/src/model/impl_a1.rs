@@ -726,6 +726,7 @@ impl TransformerModel {
             lora: None,
             lora_install_attempted: false,
             lora_rotatable: false,
+            kv_window: super::kv_window::KvWindow::new(&kv_cache),
             kv_cache: Mutex::new(kv_cache),
             gpu,
             rms_norm_kernel,

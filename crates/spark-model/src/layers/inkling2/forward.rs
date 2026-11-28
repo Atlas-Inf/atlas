@@ -46,6 +46,18 @@ impl Inkling2Layer {
         let bs = kv_cache.block_size();
         let gm = &self.gk;
         let meta = self.meta(gpu, batch, ctx, bs, v.first, stream)?;
+        // window-bounded KV: the sliding-window visits' rows sit at local
+        // blocks (`kv_cache::window`); visit 0 maps the rows' slots and tables
+        let window = kv_cache.window_map_ptr();
+        if v.first && !window.is_null() {
+            let local = (s.local_slots, s.local_table);
+            gm.window_meta(gpu, &meta, window, local, n, bs, p.sliding_window, stream)?;
+        }
+        let (kv_slots, kv_table) = if v.full || window.is_null() {
+            (meta.slots, meta.block_table)
+        } else {
+            (s.local_slots, s.local_table)
+        };
 
         // `hidden` arrives normed: the embedding table is (`load_embedding`),
         // and image rows never pass through `embed_norm`.
@@ -209,7 +221,7 @@ impl Inkling2Layer {
             kv_cache.v_pool_ptr(self.visit_idx),
         );
         gm.kv_write(
-            gpu, n, s.kn, s.vn, k_pool, v_pool, meta.slots, p.kv_heads, p.head_dim, bs, stream,
+            gpu, n, s.kn, s.vn, k_pool, v_pool, kv_slots, p.kv_heads, p.head_dim, bs, stream,
         )?;
         let body = ops::attn_body(
             batch.seqs.len(),
@@ -227,7 +239,7 @@ impl Inkling2Layer {
                     k_cache: k_pool,
                     v_cache: v_pool,
                     out: s.attn,
-                    block_table: meta.block_table,
+                    block_table: kv_table,
                     rel: s.rn,
                     rel_proj: w.rel_proj,
                     rel_proj_t: w.rel_proj_t,
@@ -261,7 +273,7 @@ impl Inkling2Layer {
                     v_cache: v_pool,
                     partials: s.attn_partials,
                     out: s.attn,
-                    block_tables: meta.block_table,
+                    block_tables: kv_table,
                     positions: meta.positions,
                     rel: s.rn,
                     rel_proj: w.rel_proj,
