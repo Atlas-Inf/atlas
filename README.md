@@ -10,12 +10,11 @@
   <p align="center">
     <img alt="NVIDIA" src="https://img.shields.io/badge/NVIDIA-76B900?style=flat-square&logo=nvidia&logoColor=white">
     <img alt="AMD" src="https://img.shields.io/badge/AMD-ED1C24?style=flat-square&logo=amd&logoColor=white">
-    <img alt="Intel" src="https://img.shields.io/badge/Intel-0071C5?style=flat-square&logo=intel&logoColor=white">
   </p>
   <p align="center">
     <a href="LICENSE"><img alt="License: AGPLv3" src="https://img.shields.io/badge/license-AGPLv3-yellow?style=flat-square"></a>
     <a href="#quick-start"><img alt="Pure Rust" src="https://img.shields.io/badge/runtime-pure%20Rust-orange?style=flat-square"></a>
-    <a href="https://hub.docker.com/r/azeezish/atlas-gb10:latest"><img alt="Docker Hub" src="https://img.shields.io/badge/Docker%20Hub-azeezish%2Fatlas--gb10-2496ED?style=flat-square&logo=docker&logoColor=white"></a>
+    <a href="https://github.com/Atlas-Inf/atlas/pkgs/container/atlas-gb10"><img alt="Container image" src="https://img.shields.io/badge/ghcr.io-atlas--inf%2Fatlas--gb10-2496ED?style=flat-square&logo=docker&logoColor=white"></a>
     <a href="https://discord.com/invite/6vDbKaKrKD"><img alt="Discord" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fdiscord.com%2Fapi%2Fv10%2Finvites%2F6vDbKaKrKD%3Fwith_counts%3Dtrue&query=%24.approximate_member_count&label=discord&suffix=%20members&style=flat-square&logo=discord&logoColor=white&color=5865F2"></a>
     <a href="https://x.com/AtlasInference"><img alt="X / Twitter" src="https://img.shields.io/badge/X-%40AtlasInference-000000?style=flat-square&logo=x&logoColor=white"></a>
   </p>
@@ -38,9 +37,9 @@
 
 Atlas is a high-performance, pure Rust & CUDA LLM inference engine purpose-built for prosumer workstations (NVIDIA DGX Spark / GB10 SM121 and AMD Strix Halo). No Python, no PyTorch, no bloated dependency trees—just one compact binary with hand-tuned micro-kernels.
 
-- **Sub-90s First Token**: Boots in seconds with cached weights; zero JIT compile or Python startup lag.
-- **Default Flagship Qwen 3.8 27B**: Dense hybrid GDN + Attention running at 23.59 tok/s single-stream with MTP speculative decoding on a single GB10.
-- **Nemotron 3.5 Lightning + DSpark**: Full bring-up of hybrid Mamba-2 SSM + MoE paired with DSpark speculative decoding drafters for sub-10ms token decode latencies.
+- **Precompiled Kernels**: Kernels ship inside the binary as PTX, so there is no `nvcc` and no Python at runtime; the driver JITs them for your GPU at launch.
+- **Default Flagship Qwen 3.8 27B**: Dense hybrid GDN + Attention running at 23.59 tok/s single-stream with MTP speculative decoding on a single GB10 (26.3 tok/s on the agentic profile, decode-floor gate).
+- **Nemotron 3.5 Lightning + DSpark**: Full bring-up of hybrid Mamba-2 SSM + MoE paired with NVIDIA's DSpark speculative decoding drafter.
 - **Qwen 3.8 Flash-Next Support**: Stream massive ~180B hybrid MoE models inside ~90 GB resident VRAM using direct parallel `pread` NVMe offloading.
 - **Turnkey Sparkrun Integration**: Launch any verified model recipe instantly with `sparkrun run @atlas/<recipe>`.
 - **OpenAI & Anthropic Compatible**: Drop-in API endpoint supporting streaming, tool calling, and reasoning traces.
@@ -68,34 +67,37 @@ Atlas began as a solution to a widely known problem with Python inference engine
 
 One multi-model binary. The right kernel set is selected at startup from the model's `config.json`, so there is no swapping images and no rebuilding. Point Atlas at a HuggingFace ID, or launch a verified recipe with `sparkrun run @atlas/<recipe>`. The recipe SSOT is [sparkrun-recipes](https://github.com/Atlas-Inf/sparkrun-recipes) and the interactive browser lives at [atlasinference.dev/#models](https://atlasinference.dev/#models).
 
-Numbers are single-GB10 decode tok/s measured end-to-end through the HTTP API on a short prompt (`max_tokens ≤ 30`, `temperature = 0.1`), reproducible via `scripts/sweep_all_models.sh`.
+Numbers are decode tok/s unless the row says otherwise. Qwen3.8-27B quotes both measured figures: 23.59 is the default `qwen3.8-27b-nvfp4` recipe's single-stream number (C=1 rung of the 2026-08-17 vLLM comparison; ISL 128 / OSL 1024, temp 0, FP8 KV, thinking off, MTP K=4), and 26.3 is the decode-floor PR gate median (3 runs, one pinned code prompt, `max_tokens = 1500`, `reasoning_effort: "none"`), served by the `qwen3.8-27b-nvfp4-agentic` profile (BF16 KV + head) on one GB10, 2026-11-12. Qwen3.8-Flash-Next quotes the same decode-floor gate at TP=EP=2 on two GB10s (median of 3). The other rows were measured end-to-end through the HTTP API on a short prompt (`max_tokens = 30`, `temperature = 0.1`) with `scripts/sweep_all_models.sh`. Prompt length and timing method differ across these figures, so compare rows with care.
 
 | Model | HuggingFace ID | Params / active | Architecture | Recipe | tok/s |
 |---|---|---|---:|---|---:|
-| **Qwen3.8-27B flagship** | `nvidia/Qwen3.8-27B-NVFP4` | 27B dense | GDN + attention hybrid, MTP | `@atlas/qwen3.8-27b-nvfp4` | 23.59 |
-| **Qwen3.8-Flash-Next** | `RadixArk/Qwen3.8-Flash-Next-NVFP4` | ~180B MoE | GDN + attention + MoE, PLE NVMe streaming | `@atlas/qwen3.8-flash-next-nvfp4` | 36.7 |
-| Nemotron-3.5-Lightning + DSpark | `nvidia` checkpoint via recipe | 30B / 3B | Mamba-2 + attention + MoE + DSpark drafter | `@atlas/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark` | sub-10ms/token |
+| **Qwen3.8-27B flagship** | `nvidia/Qwen3.8-27B-NVFP4` | 27B dense | GDN + attention hybrid, MTP | `@atlas/qwen3.8-27b-nvfp4` | 23.59 (default); 26.3 (agentic, gate) |
+| **Qwen3.8-Flash-Next (FP4-Local)** | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | ~180B MoE | GDN + attention + MoE, PLE resident | `@atlas/qwen3.8-flash-next-fp4-local-tp2` | 83.6 (2× GB10, TP=EP=2) |
+| Nemotron-3.5-Lightning + DSpark | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` | 30B / 3B | Mamba-2 + attention + MoE + DSpark drafter | `@atlas/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark` | |
 | **Nemotron-3.5-Super-VL + LiLiCorr** | `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` | 120B / 12B | Mamba-2 + attention + LatentMoE, C-RADIO vision, LiLiCorr drafter (DFlash γ8) | `@atlas/nemotron-3.5-super-vl-120b-a12b-nvfp4-dflash2` | 28 (γ8); also Strix Halo Windows/Linux |
-| Qwen3.5-27B | `Kbenkhaled/Qwen3.5-27B-NVFP4` | 27B dense | Hybrid SSM + attention, dense FFN, MRoPE | | 13 |
-| Qwen3.5-35B-A3B | `Sehyo/Qwen3.5-35B-A3B-NVFP4` | 35B / 3B | GDN + attention + MoE, MTP | | **131** (MTP K=2) |
-| Qwen3.5-122B-A10B | `Sehyo/Qwen3.5-122B-A10B-NVFP4` | 122B / 10B | GDN + attention + MoE, MTP | | 46 (EP=2) |
+| Qwen3.5-27B | `Kbenkhaled/Qwen3.5-27B-NVFP4` | 27B dense | Hybrid SSM + attention, dense FFN, MRoPE | `@atlas/qwen3.5-27b-dense-nvfp4` | 13 |
+| Qwen3.5-35B-A3B | `Sehyo/Qwen3.5-35B-A3B-NVFP4` | 35B / 3B | GDN + attention + MoE, MTP | `@atlas/qwen3.5-35b-a3b-nvfp4` | **131** (MTP K=2) |
+| Qwen3.5-122B-A10B | `Sehyo/Qwen3.5-122B-A10B-NVFP4` | 122B / 10B | GDN + attention + MoE, MTP | `@atlas/qwen3.5-122b-a10b-nvfp4-ep2` | 46 (EP=2) |
 | Qwen3.6-35B-A3B | `Qwen/Qwen3.6-35B-A3B-FP8` | 35B / 3B | GDN + attention + MoE, MRoPE, vision | `@atlas/qwen3.6-35b-a3b-fp8-mtp` | |
+| Qwen3.6-27B | `Qwen/Qwen3.6-27B-FP8` | 27B dense | GDN + attention + dense FFN | `@atlas/qwen3.6-27b-fp8` | |
 | Holo-3.1-35B-A3B | `Hcompany/Holo-3.1-35B-A3B-NVFP4` | 35B / 3B | GDN + attention + 256-expert MoE, Qwen3-VL vision | | |
 | Holo-3.1-0.8B | `Hcompany/Holo-3.1-0.8B` | 0.8B dense | GDN + attention + dense FFN, Qwen3-VL vision | | |
 | Ornith-1.0-9B | `deepreinforce-ai/Ornith-1.0-9B` | 9B dense | GDN + attention + dense FFN, Qwen3-VL vision, MRoPE | | |
-| Qwen3-Next-80B-A3B | `nvidia/Qwen3-Next-80B-A3B-Instruct-NVFP4` | 80B / 3B | SSM + attention + MoE | | 74 |
-| Qwen3-VL-30B-A3B | `ig1/Qwen3-VL-30B-A3B-Instruct-NVFP4` | 30B / 3B | Vision + attention + MoE | | 97 |
+| Qwen3-Next-80B-A3B | `nvidia/Qwen3-Next-80B-A3B-Instruct-NVFP4` | 80B / 3B | SSM + attention + MoE | `@atlas/qwen3-next-80b-a3b-nvfp4` | 74 |
+| Qwen3-Coder-Next | `Qwen/Qwen3-Coder-Next-FP8` | 80B / 3B | GDN + attention + MoE | `@atlas/qwen3-coder-next-fp8` | |
+| Qwen3-VL-30B-A3B | `ig1/Qwen3-VL-30B-A3B-Instruct-NVFP4` | 30B / 3B | Vision + attention + MoE | `@atlas/qwen3-vl-30b-a3b-nvfp4` | 97 |
 | Gemma-4-26B-A4B | `bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4A16` | 26B / 4B | Attention + MoE, GeGLU | `@atlas/gemma-4-26b-a4b-nvfp4` | 67 |
-| Gemma-4-31B | `nvidia/Gemma-4-31B-IT-NVFP4` | 31B dense | Attention (sliding + full), GeGLU | | 9 |
-| Mistral-Small-4-119B | `mistralai/Mistral-Small-4-119B-2603-NVFP4` | 119B / 6.5B | Attention + MoE | | 33 |
-| MiniMax-M2.7 | `lukealonso/MiniMax-M2.7-NVFP4` | 229B / ~10B | Attention + 256-expert MoE + MTP | | |
+| Gemma-4-31B | `nvidia/Gemma-4-31B-IT-NVFP4` | 31B dense | Attention (sliding + full), GeGLU | `@atlas/gemma-4-31b-nvfp4` | 9 |
+| Mistral-Small-4-119B | `mistralai/Mistral-Small-4-119B-2603-NVFP4` | 119B / 6.5B | MLA + MoE | `@atlas/mistral-small-4-119b-nvfp4` | 33 |
+| MiniMax-M2.7 | `lukealonso/MiniMax-M2.7-NVFP4` | 229B / ~10B | Attention + 256-expert MoE | `@atlas/minimax-m2.7-nvfp4-ep2` | EP=2, 2 Sparks |
 | Nemotron-3-Nano-30B-A3B | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` | 30B / 3B | Mamba-2 + attention + MoE | `@atlas/nemotron-3-nano-30b-a3b-nvfp4` | 88 |
 | Nemotron-3-Super-120B-A12B | `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` | 120B / 12B | Mamba-2 + attention + MoE | `@atlas/nemotron-3-super-120b-a12b-nvfp4` | 24 |
-| DeepSeek-V4-Flash | via recipe | | Attention + MoE | `@atlas/deepseek-v4-flash-nvfp4-ep2` | EP=2, 2 Sparks |
+| Ricursive Ripple-65B Preview | `ricursiveAI/Ripple-65B-Preview-NVFP4` | 65B dense | Sliding + full attention, DFlash2 drafter | `@atlas/ricursive-ripple-65b-nvfp4-dflash2` | |
+| DeepSeek-V4-Flash | `nvidia/DeepSeek-V4-Flash-NVFP4` | | Attention + MoE | `@atlas/deepseek-v4-flash-nvfp4-ep2` | EP=2, 2 Sparks |
 
-Flagship and Flash-Next also ship `-latency` and `-throughput` recipe variants for single-stream latency and 1 to 128 stream concurrency. On Qwen3.5-35B-A3B with MTP speculative decoding, Atlas decodes faster than NVIDIA's own vLLM build on the same hardware, on numbers we can hand you the script for. If you reproduce a faster vLLM number, file an issue. We would rather be measured than congratulated. The kernel-by-kernel comparison against PyTorch eager lives in the [benchmarks chapter](book/src/operations/benchmarks.md).
+The flagship also ships `-concurrency` (batch serving), `-agentic` (thinking-on agentic coding) and `-dflash2` (DFlash2 drafter) recipe variants. Flash-Next ships single-GB10 NVFP4 (`@atlas/qwen3.8-flash-next-nvfp4`) and FP4-Local (`@atlas/qwen3.8-flash-next-fp4-local`) recipes, plus two-Spark TP=EP=2 variants (`-nvfp4-tp2`, `-fp4-local-tp2`). The full list is in [sparkrun-recipes](https://github.com/Atlas-Inf/sparkrun-recipes). On Qwen3.5-35B-A3B with MTP speculative decoding, Atlas decodes faster than NVIDIA's own vLLM build on the same hardware, on numbers we can hand you the script for. If you reproduce a faster vLLM number, file an issue. We would rather be measured than congratulated. The kernel-by-kernel comparison against PyTorch eager lives in the [benchmarks chapter](book/src/operations/benchmarks.md).
 
-And this is only the beginning. The plug-and-play design has already carried AMD into the garden, Apple Silicon and Intel are next, and next quarter's models will slot in the same way the Qwens did this quarter.
+And this is only the beginning. The plug-and-play design has already carried AMD into the garden, an experimental Apple Silicon backend has landed ([`METAL_BACKEND.md`](docs/METAL_BACKEND.md)), Intel is next, and next quarter's models will slot in the same way the Qwens did this quarter.
 
 > **New to Atlas on a Spark?** The [**GB10 Deployment & Compatibility Guide**](docs/GB10_DEPLOYMENT_GUIDE.md) is the one page to read first. It covers which model and quant fit your box, what to do when it OOMs, the known gotchas, and what verified means, then hands you the exact recipe.
 
@@ -111,9 +113,8 @@ And this is only the beginning. The plug-and-play design has already carried AMD
 # Step 1, install sparkrun
 pip install sparkrun  # or uvx sparkrun setup install
 
-# Step 2, download weights (or let sparkrun fetch automatically)
-huggingface-cli download unsloth/Qwen3.8-27B-NVFP4 \
-  --local-dir ~/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4
+# Step 2, download weights into the HF cache (or let sparkrun fetch automatically)
+hf download nvidia/Qwen3.8-27B-NVFP4
 
 # Step 3, launch the flagship (port 8888)
 sparkrun run @atlas/qwen3.8-27b-nvfp4 --hosts localhost
@@ -127,7 +128,8 @@ curl -fsSL https://atlasinference.dev/quickstart.sh | sh
 The other flagships work the same way. The recipe is the command.
 
 ```bash
-# Nemotron 3.5 Lightning 30B + DSpark drafter, sub-10ms decode
+# Nemotron 3.5 Lightning 30B + DSpark drafter. The recipe cannot carry env vars:
+# OPTION_B is required to boot, NO_TOOL_INJECT is the recipe's measured BFCL win.
 export ATLAS_DFLASH_OPTION_B=1 ATLAS_NO_TOOL_INJECT=1
 sparkrun run @atlas/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark --hosts localhost
 
@@ -139,7 +141,7 @@ sparkrun run @atlas/qwen3.8-flash-next-nvfp4 --hosts localhost
 
 Strix Halo is a unified-memory APU, so the validated path is the native binary built against ROCm with no container. Both legs merged into main via [PR #8](https://github.com/Atlas-Inf/atlas/pull/8) (Linux) and [PR #9](https://github.com/Atlas-Inf/atlas/pull/9) (Windows).
 
-**Linux** (Ubuntu 24.04, ROCm 6.2+)
+**Linux** (Ubuntu 24.04, verified on ROCm 7.13 and 10)
 
 ```bash
 git clone https://github.com/Atlas-Inf/atlas.git
