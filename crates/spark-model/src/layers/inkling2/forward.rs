@@ -13,9 +13,14 @@ use spark_runtime::kv_cache::PagedKvCache;
 
 use super::batch::Batch;
 use super::layer::Inkling2Layer;
-use super::ops::{self, DecodeAttn, HeadNorm};
+use super::ops::{self, DecodeAttn};
 use super::weights::{InputNorms, KvConv};
 use crate::layer::ForwardContext;
+
+/// Planes of `Shared::res_sq`: res3's three, msg4's four, then mlp_in.
+const SQ_RES3: usize = 0;
+const SQ_MSG4: usize = 3;
+const SQ_MLP: usize = 7;
 
 impl Inkling2Layer {
     /// This visit over the batch's rows; `conv_states` are the sequences'
@@ -78,11 +83,71 @@ impl Inkling2Layer {
         let x = hidden;
         let res = |i: usize| s.res3.offset(i * rf);
         let normed = |i: usize| s.normed3.offset(i * rb);
+        // decode and verify rows read keys split over the GPU; a prefill chunk of one
+        // sequence takes the prefill kernels
+        let body = ops::attn_body(
+            batch.seqs.len(),
+            batch.rows_per_seq,
+            super::layer::MAX_VERIFY_ROWS,
+            ops::attn_slots(d.max_rows, d.max_seqs),
+        );
+        let prefill = body == ops::AttnBody::Prefill;
+        // later passes gate their inputs by messages; a prefill chunk's fused gate reads
+        // its rows' sums of squares, which their block residuals write (planes SQ_* of
+        // res_sq), and (gb10) rebuilds the messages from their sources with the mix
+        // weights the message block residual writes instead of the fp32 messages
+        let gated_inputs = v.pass > 0;
+        let fused_gate = gated_inputs && prefill && ops::fused_takes(n, false, self.p.gate_rank, h);
+        let rebuilt_msgs = fused_gate && !cfg!(atlas_scale);
+        let sq = |plane: usize| {
+            if fused_gate {
+                s.res_sq.offset(plane * n * 4)
+            } else {
+                DevicePtr::NULL
+            }
+        };
+        let msg = |first: usize| {
+            rebuilt_msgs.then(|| ops::MsgSources {
+                blocks: s.msg_blocks,
+                block_stride: d.block_stride(),
+                num_blocks: v.message_blocks,
+                partial: s.msg_h,
+                p: s.msg_p,
+                first,
+            })
+        };
 
-        // attention inputs (fp32 in res3 unless layer 0)
+        // attention inputs (fp32 in res3 unless layer 0), then their norms into normed3
         let n_in = if v.full { 3 } else { 1 };
         let has_res = !w.attn_query.is_null();
+        let ws = match w.input_norms {
+            InputNorms::Shared(nw) if !self.inputs_split() => vec![nw],
+            InputNorms::Shared(nw) => vec![nw; 3],
+            InputNorms::Separate { q, k, v: vn } => vec![q, k, vn],
+        };
+        // a prefill chunk's rows no message gate rewrites: the block residual norms
+        // its own outputs (the fp32 rows never leave the kernel). Decode rows keep
+        // verify's kernels, so text with drafts stays the text without.
+        let res_norm = |ws: &[DevicePtr], y: DevicePtr| {
+            let fused = prefill && !gated_inputs;
+            let wq = |q: usize| ws[q.min(ws.len() - 1)];
+            fused.then(|| ops::ResNorm {
+                w: [wq(0), wq(1), wq(2)],
+                y,
+                eps: p.eps,
+            })
+        };
+        let in_norm = if has_res && ws.len() == n_in {
+            res_norm(&ws, normed(0))
+        } else {
+            None
+        };
         if has_res {
+            let out = if in_norm.is_some() {
+                DevicePtr::NULL
+            } else {
+                s.res3
+            };
             self.block_res(
                 gpu,
                 n,
@@ -92,11 +157,10 @@ impl Inkling2Layer {
                 x,
                 w.attn_query,
                 n_in,
-                s.res3,
+                (out, sq(SQ_RES3), in_norm, DevicePtr::NULL),
                 stream,
             )?;
         }
-        let gated_inputs = v.pass > 0;
         if gated_inputs {
             let ll = v
                 .loop_layer
@@ -111,7 +175,11 @@ impl Inkling2Layer {
                 s.msg_h,
                 q,
                 4,
-                s.msg4,
+                if rebuilt_msgs {
+                    (DevicePtr::NULL, sq(SQ_MSG4), None, s.msg_p)
+                } else {
+                    (s.msg4, sq(SQ_MSG4), None, DevicePtr::NULL)
+                },
                 stream,
             )?;
             // q, k, v inputs gated by their messages in one pass; SWA layers fan
@@ -119,101 +187,40 @@ impl Inkling2Layer {
             let row_elems = n * h;
             self.msg_gates(
                 gpu,
-                (n, exact),
+                (n, prefill),
                 0..3,
                 (res(0), if v.full { row_elems } else { 0 }),
                 (s.msg4, row_elems),
                 (res(0), row_elems),
+                (sq(SQ_RES3), sq(SQ_MSG4)),
+                msg(0),
                 stream,
             )?;
         }
-        // input norms -> normed3
-        let inputs_split = self.inputs_split();
-        let src_f32 = |i: usize| if has_res { res(i) } else { DevicePtr::NULL };
-        let src_bf16 = if has_res { DevicePtr::NULL } else { x };
-        // one launch for the visit's input norms; layer 0 reads x for all three
-        let in_plane = if has_res { n * h } else { 0 };
-        let ws = match w.input_norms {
-            InputNorms::Shared(nw) if !inputs_split => vec![nw],
-            InputNorms::Shared(nw) => vec![nw; 3],
-            InputNorms::Separate { q, k, v: vn } => vec![q, k, vn],
-        };
-        gm.rmsnorms(
-            gpu,
-            n,
-            src_f32(0),
-            src_bf16,
-            in_plane,
-            &ws,
-            normed(0),
-            h,
-            p.eps,
-            stream,
-        )?;
+        // input norms -> normed3, one launch; layer 0 reads x for all three
+        if in_norm.is_none() {
+            let src_f32 = if has_res { res(0) } else { DevicePtr::NULL };
+            let src_bf16 = if has_res { DevicePtr::NULL } else { x };
+            let in_plane = if has_res { n * h } else { 0 };
+            gm.rmsnorms(
+                gpu,
+                n,
+                src_f32,
+                src_bf16,
+                in_plane,
+                &ws,
+                normed(0),
+                h,
+                p.eps,
+                stream,
+            )?;
+        }
         self.project(gpu, n, exact, stream)?;
 
-        // k/v convs, then the per-head epilogues
         // each state: k, v, post-attention, post-MLP convs (fp32 elements)
         let kvs = d.kv_dim * (p.conv_k - 1);
         let hs = h * (p.conv_k - 1);
-        self.journal_inputs(gpu, batch, [s.k_lin, s.v_lin], 0, stream)?;
-        self.conv(
-            gpu, n, seqs, s.k_lin, s.kc, states, 0, w.k_conv, s.dyn_k, d.kv_dim, p.head_dim, stream,
-        )?;
-        self.conv(
-            gpu, n, seqs, s.v_lin, s.vc, states, kvs, w.v_conv, s.dyn_v, d.kv_dim, p.head_dim,
-            stream,
-        )?;
-        let clip = HeadNorm::Clip {
-            threshold: p.qk_clip,
-        };
-        // full layers scale q and the relative-bias queries by log length
-        let log_pos = if v.full {
-            meta.positions
-        } else {
-            DevicePtr::NULL
-        };
-        self.head_norm(
-            gpu, n, s.q, s.qn, w.q_scale, log_pos, p.heads, p.head_dim, clip, stream,
-        )?;
-        self.head_norm(
-            gpu,
-            n,
-            s.kc,
-            s.kn,
-            DevicePtr::NULL,
-            DevicePtr::NULL,
-            p.kv_heads,
-            p.head_dim,
-            clip,
-            stream,
-        )?;
-        self.head_norm(
-            gpu,
-            n,
-            s.vc,
-            s.vn,
-            DevicePtr::NULL,
-            DevicePtr::NULL,
-            p.kv_heads,
-            p.head_dim,
-            HeadNorm::Rms { eps: p.eps },
-            stream,
-        )?;
-        self.head_norm(
-            gpu,
-            n,
-            s.r,
-            s.rn,
-            w.rel_scale,
-            log_pos,
-            p.heads,
-            p.d_rel,
-            HeadNorm::Clip {
-                threshold: p.rel_clip,
-            },
-            stream,
-        )?;
+        self.kv_convs_and_head_norms(gpu, batch, states, meta.positions, stream)?;
 
         // KV of every row first, then each row attends over its own prefix
         let (k_pool, v_pool) = (
@@ -223,13 +230,7 @@ impl Inkling2Layer {
         gm.kv_write(
             gpu, n, s.kn, s.vn, k_pool, v_pool, kv_slots, p.kv_heads, p.head_dim, bs, stream,
         )?;
-        let body = ops::attn_body(
-            batch.seqs.len(),
-            batch.rows_per_seq,
-            super::layer::MAX_VERIFY_ROWS,
-            ops::attn_slots(d.max_rows, d.max_seqs),
-        );
-        if body == ops::AttnBody::Prefill {
+        let gated = if body == ops::AttnBody::Prefill {
             // a prefill chunk of one sequence: tensor cores
             ops::prefill_attn(
                 gpu,
@@ -239,6 +240,8 @@ impl Inkling2Layer {
                     k_cache: k_pool,
                     v_cache: v_pool,
                     out: s.attn,
+                    gate: s.gate,
+                    gated: s.gated,
                     block_table: kv_table,
                     rel: s.rn,
                     rel_proj: w.rel_proj,
@@ -256,7 +259,7 @@ impl Inkling2Layer {
                     rel_extent: p.rel_extent,
                 },
                 stream,
-            )?;
+            )?
         } else {
             // decode and verify rows split their keys over the GPU; prefill
             // rows have rows enough
@@ -293,16 +296,24 @@ impl Inkling2Layer {
                 },
                 stream,
             )?;
+            false
+        };
+        if !gated {
+            gm.gate_mul(gpu, s.attn, s.gate, s.gated, n * d.q_dim, stream)?;
         }
-        gm.gate_mul(gpu, s.attn, s.gate, s.gated, n * d.q_dim, stream)?;
         gm.proj(gpu, (n, exact), s.gated, w.wo, s.proj, h, d.q_dim, stream)?;
         self.journal_inputs(gpu, batch, [s.proj], 2, stream)?;
+        // the post-attention conv adds itself to the residual stream (fp32 resid)
         self.conv(
             gpu,
             n,
             seqs,
             s.proj,
-            s.conv_out,
+            ops::ConvOut::AddTo {
+                x,
+                restart: v.boundary,
+                r: s.resid,
+            },
             states,
             2 * kvs,
             KvConv::Static {
@@ -314,12 +325,12 @@ impl Inkling2Layer {
             stream,
         )?;
 
-        // block push + residual, MLP input
+        // block push, MLP input
         if v.boundary {
             gpu.copy_d2d_async(x, s.blocks.offset(v.blocks_before * bstride), rb, stream)?;
         }
-        gm.residual(gpu, x, s.conv_out, s.resid, n * h, v.boundary, stream)?;
         let nb_mlp = v.blocks_before + usize::from(v.boundary);
+        let mlp_norm = res_norm(&[w.mlp_norm], s.mlp_normed);
         self.block_res(
             gpu,
             n,
@@ -329,32 +340,39 @@ impl Inkling2Layer {
             DevicePtr::NULL,
             w.mlp_query,
             1,
-            s.mlp_in,
+            match mlp_norm {
+                Some(_) => (DevicePtr::NULL, DevicePtr::NULL, mlp_norm, DevicePtr::NULL),
+                None => (s.mlp_in, sq(SQ_MLP), None, DevicePtr::NULL),
+            },
             stream,
         )?;
         if gated_inputs {
             let mlp_msg = s.msg4.offset(3 * rf);
             self.msg_gates(
                 gpu,
-                (n, exact),
+                (n, prefill),
                 3..4,
                 (s.mlp_in, 0),
                 (mlp_msg, 0),
                 (s.mlp_in, 0),
+                (sq(SQ_MLP), sq(SQ_MSG4 + 3)),
+                msg(3),
                 stream,
             )?;
         }
-        gm.rmsnorm(
-            gpu,
-            n,
-            s.mlp_in,
-            DevicePtr::NULL,
-            w.mlp_norm,
-            s.mlp_normed,
-            h,
-            p.eps,
-            stream,
-        )?;
+        if mlp_norm.is_none() {
+            gm.rmsnorm(
+                gpu,
+                n,
+                s.mlp_in,
+                DevicePtr::NULL,
+                w.mlp_norm,
+                s.mlp_normed,
+                h,
+                p.eps,
+                stream,
+            )?;
+        }
 
         // router, experts, post-MLP conv, layer output
         gm.proj_f32(
@@ -386,7 +404,10 @@ impl Inkling2Layer {
             n,
             seqs,
             s.moe_out,
-            s.mlp_conv,
+            ops::ConvOut::Finish {
+                r: s.resid,
+                out: hidden,
+            },
             states,
             2 * kvs + hs,
             KvConv::Static { weight: w.mlp_conv },
@@ -395,7 +416,6 @@ impl Inkling2Layer {
             h,
             stream,
         )?;
-        gm.layer_out(gpu, s.resid, s.mlp_conv, hidden, n * h, stream)?;
 
         if v.save_prelude {
             gpu.copy_d2d_async(hidden, s.prelude_h, rb, stream)?;
@@ -410,7 +430,7 @@ impl Inkling2Layer {
                 hidden,
                 self.g.output_query,
                 1,
-                s.final_out,
+                (s.final_out, DevicePtr::NULL, None, DevicePtr::NULL),
                 stream,
             )?;
             gm.cast_bf16(gpu, s.final_out, hidden, n * h, stream)?;

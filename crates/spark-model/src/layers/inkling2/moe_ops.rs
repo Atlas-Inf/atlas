@@ -128,7 +128,8 @@ pub(crate) struct MoePrefill {
     pub experts: StackedExperts,
     pub expert_ids: DevicePtr,
     pub weights: DevicePtr,
-    /// `[rows * top_k, 2 * inter]` BF16
+    /// [`moe_gu_bytes`]: AMD's BF16 gate_up rows `[rows * top_k, 2 * inter]`, or on
+    /// gb10 the fused gate_up's per-row partial maxima and counters
     pub gu: DevicePtr,
     /// `[rows * top_k, inter]` BF16
     pub act: DevicePtr,
@@ -161,6 +162,16 @@ pub(crate) const MOE_GROUPED_MIN_ROWS: usize = 16;
 /// expert beyond the full ones).
 pub(crate) fn moe_sort_bytes(expanded: usize, experts: usize) -> usize {
     (3 * expanded + experts + 1 + 1 + max_row_tiles(expanded, experts)) * 4
+}
+
+/// The prefill MoE's `gu` buffer for `slots` expert slots ([`MoePrefill::gu`]).
+pub(crate) fn moe_gu_bytes(slots: usize, inter: usize, experts: usize) -> usize {
+    if cfg!(atlas_scale) {
+        slots * 2 * inter * 2
+    } else {
+        let tiles = max_row_tiles(slots, experts);
+        tiles * (2 * inter).div_ceil(128) * LOWP_M_TILE * 4 + (tiles + 1) * 4
+    }
 }
 
 fn max_row_tiles(expanded: usize, experts: usize) -> usize {
@@ -205,9 +216,6 @@ pub(crate) fn moe_prefill(
     moe_prefill_lowp(gpu, k, a, sorted_rows, offsets, to_perm, stream)
 }
 
-/// `inkling2_situ_quant_fp4`: 32 lanes x INK_SITU_BLOCKS blocks of 16.
-const SITU_MAX_INTER: usize = 32 * 3 * 16;
-
 /// Tile rows of `inkling2_moe_gemm_w4a4` / `_w8a8` (nvfp4_w4a4_tile.cuh `W4_BM`).
 const LOWP_M_TILE: usize = 128;
 
@@ -215,8 +223,9 @@ const LOWP_M_TILE: usize = 128;
 /// row quantized once (NVFP4 for NVFP4 experts, MXFP8 for MXFP8 ones; staged in
 /// `y`, which the down projection fills only later), the gate_up GEMM on the
 /// block-scaled tensor cores (W4A4 or W8A8), the softcapped SwiGLU quantized per
-/// expert row the same way (staged in `act`), the down GEMM likewise, then the
-/// weighted combine.
+/// expert row the same way in the gate_up GEMM's own epilogue (staged in `act`:
+/// `inkling2_moe_fused_gate_up_fp4` / `_mx8`), the down GEMM likewise, then the weighted
+/// combine.
 #[allow(clippy::too_many_arguments)]
 fn moe_prefill_lowp(
     gpu: &dyn GpuBackend,
@@ -231,8 +240,8 @@ fn moe_prefill_lowp(
     let mx = e.mxfp8;
     let te = a.rows * a.top_k;
     ensure!(
-        a.hidden.is_multiple_of(128) && a.inter.is_multiple_of(128) && a.inter <= SITU_MAX_INTER,
-        "inkling2 low-precision experts need dims that are multiples of 128 (inter up to {SITU_MAX_INTER})"
+        a.hidden.is_multiple_of(128) && a.inter.is_multiple_of(128),
+        "inkling2 low-precision experts need dims that are multiples of 128"
     );
     // the tile copies each row's scales 4 (W8A8) or 8 (W4A4) bytes at a time
     e.ensure_aligned(if mx { 4 } else { 8 })?;
@@ -251,7 +260,6 @@ fn moe_prefill_lowp(
     let (xq, xs, xo) = plane(a.y, a.rows, a.hidden);
     let (aq, as_, ao) = plane(a.act, te, a.inter);
     let rows = u32_of(a.rows, "rows")?;
-    let slots = u32_of(te, "slots")?;
     if mx {
         KernelLaunch::new(gpu, k.quant_mxfp8)
             .grid([u32_of((a.rows * a.hidden).div_ceil(256), "x")?, 1, 1])
@@ -273,17 +281,24 @@ fn moe_prefill_lowp(
             .arg_u32(h)
             .launch(stream)?;
     }
-    // the experts' row tiles, one CTA row each
+    // the experts' row tiles, one CTA row each; for NVFP4 the fused gate_up's per-row
+    // partial maxima [row tiles, 2 I / 128, 128] and its row-tile and work counters, in gu
     ensure!(a.num_experts <= 1024, "inkling2: over 1024 experts");
     let tiles = to_perm.offset(te * 4);
+    let m_tiles = u32_of(max_row_tiles(te, a.num_experts), "row tiles")?;
+    let (partial, done) = (
+        a.gu,
+        a.gu.offset(m_tiles as usize * (2 * a.inter / 128) * LOWP_M_TILE * 4),
+    );
     KernelLaunch::new(gpu, k.moe_tiles)
         .grid([1, 1, 1])
         .block([u32_of(a.num_experts.next_multiple_of(32), "experts")?, 1, 1])
         .arg_ptr(offsets)
         .arg_ptr(tiles)
         .arg_u32(ne)
+        .arg_ptr(if mx { DevicePtr::NULL } else { done })
+        .arg_u32(if mx { 0 } else { m_tiles + 1 })
         .launch(stream)?;
-    let m_tiles = u32_of(max_row_tiles(te, a.num_experts), "row tiles")?;
     let gemm = |q: DevicePtr,
                 qs: DevicePtr,
                 outer: DevicePtr,
@@ -310,39 +325,52 @@ fn moe_prefill_lowp(
             .arg_u32(kk)
             .launch(stream)
     };
-    gemm(
-        xq,
-        xs,
-        xo,
-        e.w13,
-        e.w13_scale,
-        e.w13_global,
-        a.gu,
-        sorted_rows,
-        2 * i,
-        h,
-    )?;
     if mx {
-        KernelLaunch::new(gpu, k.situ_quant_mxfp8)
-            .grid([slots, i.div_ceil(256), 1])
+        KernelLaunch::new(gpu, k.moe_fused_gate_up_mx8)
+            .grid([(2 * i).div_ceil(GEMM_N_TILE), m_tiles, 1])
             .block([256, 1, 1])
-            .arg_ptr(a.gu)
+            .arg_ptr(xq)
+            .arg_ptr(xs)
+            .arg_ptr(e.w13)
+            .arg_ptr(e.w13_scale)
             .arg_ptr(aq)
             .arg_ptr(as_)
-            .arg_u32(i)
+            .arg_ptr(offsets)
+            .arg_ptr(tiles)
+            .arg_ptr(sorted_rows)
+            .arg_u32(2 * i)
+            .arg_u32(h)
             .arg_f32(a.gate_softcap)
             .arg_f32(a.up_softcap)
             .launch(stream)?;
     } else {
-        KernelLaunch::new(gpu, k.situ_quant_fp4)
-            .grid([slots.div_ceil(8), 1, 1])
+        // persistent: two CTAs an SM take the (row tile, column tile) items in order; a
+        // row tile's column tiles wait for each other, so all of them must fit at once
+        let ctas = 2 * gpu.sm_count()?;
+        ensure!(
+            ctas >= (2 * i).div_ceil(GEMM_N_TILE),
+            "inkling2 fused gate_up: {ctas} resident CTAs for {} column tiles",
+            (2 * i).div_ceil(GEMM_N_TILE)
+        );
+        KernelLaunch::new(gpu, k.moe_fused_gate_up_fp4)
+            .grid([ctas, 1, 1])
             .block([256, 1, 1])
-            .arg_ptr(a.gu)
+            .arg_ptr(xq)
+            .arg_ptr(xs)
+            .arg_ptr(xo)
+            .arg_ptr(e.w13)
+            .arg_ptr(e.w13_scale)
+            .arg_ptr(e.w13_global)
             .arg_ptr(aq)
             .arg_ptr(as_)
             .arg_ptr(ao)
-            .arg_u32(slots)
-            .arg_u32(i)
+            .arg_ptr(partial)
+            .arg_ptr(done)
+            .arg_ptr(offsets)
+            .arg_ptr(tiles)
+            .arg_ptr(sorted_rows)
+            .arg_u32(2 * i)
+            .arg_u32(h)
             .arg_f32(a.gate_softcap)
             .arg_f32(a.up_softcap)
             .launch(stream)?;

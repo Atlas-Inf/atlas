@@ -69,9 +69,16 @@ pub(crate) struct Shared {
     pub gate_z: DevicePtr,
     /// block-residual chunk sums, `ops::block_res_sums_per_row` per row
     pub res_sums: DevicePtr,
+    /// `[8, rows]` sums of squares of the message gates' fp32 inputs:
+    /// res3's three planes, msg4's four, mlp_in (`forward.rs` `SQ_*`)
+    pub res_sq: DevicePtr,
+    /// `[rows, 4, 9]` fp32: the message mix's weights (`BlockRes::p_out`)
+    pub msg_p: DevicePtr,
     /// attention split partials: decode rows x splits, or prefill rows x 1
     pub attn_partials: DevicePtr,
-    /// prefill relative-bias table `[rows, heads, rel_extent]` BF16
+    /// the per-head prefill attention's relative-bias table `[rows, heads,
+    /// rel_extent]` BF16, for its runs of up to `REL_TABLE_ROWS` rows (longer
+    /// runs take the flash kernel, which computes the bias in place)
     pub rel_table: DevicePtr,
     pub resid: DevicePtr,
     pub mlp_in: DevicePtr,
@@ -97,15 +104,14 @@ pub(crate) struct Shared {
     pub attn: DevicePtr,
     pub gated: DevicePtr,
     pub proj: DevicePtr,
-    pub conv_out: DevicePtr,
     pub mlp_normed: DevicePtr,
     pub act: DevicePtr,
-    /// prefill MoE: interleaved gate/up `[rows * top_k, 2 * inter]` and sort scratch
+    /// prefill MoE: `moe_gu_bytes` (AMD's interleaved gate/up rows; gb10's fused
+    /// gate_up scratch) and sort scratch
     pub gu: DevicePtr,
     pub moe_sort: DevicePtr,
     pub y: DevicePtr,
     pub moe_out: DevicePtr,
-    pub mlp_conv: DevicePtr,
     pub ids: DevicePtr,
     // row metadata (visit 0 uploads)
     pub positions: DevicePtr,
@@ -155,7 +161,10 @@ impl Shared {
             msg4: a.take(4 * r * h * f),
             gate_z: a.take(3 * r * super::ops::MAX_GATE_RANK * f),
             res_sums: a.take(r * super::ops::block_res_sums_per_row(h) * f),
-            rel_table: a.take(r * d.heads * super::ops::MAX_REL_EXTENT * b),
+            res_sq: a.take(8 * r * f),
+            msg_p: a.take(r * super::ops::MAX_RES_QUERIES * super::ops::MAX_BLOCK_STATES * f),
+            rel_table: a
+                .take(r.min(super::ops::REL_TABLE_ROWS) * d.heads * super::ops::MAX_REL_EXTENT * b),
             attn_partials: a.take(
                 super::ops::attn_partials_len(
                     super::ops::attn_slots(r, d.max_seqs),
@@ -186,14 +195,12 @@ impl Shared {
             attn: a.take(r * d.q_dim * b),
             gated: a.take(r * d.q_dim * b),
             proj: a.take(r * h * b),
-            conv_out: a.take(r * h * b),
             mlp_normed: a.take(r * h * b),
             act: a.take(r * d.top_k * d.inter * b),
-            gu: a.take(r * d.top_k * 2 * d.inter * b),
+            gu: a.take(super::ops::moe_gu_bytes(r * d.top_k, d.inter, d.experts)),
             moe_sort: a.take(super::ops::moe_sort_bytes(r * d.top_k, d.experts)),
             y: a.take(r * d.top_k * h * b),
             moe_out: a.take(r * h * b),
-            mlp_conv: a.take(r * h * b),
             ids: a.take(r * d.top_k * 4),
             positions: a.take(r * 4),
             slots: a.take(r * 8),

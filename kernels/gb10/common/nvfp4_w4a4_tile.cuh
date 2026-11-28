@@ -49,6 +49,17 @@ __device__ __forceinline__ void w4_cps(void* dst, const void* src, bool pred) {
     asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;" ::"r"(d), "l"(src), "n"(N), "r"(pred ? N : 0u));
 }
 
+// Four 8x8 b16 matrices from shared memory, one 16-byte row address a lane (lanes 8m ..
+// 8m + 7: matrix m's rows): each register is a lane's 4 bytes of its matrix, exactly the
+// operand layout of the FP4 (and E4M3) MMAs below, so one instruction replaces four 4-byte
+// loads.
+__device__ __forceinline__ void w4_ldsm_x4(const void* row, unsigned int& r0, unsigned int& r1, unsigned int& r2,
+                                           unsigned int& r3) {
+    const unsigned int a = (unsigned int)__cvta_generic_to_shared(row);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+}
+
 __device__ __forceinline__ void w4_mma(float (&c)[4], unsigned int a0, unsigned int a1, unsigned int a2,
                                        unsigned int a3, unsigned int b0, unsigned int b1, unsigned int sfa,
                                        unsigned int sfb) {
@@ -148,21 +159,28 @@ __device__ __forceinline__ void w4_tile(
             const unsigned int j0 = 2 * kk, j1 = j0 + 1;
             // the scale bytes of this MMA's K: NVFP4 four (k64), MX8 one (k32)
             const unsigned int sk = MX8 ? 2 * (s % 2) + kk : 4 * kk;
+            // B: n-tiles 2h and 2h + 1, both K halves of each, in one ldmatrix (lanes 8m ..:
+            // n-tile 2h + m / 2, half m % 2); b[j][0 / 1] = rows q of chunks j0 / j1
             unsigned int b[4][2], sfb[4];
+            #pragma unroll
+            for (unsigned int h = 0; h < 2; ++h) {
+                const unsigned int m = lane >> 3, nl = w4_nt(wn, 2 * h + (m >> 1)) * 8 + (lane & 7u);
+                w4_ldsm_x4(&sm.b[buf][nl][16 * w4_swz(nl, (m & 1u) ? j1 : j0)], b[2 * h][0], b[2 * h][1],
+                           b[2 * h + 1][0], b[2 * h + 1][1]);
+            }
             #pragma unroll
             for (unsigned int j = 0; j < 4; ++j) {
                 const unsigned int nc = w4_nt(wn, j) * 8 + q;
-                b[j][0] = *(const unsigned int*)&sm.b[buf][nc][16 * w4_swz(nc, j0) + 4 * c];
-                b[j][1] = *(const unsigned int*)&sm.b[buf][nc][16 * w4_swz(nc, j1) + 4 * c];
                 sfb[j] = MX8 ? sm.bs[sb][nc][sk] : *(const unsigned int*)&sm.bs[sb][nc][sk];
             }
             #pragma unroll
             for (unsigned int mt = 0; mt < 4; ++mt) {
-                const unsigned int ra = wm * 64 + mt * 16 + q, rc = ra + 8;
-                const unsigned int a0 = *(const unsigned int*)&sm.a[buf][ra][16 * w4_swz(ra, j0) + 4 * c];
-                const unsigned int a1 = *(const unsigned int*)&sm.a[buf][rc][16 * w4_swz(rc, j0) + 4 * c];
-                const unsigned int a2 = *(const unsigned int*)&sm.a[buf][ra][16 * w4_swz(ra, j1) + 4 * c];
-                const unsigned int a3 = *(const unsigned int*)&sm.a[buf][rc][16 * w4_swz(rc, j1) + 4 * c];
+                const unsigned int ra = wm * 64 + mt * 16 + q;
+                // A: rows 0-7 / 8-15 of the m16 tile, chunks j0 then j1 (lanes 8m ..: rows
+                // 8 (m % 2) .., chunk m / 2) -> a0 (q, j0), a1 (q + 8, j0), a2 (q, j1), a3 (q + 8, j1)
+                const unsigned int rl = wm * 64 + mt * 16 + (lane & 7u) + 8u * ((lane >> 3) & 1u);
+                unsigned int a0, a1, a2, a3;
+                w4_ldsm_x4(&sm.a[buf][rl][16 * w4_swz(rl, (lane >> 4) ? j1 : j0)], a0, a1, a2, a3);
                 // Scale lanes: rows 0-7 on lanes 4i, rows 8-15 on lanes 4i + 1.
                 const unsigned char* sa = &sm.as[sb][ra + 8 * (c & 1u)][sk];
                 const unsigned int sfa = MX8 ? *sa : *(const unsigned int*)sa;
