@@ -114,6 +114,13 @@ impl GlueKernels {
     }
 }
 
+/// Whether `ATLAS_SKINNY_MMA`'s row-invariant kernels take `rows` rows of a
+/// `k`-wide NVFP4 projection in one call.
+pub(crate) fn skinny_takes(rows: usize, k: usize) -> bool {
+    use crate::layers::ops::skinny_mma::{Family, serves_rows};
+    serves_rows(Family::W4a16, rows as u32, k as u32)
+}
+
 /// `(first row, rows)` passes of at most `width` rows over `rows`.
 pub(crate) fn passes(rows: usize, width: usize) -> impl Iterator<Item = (usize, usize)> {
     (0..rows)
@@ -189,7 +196,8 @@ impl GlueKernels {
     /// `w4a16_gemv_batch8/16` for decode and verify rows, and its checkpoint BF16
     /// weight for prefill rows (from `MOE_GROUPED_MIN_ROWS`, where the experts
     /// take the checkpoint's too). `exact` (a verify run): every row through
-    /// the decode GEMVs at any row count, in passes of their widest batch.
+    /// the decode GEMVs at any row count, in passes of their widest batch
+    /// (one call under `ATLAS_SKINNY_MMA`, whose rows are the decode row's).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn proj(
         &self,
@@ -204,6 +212,9 @@ impl GlueKernels {
     ) -> Result<()> {
         let pass = match w {
             Linear::Bf16(_) => BATCHM_MAX_ROWS,
+            // `ATLAS_SKINNY_MMA`: one row-invariant call for every row, so the
+            // weight is read once (a pass per 15 rows read it again)
+            Linear::Nvfp4 { .. } if exact && skinny_takes(rows, k) => rows,
             Linear::Nvfp4 { .. } => super::moe_ops::MOE_GROUPED_MIN_ROWS - 1,
         };
         if exact && rows > pass {
@@ -278,6 +289,17 @@ impl GlueKernels {
                 };
                 ops::w4a16_gemv_batchm(gpu, kernel, x, &q, y, rows as u32, n as u32, k as u32, s)
             }
+            Linear::Nvfp4 { q, .. } if exact => ops::w4a16_gemv_batchm(
+                gpu,
+                self.w4a16_gemv_b16,
+                x,
+                &q,
+                y,
+                rows as u32,
+                n as u32,
+                k as u32,
+                s,
+            ),
             Linear::Nvfp4 { prefill, .. } => {
                 ops::bf16_gemm(x, prefill.0, y, rows as u32, n as u32, k as u32, s)
             }
@@ -443,37 +465,6 @@ impl GlueKernels {
             .arg_ptr(x)
             .arg_ptr(out)
             .arg_u32(n as u32)
-            .launch(s)
-    }
-
-    /// The window layers' KV slots and block tables for `rows` rows
-    /// (`inkling2_window_meta`): `meta`'s, through the window `map`.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn window_meta(
-        &self,
-        gpu: &dyn GpuBackend,
-        meta: &super::batch::Meta,
-        map: DevicePtr,
-        (local_slots, local_tables): (DevicePtr, DevicePtr),
-        rows: usize,
-        block_size: usize,
-        window: usize,
-        s: u64,
-    ) -> Result<()> {
-        let tables = if meta.table_stride == 0 { 1 } else { rows };
-        KernelLaunch::new(gpu, self.window_meta)
-            .grid([tables as u32, 1, 1])
-            .block([128, 1, 1])
-            .arg_ptr(meta.slots)
-            .arg_ptr(meta.positions)
-            .arg_ptr(meta.block_table)
-            .arg_ptr(map)
-            .arg_ptr(local_slots)
-            .arg_ptr(local_tables)
-            .arg_u32(rows as u32)
-            .arg_u32(meta.table_stride as u32)
-            .arg_u32(block_size as u32)
-            .arg_u32(window as u32)
             .launch(s)
     }
 }

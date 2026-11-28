@@ -2,9 +2,9 @@
 
 //! `ATLAS_SKINNY_MMA=1` (default off): the NVFP4, Q+gate and block-FP8
 //! projections of 1..=16 rows run on one row-invariant tensor-core kernel
-//! family (`skinny_mma.cu`, `kernels/gb10/qwen3.6-27b/nvfp4/`, so the
-//! qwen3.6-27b and qwen3.8-27b targets), serial decode (M = 1) and every
-//! verify width alike.
+//! family (`kernels/gb10/common/skinny_mma.cu`, every GB10 target; on for
+//! the Qwen 27B exact verify and Inkling 2 Mini's Spark mode), serial
+//! decode (M = 1) and every verify width alike.
 //!
 //! | family | kernels | replaces |
 //! |---|---|---|
