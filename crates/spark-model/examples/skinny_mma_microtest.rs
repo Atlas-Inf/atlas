@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Row-invariance and accuracy gate for the `ATLAS_SKINNY_MMA` kernels
-//! (`kernels/gb10/qwen3.6-27b/nvfp4/skinny_mma.cu`, `layers/ops/skinny_mma.rs`).
+//! (`kernels/gb10/common/skinny_mma.cu`, `layers/ops/skinny_mma.rs`).
 //!
 //! 1. BYTES. On every served Qwen3.8-27B shape, an M-row call (M =
 //!    1..=`MAX_ROWS`, past 16 rows several 16-row launches) must write
@@ -21,6 +21,8 @@
 //!   ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=qwen3.8-27b ATLAS_TARGET_QUANT=nvfp4 \
 //!   cargo run -p spark-model --release --features cuda,gpu-examples \
 //!     --example skinny_mma_microtest
+//!
+//! (`ATLAS_TARGET_MODEL=inkling-2-mini` runs it on Inkling 2 Mini's set.)
 
 use anyhow::Result;
 use half::bf16;
@@ -42,98 +44,9 @@ const SHARED: [(usize, usize); 4] = [(5, 0), (12, 3), (15, 9), (70, 3)];
 /// Rows checked against FP64.
 const ACC_ROWS: usize = 2;
 
-/// `(label, family, N, K, heads, head_dim)`; heads/head_dim only for Q+gate.
-const SHAPES: &[(&str, Family, usize, usize, u32, u32)] = &[
-    (
-        "w4 gate/up  [17408 x 5120]",
-        Family::W4a16,
-        17408,
-        5120,
-        0,
-        0,
-    ),
-    (
-        "w4 down     [5120 x 17408]",
-        Family::W4a16,
-        5120,
-        17408,
-        0,
-        0,
-    ),
-    (
-        "w4 gdn qkvz [16384 x 5120]",
-        Family::W4a16,
-        16384,
-        5120,
-        0,
-        0,
-    ),
-    (
-        "w4 o_proj   [ 5120 x 6144]",
-        Family::W4a16,
-        5120,
-        6144,
-        0,
-        0,
-    ),
-    (
-        "w4 k/v      [ 1024 x 5120]",
-        Family::W4a16,
-        1024,
-        5120,
-        0,
-        0,
-    ),
-    (
-        "w4 lm_head [248077 x 5120]",
-        Family::W4a16,
-        248_077,
-        5120,
-        0,
-        0,
-    ),
-    (
-        "w4 tail     [10307 x 2560]",
-        Family::W4a16,
-        10307,
-        2560,
-        0,
-        0,
-    ),
-    (
-        "qg q+gate   [12288 x 5120]",
-        Family::Qg,
-        12288,
-        5120,
-        24,
-        256,
-    ),
-    ("qg tail     [  500 x 1024]", Family::Qg, 500, 1024, 5, 50),
-    (
-        "w8 gdn qkvz [16384 x 5120]",
-        Family::W8a16,
-        16384,
-        5120,
-        0,
-        0,
-    ),
-    (
-        "w8 gdn out  [ 5120 x 6144]",
-        Family::W8a16,
-        5120,
-        6144,
-        0,
-        0,
-    ),
-    (
-        "w8 tail     [10308 x 2048]",
-        Family::W8a16,
-        10308,
-        2048,
-        0,
-        0,
-    ),
-];
+#[path = "skinny_mma_microtest_parts/shapes.rs"]
+mod shapes;
+use shapes::SHAPES;
 
 struct Shape {
     family: Family,
@@ -313,9 +226,10 @@ fn gemv_today(g: &dyn GpuBackend, sh: &Shape, op: &Ops, t: usize, c: DevicePtr) 
 }
 
 fn main() -> Result<()> {
-    let set = atlas_kernels::ptx_for_model("qwen3.8-27b")
-        .or_else(|| atlas_kernels::ptx_for_model("qwen3.6-27b"))
-        .expect("no qwen3.8-27b or qwen3.6-27b ptx set: build with ATLAS_TARGET_MODEL=qwen3.8-27b");
+    let set = ["qwen3.8-27b", "qwen3.6-27b", "inkling-2-mini"]
+        .into_iter()
+        .find_map(atlas_kernels::ptx_for_model)
+        .expect("no qwen3.8-27b, qwen3.6-27b or inkling-2-mini ptx set: build with ATLAS_TARGET_MODEL=qwen3.8-27b");
     println!("kernel set: {}", set.target.model);
     let backend = AtlasCudaBackend::new(0, &set.modules)?;
     let g: &dyn GpuBackend = &backend;

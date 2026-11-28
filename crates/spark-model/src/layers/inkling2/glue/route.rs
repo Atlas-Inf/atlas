@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The router's top-k and the visit's KV page write (split from `glue.rs`
-//! for the 500-line cap; code moved as is).
+//! The router's top-k, the visit's KV page write and the window layers' KV
+//! slot map (split from `glue.rs` for the 500-line cap; code moved as is).
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -69,6 +69,37 @@ impl GlueKernels {
             .arg_u32(block_size as u32)
             .arg_u32(stride)
             .arg_u32(stride)
+            .launch(s)
+    }
+
+    /// The window layers' KV slots and block tables for `rows` rows
+    /// (`inkling2_window_meta`): `meta`'s, through the window `map`.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layers::inkling2) fn window_meta(
+        &self,
+        gpu: &dyn GpuBackend,
+        meta: &crate::layers::inkling2::batch::Meta,
+        map: DevicePtr,
+        (local_slots, local_tables): (DevicePtr, DevicePtr),
+        rows: usize,
+        block_size: usize,
+        window: usize,
+        s: u64,
+    ) -> Result<()> {
+        let tables = if meta.table_stride == 0 { 1 } else { rows };
+        KernelLaunch::new(gpu, self.window_meta)
+            .grid([tables as u32, 1, 1])
+            .block([128, 1, 1])
+            .arg_ptr(meta.slots)
+            .arg_ptr(meta.positions)
+            .arg_ptr(meta.block_table)
+            .arg_ptr(map)
+            .arg_ptr(local_slots)
+            .arg_ptr(local_tables)
+            .arg_u32(rows as u32)
+            .arg_u32(meta.table_stride as u32)
+            .arg_u32(block_size as u32)
+            .arg_u32(window as u32)
             .launch(s)
     }
 }

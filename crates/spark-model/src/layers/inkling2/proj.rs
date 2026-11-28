@@ -172,9 +172,14 @@ impl Inkling2Layer {
 
     /// One decode row's table for a visit with NVFP4 projections, where the
     /// target ships the mixed kernel and every NVFP4 weight has one global
-    /// scale (the kernel reads no per-row scales).
+    /// scale (the kernel reads no per-row scales). Not under
+    /// `ATLAS_SKINNY_MMA`: the mixed kernel computes a row as `w4a16_gemv`
+    /// does, and with the lever a verify row is the row-invariant tensor-core
+    /// kernel's, so a decode row must take it too.
     fn upload_mixed_table(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
-        if self.gk.proj_gemv_mixed.0 == 0 {
+        // resolved here too: the layers load before the model's tiers do
+        crate::layers::ops::skinny_mma::init(gpu);
+        if self.gk.proj_gemv_mixed.0 == 0 || crate::layers::ops::skinny_mma::active().is_some() {
             return Ok(());
         }
         let mut entries = Vec::new();

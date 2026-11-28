@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// Row-invariant tensor-core skinny GEMMs for the Qwen3.6/3.8-27B decode and
+// Row-invariant tensor-core skinny GEMMs for decode and
 // verify (ATLAS_SKINNY_MMA=1, `crates/spark-model/src/layers/ops/skinny_mma.rs`):
 // C[M, N] = A[M, K] · W[N, K]ᵀ for M = 1..16 BF16 rows, one kernel for serial
 // decode (M = 1) and every verify width, so a row's bits never depend on M.
@@ -60,8 +60,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#include "../../common/atlas_pdl.cuh"
-#include "../../common/bf16mma_dequant.cuh"
+#include "atlas_pdl.cuh"
+#include "bf16mma_dequant.cuh"
 
 #define SK_WARPS 8u
 #define SK_ROWS 16u  // outputs a CTA: the MMA's M
