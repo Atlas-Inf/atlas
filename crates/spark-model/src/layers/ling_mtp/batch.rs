@@ -80,15 +80,16 @@ pub(super) fn pack_meta(rows: &[(u32, i64, i32, &[u32])], max_blocks: usize) -> 
 }
 
 impl LingMtp {
-    /// Draft one token for each sequence. `Ok(None)` hands the step to the
-    /// per-sequence loop: a grammar mask, a batch kernel this build lacks, or a
-    /// sequence whose predictor KV is full.
+    /// Draft `num_drafts` tokens (1..=3) for each sequence. `Ok(None)` hands
+    /// the step to the per-sequence loop: a grammar mask, a batch kernel this
+    /// build lacks, or a sequence whose predictor KV is full.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn propose_rows(
         &self,
         tokens: &[u32],
         targets: &[DevicePtr],
         positions: &[usize],
+        num_drafts: usize,
         states: &mut [&mut dyn ProposerState],
         ctx: &ForwardContext,
         stream: u64,
@@ -118,228 +119,289 @@ impl LingMtp {
         let gpu = ctx.gpu;
         let h = ctx.config.hidden_size;
         let eps = ctx.config.rms_norm_eps as f32;
-        let mut cache = self.cache.lock();
-        let bs = cache.block_size();
-        // Reserve every row's KV slot first: a full cache must leave all
-        // sequences untouched for the per-sequence fallback.
-        let needed = states
-            .iter_mut()
-            .map(|v| state(*v).map(|s| usize::from(s.rows / bs == s.blocks.len())))
-            .sum::<Result<usize>>()?;
-        if needed > cache.num_free_blocks()
-            || states
-                .iter_mut()
-                .any(|v| state(*v).is_ok_and(|s| s.capacity_exhausted))
+        let vocab = ctx.config.vocab_size;
         {
-            return Ok(None);
-        }
-        let mut rows = Vec::with_capacity(n);
-        let max_blocks = b.max_blocks;
-        for (v, &position) in states.iter_mut().zip(positions) {
-            let s: &mut State = state(*v)?;
-            if s.rows / bs == s.blocks.len() {
-                s.blocks.push(cache.alloc_block()?);
+            let cache = self.cache.lock();
+            let bs = cache.block_size();
+            let needed = states
+                .iter_mut()
+                .map(|v| {
+                    state(*v).map(|s| {
+                        (s.rows + num_drafts)
+                            .div_ceil(bs)
+                            .saturating_sub(s.blocks.len())
+                    })
+                })
+                .sum::<Result<usize>>()?;
+            if needed > cache.num_free_blocks()
+                || states
+                    .iter_mut()
+                    .any(|v| state(*v).is_ok_and(|s| s.capacity_exhausted))
+            {
+                return Ok(None);
             }
-            ensure!(
-                s.blocks.len() <= max_blocks,
-                "Ling predictor block table is full"
-            );
-            let slot = (s.blocks[s.rows / bs] as usize * bs + s.rows % bs) as i64;
-            rows.push((
-                u32::try_from(position.saturating_sub(1))?,
-                slot,
-                i32::try_from(s.rows + 1)?,
-            ));
         }
-        let widest = states
-            .iter_mut()
-            .map(|v| state(*v).map(|s| s.blocks.len()))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .unwrap_or(1);
+        let max_blocks = b.max_blocks;
+        let mut cur_tokens = tokens.to_vec();
+        let mut out = vec![Vec::with_capacity(num_drafts); n];
 
-        // Inputs: [embed(token) after enorm | target after model.norm, hnorm].
-        let ids: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
-        gpu.copy_h2d_async(&ids, self.inputs, stream)?;
-        ops::batched_embed(
-            gpu,
-            self.embed_k,
-            self.inputs,
-            self.embed.weight,
-            self.hidden,
-            n as u32,
-            h as u32,
-            stream,
-        )?;
-        ops::rms_norm(
-            gpu,
-            self.norm_k,
-            self.hidden,
-            &self.enorm,
-            self.residual,
-            n as u32,
-            h as u32,
-            eps,
-            stream,
-        )?;
-        gpu.copy_d2d_2d_async(self.residual, 2 * h, self.pair, 4 * h, 2 * h, n, stream)?;
-        for (i, &target) in targets.iter().enumerate() {
-            gpu.copy_d2d_async(target, self.residual.offset(i * 2 * h), 2 * h, stream)?;
-        }
-        ops::rms_norm(
-            gpu,
-            self.norm_k,
-            self.residual,
-            &self.target_norm,
-            self.hidden,
-            n as u32,
-            h as u32,
-            eps,
-            stream,
-        )?;
-        ops::rms_norm(
-            gpu,
-            self.norm_k,
-            self.hidden,
-            &self.hnorm,
-            self.residual,
-            n as u32,
-            h as u32,
-            eps,
-            stream,
-        )?;
-        gpu.copy_d2d_2d_async(
-            self.residual,
-            2 * h,
-            self.pair.offset(2 * h),
-            4 * h,
-            2 * h,
-            n,
-            stream,
-        )?;
-        let max_m = ops::DENSE_GEMV_BATCHM_MAX_M as usize;
-        for first in (0..n).step_by(max_m) {
-            let m = max_m.min(n - first);
-            ops::dense_gemv_batchm(
+        for step in 0..num_drafts {
+            // Prepare hidden half first on chained steps while `self.residual`
+            // still holds the preceding step's post-`self.norm` hidden rows.
+            if step > 0 {
+                ops::rms_norm(
+                    gpu,
+                    self.norm_k,
+                    self.residual,
+                    &self.hnorm,
+                    self.hidden,
+                    n as u32,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
+                gpu.copy_d2d_2d_async(
+                    self.hidden,
+                    2 * h,
+                    self.pair.offset(2 * h),
+                    4 * h,
+                    2 * h,
+                    n,
+                    stream,
+                )?;
+            }
+            let ids: Vec<u8> = cur_tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+            gpu.copy_h2d_async(&ids, self.inputs, stream)?;
+            ops::batched_embed(
                 gpu,
-                b.merge,
-                self.pair.offset(first * 4 * h),
-                &self.merge,
-                self.hidden.offset(first * 2 * h),
-                m as u32,
-                h as u32,
-                (2 * h) as u32,
+                self.embed_k,
+                self.inputs,
+                self.embed.weight,
+                self.hidden,
+                n as u32,
                 h as u32,
                 stream,
             )?;
-        }
+            ops::rms_norm(
+                gpu,
+                self.norm_k,
+                self.hidden,
+                &self.enorm,
+                self.residual,
+                n as u32,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            gpu.copy_d2d_2d_async(self.residual, 2 * h, self.pair, 4 * h, 2 * h, n, stream)?;
+            if step == 0 {
+                for (i, &target) in targets.iter().enumerate() {
+                    gpu.copy_d2d_async(target, self.residual.offset(i * 2 * h), 2 * h, stream)?;
+                }
+                ops::rms_norm(
+                    gpu,
+                    self.norm_k,
+                    self.residual,
+                    &self.target_norm,
+                    self.hidden,
+                    n as u32,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
+                ops::rms_norm(
+                    gpu,
+                    self.norm_k,
+                    self.hidden,
+                    &self.hnorm,
+                    self.residual,
+                    n as u32,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
+                gpu.copy_d2d_2d_async(
+                    self.residual,
+                    2 * h,
+                    self.pair.offset(2 * h),
+                    4 * h,
+                    2 * h,
+                    n,
+                    stream,
+                )?;
+            }
+            let max_m = ops::DENSE_GEMV_BATCHM_MAX_M as usize;
+            for first in (0..n).step_by(max_m) {
+                let m = max_m.min(n - first);
+                ops::dense_gemv_batchm(
+                    gpu,
+                    b.merge,
+                    self.pair.offset(first * 4 * h),
+                    &self.merge,
+                    self.hidden.offset(first * 2 * h),
+                    m as u32,
+                    h as u32,
+                    (2 * h) as u32,
+                    h as u32,
+                    stream,
+                )?;
+            }
 
-        // The body: one MLA + MoE pass over the n rows.
-        let mut tables: Vec<Vec<u32>> = Vec::with_capacity(n);
+            let mut cache = self.cache.lock();
+            let bs = cache.block_size();
+            let mut rows = Vec::with_capacity(n);
+            for (v, &position) in states.iter_mut().zip(positions) {
+                let s: &mut State = state(*v)?;
+                if s.rows / bs == s.blocks.len() {
+                    s.blocks.push(cache.alloc_block()?);
+                }
+                ensure!(
+                    s.blocks.len() <= max_blocks,
+                    "Ling predictor block table is full"
+                );
+                let slot = (s.blocks[s.rows / bs] as usize * bs + s.rows % bs) as i64;
+                rows.push((
+                    u32::try_from(position.saturating_sub(1) + step)?,
+                    slot,
+                    i32::try_from(s.rows + 1)?,
+                ));
+            }
+            let widest = states
+                .iter_mut()
+                .map(|v| state(*v).map(|s| s.blocks.len()))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(1);
+
+            let mut tables: Vec<Vec<u32>> = Vec::with_capacity(n);
+            for v in states.iter_mut() {
+                tables.push(state(*v)?.blocks.clone());
+            }
+            let packed: Vec<_> = rows
+                .iter()
+                .zip(&tables)
+                .map(|(&(p, slot, len), t)| (p, slot, len, t.as_slice()))
+                .collect();
+            let data = pack_meta(&packed, widest);
+            ensure!(
+                data.len() <= b.meta_bytes,
+                "Ling batched predictor metadata overflow"
+            );
+            gpu.copy_h2d_async(&data, b.meta, stream)?;
+            let [_, slots, seq_lens, _] = meta_layout(n, widest);
+            let meta = AttnMetadataDev {
+                positions: b.meta,
+                positions_h: b.meta,
+                positions_w: b.meta,
+                slot: b.meta.offset(slots),
+                seq_len: b.meta.offset(seq_lens),
+                block_table: b.meta.offset(seq_lens + n * 4),
+                max_blocks_per_seq: widest as u32,
+                num_seqs: n as u32,
+                seq_slot: DevicePtr::NULL,
+                moe_row_adapter: DevicePtr::NULL,
+            };
+            let context = ForwardContext {
+                attn_metadata: Some(meta),
+                ssm_batch: None,
+                graph_capture: false,
+                comm: None,
+                midchunk_capture: None,
+                moe_lora_route: crate::layer::MoeLoraRoute::Skip,
+                ..*ctx
+            };
+            let mut empty: Vec<EmptyLayerState> = (0..n).map(|_| EmptyLayerState).collect();
+            let mut body_states: Vec<&mut (dyn LayerState + 'static)> = empty
+                .iter_mut()
+                .map(|s| s as &mut (dyn LayerState + 'static))
+                .collect();
+            let seq_lens_host: Vec<usize> = rows.iter().map(|r| r.2 as usize - 1).collect();
+            self.body.decode_multi_seq(
+                self.hidden,
+                self.residual,
+                n,
+                n,
+                &mut body_states,
+                &mut cache,
+                &seq_lens_host,
+                &tables,
+                &context,
+                stream,
+            )?;
+            for (v, &(position, ..)) in states.iter_mut().zip(&rows) {
+                let s = state(*v)?;
+                s.rows += 1;
+                s.pair = Some(position as usize);
+            }
+            drop(cache);
+
+            ops::rms_norm(
+                gpu,
+                self.norm_k,
+                self.hidden,
+                &self.norm,
+                self.residual,
+                n as u32,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            match n {
+                2 => ops::w4a16_gemv_batch2(
+                    gpu,
+                    head_k,
+                    self.residual,
+                    head_weight,
+                    b.logits,
+                    vocab as u32,
+                    h as u32,
+                    stream,
+                )?,
+                3 => ops::w4a16_gemv_batch3(
+                    gpu,
+                    head_k,
+                    self.residual,
+                    head_weight,
+                    b.logits,
+                    vocab as u32,
+                    h as u32,
+                    stream,
+                )?,
+                _ => ops::w4a16_gemv_batchm(
+                    gpu,
+                    head_k,
+                    self.residual,
+                    head_weight,
+                    b.logits,
+                    n as u32,
+                    vocab as u32,
+                    h as u32,
+                    stream,
+                )?,
+            }
+            ops::argmax_bf16_batch(
+                gpu,
+                b.argmax,
+                b.logits,
+                self.inputs,
+                vocab as u32,
+                n as u32,
+                vocab as u32,
+                stream,
+            )?;
+            let mut raw = vec![0u8; 4 * n];
+            gpu.copy_d2h_on_stream(self.inputs, &mut raw, stream)?;
+            for (i, c) in raw.chunks_exact(4).enumerate() {
+                let id = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                cur_tokens[i] = id;
+                out[i].push(id);
+            }
+        }
         for v in states.iter_mut() {
-            tables.push(state(*v)?.blocks.clone());
+            state(*v)?.speculative_rows = num_drafts.saturating_sub(1);
         }
-        let packed: Vec<_> = rows
-            .iter()
-            .zip(&tables)
-            .map(|(&(p, slot, len), t)| (p, slot, len, t.as_slice()))
-            .collect();
-        let data = pack_meta(&packed, widest);
-        ensure!(
-            data.len() <= b.meta_bytes,
-            "Ling batched predictor metadata overflow"
-        );
-        gpu.copy_h2d_async(&data, b.meta, stream)?;
-        let [_, slots, seq_lens, _] = meta_layout(n, widest);
-        let meta = AttnMetadataDev {
-            positions: b.meta,
-            positions_h: b.meta,
-            positions_w: b.meta,
-            slot: b.meta.offset(slots),
-            seq_len: b.meta.offset(seq_lens),
-            block_table: b.meta.offset(seq_lens + n * 4),
-            max_blocks_per_seq: widest as u32,
-            num_seqs: n as u32,
-            seq_slot: DevicePtr::NULL,
-            moe_row_adapter: DevicePtr::NULL,
-        };
-        let context = ForwardContext {
-            attn_metadata: Some(meta),
-            ssm_batch: None,
-            graph_capture: false,
-            comm: None,
-            midchunk_capture: None,
-            moe_lora_route: crate::layer::MoeLoraRoute::Skip,
-            ..*ctx
-        };
-        // The MLA body keeps no per-sequence layer state.
-        let mut empty: Vec<EmptyLayerState> = (0..n).map(|_| EmptyLayerState).collect();
-        let mut body_states: Vec<&mut (dyn LayerState + 'static)> = empty
-            .iter_mut()
-            .map(|s| s as &mut (dyn LayerState + 'static))
-            .collect();
-        let seq_lens_host: Vec<usize> = rows.iter().map(|r| r.2 as usize - 1).collect();
-        self.body.decode_multi_seq(
-            self.hidden,
-            self.residual,
-            n,
-            n,
-            &mut body_states,
-            &mut cache,
-            &seq_lens_host,
-            &tables,
-            &context,
-            stream,
-        )?;
-        for (v, &(position, ..)) in states.iter_mut().zip(&rows) {
-            let s = state(*v)?;
-            s.rows += 1;
-            s.pair = Some(position as usize);
-        }
-        drop(cache);
-
-        // Head and argmax over the n rows.
-        let vocab = ctx.config.vocab_size;
-        ops::rms_norm(
-            gpu,
-            self.norm_k,
-            self.hidden,
-            &self.norm,
-            self.residual,
-            n as u32,
-            h as u32,
-            eps,
-            stream,
-        )?;
-        ops::w4a16_gemv_batchm(
-            gpu,
-            head_k,
-            self.residual,
-            head_weight,
-            b.logits,
-            n as u32,
-            vocab as u32,
-            h as u32,
-            stream,
-        )?;
-        ops::argmax_bf16_batch(
-            gpu,
-            b.argmax,
-            b.logits,
-            self.inputs,
-            vocab as u32,
-            n as u32,
-            vocab as u32,
-            stream,
-        )?;
-        let mut raw = vec![0u8; 4 * n];
-        gpu.copy_d2h_on_stream(self.inputs, &mut raw, stream)?;
-        Ok(Some(
-            raw.chunks_exact(4)
-                .map(|c| vec![u32::from_le_bytes([c[0], c[1], c[2], c[3]])])
-                .collect(),
-        ))
+        Ok(Some(out))
     }
 }
 

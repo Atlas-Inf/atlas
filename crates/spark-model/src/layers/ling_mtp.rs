@@ -28,6 +28,9 @@ struct State {
     rows: usize,
     capacity_exhausted: bool,
     pair: Option<usize>,
+    /// Speculative KV rows appended past the committed anchor during the last
+    /// `propose` / `propose_batch` (`num_drafts - 1`), trimmed in `after_verify`.
+    speculative_rows: usize,
     body: Box<dyn LayerState>,
 }
 impl ProposerState for State {
@@ -78,6 +81,7 @@ impl LingMtp {
         embed: DenseWeight,
         head: DenseWeight,
         max_seq_len: usize,
+        max_batch_size: usize,
     ) -> Result<Self> {
         ensure!(
             c.mtp_num_hidden_layers == 1,
@@ -96,8 +100,18 @@ impl LingMtp {
             Ok(DenseWeight { weight: t.ptr })
         };
         let body = ling_decoder::load_predictor_body(store, c, gpu)?;
-        let blocks = max_seq_len.div_ceil(16) + 1;
-        let max_meta_bytes = 256 + 4 * blocks;
+        let blocks_per_seq = max_seq_len.div_ceil(16) + 1;
+        // Size the private latent KV pool for concurrent long-context drafting
+        // (1 layer × 576 × 2B ≈ 288 MiB per 262K window). Default to up to 2
+        // windows (override via ATLAS_LING_MTP_KV_WINDOWS) so multi-request
+        // long prompts keep drafting without crowding the target KV budget.
+        let windows = std::env::var("ATLAS_LING_MTP_KV_WINDOWS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&w| w >= 1)
+            .unwrap_or_else(|| max_batch_size.clamp(1, 2));
+        let blocks = blocks_per_seq * windows;
+        let max_meta_bytes = 256 + 4 * blocks_per_seq;
         // The predictor's one MLA layer caches the same latent rows as the
         // target's (`ling_mla::LATENT_ROW`), V aliasing K.
         let cache = PagedKvCache::new_with_v_alias(
@@ -145,7 +159,7 @@ impl LingMtp {
             norm_k: gpu.kernel("ling_norm", "ling_rms_norm")?,
             gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
             argmax: gpu.kernel("argmax", "argmax_bf16")?,
-            batch: batch::BatchKernels::load(gpu, blocks, c.vocab_size)?,
+            batch: batch::BatchKernels::load(gpu, blocks_per_seq, c.vocab_size)?,
         })
     }
 
@@ -298,6 +312,7 @@ impl LingMtp {
         token: u32,
         target: DevicePtr,
         position: usize,
+        apply_target_norm: bool,
         s: &mut State,
         ctx: &ForwardContext,
         stream: u64,
@@ -321,13 +336,19 @@ impl LingMtp {
                 stream,
             )
         };
+        if apply_target_norm {
+            normalize(target, &self.target_norm, self.hidden)?;
+            normalize(self.hidden, &self.hnorm, self.pair.offset(h * 2))?;
+        } else {
+            // Chained draft step: `target` is already post-`self.norm`
+            // (`self.residual` from the preceding draft step).
+            normalize(target, &self.hnorm, self.pair.offset(h * 2))?;
+        }
         normalize(
             self.embed.weight.offset(token as usize * h * 2),
             &self.enorm,
             self.pair,
         )?;
-        normalize(target, &self.target_norm, self.hidden)?;
-        normalize(self.hidden, &self.hnorm, self.pair.offset(h * 2))?;
         ops::dense_gemv(
             gpu,
             self.gemv,
@@ -389,5 +410,23 @@ impl LingMtp {
         s.rows += 1;
         s.pair = Some(position);
         Ok(())
+    }
+
+    fn trim_speculative(&self, s: &mut State, accepted: usize) {
+        let spec = std::mem::take(&mut s.speculative_rows);
+        let drop_rows = spec.saturating_sub(accepted.min(spec));
+        if drop_rows == 0 {
+            return;
+        }
+        s.rows = s.rows.saturating_sub(drop_rows);
+        if let Some(p) = s.pair {
+            s.pair = Some(p.saturating_sub(drop_rows));
+        }
+        let mut cache = self.cache.lock();
+        let keep_blocks = s.rows.div_ceil(cache.block_size());
+        if s.blocks.len() > keep_blocks {
+            let freed: Vec<u32> = s.blocks.drain(keep_blocks..).collect();
+            cache.free_blocks(&freed);
+        }
     }
 }

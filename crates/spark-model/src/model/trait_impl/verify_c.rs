@@ -92,11 +92,8 @@ impl TransformerModel {
         let max_blocks = self.max_blocks_per_seq;
 
         // Zero-alloc metadata upload for K=3.
-        let positions = [
-            seq.seq_len as u32,
-            (seq.seq_len + 1) as u32,
-            (seq.seq_len + 2) as u32,
-        ];
+        let first_position = self.decode_position(seq);
+        let positions = [first_position, first_position + 1, first_position + 2];
         // SAFETY: `positions` is the 3-element `[u32; _]` literal directly
         // above (one entry per K=3 verify row), size 3 * 4 = 12 — exactly the
         // byte length requested. `u32` is POD and the local outlives the copy.
@@ -290,7 +287,7 @@ impl TransformerModel {
                 let layer_type = self.config.layer_type(layer_idx);
 
                 if layer_type == LayerType::FullAttention {
-                    if hss_engaged {
+                    if hss_engaged || self.config.model_type == "bailing_moe_v3_vl" {
                         // HSS path: decode_multi_seq's paged-decode kernel
                         // reads K/V from HBM only, missing the long-context
                         // history on disk. Fall back to decode_batched

@@ -17,6 +17,7 @@ impl DraftProposer for LingMtp {
             rows: 0,
             capacity_exhausted: false,
             pair: None,
+            speculative_rows: 0,
             body: self.body.alloc_state(gpu)?,
         }))
     }
@@ -34,84 +35,99 @@ impl DraftProposer for LingMtp {
         mask: Option<&[i32]>,
         _stack: Option<DevicePtr>,
     ) -> Result<Vec<u32>> {
-        ensure!(num_drafts == 1, "Ling has one native draft stage");
+        ensure!(
+            (1..=3).contains(&num_drafts),
+            "Ling native MTP supports 1..=3 drafts, got {num_drafts}"
+        );
         let s = state(value)?;
         {
             let cache = self.cache.lock();
-            if s.capacity_exhausted
-                || (s.rows == s.blocks.len() * cache.block_size() && cache.num_free_blocks() == 0)
-            {
+            let bs = cache.block_size();
+            let needed = (s.rows + num_drafts)
+                .div_ceil(bs)
+                .saturating_sub(s.blocks.len());
+            if s.capacity_exhausted || needed > cache.num_free_blocks() {
                 s.capacity_exhausted = true;
                 return Ok(vec![]);
             }
         }
-        self.append(
-            last_token,
-            target_hidden,
-            position.saturating_sub(1),
-            s,
-            ctx,
-            stream,
-        )?;
         let h = ctx.config.hidden_size as u32;
         let vocab = ctx.config.vocab_size as u32;
-        ops::rms_norm(
-            ctx.gpu,
-            self.norm_k,
-            self.hidden,
-            &self.norm,
-            self.residual,
-            1,
-            h,
-            ctx.config.rms_norm_eps as f32,
-            stream,
-        )?;
-        if let Some((weight, kernel)) = &self.draft_head {
-            ops::w4a16_gemv(
-                ctx.gpu,
-                *kernel,
-                self.residual,
-                weight,
-                self.logits,
-                vocab,
-                h,
+        let mut drafts = Vec::with_capacity(num_drafts);
+        let mut cur_token = last_token;
+        let mut cur_hidden = target_hidden;
+        for step in 0..num_drafts {
+            self.append(
+                cur_token,
+                cur_hidden,
+                position.saturating_sub(1) + step,
+                step == 0,
+                s,
+                ctx,
                 stream,
             )?;
-        } else {
-            ops::dense_gemv(
+            ops::rms_norm(
                 ctx.gpu,
-                self.gemv,
+                self.norm_k,
+                self.hidden,
+                &self.norm,
                 self.residual,
-                &self.head,
-                self.logits,
-                vocab,
+                1,
                 h,
+                ctx.config.rms_norm_eps as f32,
                 stream,
             )?;
+            if let Some((weight, kernel)) = &self.draft_head {
+                ops::w4a16_gemv(
+                    ctx.gpu,
+                    *kernel,
+                    self.residual,
+                    weight,
+                    self.logits,
+                    vocab,
+                    h,
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemv(
+                    ctx.gpu,
+                    self.gemv,
+                    self.residual,
+                    &self.head,
+                    self.logits,
+                    vocab,
+                    h,
+                    stream,
+                )?;
+            }
+            let id = if let Some(mask) = mask {
+                crate::layers::deepseek_v4_mtp::argmax_grammar_masked(
+                    ctx.gpu,
+                    self.logits,
+                    vocab as usize,
+                    mask,
+                    position + step,
+                )?
+            } else {
+                ops::argmax_bf16(
+                    ctx.gpu,
+                    self.argmax,
+                    self.logits,
+                    self.inputs,
+                    vocab,
+                    stream,
+                )?;
+                let mut raw = [0; 4];
+                ctx.gpu.copy_d2h_on_stream(self.inputs, &mut raw, stream)?;
+                u32::from_le_bytes(raw)
+            };
+            drafts.push(id);
+            cur_token = id;
+            // `self.residual` holds post-`self.norm` output for the next chained step.
+            cur_hidden = self.residual;
         }
-        let id = if let Some(mask) = mask {
-            crate::layers::deepseek_v4_mtp::argmax_grammar_masked(
-                ctx.gpu,
-                self.logits,
-                vocab as usize,
-                mask,
-                position,
-            )?
-        } else {
-            ops::argmax_bf16(
-                ctx.gpu,
-                self.argmax,
-                self.logits,
-                self.residual,
-                vocab,
-                stream,
-            )?;
-            let mut raw = [0; 4];
-            ctx.gpu
-                .copy_d2h_on_stream(self.residual, &mut raw, stream)?;
-            u32::from_le_bytes(raw)
-        };
-        Ok(vec![id])
+        s.speculative_rows = drafts.len().saturating_sub(1);
+        Ok(drafts)
     }
     fn propose_batch(
         &self,
@@ -126,10 +142,20 @@ impl DraftProposer for LingMtp {
         _out_conf: Option<&mut Vec<Vec<f32>>>,
         grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
     ) -> Result<Option<Vec<Vec<u32>>>> {
-        if num_drafts != 1 || grammar_bitmasks.is_some_and(|m| m.iter().any(Option::is_some)) {
+        if !(1..=3).contains(&num_drafts)
+            || grammar_bitmasks.is_some_and(|m| m.iter().any(Option::is_some))
+        {
             return Ok(None);
         }
-        self.propose_rows(last_tokens, target_hiddens, positions, states, ctx, stream)
+        self.propose_rows(
+            last_tokens,
+            target_hiddens,
+            positions,
+            num_drafts,
+            states,
+            ctx,
+            stream,
+        )
     }
     fn propose_batch_max(
         &self,
@@ -181,13 +207,14 @@ impl DraftProposer for LingMtp {
     }
     fn after_verify(
         &self,
-        _accepted: usize,
+        accepted: usize,
         _owner: Option<SequenceGeneration>,
-        _state: &mut dyn ProposerState,
+        value: &mut dyn ProposerState,
         _stream: u64,
     ) -> Result<()> {
-        // One proposal consumed the committed anchor token. Its private KV row
-        // remains valid whether the proposed next token was accepted or rejected.
+        // Row 0 consumed the committed anchor token and always remains valid.
+        // Any chained speculative draft rows past `accepted` are trimmed.
+        self.trim_speculative(state(value)?, accepted);
         Ok(())
     }
     fn free_state(
@@ -202,6 +229,7 @@ impl DraftProposer for LingMtp {
         s.rows = 0;
         s.capacity_exhausted = false;
         s.pair = None;
+        s.speculative_rows = 0;
         Ok(())
     }
 }

@@ -480,12 +480,37 @@ impl LingDecoderLayer {
         ops::residual_add(ctx.gpu, self.residual_add_k, hidden, ffn_out, h, stream)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_kda_rows(
         &self,
         hidden: DevicePtr,
         residual: DevicePtr,
         num_tokens: usize,
         states: &[LingKdaState],
+        verify_snapshots: &[(DevicePtr, DevicePtr)],
+        ctx: &ForwardContext<'_>,
+        stream: u64,
+    ) -> Result<()> {
+        self.run_kda_rows_ks(
+            hidden,
+            residual,
+            num_tokens,
+            states,
+            None,
+            verify_snapshots,
+            ctx,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_kda_rows_ks(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_tokens: usize,
+        states: &[LingKdaState],
+        ks: Option<&[usize]>,
         verify_snapshots: &[(DevicePtr, DevicePtr)],
         ctx: &ForwardContext<'_>,
         stream: u64,
@@ -547,11 +572,12 @@ impl LingDecoderLayer {
             && sizes.expert_down_out >= 4 * plane_bytes + num_tokens * LING_KDA_HEADS * 4)
             .then(|| ctx.buffers.expert_down_out());
         let attn = match &self.attention {
-            LingAttention::Kda { layer, .. } => layer.forward_prefill(
+            LingAttention::Kda { layer, .. } => layer.forward_prefill_ks(
                 ctx.gpu,
                 normed,
                 num_tokens,
                 states,
+                ks,
                 verify_snapshots,
                 fp32_workspace,
                 scratch,

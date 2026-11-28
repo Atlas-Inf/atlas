@@ -252,7 +252,39 @@ fn mock_multi_sequence_verify_snapshots_each_sequence_after_its_first_row() {
 }
 
 #[test]
-fn verify_snapshots_must_match_two_rows_per_sequence() {
+fn mock_multi_sequence_k3_verify_snapshots_two_rows_per_sequence() {
+    let gpu = MockGpuBackend::new();
+    let weights = LingKdaWeights::load(&gpu, &test_store(), "").unwrap();
+    let layer = LingKdaLayer::new(weights, LingKdaConfig::pinned(), &gpu).unwrap();
+    let (a, a0) = verify_state(&gpu);
+    let (_, a1) = verify_state(&gpu);
+    let (b, b0) = verify_state(&gpu);
+    let (_, b1) = verify_state(&gpu);
+    let states = [a, b];
+    let snapshots = [a0, a1, b0, b1];
+    let projection_scratch = LingProjectionScratch::new(DevicePtr::NULL, 0, DevicePtr::NULL, 0);
+
+    layer
+        .forward_prefill(
+            &gpu,
+            DevicePtr(0x25_0000),
+            6,
+            &states,
+            &snapshots,
+            None,
+            prefill_scratch(),
+            projection_scratch,
+            9,
+        )
+        .unwrap();
+    // 6 projections + 2 seqs * 3 planes * 3 rows conv + 3 batched recurrences + pack/norm/o_proj.
+    assert_eq!(gpu.launch_count(), 6 + 2 * 3 * 3 + 3 + 3);
+    // 2 seqs * 2 snapshot steps * (3 conv planes + 1 h state).
+    assert_eq!(gpu.d2d_count(), 2 * 2 * 4);
+}
+
+#[test]
+fn verify_snapshots_must_match_rows_per_sequence() {
     let gpu = MockGpuBackend::new();
     let weights = LingKdaWeights::load(&gpu, &test_store(), "").unwrap();
     let layer = LingKdaLayer::new(weights, LingKdaConfig::pinned(), &gpu).unwrap();

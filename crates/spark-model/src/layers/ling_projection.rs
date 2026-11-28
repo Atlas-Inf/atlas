@@ -9,9 +9,12 @@ use spark_runtime::weights::{WeightDtype, WeightStore};
 use crate::layers::ops;
 use crate::weight_map::DenseWeight;
 
-/// BF16 rows: up to the batched GEMV's limit one kernel whose rows do not
-/// depend on the row count (serial decode and a small verify or batch agree
-/// byte for byte), a tensor-core GEMM past it.
+/// Row caps of the NVFP4 decode tiers (`w4a16_gemv_batch{8,16,32}`).
+const DECODE_TIERS: [u32; 3] = [8, 16, 32];
+
+/// BF16 rows: up to the batched GEMV's 8-row limit one kernel whose rows do not
+/// depend on the row count, cuBLASLt tensor-core GEMM from 9 rows up so wider
+/// batches (e.g. C8 K=2 verify at 16 rows) read BF16 weights once, not twice.
 pub(crate) fn bf16_prompt_rows(
     gpu: &dyn GpuBackend,
     batch_gemv: KernelHandle,
@@ -56,7 +59,7 @@ enum Format {
         decode_nvfp4: Option<(
             crate::weight_map::QuantizedWeight,
             KernelHandle,
-            KernelHandle,
+            [KernelHandle; 3],
         )>,
     },
     Fp8 {
@@ -115,7 +118,11 @@ impl LingProjection {
                     Some((
                         packed,
                         gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
-                        gpu.kernel("w4a16_gemv", "w4a16_gemv_batch8")?,
+                        [
+                            gpu.kernel("w4a16_gemv", "w4a16_gemv_batch8")?,
+                            gpu.kernel("w4a16_gemv", "w4a16_gemv_batch16")?,
+                            gpu.kernel("w4a16_gemv", "w4a16_gemv_batch32")?,
+                        ],
                     ))
                 } else {
                     None
@@ -225,15 +232,17 @@ impl LingProjection {
                 batch_gemv,
                 decode_nvfp4,
             } => {
-                if let Some((weight, one, batch)) = decode_nvfp4 {
+                if let Some((weight, one, tiers)) = decode_nvfp4 {
                     if rows == 1 {
                         return ops::w4a16_gemv(
                             gpu, one, input, &weight, output, self.n, self.k, stream,
                         );
                     }
-                    if rows <= 8 {
+                    // Decode and verify rows up to 32 (e.g. C16 decode or
+                    // C8 verify): each tier is row-invariant and stays in NVFP4.
+                    if let Some(i) = DECODE_TIERS.iter().position(|&m| rows <= m) {
                         return ops::w4a16_gemv_batchm(
-                            gpu, batch, input, &weight, output, rows, self.n, self.k, stream,
+                            gpu, tiers[i], input, &weight, output, rows, self.n, self.k, stream,
                         );
                     }
                 }

@@ -80,11 +80,12 @@ impl TransformerModel {
         let meta_base = self.buffers.scratch().offset(32768);
         let max_blocks = self.max_blocks_per_seq;
 
+        let first_position = self.decode_position(seq);
         let positions = [
-            seq.seq_len as u32,
-            (seq.seq_len + 1) as u32,
-            (seq.seq_len + 2) as u32,
-            (seq.seq_len + 3) as u32,
+            first_position,
+            first_position + 1,
+            first_position + 2,
+            first_position + 3,
         ];
         // SAFETY: `positions` is the 4-element `[u32; _]` literal directly
         // above (one entry per K=4 verify row), size 4 * 4 = 16 — exactly the
@@ -298,7 +299,7 @@ impl TransformerModel {
                 };
 
                 if layer_type == LayerType::FullAttention {
-                    if hss_engaged {
+                    if hss_engaged || self.config.model_type == "bailing_moe_v3_vl" {
                         // HSS path: decode_multi_seq's paged-decode kernel
                         // reads K/V from HBM only, missing the long-context
                         // history on disk. Fall back to decode_batched

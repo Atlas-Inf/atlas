@@ -100,7 +100,6 @@ enum UnionProjection {
 
 struct Kernels {
     router_gemv: KernelHandle,
-    router_gemm: Option<KernelHandle>,
     router_batch_gemv: Option<KernelHandle>,
     router: KernelHandle,
     quant: KernelHandle,

@@ -373,8 +373,8 @@ pub fn build_model(
         && dflash_args.is_none()
     {
         anyhow::ensure!(
-            num_drafts == 1,
-            "Ling native MTP currently verifies one draft per step"
+            (1..=3).contains(&num_drafts),
+            "Ling native MTP verifies 1..=3 drafts per step, got {num_drafts}"
         );
         Some(crate::layers::ling_mtp::LingMtp::load(
             &store,
@@ -383,6 +383,7 @@ pub fn build_model(
             embed,
             lm_head,
             max_seq_len,
+            max_batch_size,
         )?)
     } else {
         None

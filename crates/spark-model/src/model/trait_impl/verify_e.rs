@@ -56,8 +56,10 @@ impl TransformerModel {
     /// is armed. Everything outside falls back to the per-seq loop.
     pub(super) fn can_batch_verify_dispatch(&self, ks: &[usize]) -> bool {
         let n = ks.len();
-        // Ling verifies its one native draft: two rows per sequence.
-        if self.config.model_type == "bailing_moe_v3_vl" && ks.iter().any(|&k| k != 2) {
+        // Ling verifies 1..=3 native drafts (uniform or ragged 2..=4 rows/seq).
+        if self.config.model_type == "bailing_moe_v3_vl"
+            && (ks.is_empty() || ks.iter().any(|&k| !(2..=4).contains(&k)))
+        {
             return false;
         }
         // One sequence only on the exact lane past its own 4-row verify

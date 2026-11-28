@@ -134,4 +134,13 @@ impl TransformerModel {
                 && self.config.index_kpool > 0
                 && self.config.index_topk > 0)
     }
+
+    /// Ling A16's verify rows use the same row-independent arithmetic as serial
+    /// decode (KDA per-row recurrence, absorbed MLA decode, row-independent
+    /// projections and FFN), so MTP speculation is lossless inside `<think>`.
+    pub(super) fn ling_verify_bit_exact(&self) -> bool {
+        self.config.model_type == "bailing_moe_v3_vl"
+            && !self.layers.is_empty()
+            && !self.layers.iter().any(|l| l.multi_seq_decode_graph_unsupported())
+    }
 }

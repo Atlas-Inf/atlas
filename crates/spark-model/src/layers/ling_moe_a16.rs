@@ -36,10 +36,6 @@ impl LingMoeFfn {
         ensure!(ctx.config.hidden_size == self.hidden);
         let rows = u32::try_from(num_tokens)
             .map_err(|_| anyhow::anyhow!("Ling A16 prefill row count exceeds CUDA launch range"))?;
-        let router_gemm = self
-            .kernels
-            .router_gemm
-            .ok_or_else(|| anyhow::anyhow!("Ling A16 router GEMM kernel is unavailable"))?;
         let silu_kernel = self
             .kernels
             .silu_bf16
@@ -153,6 +149,9 @@ impl LingMoeFfn {
         // Keep routing entirely on device.  The existing Ling router block
         // indexes logits by blockIdx.x, so launching one block per row gives
         // exactly the one-token tie-breaking implementation for every row.
+        // Up to 8 rows use single-launch batched GEMV (row-invariant with
+        // serial decode); from 9 rows up use cuBLASLt BF16→FP32 GEMM so wider
+        // verify batches read the router matrix once instead of twice.
         if rows <= ops::DENSE_GEMV_BATCHM_MAX_M {
             ops::dense_gemv_batchm(
                 ctx.gpu,
@@ -166,22 +165,10 @@ impl LingMoeFfn {
                 EXPERTS as u32,
                 stream,
             )?;
-        } else if rows >= 32 {
+        } else {
             ops::bf16_gemm_f32out(
                 input,
                 self.router.weight.0,
-                ctx.buffers.gate_logits_f32(),
-                rows,
-                EXPERTS as u32,
-                self.hidden as u32,
-                stream,
-            )?;
-        } else {
-            ops::dense_gemm(
-                ctx.gpu,
-                router_gemm,
-                input,
-                &self.router,
                 ctx.buffers.gate_logits_f32(),
                 rows,
                 EXPERTS as u32,
@@ -202,13 +189,22 @@ impl LingMoeFfn {
             stream,
         )?;
 
-        if rows >= 128 {
+        if rows >= 33 {
             return self.grouped_a16_prefill(input, ids, weights, rows, ctx, stream);
         }
         // At most one slot per token can route to an expert. The union kernel
         // owns room for 32 such matches for each of Ling's 512 experts.
+        static UNION_MIN_ROWS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let union_min = *UNION_MIN_ROWS.get_or_init(|| {
+            std::env::var("ATLAS_LING_UNION_MIN_ROWS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&v| (1..=32).contains(&v))
+                .unwrap_or(2)
+        });
         let union = self.kernels.decode_union.filter(|_| {
-            (4..=32).contains(&rows) && (1 + EXPERTS * (2 + 2 * 32)) * 4 <= sizes.gate_logits_f32
+            (union_min..=32).contains(&rows)
+                && (1 + EXPERTS * (2 + 2 * 32)) * 4 <= sizes.gate_logits_f32
         });
         let workspace = ctx.buffers.gate_logits_f32();
         if let Some((plan, _)) = union {

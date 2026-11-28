@@ -92,10 +92,18 @@ impl TransformerLayer for LingDecoderLayer {
         stream: u64,
     ) -> Result<()> {
         if matches!(&self.attention, LingAttention::Kda { .. }) {
-            if num_tokens == 2 && self.batch_verify {
+            if (2..=4).contains(&num_tokens) && self.batch_verify {
                 let kda = self.state_kda(state, ctx.config)?;
-                let snapshot = Self::verify_snapshot(state)?;
-                return self.run_kda_rows(hidden, residual, 2, &[kda], &[snapshot], ctx, stream);
+                let snapshots = Self::verify_snapshots(state, num_tokens - 1)?;
+                return self.run_kda_rows(
+                    hidden,
+                    residual,
+                    num_tokens,
+                    &[kda],
+                    &snapshots,
+                    ctx,
+                    stream,
+                );
             }
             let h_bytes = self.hidden_size * 2;
             for token in 0..num_tokens {
@@ -140,7 +148,7 @@ impl TransformerLayer for LingDecoderLayer {
             "Ling MLA verify metadata has {} rows for {num_tokens} tokens",
             meta.num_seqs
         );
-        if num_tokens == 2 && self.batch_verify {
+        if (2..=4).contains(&num_tokens) && self.batch_verify {
             return self.mla_decode_rows(hidden, residual, num_tokens, kv_cache, meta, ctx, stream);
         }
         let h_bytes = self.hidden_size * 2;
@@ -241,17 +249,17 @@ impl TransformerLayer for LingDecoderLayer {
             n_seqs > 0
                 && ks.len() == n_seqs
                 && states.len() >= n_seqs
-                && ks.iter().all(|&k| k == 2),
-            "Ling batched verify takes two rows for each sequence, got {ks:?}"
+                && ks.iter().all(|&k| (2..=4).contains(&k)),
+            "Ling batched verify takes 2..=4 rows per sequence, got {ks:?}"
         );
         if !self.batch_verify {
             // ATLAS_LING_SERIAL_VERIFY: each sequence's rows one at a time.
-            let row_bytes = 2 * self.hidden_size * 2;
-            for (i, state) in states[..n_seqs].iter_mut().enumerate() {
+            let mut row_off = 0usize;
+            for (state, &k) in states[..n_seqs].iter_mut().zip(ks) {
                 self.decode_batched(
-                    hidden.offset(i * row_bytes),
-                    residual.offset(i * row_bytes),
-                    2,
+                    hidden.offset(row_off * self.hidden_size * 2),
+                    residual.offset(row_off * self.hidden_size * 2),
+                    k,
                     *state,
                     kv_cache,
                     0,
@@ -261,16 +269,28 @@ impl TransformerLayer for LingDecoderLayer {
                     ctx,
                     stream,
                 )?;
+                row_off += k;
             }
             return Ok(());
         }
+        let total_rows: usize = ks.iter().sum();
+        let total_snaps: usize = ks.iter().map(|&k| k - 1).sum();
         let mut kda = Vec::with_capacity(n_seqs);
-        let mut snapshots = Vec::with_capacity(n_seqs);
-        for state in states[..n_seqs].iter_mut() {
+        let mut snapshots = Vec::with_capacity(total_snaps);
+        for (state, &k) in states[..n_seqs].iter_mut().zip(ks) {
             kda.push(self.state_kda(*state, ctx.config)?);
-            snapshots.push(Self::verify_snapshot(*state)?);
+            snapshots.extend(Self::verify_snapshots(*state, k - 1)?);
         }
-        self.run_kda_rows(hidden, residual, 2 * n_seqs, &kda, &snapshots, ctx, stream)
+        self.run_kda_rows_ks(
+            hidden,
+            residual,
+            total_rows,
+            &kda,
+            Some(ks),
+            &snapshots,
+            ctx,
+            stream,
+        )
     }
 
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
@@ -299,21 +319,28 @@ impl TransformerLayer for LingDecoderLayer {
 }
 
 impl LingDecoderLayer {
-    /// A KDA sequence's verify snapshot: where its recurrent matrix and
-    /// convolution windows land after the verify's first row.
-    fn verify_snapshot(state: &mut dyn LayerState) -> Result<(DevicePtr, DevicePtr)> {
+    /// A KDA sequence's verify snapshots: where its recurrent matrix and
+    /// convolution windows land after each of the first `count` rows.
+    fn verify_snapshots(
+        state: &mut dyn LayerState,
+        count: usize,
+    ) -> Result<Vec<(DevicePtr, DevicePtr)>> {
         let ssm = state
             .as_any_mut()
             .downcast_mut::<SsmLayerState>()
             .ok_or_else(|| anyhow::anyhow!("missing Ling verify slot"))?;
-        Ok((
-            *ssm.h_state_intermediates
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("missing Ling verify H row"))?,
-            *ssm.conv_state_intermediates
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("missing Ling verify convolution row"))?,
-        ))
+        let mut out = Vec::with_capacity(count);
+        for step in 0..count {
+            out.push((
+                *ssm.h_state_intermediates
+                    .get(step)
+                    .ok_or_else(|| anyhow::anyhow!("missing Ling verify H row {step}"))?,
+                *ssm.conv_state_intermediates
+                    .get(step)
+                    .ok_or_else(|| anyhow::anyhow!("missing Ling verify convolution row {step}"))?,
+            ));
+        }
+        Ok(out)
     }
 
     #[allow(clippy::too_many_arguments)]

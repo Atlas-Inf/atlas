@@ -82,6 +82,9 @@ pub(super) fn k3_record_outcome(
         _ => &sched.stats.k3_accept[0],
     };
     counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::metrics::SPEC_DECODE_VERIFY
+        .with_label_values(&["3", if num_accepted > 0 { "accept" } else { "reject" }])
+        .inc();
     let total = sched.stats.k3_accept[2].load(std::sync::atomic::Ordering::Relaxed)
         + sched.stats.k3_accept[1].load(std::sync::atomic::Ordering::Relaxed)
         + sched.stats.k3_accept[0].load(std::sync::atomic::Ordering::Relaxed);

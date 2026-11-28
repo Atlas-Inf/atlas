@@ -66,16 +66,59 @@ impl LingKdaLayer {
         projection: LingProjectionScratch,
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.forward_prefill_ks(
+            gpu,
+            input_norm,
+            tokens,
+            states,
+            None,
+            verify_snapshots,
+            fp32_workspace,
+            scratch,
+            projection,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill_ks(
+        &self,
+        gpu: &dyn GpuBackend,
+        input_norm: DevicePtr,
+        tokens: usize,
+        states: &[LingKdaState],
+        ks: Option<&[usize]>,
+        verify_snapshots: &[(DevicePtr, DevicePtr)],
+        fp32_workspace: Option<DevicePtr>,
+        scratch: LingKdaPrefillScratch,
+        projection: LingProjectionScratch,
+        stream: u64,
+    ) -> Result<DevicePtr> {
         ensure!(tokens > 0, "Ling KDA prefill needs at least one token");
         ensure!(tokens <= u32::MAX as usize, "Ling KDA prefill is too long");
         ensure!(!input_norm.is_null(), "Ling KDA prefill input is null");
-        // A verify is two rows per sequence (the committed token and its
-        // draft), with one snapshot per sequence: (H, convolution windows)
-        // after its first row, the state a rejected draft rolls back to.
+        // A verify carries k = 2..=4 rows per sequence (committed token plus
+        // 1..=3 drafts, uniform or ragged), with (k - 1) snapshots per sequence
+        // packed seq-major for rejection rollback.
         let verify = !verify_snapshots.is_empty();
+        let uniform_rows = tokens / states.len().max(1);
+        let seq_ks: Vec<usize> = match ks {
+            Some(ks) => ks.to_vec(),
+            None => vec![uniform_rows; states.len()],
+        };
+        let total_ks: usize = seq_ks.iter().sum();
+        let expected_snaps: usize = seq_ks.iter().map(|&k| k.saturating_sub(1)).sum();
+        let uniform_k = seq_ks
+            .first()
+            .copied()
+            .filter(|&k0| seq_ks.iter().all(|&k| k == k0));
         ensure!(
-            !verify || (verify_snapshots.len() == states.len() && tokens == 2 * states.len()),
-            "Ling verify snapshots ({}) need two rows for each of {} sequences, not {tokens}",
+            !verify
+                || (seq_ks.len() == states.len()
+                    && total_ks == tokens
+                    && seq_ks.iter().all(|&k| (2..=4).contains(&k))
+                    && verify_snapshots.len() == expected_snaps),
+            "Ling verify snapshots ({}) need 2..=4 rows per sequence for {} sequences, not {tokens}",
             verify_snapshots.len(),
             states.len()
         );
@@ -86,8 +129,6 @@ impl LingKdaLayer {
         for state in states {
             state.validate()?;
         }
-        let rows_per_state = tokens / states.len();
-        let chunk = if verify { 1 } else { rows_per_state };
         let row_bytes = LING_KDA_PROJECTION_SIZE * 2;
         scratch.validate()?;
         let rows = tokens as u32;
@@ -115,14 +156,18 @@ impl LingKdaLayer {
 
         let conv_bytes = LingKdaState::conv_state_bytes();
         let input_stride = LING_KDA_PROJECTION_SIZE as u32;
+        let mut row_off = 0usize;
+        let mut snap_off = 0usize;
         for (index, state) in states.iter().enumerate() {
-            let first = index * rows_per_state;
+            let seq_rows = seq_ks[index];
+            let seq_snaps = seq_rows.saturating_sub(1);
+            let chunk = if verify { 1 } else { seq_rows };
             for (plane, (state_ptr, weight)) in [
                 (0usize, (state.q_conv, &self.weights.q_conv)),
                 (1usize, (state.k_conv, &self.weights.k_conv)),
                 (2usize, (state.v_conv, &self.weights.v_conv)),
             ] {
-                for offset in (0..rows_per_state).step_by(chunk) {
+                for offset in (0..seq_rows).step_by(chunk) {
                     ops::conv1d_update_prefill(
                         gpu,
                         self.conv_prefill_k,
@@ -130,12 +175,12 @@ impl LingKdaLayer {
                         state_ptr,
                         scratch
                             .qkv_planes
-                            .offset(plane * plane_bytes + (first + offset) * row_bytes),
+                            .offset(plane * plane_bytes + (row_off + offset) * row_bytes),
                         weight,
                         DevicePtr::NULL,
                         scratch
                             .conv_planes
-                            .offset(plane * plane_bytes + (first + offset) * row_bytes),
+                            .offset(plane * plane_bytes + (row_off + offset) * row_bytes),
                         LING_KDA_PROJECTION_SIZE as u32,
                         LING_KDA_CONV_WIDTH as u32,
                         chunk as u32,
@@ -143,8 +188,9 @@ impl LingKdaLayer {
                         input_stride,
                         stream,
                     )?;
-                    if offset == 0
-                        && let Some(&(_, conv)) = verify_snapshots.get(index)
+                    if verify
+                        && offset < seq_snaps
+                        && let Some(&(_, conv)) = verify_snapshots.get(snap_off + offset)
                     {
                         gpu.copy_d2d_async(
                             state_ptr,
@@ -156,6 +202,8 @@ impl LingKdaLayer {
                 }
                 debug_assert_eq!(state_ptr.0, state.q_conv.offset(plane * conv_bytes).0);
             }
+            row_off += seq_rows;
+            snap_off += seq_snaps;
         }
         ops::kda_pack_qkv(
             gpu,
@@ -212,24 +260,49 @@ impl LingKdaLayer {
                 LING_KDA_HEAD_DIM as u32,
                 stream,
             )?;
-        } else if rows_per_state == 1 && (2..=8).contains(&states.len()) {
-            self.batch_recurrent(gpu, &scratch, states, 1, 0, stream)?;
-        } else if verify && states.len() > 1 {
-            // Every sequence's first row in one launch, the snapshots a
-            // rejected draft rolls back to, then every second row.
+        } else if uniform_k == Some(1) && states.len() >= 2 {
             for (group, chunk) in states.chunks(8).enumerate() {
-                let base = 2 * 8 * group as u32;
-                self.batch_recurrent(gpu, &scratch, chunk, 2, base, stream)?;
-                for (state, &(snapshot, _)) in chunk.iter().zip(&verify_snapshots[8 * group..]) {
-                    gpu.copy_d2d_async(state.h, snapshot, LingKdaState::h_state_bytes(), stream)?;
+                self.batch_recurrent(gpu, &scratch, chunk, 1, (8 * group) as u32, stream)?;
+            }
+        } else if verify && states.len() > 1 && uniform_k.is_some() {
+            // Advance every sequence by one row per launch, saving rollback
+            // snapshots after each of the first `k - 1` rows.
+            let k = uniform_k.unwrap();
+            let snaps_per_state = k - 1;
+            for (group, chunk) in states.chunks(8).enumerate() {
+                let base = (k * 8 * group) as u32;
+                for step in 0..k {
+                    self.batch_recurrent(
+                        gpu,
+                        &scratch,
+                        chunk,
+                        k as u32,
+                        base + step as u32,
+                        stream,
+                    )?;
+                    if step < snaps_per_state {
+                        for (i, state) in chunk.iter().enumerate() {
+                            let snap_idx = (8 * group + i) * snaps_per_state + step;
+                            let (snapshot, _) = verify_snapshots[snap_idx];
+                            gpu.copy_d2d_async(
+                                state.h,
+                                snapshot,
+                                LingKdaState::h_state_bytes(),
+                                stream,
+                            )?;
+                        }
+                    }
                 }
-                self.batch_recurrent(gpu, &scratch, chunk, 2, base + 1, stream)?;
             }
         } else {
+            let mut row_off = 0usize;
+            let mut snap_off = 0usize;
             for (index, state) in states.iter().enumerate() {
-                let first = index * rows_per_state;
-                for offset in (0..rows_per_state).step_by(chunk) {
-                    let first = first + offset;
+                let seq_rows = seq_ks[index];
+                let seq_snaps = seq_rows.saturating_sub(1);
+                let chunk = if verify { 1 } else { seq_rows };
+                for offset in (0..seq_rows).step_by(chunk) {
+                    let first = row_off + offset;
                     ops::kda_recurrent(
                         gpu,
                         self.recurrent_k,
@@ -246,8 +319,9 @@ impl LingKdaLayer {
                         self.config.lower_bound,
                         stream,
                     )?;
-                    if offset == 0
-                        && let Some(&(snapshot, _)) = verify_snapshots.get(index)
+                    if verify
+                        && offset < seq_snaps
+                        && let Some(&(snapshot, _)) = verify_snapshots.get(snap_off + offset)
                     {
                         gpu.copy_d2d_async(
                             state.h,
@@ -257,6 +331,8 @@ impl LingKdaLayer {
                         )?;
                     }
                 }
+                row_off += seq_rows;
+                snap_off += seq_snaps;
             }
         }
         ops::kda_sigmoid_gated_norm(
