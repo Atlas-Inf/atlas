@@ -235,12 +235,15 @@ pub(crate) fn record_verify(
 }
 
 /// Serial tokens before the re-probe after the `failed`-th failed probe in
-/// a row: an eighth of the interval `reprobe` first, doubling to four times
-/// it. Text that drafts well again soon (a comment inside code) is back in
-/// a few dozen tokens; text that keeps failing (prose) is probed less often
-/// than the fixed interval probed it.
+/// a row: the interval `reprobe` first, doubling to four times it. Text that
+/// keeps failing (prose) is probed less often than the fixed interval probed
+/// it. The first wait is the interval itself, as before this backoff: a
+/// shorter start re-probed 5x as often on low-acceptance text and cost 3-8%
+/// of decode there (Inkling Strict, one GB10, sparky 188b). A model whose
+/// drafts come back quickly (Inkling code) sets a short
+/// `ATLAS_DFLASH_ADAPTIVE_REPROBE` in its recipe instead.
 fn hold_tokens(reprobe: u32, failed: u32) -> u32 {
-    (reprobe / 8).max(1).saturating_mul(1 << failed.min(5))
+    reprobe.max(1).saturating_mul(1 << failed.min(2))
 }
 
 /// May this sequence propose/speculate right now? Un-suspends (re-probe)
@@ -306,10 +309,13 @@ mod tests {
     }
 
     #[test]
-    fn the_wait_starts_short_and_doubles_to_four_intervals() {
-        let waits: Vec<u32> = (0..7).map(|f| super::hold_tokens(256, f)).collect();
-        assert_eq!(waits, [32, 64, 128, 256, 512, 1024, 1024]);
-        assert_eq!(super::hold_tokens(2, 0), 1);
+    fn the_wait_starts_at_the_interval_and_doubles_to_four_intervals() {
+        let waits: Vec<u32> = (0..5).map(|f| super::hold_tokens(256, f)).collect();
+        assert_eq!(waits, [256, 512, 1024, 1024, 1024]);
+        // a recipe's short interval keeps the short first wait
+        let short: Vec<u32> = (0..4).map(|f| super::hold_tokens(32, f)).collect();
+        assert_eq!(short, [32, 64, 128, 128]);
+        assert_eq!(super::hold_tokens(0, 0), 1);
     }
 
     #[test]
