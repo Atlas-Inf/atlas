@@ -259,6 +259,12 @@ impl BlockDiffusionDraftHead {
         {
             return Ok(());
         }
+        // ATLAS_DFLASH_NVFP4_T: the twins are transposed; nothing else reads them.
+        if let Some(kernel) = self.twins.nvfp4_t
+            && let Some(w) = w_nvfp4
+        {
+            return self.nvfp4_t_rows(gpu, kernel, w, src, dst, m, n_out, k_in, stream);
+        }
         let nvfp4_kernel = drafter_nvfp4_tier(m).map(|tier| match tier {
             DrafterNvfp4Tier::Batch4 => self.kernels.w4a16_gemv_batch4,
             DrafterNvfp4Tier::Batch8 => self.kernels.w4a16_gemv_batch8,
