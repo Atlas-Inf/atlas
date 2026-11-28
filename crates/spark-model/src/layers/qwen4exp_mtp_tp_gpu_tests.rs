@@ -96,6 +96,60 @@ fn qwen4exp_mtp_tp_gpu_shards_assemble_to_the_unsplit_head() {
     }
 }
 
+/// `ATLAS_QWEN4EXP_MTP_DRAFT_TP_ONE`: at ONE row the two shards, assembled,
+/// are the bytes the per-sequence propose's own head writes
+/// ([`DraftHead::project`]: `dense_gemv_bf16` / `w4a16_gemv`), for several
+/// input rows.
+#[test]
+#[ignore]
+fn qwen4exp_mtp_tp_gpu_one_row_shards_assemble_to_the_per_sequence_head() {
+    let set = atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "nvfp4")
+        .expect("build with ATLAS_TARGET_MODEL=qwen3.8-flash-next");
+    let gpu =
+        spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &set.modules).expect("CUDA backend");
+    let g: &dyn GpuBackend = &gpu;
+    let stream = g.default_stream();
+    let lm_head = DenseWeight {
+        weight: g.alloc(VOCAB * HIDDEN * BF16).unwrap(),
+    };
+    g.copy_h2d(&bf16_bytes(VOCAB * HIDDEN, 7, 0.05), lm_head.weight)
+        .unwrap();
+    const INPUTS: usize = 6;
+    let input = g.alloc(INPUTS * HIDDEN * BF16).unwrap();
+    g.copy_h2d(&bf16_bytes(INPUTS * HIDDEN, 13, 2.0), input)
+        .unwrap();
+    let k = crate::layers::try_kernel(g, "dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm");
+    let k1 = g.kernel("gemv", "dense_gemv_bf16").unwrap();
+    let bytes = VOCAB * BF16;
+    let full = g.alloc(bytes).unwrap();
+    let joined = g.alloc(bytes).unwrap();
+    for nvfp4 in [false, true] {
+        let draft = DraftHead::build_with(&lm_head, VOCAB, HIDDEN, 0, nvfp4, g).unwrap();
+        assert!(draft.rows_batchable(1, k), "nvfp4={nvfp4}: no one-row tier");
+        let tp = [0, 1].map(|rank| DraftTp::new(&draft, HIDDEN, rank, g).unwrap());
+        for i in 0..INPUTS {
+            let row = input.offset(i * HIDDEN * BF16);
+            g.memset(full, 0x55, bytes).unwrap();
+            g.memset(joined, 0xAA, bytes).unwrap();
+            draft
+                .project(g, k1, row, full, HIDDEN as u32, stream)
+                .unwrap();
+            for t in &tp {
+                t.project(&draft, g, k, row, 1, stream).unwrap();
+            }
+            let pair = (tp[0].send, tp[1].send);
+            assemble(g, tp[0].geom, 0, pair, joined, 1, stream).unwrap();
+            g.synchronize(stream).unwrap();
+            let (mut a, mut b) = (vec![0u8; bytes], vec![0u8; bytes]);
+            g.copy_d2h(full, &mut a).unwrap();
+            g.copy_d2h(joined, &mut b).unwrap();
+            let diff = a.chunks(2).zip(b.chunks(2)).filter(|(x, y)| x != y).count();
+            assert_eq!(diff, 0, "nvfp4={nvfp4} input {i}: {diff} logits differ");
+        }
+        println!("ok nvfp4={nvfp4}: {INPUTS} one-row heads byte-identical ({VOCAB} logits each)");
+    }
+}
+
 /// What a rank's shard saves: the 100k-row NVFP4 draft head (the profiled
 /// configuration) at 8 rows, whole against one shard, wall time over a
 /// stream sync (the projections are ~1 ms).

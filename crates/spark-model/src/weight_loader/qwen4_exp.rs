@@ -88,6 +88,7 @@ mod mx8_common;
 mod ple;
 mod probe;
 mod shared_mx8;
+mod slab;
 
 pub(crate) use gdn_fp8::GdnProjections;
 pub use mtp::{Qwen4ExpMtpModule, load_qwen4exp_mtp_module};
@@ -101,6 +102,9 @@ pub use shard_layout::ple_shard_layout;
 pub struct Qwen4ExpWeightLoader;
 
 impl ModelWeightLoader for Qwen4ExpWeightLoader {
+    fn slab_pack_weights(&self, config: &ModelConfig) -> bool {
+        slab::requested(config)
+    }
     fn supports_tp(&self) -> bool {
         // Two ranks in the overlapping TP=EP=2 shape only (checked in
         // `load_layers`): GDN and attention are head-parallel through the

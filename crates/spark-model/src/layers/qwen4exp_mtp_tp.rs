@@ -28,7 +28,19 @@
 //! worker builds its draft head from its own (full) LM head exactly as the
 //! head does: the same rows, the same NVFP4 copy.
 //!
-//! Lockstep. Only a batched propose splits. The head announces it at its
+//! One sequence (`ATLAS_QWEN4EXP_MTP_DRAFT_TP_ONE=1`, default off, with the
+//! switch above). A lone sequence drafts on the per-sequence propose, which
+//! no batched propose serves, so on the pair the worker idled through it:
+//! 8.4 ms of a 49.5 ms step at C1 (nsys, 2026-11-15), the draft head 611 us
+//! of each ~1.5 ms position. With it the model announces that propose as a
+//! one-row plan and each position's draft head runs [`TpRun::head`] at one
+//! row: the scalar `w4a16_gemv_batch{M}` tier (or `dense_gemv_bf16_batchm`),
+//! whose row is `w4a16_gemv`'s (`dense_gemv_bf16`'s) bytes, over half the
+//! rows on each rank. A grammar-masked propose reads the full head and is
+//! never announced.
+//!
+//! Lockstep. A batched propose splits, and under the second switch a lone
+//! sequence's. The head announces it at its
 //! command loop (`EP_CMD_DRAFT_ASSIST`, the preamble word [`Plan::word`]: `n`
 //! rows, `drafts` positions), so the worker is at its idle receive; the worker
 //! enqueues its whole walk ([`Qwen4ExpDraftAssist::serve`]) and returns. Both
@@ -74,10 +86,13 @@ pub fn requested() -> Result<bool> {
 
 /// The value both ranks must agree on: the switch (bit 0), then what picks
 /// the draft head's rows and kernel: the NVFP4 copy (bit 1) and an id list
-/// (bit 2). 0 with the switch off. `--mtp-vocab` is agreed by the server.
+/// (bit 2), then the lone-sequence switch (bit 3). 0 with the switch off.
+/// `--mtp-vocab` is agreed by the server.
 pub fn parity_word() -> Result<u64> {
     Ok(if requested()? {
-        1 | (draft_head::nvfp4_requested() as u64) << 1 | (draft_head::list_requested() as u64) << 2
+        1 | (draft_head::nvfp4_requested() as u64) << 1
+            | (draft_head::list_requested() as u64) << 2
+            | (one_requested()? as u64) << 3
     } else {
         0
     })
@@ -244,6 +259,13 @@ impl Qwen4ExpMtpHead {
             0,
             gpu,
         )?);
+        self.tp_one = one_requested()?;
+        if self.tp_one {
+            tracing::info!(
+                "qwen4_exp MTP draft TP: a lone sequence's propose splits its draft head too \
+                 (ATLAS_QWEN4EXP_MTP_DRAFT_TP_ONE=1)"
+            );
+        }
         tracing::info!(
             "qwen4_exp MTP draft TP: the worker projects draft rows {}.. of each batched propose \
              (ATLAS_QWEN4EXP_MTP_DRAFT_TP=1)",
@@ -264,6 +286,9 @@ impl Qwen4ExpMtpHead {
         grammar: bool,
         ctx: &crate::layer::ForwardContext,
     ) -> Option<u32> {
+        if n == 1 {
+            return self.tp_one_word(comm, drafts, grammar);
+        }
         let pair = comm.rank() == 0 && comm.world_size() == 2;
         (self.tp.is_some()
             && pair
@@ -429,9 +454,17 @@ impl Qwen4ExpDraftAssist {
     }
 }
 
+#[path = "qwen4exp_mtp_tp_one.rs"]
+mod one;
+pub use one::one_requested;
+
 #[cfg(test)]
 #[path = "qwen4exp_mtp_tp_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "qwen4exp_mtp_tp_one_tests.rs"]
+mod one_tests;
 
 #[cfg(all(test, feature = "cuda"))]
 #[path = "qwen4exp_mtp_tp_gpu_tests.rs"]

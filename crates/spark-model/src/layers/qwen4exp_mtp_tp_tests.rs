@@ -16,7 +16,7 @@ const VOCAB: usize = 4101;
 const HIDDEN: usize = 64;
 
 /// One rank of the pair: the bytes of every exchange it issued, in order.
-struct Pair {
+pub(super) struct Pair {
     rank: usize,
     /// The one-shot cap the logits exchange chunks by (0: one exchange).
     max: usize,
@@ -24,14 +24,14 @@ struct Pair {
 }
 
 impl Pair {
-    fn new(rank: usize, max: usize) -> Self {
+    pub(super) fn new(rank: usize, max: usize) -> Self {
         Self {
             rank,
             max,
             sizes: Mutex::default(),
         }
     }
-    fn sizes(&self) -> Vec<usize> {
+    pub(super) fn sizes(&self) -> Vec<usize> {
         self.sizes.lock().unwrap().clone()
     }
 }
