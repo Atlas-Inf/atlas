@@ -22,6 +22,10 @@
 // two apart, so no row reads a state another thread is replacing). With one row a
 // sequence (decode), `roll` has `inkling2_sconv` roll the state itself: the thread of
 // (sequence, channel) is that state's only reader, and it has read it.
+//
+// The post-attention and post-MLP convs feed the residual stream directly: with
+// `res_f32` the output y (BF16-rounded) is added as r = (restart ? 0 : res_x) + y into
+// fp32 `res_f32`, with `res_bf16` as BF16(res_r + y); `out` is then not written.
 
 #include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
@@ -43,7 +47,12 @@ extern "C" __global__ void inkling2_sconv(
     const unsigned int out_stride,
     const unsigned int dyn_stride,
     const unsigned int head_dim,                // channels per dynamic-tap head
-    const unsigned int roll                     // 1: roll the state too (rows_per_seq == 1)
+    const unsigned int roll,                    // 1: roll the state too (rows_per_seq == 1)
+    const __nv_bfloat16* __restrict__ res_x,    // residual add (res_f32): the stream's BF16 rows
+    const float* __restrict__ res_r,            // layer output (res_bf16): the fp32 residual
+    float* __restrict__ res_f32,                // NULL, or r = (restart ? 0 : res_x) + y
+    __nv_bfloat16* __restrict__ res_bf16,       // NULL, or BF16(res_r + y)
+    const unsigned int restart
 ) {
     atlas_pdl_enter();
     const unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -70,7 +79,11 @@ extern "C" __global__ void inkling2_sconv(
         acc += tap * xv;
     }
     const float denom = dyn == nullptr ? (float)(k + 1) : (float)(2 * k + 1);
-    out[(unsigned long long)r * out_stride + c] = __float2bfloat16((acc + xc) * rsqrtf(denom));
+    const __nv_bfloat16 y = __float2bfloat16((acc + xc) * rsqrtf(denom));
+    const unsigned long long o = (unsigned long long)r * out_stride + c;
+    if (res_f32 != nullptr) res_f32[o] = (restart ? 0.0f : __bfloat162float(res_x[o])) + __bfloat162float(y);
+    else if (res_bf16 != nullptr) res_bf16[o] = __float2bfloat16(res_r[o] + __bfloat162float(y));
+    else out[o] = y;
     if (roll) {
         // as inkling2_sconv_state with one row: shift, the new input last
         for (unsigned int j = 0; j + 2 < k; j++) st[j] = st[j + 1];

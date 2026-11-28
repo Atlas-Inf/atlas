@@ -8,6 +8,7 @@ mod attn_ops;
 mod batch;
 mod calls;
 mod forward;
+mod forward_heads;
 mod gate_ops;
 pub(crate) mod glue;
 pub(crate) mod layer;
