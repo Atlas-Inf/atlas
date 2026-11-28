@@ -16,10 +16,14 @@
 
 // The row tiles of the experts' sorted rows, 128 rows each, for the grouped W4A4 / W8A8
 // GEMMs: tiles[0] = their number, tiles[1 + t] = expert << 16 | tile index within the
-// expert. One block of up to 1024 experts. grid (1), block E rounded up to a warp.
+// expert; done[0 .. n_done) zeroed (inkling2_moe_fused_gate_up_fp4's row-tile counters and
+// work counter; done may be NULL). One block of up to 1024 experts. grid (1), block E rounded up to a warp.
 extern "C" __global__ void __launch_bounds__(1024) inkling2_moe_tiles(const int* __restrict__ offsets,
-                                                                       int* __restrict__ tiles, const unsigned int E) {
+                                                                       int* __restrict__ tiles, const unsigned int E,
+                                                                       int* __restrict__ done, const unsigned int n_done) {
     atlas_pdl_enter();
+    if (done)
+        for (unsigned int i = threadIdx.x; i < n_done; i += blockDim.x) done[i] = 0;
     __shared__ int warp_sums[32];
     const unsigned int e = threadIdx.x, lane = e % 32, warp = e / 32;
     const int n = e < E ? (offsets[e + 1] - offsets[e] + W4_BM - 1) / W4_BM : 0;
@@ -84,7 +88,7 @@ __device__ __forceinline__ void ink_moe_lowp(
 }
 
 // The checkpoint's own NVFP4 experts at its declared numerics (W4A4): rows
-// quantized by inkling2_quant_fp4 / inkling2_situ_quant_fp4 (codes [*, K/2],
+// quantized by inkling2_quant_fp4 / inkling2_moe_fused_gate_up_fp4 (codes [*, K/2],
 // E4M3 scales [*, K/16], outer scales [*]) against the experts as stored, on
 // the E2M1 tensor cores (nvfp4_w4a4_tile.cuh, 128 x 128 tiles);
 // C[m, n] = BF16(acc * (outer[row(m)] * s2[e])), as vLLM's Inkling 2 expert
@@ -108,7 +112,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) inkling2_moe_gemm_w4a4(
 }
 
 // The checkpoint's MXFP8 experts at its declared numerics (W8A8): rows quantized by
-// inkling2_quant_mxfp8 / inkling2_situ_quant_mxfp8 (E4M3 [*, K], UE8M0 scales
+// inkling2_quant_mxfp8 / inkling2_moe_fused_gate_up_mx8 (E4M3 [*, K], UE8M0 scales
 // [*, K/32]) against the experts as stored (codes [E, N, K], scales [E, N, K/32]) on
 // kind::mxf8f6f4; C[m, n] = BF16(acc). Same grid as inkling2_moe_gemm_w4a4.
 extern "C" __global__ void __launch_bounds__(256, 2) inkling2_moe_gemm_w8a8(
