@@ -18,8 +18,6 @@ mod route;
 pub(crate) struct GlueKernels {
     pub rmsnorm: KernelHandle,
     pub gate_mul: KernelHandle,
-    pub residual: KernelHandle,
-    pub layer_out: KernelHandle,
     pub f32_to_bf16: KernelHandle,
     /// `dense_gemv_bf16`: y[N] = W[N, K] x[K], BF16
     pub dense_gemv: KernelHandle,
@@ -78,8 +76,6 @@ impl GlueKernels {
         Ok(Self {
             rmsnorm: m("inkling2_rmsnorm")?,
             gate_mul: m("inkling2_gate_mul")?,
-            residual: m("inkling2_residual")?,
-            layer_out: m("inkling2_layer_out")?,
             f32_to_bf16: m("inkling2_f32_to_bf16")?,
             dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
             dense_gemv_batchm: gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?,
@@ -405,47 +401,6 @@ impl GlueKernels {
             .block([256, 1, 1])
             .arg_ptr(a)
             .arg_ptr(g)
-            .arg_ptr(out)
-            .arg_u32(n as u32)
-            .launch(s)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn residual(
-        &self,
-        gpu: &dyn GpuBackend,
-        x: DevicePtr,
-        c: DevicePtr,
-        r: DevicePtr,
-        n: usize,
-        restart: bool,
-        s: u64,
-    ) -> Result<()> {
-        KernelLaunch::new(gpu, self.residual)
-            .grid([blocks(n), 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(x)
-            .arg_ptr(c)
-            .arg_ptr(r)
-            .arg_u32(n as u32)
-            .arg_u32(u32::from(restart))
-            .launch(s)
-    }
-
-    pub(crate) fn layer_out(
-        &self,
-        gpu: &dyn GpuBackend,
-        r: DevicePtr,
-        m: DevicePtr,
-        out: DevicePtr,
-        n: usize,
-        s: u64,
-    ) -> Result<()> {
-        KernelLaunch::new(gpu, self.layer_out)
-            .grid([blocks(n), 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(r)
-            .arg_ptr(m)
             .arg_ptr(out)
             .arg_u32(n as u32)
             .launch(s)
